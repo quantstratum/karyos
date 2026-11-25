@@ -21,6 +21,37 @@ pub fn host_monotonic_ns() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// The host's boot identity and this process's time namespace, as
+/// ADR-0117 (point 3) derives a `CLOCK_MONOTONIC` epoch from them: the 36
+/// ASCII characters of `/proc/sys/kernel/random/boot_id` and the inode of
+/// `/proc/self/ns/time`. A control-path call.
+///
+/// # Errors
+///
+/// Either file unreadable, or a boot id that is not 36 characters.
+#[cfg(target_os = "linux")]
+pub fn time_identity() -> std::io::Result<([u8; 36], u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let text = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let boot: [u8; 36] = text
+        .trim_end_matches('\n')
+        .as_bytes()
+        .try_into()
+        .map_err(|_| std::io::Error::other("the boot id is not 36 characters"))?;
+    let namespace = std::fs::metadata("/proc/self/ns/time")?.ino();
+    Ok((boot, namespace))
+}
+
+/// [`time_identity`] off Linux: neither identity exists.
+///
+/// # Errors
+///
+/// Always [`std::io::ErrorKind::Unsupported`].
+#[cfg(not(target_os = "linux"))]
+pub fn time_identity() -> std::io::Result<([u8; 36], u64)> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
 /// Nanoseconds of the host's `CLOCK_TAI`, the clock domain of timed
 /// transmission's `Tai` schedules (`quantstratum-docs:
 /// karyos/design/timed-tx.md`, TT-2; Linux only), through the same

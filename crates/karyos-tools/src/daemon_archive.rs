@@ -51,6 +51,12 @@ use karyos_sys::term_bytes::SharedTerms;
 
 use crate::archive::DriverHost;
 use crate::args::{ArchiveOptions, RecordOption, StreamOption, TermOptions};
+use crate::daemon_trace::TracePublisher;
+
+/// The daemon's trace publisher: the driver's trace mirror on the trace
+/// stream's publication (ADR-0117).
+type DaemonTrace =
+    TracePublisher<ClientPublication<SharedTerms>, karyos_sys::trace_mirror::TraceMirrorReader>;
 
 /// The `tracing` target of the Archive's audit trail.
 pub const AUDIT: &str = "karyos::archive::audit";
@@ -519,6 +525,8 @@ pub struct DaemonArchive {
     audits_dropped: u64,
     /// The signing alarm last logged: a change is logged once (karyos#1031).
     signing_alarm: bool,
+    /// The trace mirror's publisher (`--archive-trace-record`, ADR-0117).
+    trace: Option<DaemonTrace>,
 }
 
 impl std::fmt::Debug for DaemonArchive {
@@ -563,6 +571,21 @@ impl DaemonArchive {
         };
         let mut control = vec![requests, responses];
         control.extend(retention_stream);
+        let trace_stream = match &options.trace {
+            Some(trace) => Some(
+                driver
+                    .add_stream(control_config(
+                        terms,
+                        StreamOption {
+                            stream_id: trace.stream_id,
+                            session_id: trace.session_id,
+                            allow_unconnected: false,
+                        },
+                    )?)
+                    .map_err(ArchiveStartError::Stream)?,
+            ),
+            None => None,
+        };
         for &stream in &control {
             driver
                 .audit_grants(stream)
@@ -607,6 +630,15 @@ impl DaemonArchive {
             started: Vec::new(),
             next: 1,
         };
+        let trace = match trace_stream {
+            Some(stream) => {
+                control.push(stream);
+                let own = trace_self(options)?;
+                let publication = driver.publication(stream).map_err(handle)?;
+                Some(TracePublisher::new(publication, driver.trace_mirror(), own))
+            }
+            None => None,
+        };
         if options.time_evidence {
             let entries = karyos_archive::integrity::time_evidence::entries_dir(&options.dir);
             std::fs::create_dir_all(&entries).map_err(|error| {
@@ -645,9 +677,18 @@ impl DaemonArchive {
             replicas,
             audits_dropped: 0,
             signing_alarm: false,
+            trace,
         };
         for record in &options.records {
             archive.requester.ask(Asked::Start(*record), "karyos:ipc");
+        }
+        if let Some(trace) = &options.trace {
+            let record = RecordOption {
+                stream_id: trace.stream_id,
+                session_id: trace.session_id,
+                sync: karyos_archive::segment::SyncPolicy::PerSegment,
+            };
+            archive.requester.ask(Asked::Start(record), "karyos:ipc");
         }
         archive.release_idle_requester();
         Ok((archive, control))
@@ -672,6 +713,7 @@ impl DaemonArchive {
     /// The driver's duty cycle error; the rest still runs.
     pub fn cycle(&mut self) -> Result<u32, DriverError> {
         let work = self.driver_mut().do_work();
+        let traced = self.trace.as_mut().is_some_and(TracePublisher::publish);
         let served = self.server.duty();
         self.server.host_mut().inner.finish_ended();
         let _ = self.requester.serve();
@@ -696,7 +738,7 @@ impl DaemonArchive {
         // A request served counts as work, so the idle strategy does not
         // back off while requests arrive.
         work.map(|work| {
-            if served || replicated {
+            if served || replicated || traced {
                 work.max(1)
             } else {
                 work
@@ -727,6 +769,32 @@ impl DaemonArchive {
                 records = lag.records,
                 lag_ns = lag.ns,
                 "signed coverage is within the anchor interval again"
+            );
+        }
+    }
+
+    /// Runs cycles until the trace publisher has published everything the
+    /// trace mirror held when it was called (ADR-0117), or until
+    /// `deadline`: the trace recording is stopped after it.
+    pub fn drain_trace(&mut self, deadline: Option<std::time::Instant>) {
+        let Some(trace) = self.trace.as_mut() else {
+            return;
+        };
+        // One more read of the mirror, then the queue emptied.
+        let _ = trace.publish();
+        while self.trace.as_ref().is_some_and(|trace| trace.queued() > 0)
+            && deadline.is_none_or(|deadline| std::time::Instant::now() < deadline)
+        {
+            let _ = self.cycle();
+            std::thread::yield_now();
+        }
+        if let Some(trace) = &self.trace {
+            let counts = trace.counts();
+            tracing::info!(
+                published = counts.published,
+                losses = counts.losses,
+                queued = trace.queued(),
+                "trace mirror published"
             );
         }
     }
@@ -777,6 +845,28 @@ impl DaemonArchive {
             self.requester.responses = None;
         }
     }
+}
+
+/// The trace stream's self message (ADR-0117, point 1): the namespace word
+/// the driver writes for a journal in its own time namespace (T2's
+/// [`TimeNamespace::Same`]), the namespace's inode when readable, and the
+/// clock the trace recording declares (none yet: all zero).
+///
+/// [`TimeNamespace::Same`]: karyos_sys::trace_mirror::TimeNamespace::Same
+///
+/// # Errors
+///
+/// None yet; the declared clock's derivation may refuse.
+fn trace_self(
+    _options: &ArchiveOptions,
+) -> Result<karyos_trace::stream::DriverSelf, ArchiveStartError> {
+    let namespace_inode = karyos_sys::host_clock::time_identity().map_or(0, |(_, inode)| inode);
+    Ok(karyos_trace::stream::DriverSelf {
+        namespace: karyos_sys::trace_mirror::TimeNamespace::Same.code(),
+        namespace_inode,
+        clock: [0; 5],
+        granularity: 0,
+    })
 }
 
 /// A control stream's configuration from the daemon's term settings.

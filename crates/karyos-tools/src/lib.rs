@@ -42,6 +42,7 @@ pub mod daemon_archive;
 pub mod daemon_replica;
 #[cfg(target_os = "linux")]
 pub mod daemon_replication;
+pub mod daemon_trace;
 pub mod errors;
 pub mod idle;
 #[cfg(target_os = "linux")]

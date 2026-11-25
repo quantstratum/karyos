@@ -188,6 +188,12 @@ Archive:
   --archive-calibration-journal <dir>
                                     the calibration journal `karyos-tools calibrate append`
                                     writes: groups' time evidence takes its snapshots from it
+  --archive-trace-record <stream_id>:<session_id>
+                                    add this stream, publish the driver's trace mirror on it
+                                    and record it at boot, required (ADR-0117); not a
+                                    --stream; needs --archive
+  --trace-network                   set the driver's network trace hooks, so network trace
+                                    journals are mirrored (and recorded); needs --network on
 
 Shutdown:
   --shutdown-linger <duration>      time clients have to leave after SIGTERM or SIGINT [5s]
@@ -408,6 +414,20 @@ pub struct ArchiveOptions {
     /// (`--replication-trusted-network`, ADR-0102 decision 10): without it
     /// no replication starts.
     pub trusted_network: bool,
+    /// The trace recording (`--archive-trace-record`, ADR-0117), when
+    /// asked for.
+    pub trace: Option<TraceRecordOption>,
+}
+
+/// The daemon's trace recording (`--archive-trace-record`, ADR-0117): the
+/// stream the daemon adds, publishes its driver's trace mirror on and
+/// records at boot, required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceRecordOption {
+    /// The trace stream's wire stream id.
+    pub stream_id: i32,
+    /// Its session alias.
+    pub session_id: i32,
 }
 
 /// The head signer of an Archive (`--archive-signer`,
@@ -468,6 +488,9 @@ pub struct Options {
     pub idle_image_timeout: Option<Duration>,
     /// How long the shutdown waits for clients to leave.
     pub shutdown_linger: Duration,
+    /// Whether the driver's network trace hooks are set
+    /// (`--trace-network`, ADR-0117).
+    pub trace_network: bool,
     /// The control-path log verbosity.
     pub log_level: LogLevel,
     /// The Archive agent, when `--archive` is given.
@@ -511,6 +534,7 @@ impl Options {
             timed_networks: Vec::new(),
             idle_image_timeout: None,
             shutdown_linger: DEFAULT_SHUTDOWN_LINGER,
+            trace_network: false,
             log_level: LogLevel::Info,
             archive: None,
             io: IoConfig::default(),
@@ -628,6 +652,10 @@ where
             archive.trusted_network = true;
             continue;
         }
+        if text == "--trace-network" {
+            options.trace_network = true;
+            continue;
+        }
         let (name, inline) = match text.split_once('=') {
             Some((name, value)) if name.starts_with("--") => (name, Some(OsString::from(value))),
             _ => (text, None),
@@ -699,6 +727,9 @@ where
             }
             "--archive-control" => control(&value).map(|control| archive.control = Some(control)),
             "--record" => record(&value).map(|record| archive.records.push(record)),
+            "--archive-trace-record" => trace_record(&value).map(|trace| {
+                archive.trace = Some(trace);
+            }),
             "--replica" => replica(&value).map(|replica| archive.replicas.push(replica)),
             "--replicate" => {
                 replicate(&value).map(|replicate| archive.replications.push(replicate))
@@ -767,6 +798,13 @@ where
                 });
             }
         }
+    }
+    // The network trace hooks need the network agents.
+    if options.trace_network && options.driver.network.is_none() {
+        return Err(ArgsError::Needs {
+            option: "--trace-network",
+            needs: "--network on",
+        });
     }
     if sizing {
         return Ok(Command::SizingReport(Box::new(options)));
@@ -910,6 +948,7 @@ const OPTIONS: &[&str] = &[
     "--archive-trust",
     "--archive-copy-location",
     "--archive-calibration-journal",
+    "--archive-trace-record",
     "--archive-retain-for",
     "--archive-purge",
     "--archive-min-copies",
@@ -1332,6 +1371,7 @@ struct Archive {
     replications: Vec<ReplicateOption>,
     replicas: Vec<ReplicaOption>,
     trusted_network: bool,
+    trace: Option<TraceRecordOption>,
 }
 
 impl Archive {
@@ -1365,6 +1405,7 @@ impl Archive {
                 (!self.replications.is_empty(), "--replicate"),
                 (!self.replicas.is_empty(), "--replica"),
                 (self.trusted_network, "--replication-trusted-network"),
+                (self.trace.is_some(), "--archive-trace-record"),
             ] {
                 if given {
                     return Err(ArgsError::Needs {
@@ -1471,8 +1512,18 @@ impl Archive {
             replications: self.replications,
             replicas: self.replicas,
             trusted_network: self.trusted_network,
+            trace: self.trace,
         }))
     }
+}
+
+/// `<stream_id>:<session_id>`: the trace recording's stream.
+fn trace_record(value: &str) -> Option<TraceRecordOption> {
+    let (stream_id, session_id) = value.split_once(':')?;
+    Some(TraceRecordOption {
+        stream_id: stream_id.parse().ok()?,
+        session_id: session_id.parse().ok()?,
+    })
 }
 
 /// The retention policy: `--archive-retain-for`, `--archive-purge` and
@@ -1627,6 +1678,56 @@ mod tests {
             Command::Run(options) => *options,
             Command::Help | Command::SizingReport(_) => panic!("expected options"),
         }
+    }
+
+    /// ADR-0117: `--archive-trace-record` names the trace stream and
+    /// needs `--archive`; `--trace-network` needs `--network on`.
+    #[test]
+    fn the_trace_recording_and_network_hooks_parse_with_their_needs() {
+        let archive = [
+            "--dir",
+            "d",
+            "--archive",
+            "a",
+            "--archive-control",
+            "100,101",
+            "--archive-anchor-interval",
+            "1s",
+        ];
+        let parsed = options(&[&archive[..], &["--archive-trace-record", "40:3"]].concat());
+        assert_eq!(
+            parsed.archive.unwrap().trace,
+            Some(TraceRecordOption {
+                stream_id: 40,
+                session_id: 3,
+            })
+        );
+        assert_eq!(options(&archive).archive.unwrap().trace, None);
+        for value in ["40", "40:x", "x:3"] {
+            assert_eq!(
+                run(&[&archive[..], &["--archive-trace-record", value]].concat()),
+                Err(ArgsError::InvalidValue {
+                    option: "--archive-trace-record",
+                    value: value.into(),
+                })
+            );
+        }
+        assert_eq!(
+            run(&["--dir", "d", "--archive-trace-record", "40:3"]),
+            Err(ArgsError::Needs {
+                option: "--archive-trace-record",
+                needs: "--archive",
+            })
+        );
+        assert!(options(&["--dir", "d", "--network", "on", "--trace-network"]).trace_network);
+        assert!(!options(&["--dir", "d", "--network", "on"]).trace_network);
+        assert_eq!(
+            run(&["--dir", "d", "--trace-network"]),
+            Err(ArgsError::Needs {
+                option: "--trace-network",
+                needs: "--network on",
+            })
+        );
     }
 
     #[test]
@@ -2137,6 +2238,7 @@ mod tests {
                 retention: None,
                 time_evidence: false,
                 calibration_journal: None,
+                trace: None,
                 replications: Vec::new(),
                 replicas: Vec::new(),
                 trusted_network: false,
