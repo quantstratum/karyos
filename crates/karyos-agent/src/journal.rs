@@ -199,7 +199,7 @@ pub enum Kind {
     /// The requester withdrew the pending operation.
     ApprovalWithdrawn,
     /// The operation ended without being sent, its
-    /// [`crate::approval::EndCode`] in `code` and its text in `reason`:
+    /// `approval::EndCode` in `code` and its text in `reason`:
     /// its deadline passed, the agent restarted while it was pending or
     /// before its dispatch, or at approval its target had changed, its
     /// Cluster was busy, its dispatch record could not be made durable or
@@ -291,6 +291,16 @@ impl Kind {
         matches!(
             self,
             Self::ClusterRequest | Self::ClusterOutcome | Self::ClusterRefused
+        )
+    }
+
+    /// Whether its record establishes an operation id the agent rebuilds
+    /// at start (karyos#738, karyos#739, karyos#772): a purge never
+    /// removes one whose id is still retained.
+    pub(crate) const fn establishes_id(self) -> bool {
+        matches!(
+            self,
+            Self::ApprovalRequested | Self::Submitted | Self::ClusterRequest
         )
     }
 
@@ -620,6 +630,11 @@ pub enum JournalError {
     /// The record was written but did not become durable.
     #[error("the journal record is not durable")]
     NotDurable,
+    /// The segment the record would leave could not be closed first: its
+    /// seal, the wall clock or its close entry failed (ADR-0115, point 1).
+    /// Nothing was written; the next append tries the close again.
+    #[error("the journal segment could not be closed")]
+    NotClosed,
     /// No unknown interval is open, or another one is.
     #[error("no such unknown interval")]
     NoGap,
@@ -634,7 +649,7 @@ pub enum JournalError {
 /// The operations journal (see the module).
 #[derive(Debug)]
 pub struct Journal {
-    recorder: Option<Recorder<StdDisk, QueueSource>>,
+    recorder: Option<JournalRecorder>,
     recording: u64,
     failed_appends: u64,
     /// Host time of the first failed append.
@@ -657,13 +672,22 @@ pub struct Journal {
     /// The retention engine; `None` when its ledgers cannot be opened, the
     /// hold state then unreadable.
     retention: Option<retention::State>,
+    /// A close entry failed: the retention ledger is poisoned until it is
+    /// reopened, which the next rollover does first (ADR-0115, point 1).
+    reopen_retention: bool,
     /// The records the open read, for tests.
     #[cfg(test)]
     pub(crate) scanned: Vec<JournalRecord>,
     /// The records the agent rebuilds its operation ids from, until taken
     /// ([`Journal::take_operations`]).
     operations: Vec<JournalRecord>,
+    /// Where each record that establishes an operation id is, with that
+    /// id, oldest first ([`Kind::establishes_id`]).
+    id_records: Vec<(u64, u64)>,
 }
+
+/// The journal's recorder.
+pub(crate) type JournalRecorder = Recorder<StdDisk, QueueSource>;
 
 impl Journal {
     /// The [`Kind::Submitted`] and [`Kind::ClusterRequest`] records the
@@ -785,10 +809,15 @@ impl Journal {
             verification: None,
             settings,
             retention: None,
+            reopen_retention: false,
             #[cfg(test)]
             scanned: scan.all.clone(),
             operations: scan.operations,
+            id_records: scan.id_records,
         };
+        // The close times first: this start's records never land in a
+        // segment already closed (ADR-0115, point 1).
+        journal.open_retention();
         let last = scan.last.as_ref().map(|last| last.kind);
         let reason = if cut {
             Some(GapReason::TornTail)
@@ -818,7 +847,7 @@ impl Journal {
         // with a clean stop is seen as one.
         let _ = journal.append_durable(&JournalRecord::new(Kind::AgentStarted, now), now)?;
         // Recovery before the first verification (ADR-0113, point 8).
-        journal.open_retention(now);
+        journal.recover_purges(now);
         journal.verify(now);
         Ok(journal)
     }
@@ -1034,9 +1063,12 @@ impl Journal {
             return Err(JournalError::Unavailable);
         }
         // A segment left is closed, its time recorded, before this record
-        // is written (ADR-0115, point 1).
-        if let Err(error) = self.close_before(record) {
-            self.recorder = None;
+        // is written (ADR-0115, point 1). A close that could not be made
+        // writes nothing and is tried again at the next append.
+        if let Err(error) = self.close_before(record, now) {
+            if !matches!(error, JournalError::NotClosed) {
+                self.recorder = None;
+            }
             self.count_failure(now);
             return Err(error);
         }
@@ -1062,6 +1094,11 @@ impl Journal {
             self.recorder = None;
             self.count_failure(now);
         } else {
+            if let Ok(position) = result
+                && record.kind.establishes_id()
+            {
+                self.id_records.push((position, record.operation));
+            }
             self.after_write();
             if durable {
                 self.seal();
@@ -1289,6 +1326,9 @@ struct Scan {
     /// first: the agent's retained outcomes and caller ids are rebuilt from
     /// them (karyos#738, karyos#772).
     operations: Vec<JournalRecord>,
+    /// Where each record that establishes an operation id is, with that
+    /// id ([`Kind::establishes_id`]).
+    id_records: Vec<(u64, u64)>,
 }
 
 /// Reads every frame of `store`, oldest first.
@@ -1353,6 +1393,9 @@ fn scan(store: &mut SegmentStore<StdDisk>) -> Result<Scan, JournalError> {
                 ) || record.kind.is_approval()
                 {
                     found.operations.push(record.clone());
+                }
+                if record.kind.establishes_id() {
+                    found.id_records.push((position, record.operation));
                 }
                 found.last = Some(record);
             }

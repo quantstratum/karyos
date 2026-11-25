@@ -1223,7 +1223,8 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
 
     /// Raises outstanding intent `id`'s close time to `closed_ns`, in
     /// memory, never lowering it: a resumed purge is rechecked against the
-    /// segments' modification times as they are now (ADR-0093, decision 3;
+    /// close time the caller supplies (modification times for recordings,
+    /// ADR-0093, decision 3; recorded closes for the journal, ADR-0115;
     /// karyos#1121 review). Unknown ids change nothing.
     pub fn raise_close_time(&mut self, id: u64, closed_ns: u64) {
         if let Some(intent) = self.intents.get_mut(&id) {
@@ -1636,9 +1637,12 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
     /// Completes or cancels every outstanding purge intent after a crash.
     /// Each is rechecked first: `authorised` says whether its operator is
     /// still authorised, and holds, the policy and copies are evaluated
-    /// as they are now. An intent whose deletion already happened is only
-    /// recorded; one that fails the recheck is cancelled with its reason,
-    /// and nothing is deleted.
+    /// as they are now. An intent whose floor already reached its cutoff
+    /// is completed (recorded, and the files a crash left below the floor
+    /// removed) only when the recheck passes; otherwise nothing more is
+    /// deleted and it stays outstanding. One whose floor did not move that
+    /// fails the recheck is cancelled with its reason, and nothing is
+    /// deleted.
     ///
     /// # Errors
     ///
@@ -1658,9 +1662,22 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
             request.authorisation.authorised = authorised(request.authorisation.operator);
             // The completion shortcut takes the lowest retained position,
             // so an offloaded range below the start is never taken for a
-            // purged one (ADR-0104, decision 5).
+            // purged one (ADR-0104, decision 5). Holds, the policy, its
+            // expiry and the copies are rechecked first, over the intent's
+            // original range: one that fails them now deletes nothing more,
+            // the files left below the floor included, and stays
+            // outstanding, never cancelled, since its floor already moved
+            // (ADR-0113, point 8; karyos#702 review).
             if store.lowest_retained() >= request.before {
-                outcomes.push(Ok(self.complete(&request, store, journal)?));
+                let from = self
+                    .froms
+                    .get(&request.id)
+                    .copied()
+                    .unwrap_or_else(|| store.lowest_retained());
+                match self.check(&request, context, from) {
+                    Ok(()) => outcomes.push(Ok(self.complete(&request, store, journal)?)),
+                    Err(refusal) => outcomes.push(Err(refusal)),
+                }
                 continue;
             }
             // The floor moves only after the same checks a fresh purge

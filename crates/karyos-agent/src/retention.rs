@@ -357,12 +357,14 @@ fn outcome_record(
 /// only after their request is durable, and run through the journal's
 /// retention engine on this thread. `authorised` is false for a purge the
 /// requester's role does not allow: refused `not_authorised`, journalled.
-/// A refusal's outcome record keeps the reason's code in its `word`
-/// ([`refusal_word`]).
+/// `retained` says whether an operation id is still retained: a purge
+/// that would remove the record it is rebuilt from is refused
+/// `operation_state_retained`. A refusal's outcome record keeps the
+/// reason's code in its `word` ([`refusal_word`]).
 pub fn journal_command(
     journal: Option<&mut Journal>,
     command: &Command<'_>,
-    authorised: bool,
+    (authorised, retained): (bool, &dyn Fn(u64) -> bool),
     mut now: impl FnMut() -> u64,
 ) -> RetentionAnswer {
     let Some(journal) = journal else {
@@ -387,7 +389,9 @@ pub fn journal_command(
                 operator: u64::from(command.operator),
                 authorised,
             };
-            reply(id, journal.purge_journal(id, before, authorisation, now()))
+            let purged =
+                journal.purge_journal_retaining(id, before, authorisation, now(), retained);
+            reply(id, purged)
         }
         Operation::Verify => {
             journal.verify(now());

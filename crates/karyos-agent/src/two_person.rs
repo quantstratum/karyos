@@ -3,7 +3,7 @@
 //! The classes of operations a deployment marks for two people (R-CORE-20,
 //! karyos#739; quantstratum-docs: karyos/adr/0112-two-person-pending-approval.md,
 //! point 1), and the bounds of the wait for an approval (point 7). The
-//! flow itself is [`crate::approval`].
+//! flow itself is `crate::approval` (Linux).
 
 use std::time::Duration;
 

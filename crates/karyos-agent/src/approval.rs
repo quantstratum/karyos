@@ -56,7 +56,7 @@
 //!   retained for [`crate::preview::RETAINED`] from the record that ended
 //!   it; past that, or from another boot, the id is a tombstone, answered
 //!   `operation expired`.
-//! - **Restarts** ([`Approvals::rebuild`]). A pending operation never
+//! - **Restarts** (`Approvals::rebuild`). A pending operation never
 //!   survives a restart: it is journalled expired, "agent restarted". A
 //!   granted one without its dispatch record (a `ReopenRequest`, or a kind
 //!   20, of its id) was not sent: journalled ended "agent restarted before

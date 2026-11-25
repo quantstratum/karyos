@@ -23,8 +23,7 @@
 //!   copies verified now.
 //! - **The expiry clock** (ADR-0115, superseding ADR-0113 point 5). When
 //!   the writer closes a segment, its close time on the host's wall clock
-//!   is recorded in the operations ledger ([`Operation::SegmentClosed`](
-//!   karyos_archive::integrity::retention::Operation::SegmentClosed)) at
+//!   is recorded in the operations ledger ([`Operation::SegmentClosed`]) at
 //!   the rollover, in order: the predecessor's last record and seal
 //!   durable, the clock read, the entry synced, and only then the
 //!   successor's first record written. A prefix expires once every
@@ -50,7 +49,7 @@ use karyos_archive::integrity::anchor::Externality;
 use karyos_archive::integrity::copies::{
     ArrivalProfile, CopyCatalog, CopyRecord, CopyState, Enforcement,
 };
-use karyos_archive::integrity::journal::read_records;
+use karyos_archive::integrity::journal::{IntegrityJournal, read_records};
 use karyos_archive::integrity::ledger::{Ledger, read_entries};
 use karyos_archive::integrity::retention::{
     Authorisation, HoldReport, MARKER_LENGTH, OPERATION_LENGTH, OPERATIONS_FILE, Operation,
@@ -88,6 +87,9 @@ pub const PURGE_PENDING: &str = "purge_pending";
 pub const INSIDE_SEGMENT: &str = "inside_segment";
 /// The refusal of a `BEFORE` past the journal's current segment's start.
 pub const CURRENT_SEGMENT: &str = "current_segment";
+/// The refusal of a purge that would remove the record an operation id
+/// still retained is rebuilt from (karyos#738, karyos#739 review).
+pub const OPERATION_STATE_RETAINED: &str = "operation_state_retained";
 
 /// The code an outcome record keeps in its `word` for refusal `name`: the
 /// library's code for its own reasons, 101 on for the agent's.
@@ -110,11 +112,12 @@ pub fn refusal_word(name: &str) -> u64 {
         "no_close_time",
         "offloaded",
     ];
-    const AGENT: [&str; 4] = [
+    const AGENT: [&str; 5] = [
         HOLD_NOT_DURABLE,
         PURGE_PENDING,
         INSIDE_SEGMENT,
         CURRENT_SEGMENT,
+        OPERATION_STATE_RETAINED,
     ];
     let at = |names: &[&str], base: u64| {
         (1u64..)
@@ -506,6 +509,28 @@ fn refuse(
     }
 }
 
+/// The configured copies that can count toward `min_copies` for the
+/// journal in `live`, by canonical path (karyos#702 review): never the live
+/// journal's directory itself, one location per directory (the first
+/// named), and none that cannot be resolved. `None` when `live` cannot.
+fn distinct_copies<'a>(
+    live: &Path,
+    copies: &'a [(String, PathBuf)],
+) -> Option<Vec<(&'a str, PathBuf)>> {
+    let live = std::fs::canonicalize(live).ok()?;
+    let mut seen = BTreeSet::new();
+    Some(
+        copies
+            .iter()
+            .filter_map(|(name, dir)| {
+                let canonical = std::fs::canonicalize(dir).ok()?;
+                (canonical != live && seen.insert(canonical.clone()))
+                    .then_some((name.as_str(), canonical))
+            })
+            .collect(),
+    )
+}
+
 /// Whether the copy of the journal in `dir` verifies over `[start,
 /// before)` of `recording`: its chain intact and holding the same seals
 /// there as `ours`, its bytes matching them, and nothing but missing
@@ -604,8 +629,41 @@ fn frame_length(record: &JournalRecord) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Pads `recorder`'s recording to `target`, a term boundary past its
+/// written end, the padding written at host time `now`: the next record
+/// then starts there.
+fn pad_to(
+    recorder: &mut super::JournalRecorder,
+    target: u64,
+    now: u64,
+) -> Result<(), super::JournalError> {
+    while recorder.source_mut().tail() < target {
+        let _ = recorder.source_mut().pad_term()?;
+    }
+    // One term at most per duty: as many duties as terms, and one more.
+    let term = u64::from(recorder.store().geometry().term_length());
+    let duties = target
+        .saturating_sub(recorder.store().written())
+        .div_ceil(term)
+        .saturating_add(1);
+    for _ in 0..duties {
+        if recorder.store().written() >= target {
+            break;
+        }
+        let _ = recorder.duty(now)?;
+    }
+    if recorder.store().written() < target {
+        return Err(super::JournalError::NotDurable);
+    }
+    Ok(())
+}
+
 /// The wall clock, in nanoseconds since the Unix epoch.
 fn wall_ns() -> Option<u64> {
+    #[cfg(test)]
+    if fault::clock_fails() {
+        return None;
+    }
     let since = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?;
@@ -616,12 +674,15 @@ fn wall_ns() -> Option<u64> {
 }
 
 impl Journal {
-    /// Opens the retention engine over the journal's directory, records
-    /// the configured policy, and recovers the purges a crash left
-    /// outstanding (ADR-0113, points 1, 4 and 8): before the first
-    /// verification. A ledger that cannot be opened leaves the hold state
-    /// unreadable: every purge is then refused `holds_unknown`.
-    pub(super) fn open_retention(&mut self, now: u64) {
+    /// Opens the retention engine over the journal's directory, with the
+    /// segments' recorded close times, and records the configured policy
+    /// (ADR-0113, points 1 and 4; ADR-0115): before this start's first
+    /// append, so that append never lands in a segment already closed and
+    /// a rollover it makes records its close. A ledger that cannot be
+    /// opened leaves the hold state unreadable: every purge is then
+    /// refused `holds_unknown`. [`Journal::recover_purges`] follows, once
+    /// the start is journalled.
+    pub(super) fn open_retention(&mut self) {
         let disk = engine_disk();
         let engine = (|| {
             let operations =
@@ -644,7 +705,14 @@ impl Journal {
                         let latest: &mut u64 = closes.entry(base).or_insert(closed_ns);
                         *latest = (*latest).max(closed_ns);
                     }
-                    Some(Operation::PurgeIntent { id, from, .. }) => {
+                    // Only this journal's intents: another recording's
+                    // with the same id never narrows `from`.
+                    Some(Operation::PurgeIntent {
+                        id,
+                        recording,
+                        from,
+                        ..
+                    }) if recording == self.recording => {
                         let _ = froms.entry(id).or_insert(from);
                     }
                     _ => {}
@@ -683,7 +751,6 @@ impl Journal {
                 skip_closes: false,
             }
         });
-        self.recover_purges(now);
     }
 
     /// Records the configured policy as a policy version when it differs
@@ -777,17 +844,19 @@ impl Journal {
     /// Records the copies that verify now over `[start, before)` as
     /// `verified` for it, and withdraws every other `verified` record of
     /// the journal: the catalog the decision reads, `None` when it cannot
-    /// be opened or written.
+    /// be opened or written, or the journal's own directory cannot be
+    /// resolved. A copy is a directory other than the live journal's, by
+    /// canonical path, and locations that resolve to the same directory
+    /// count once ([`distinct_copies`]).
     fn verified_copies(&mut self, start: u64, before: u64) -> Option<CopyCatalog<StdDisk>> {
         let recording = self.recording;
+        let copies = distinct_copies(&self.dir, &self.settings.copies)?;
         let integrity = self.integrity.as_mut()?;
         let mut catalog = CopyCatalog::open(StdDisk, &self.dir, integrity).ok()?;
         let records = integrity.records().ok()?;
         let ours = seals_digest(&records, recording, start, before);
         let trust = self.settings.trust.as_ref();
-        let verified: BTreeSet<Digest> = self
-            .settings
-            .copies
+        let verified: BTreeSet<Digest> = copies
             .iter()
             .filter(|(_, dir)| copy_verifies(dir, recording, (start, before), ours, trust))
             .map(|(name, _)| location(name))
@@ -850,8 +919,9 @@ impl Journal {
         Ok(())
     }
 
-    /// When the prefix before `before` closed: its newest segment file's
-    /// modification time, on the wall clock (ADR-0113, point 5).
+    /// When the prefix before `before` closed: the largest recorded close
+    /// time of its segments, every one of which needs its own (ADR-0115,
+    /// point 2); `None` when one has none.
     fn closed_ns(&self, before: u64) -> Option<u64> {
         let start = self.recorder.as_ref()?.store().start();
         self.closed_over(start, before)
@@ -875,20 +945,29 @@ impl Journal {
     }
 
     /// Closes the segments the writer is about to leave, before
-    /// `record` is written (ADR-0115, point 1): the predecessor's last
-    /// record and seal durable, the wall clock read, the close entry
-    /// synced, and only then may the record be written. A close entry
-    /// that cannot be written leaves its segment without a close time,
-    /// never expired.
+    /// `record` is written at host time `now` (ADR-0115, point 1): the
+    /// predecessor's last record and seal durable, the wall clock read,
+    /// the close entry synced, and only then may the record be written. A
+    /// segment whose close is recorded stays closed: a record that would
+    /// land in one, as at a start after a crash between the close entry
+    /// and the successor's first record, goes to the next segment, after
+    /// padding to it.
     ///
     /// # Errors
     ///
-    /// The recorder's sync: the journal then fails as for an append.
+    /// [`super::JournalError::NotClosed`] when the seal, the wall clock or
+    /// the close entry fails: nothing is written, the segment is not
+    /// left, and the next append tries the close again. The recorder's
+    /// errors: the journal then fails as for an append.
     pub(super) fn close_before(
         &mut self,
         record: &JournalRecord,
+        now: u64,
     ) -> Result<(), super::JournalError> {
         let recording = self.recording;
+        if self.reopen_retention && !self.reopen_retention_ledger() {
+            return Err(super::JournalError::NotClosed);
+        }
         let (Some(recorder), Some(state)) = (self.recorder.as_mut(), self.retention.as_ref())
         else {
             return Ok(());
@@ -908,17 +987,43 @@ impl Journal {
         } else {
             position
         };
+        if start < state.next_close {
+            return pad_to(recorder, state.next_close, now);
+        }
         let successor = geometry.base_of(start);
         if state.next_close >= successor {
             return Ok(());
         }
-        let _ = recorder.sync()?;
+        let not_closed = Err(super::JournalError::NotClosed);
+        let durable = recorder.sync()?;
+        // A seal that failed is tried again over a reopened integrity
+        // journal: the close needs the predecessor sealed.
+        if self.integrity.is_none() {
+            self.integrity = IntegrityJournal::open(StdDisk, &self.dir)
+                .ok()
+                .map(|opened| opened.journal);
+        }
         self.seal();
+        let floor = self
+            .recorder
+            .as_ref()
+            .map_or(0, |recorder| recorder.store().start());
+        let sealed = self
+            .integrity
+            .as_ref()
+            .is_some_and(|integrity| integrity.sealed_end(recording).unwrap_or(floor) >= durable);
+        #[cfg(test)]
+        let sealed = sealed && !fault::seal_fails();
+        if !sealed {
+            return not_closed;
+        }
         #[cfg(test)]
         if fault::crash_at() == fault::Crash::BeforeClose {
             return Err(super::JournalError::Unavailable);
         }
-        let closed_ns = wall_ns();
+        let Some(closed_ns) = wall_ns() else {
+            return not_closed;
+        };
         let Some(state) = self.retention.as_mut() else {
             return Ok(());
         };
@@ -930,12 +1035,17 @@ impl Journal {
             let skip = state.skip_closes;
             #[cfg(not(test))]
             let skip = false;
-            if let Some(closed_ns) = closed_ns.filter(|_| !skip)
-                && state
+            // Tests: an entry lost, as after its write; never retried.
+            if !skip {
+                if state
                     .engine
                     .record_segment_close(recording, base, end, closed_ns)
-                    .is_ok()
-            {
+                    .is_err()
+                {
+                    // Its ledger is poisoned: reopened at the next try.
+                    self.reopen_retention = true;
+                    return not_closed;
+                }
                 let _ = state.closes.insert(base, closed_ns);
             }
             state.next_close = end;
@@ -945,6 +1055,21 @@ impl Journal {
             return Err(super::JournalError::Unavailable);
         }
         Ok(())
+    }
+
+    /// Reopens the retention engine after a close entry failed, keeping a
+    /// hold held in memory only: whether it could.
+    fn reopen_retention_ledger(&mut self) -> bool {
+        let undurable = self.retention.take().is_some_and(|state| state.undurable);
+        self.open_retention();
+        match self.retention.as_mut() {
+            Some(state) => {
+                state.undurable = undurable;
+                self.reopen_retention = false;
+                true
+            }
+            None => false,
+        }
     }
 
     /// After a write: a segment the writer left without its close being
@@ -965,13 +1090,32 @@ impl Journal {
     /// satisfy `min_copies`, and `before` is a segment boundary outside
     /// the current segment; otherwise the library's crash-safe purge
     /// through the recorder's own store. `now` is host monotonic time,
-    /// for the verification that follows.
+    /// for the verification that follows. Tests: no operation id is
+    /// retained.
+    #[cfg(test)]
     pub(crate) fn purge_journal(
         &mut self,
         id: u64,
         before: u64,
         authorisation: Authorisation,
         now: u64,
+    ) -> RetentionReply {
+        self.purge_journal_retaining(id, before, authorisation, now, &|_| false)
+    }
+
+    /// [`Journal::purge_journal`], refused `operation_state_retained` when
+    /// the prefix holds a record an operation id is rebuilt from at start
+    /// (its `ApprovalRequested`, `Submitted` or `ClusterRequest`) and
+    /// `retained` says the id is still retained: pending, its outcome
+    /// within its retention, or a tombstone. Purged, a restart would forget
+    /// it, and a caller could reuse the id (karyos#739 review).
+    pub(crate) fn purge_journal_retaining(
+        &mut self,
+        id: u64,
+        before: u64,
+        authorisation: Authorisation,
+        now: u64,
+        retained: &dyn Fn(u64) -> bool,
     ) -> RetentionReply {
         let request = PurgeRequest {
             id,
@@ -983,6 +1127,10 @@ impl Journal {
         };
         let boundary = self.boundary(before);
         let closed = self.closed_ns(before);
+        let holds_state = self
+            .id_records
+            .iter()
+            .any(|&(position, operation)| position < before && retained(operation));
         let Some(state) = self.retention.as_mut() else {
             return refused("holds_unknown");
         };
@@ -1004,6 +1152,18 @@ impl Journal {
         if let Err(name) = boundary {
             let refusal = PurgeRefusal::NotAWriteStart { before };
             return refuse(&mut state.engine, &request, refusal, name);
+        }
+        // Journalled in the engine as not purgeable yet.
+        if holds_state {
+            let refusal = PurgeRefusal::NotExpired {
+                expires_ns: u64::MAX,
+            };
+            return refuse(
+                &mut state.engine,
+                &request,
+                refusal,
+                OPERATION_STATE_RETAINED,
+            );
         }
         let Some(policy) = state.policy else {
             let refusal = PurgeRefusal::NoPolicy;
@@ -1067,7 +1227,7 @@ impl Journal {
     /// (ADR-0113, point 8), at open: each one's audit record made durable
     /// first, and only on segment boundaries outside the current segment.
     /// An intent it cannot reconcile stays outstanding.
-    fn recover_purges(&mut self, now: u64) {
+    pub(super) fn recover_purges(&mut self, now: u64) {
         let Some(state) = self.retention.as_ref() else {
             return;
         };
@@ -1120,29 +1280,42 @@ impl Journal {
                 return;
             }
         }
-        let mut widest = 0;
+        // Every intent is rechecked, the floor already at its `BEFORE` or
+        // not (ADR-0113, point 8): its close time over its whole original
+        // range, and the copies verified again over the widest range.
+        let mut range: Option<(u64, u64)> = None;
         let mut raised = Vec::new();
         for intent in outstanding
             .iter()
-            .filter(|intent| intent.recording == self.recording && lowest < intent.before)
+            .filter(|intent| intent.recording == self.recording)
         {
-            if self.boundary(intent.before).is_err() {
+            // An intent whose floor is already at its `BEFORE` skips only
+            // the boundary check: that is safe because the expiry loop
+            // above rechecked its whole original range, from its recorded
+            // `from` (`froms`), and its holds, policy and copies are
+            // rechecked below like any other's.
+            if lowest < intent.before && self.boundary(intent.before).is_err() {
                 return;
             }
+            let from = self
+                .retention
+                .as_ref()
+                .and_then(|state| state.froms.get(&intent.id).copied())
+                .unwrap_or(lowest)
+                .min(lowest);
             // Without a recorded close the recheck never finds it expired.
-            raised.push((intent.id, self.closed_ns(intent.before).unwrap_or(u64::MAX)));
-            widest = widest.max(intent.before);
+            let closed = self.closed_over(from, intent.before).unwrap_or(u64::MAX);
+            raised.push((intent.id, closed));
+            range = Some(range.map_or((from, intent.before), |(low, high)| {
+                (low.min(from), high.max(intent.before))
+            }));
         }
-        let start = self
-            .recorder
-            .as_ref()
-            .map_or(0, |recorder| recorder.store().start());
-        let catalog = if widest > start {
-            self.verified_copies(start, widest)
-        } else {
-            self.integrity
+        let catalog = match range {
+            Some((low, high)) if low < high => self.verified_copies(low, high),
+            _ => self
+                .integrity
                 .as_mut()
-                .and_then(|integrity| CopyCatalog::open(StdDisk, &self.dir, integrity).ok())
+                .and_then(|integrity| CopyCatalog::open(StdDisk, &self.dir, integrity).ok()),
         };
         let Some(catalog) = catalog else {
             return;
@@ -1202,6 +1375,8 @@ pub(super) mod fault {
     use karyos_archive::disk::{Disk, StdDisk};
 
     thread_local! {
+        static SEAL_FAILS: Cell<bool> = const { Cell::new(false) };
+        static CLOCK_FAILS: Cell<bool> = const { Cell::new(false) };
         static FAIL: Cell<bool> = const { Cell::new(false) };
         static OFFSET: Cell<i64> = const { Cell::new(0) };
         static CRASH: Cell<Crash> = const { Cell::new(Crash::None) };
@@ -1216,6 +1391,24 @@ pub(super) mod fault {
         BeforeClose,
         /// After the close entry, before the successor's first record.
         AfterClose,
+    }
+
+    /// Makes a rollover's seal on this thread count as failed, or not.
+    pub(crate) fn fail_seal(failing: bool) {
+        SEAL_FAILS.with(|cell| cell.set(failing));
+    }
+
+    pub(crate) fn seal_fails() -> bool {
+        SEAL_FAILS.with(Cell::get)
+    }
+
+    /// Makes this thread's wall clock unreadable, or readable again.
+    pub(crate) fn fail_clock(failing: bool) {
+        CLOCK_FAILS.with(|cell| cell.set(failing));
+    }
+
+    pub(crate) fn clock_fails() -> bool {
+        CLOCK_FAILS.with(Cell::get)
     }
 
     /// Moves this thread's wall clock by `offset` nanoseconds.

@@ -670,6 +670,57 @@ fn a_second_approver_gets_the_outcome() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A completed operation's outcome goes only to a role that may approve
+/// it: a role without the clearance, or that may not reopen guards, is
+/// refused `forbidden` whatever id it names (karyos#739 review).
+#[test]
+fn test_approve_checks_the_role_before_a_completed_outcome() {
+    let dir = temp("completed-role");
+    let (mut agent, _) = cluster_agent(&dir, crate::two_person::DEFAULT_WAIT);
+    assert!(matches!(
+        kill(&mut agent, 51, REQUESTER),
+        ApprovalAnswer::Pending { .. }
+    ));
+    let first = agent.approve_for(51, OTHER, RISK_OFFICER);
+    assert!(matches!(
+        first,
+        ApprovalAnswer::Cluster(ClusterAnswer::Sequenced { .. })
+    ));
+    let viewer = Requester::local(1002);
+    for role in [(true, Clearance::None), (false, Clearance::None)] {
+        assert_eq!(
+            agent.approve_for(51, viewer, role),
+            ApprovalAnswer::Refused(Refusal::Forbidden),
+            "{role:?}"
+        );
+    }
+    assert_eq!(agent.approve_for(51, viewer, RISK_OFFICER), first);
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let mut setup = guard_setup("completed-role-guard");
+    let token = setup.token(REQUESTER);
+    assert!(matches!(
+        setup.submit(41, Some(token), b"drill over"),
+        ApprovalAnswer::Pending { .. }
+    ));
+    let agent = &mut setup.agent;
+    let approved = serving(&mut setup.driver, || {
+        agent.approve_for(41, OTHER, RISK_OFFICER)
+    });
+    assert!(matches!(approved, ApprovalAnswer::Guard(_)), "{approved:?}");
+    assert_eq!(
+        setup
+            .agent
+            .approve_for(41, viewer, (false, Clearance::Administrator)),
+        ApprovalAnswer::Refused(Refusal::Forbidden)
+    );
+    assert_eq!(setup.agent.approve_for(41, viewer, RISK_OFFICER), approved);
+    let dir = setup.dir.clone();
+    drop(setup);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// ADR-0112 point 3: the pending operation consumes its preview's token:
 /// one preview cannot create two pending operations.
 #[test]

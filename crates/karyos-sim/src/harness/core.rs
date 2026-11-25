@@ -352,20 +352,23 @@ impl<'a> LogView<'a> {
     }
 
     /// The watermark of the history up to the log's last entry (contract
-    /// C-TIME, ADR-0111): its last entry's event time, or, with no entry,
-    /// the snapshot's log time, and 0 for an empty log with no snapshot;
-    /// `None` when the last entry cannot be read or the snapshot's log
-    /// time is not known.
+    /// C-TIME, ADR-0111): the largest event time of every entry the log
+    /// holds and of the snapshot's log time, never the last entry's alone:
+    /// a tail from before C-TIME need not be ordered (`10, 50, 30` has
+    /// watermark 50). 0 for an empty log with no snapshot; `None` when an
+    /// entry cannot be read, or the log is empty after a snapshot whose
+    /// log time is not known.
     pub fn watermark(&mut self) -> Option<u64> {
-        match self.last_index() {
-            Some(last) => self
-                .entries(last..last.saturating_add(1), u64::MAX)
-                .ok()?
-                .last()
-                .map(|entry| entry.event_time),
-            None if self.base.is_some() => self.base_time,
-            None => Some(0),
-        }
+        let Some(last) = self.last_index() else {
+            return if self.base.is_some() {
+                self.base_time
+            } else {
+                Some(0)
+            };
+        };
+        let first = self.first_index();
+        let entries = self.entries(first..last.saturating_add(1), u64::MAX).ok()?;
+        Some(max_event_time(&entries, self.base_time))
     }
 
     /// The node's latest snapshot, if any: the log holds no entry at or
@@ -603,6 +606,19 @@ pub struct Persisted {
     pub durable: Option<u64>,
     /// The hard state saved, if one was.
     pub hard_state: Option<HardState>,
+}
+
+/// The C-TIME watermark of `entries` over a snapshot of log time
+/// `base_time` (ADR-0111): the largest event time of them all, 0 for
+/// none.
+#[must_use]
+pub fn max_event_time(entries: &[Entry], base_time: Option<u64>) -> u64 {
+    entries
+        .iter()
+        .map(|entry| entry.event_time)
+        .chain(base_time)
+        .max()
+        .unwrap_or(0)
 }
 
 /// A consensus core under the harness: a test-harness trait, not the

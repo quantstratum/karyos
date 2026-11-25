@@ -344,13 +344,10 @@ impl ConsensusCore for Reference {
             .filter(|end| first < *end)
             .and_then(|end| log.entries(first..end, u64::MAX).ok())
             .unwrap_or_default();
-        // C-TIME's watermark: the recovered log's last entry's time, or
-        // the snapshot's log time when the log is empty after it.
-        let watermark = entries
-            .last()
-            .map(|entry| entry.event_time)
-            .or_else(|| log.base_time())
-            .unwrap_or(0);
+        // C-TIME's watermark: the largest event time of the recovered
+        // log's entries and the snapshot's log time, never the last
+        // entry's alone (a tail from before C-TIME need not be ordered).
+        let watermark = super::core::max_event_time(&entries, log.base_time());
         let configs: Vec<Logged> = entries
             .iter()
             .filter_map(|entry| {

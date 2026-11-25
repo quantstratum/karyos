@@ -1155,7 +1155,7 @@ pub enum Observation {
         /// The section's length.
         total: u64,
     },
-    /// A server dropped a snapshot piece by [`Case::lose_snapshot_piece`].
+    /// A server dropped a snapshot piece by `Case::lose_snapshot_piece`.
     SnapshotPieceLost {
         /// The server.
         node: NodeId,
@@ -1640,7 +1640,7 @@ impl<C: ConsensusCore> ServerNode<C> {
     }
 
     /// Drops piece `piece` (from 0) of the first snapshot transfer it
-    /// receives, as if the network lost it ([`Case::lose_snapshot_piece`]).
+    /// receives, as if the network lost it (`Case::lose_snapshot_piece`).
     #[must_use]
     pub const fn losing_snapshot_piece(mut self, piece: u64) -> Self {
         self.lose_piece = Some((piece, 0));

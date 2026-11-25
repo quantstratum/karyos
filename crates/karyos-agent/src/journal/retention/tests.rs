@@ -242,7 +242,7 @@ fn a_purge_without_a_durable_request_is_refused_journal_unavailable() {
     let answer = journal_command(
         Some(&mut journal),
         &command(Op::Purge { before: SEG }),
-        true,
+        (true, &|_| false),
         || 5,
     );
     assert!(
@@ -252,7 +252,12 @@ fn a_purge_without_a_durable_request_is_refused_journal_unavailable() {
     journal.break_recorder();
     for operation in [Op::Purge { before: SEG }, Op::Release] {
         assert_eq!(
-            journal_command(Some(&mut journal), &command(operation), true, || 6),
+            journal_command(
+                Some(&mut journal),
+                &command(operation),
+                (true, &|_| false),
+                || 6
+            ),
             RetentionAnswer::JournalUnavailable
         );
     }
@@ -624,6 +629,9 @@ impl Drop for Clock {
     fn drop(&mut self) {
         fault::step_clock(0);
         fault::crash(fault::Crash::None);
+        fault::fail_seal(false);
+        fault::fail_clock(false);
+        fault::fail(false);
     }
 }
 
@@ -734,11 +742,278 @@ fn a_crash_at_the_rollover_keeps_or_lacks_the_close() {
     let dir = self::dir("crash-before");
     let mut journal = Journal::open_small(&dir, 1, settings(Some(expired()), None)).unwrap();
     crash_at_rollover(&mut journal, fault::Crash::BeforeClose);
-    assert!(closes(&journal).is_empty());
+    assert!(closes(&journal).is_empty(), "no close time was recorded");
+    drop(journal);
+    // The next start's first record does not fit the segment either: that
+    // rollover is its close, recorded then (karyos#702 review).
+    let journal = Journal::open_small(&dir, 2, settings(Some(expired()), None)).unwrap();
+    assert!(closes(&journal).contains_key(&0), "closed at the start");
+    assert_eq!(journal.gap.unwrap().position, SEG);
+    cleanup(&[&dir]);
+}
+
+fn written(journal: &Journal) -> u64 {
+    journal.recorder.as_ref().unwrap().store().written()
+}
+
+/// The room left in the current segment.
+fn room(journal: &Journal) -> u64 {
+    SEG - written(journal) % SEG
+}
+
+/// ADR-0115 point 1 (karyos#702 review): the close times are loaded
+/// before a start's first record. After a crash between a close entry and
+/// the successor's first record, the start's first record goes to the
+/// successor even where it would fit the closed segment; and a start
+/// whose first record rolls over records that close (above).
+#[test]
+fn test_journal_the_first_resumed_write_never_lands_in_a_closed_segment() {
+    let dir = dir("resume-closed");
+    let mut journal = Journal::open_small(&dir, 1, settings(Some(expired()), None)).unwrap();
+    let small = frame_length(&JournalRecord::new(Kind::UnknownInterval, 0));
+    let mut big = JournalRecord::new(Kind::CloseRequest, 10);
+    big.reason = vec![b'x'; super::super::MAX_REASON];
+    let filler = JournalRecord::new(Kind::CloseRequest, 10);
+    assert_eq!(frame_length(&filler), small);
+    assert!(frame_length(&big) >= 2 * small);
+    while room(&journal) >= frame_length(&big) {
+        let _ = journal.append(&filler, 10).unwrap();
+    }
+    assert!(room(&journal) >= small, "a start's record would fit");
+    let clock = Clock::step(0);
+    fault::crash(fault::Crash::AfterClose);
+    assert!(journal.append(&big, 11).is_err());
+    drop(clock);
+    let closed = closes(&journal)[&0];
     drop(journal);
     let journal = Journal::open_small(&dir, 2, settings(Some(expired()), None)).unwrap();
-    assert!(closes(&journal).is_empty(), "no close time was recorded");
+    // The unknown interval is the start's first record: in the successor.
+    let gap = journal.gap.unwrap();
+    assert_eq!(gap.position, SEG, "{gap:?}");
+    assert_eq!(
+        closes(&journal).get(&0),
+        Some(&closed),
+        "never closed again"
+    );
+    assert!(written(&journal) > SEG);
     cleanup(&[&dir]);
+}
+
+/// ADR-0115 point 1 (karyos#702 review): a rollover whose seal fails,
+/// whose wall clock cannot be read, or whose close entry cannot be synced
+/// writes no successor record: that append fails as a journal write does,
+/// writing nothing, and the next append closes the segment and goes on.
+#[test]
+fn test_journal_a_rollover_that_cannot_close_writes_no_successor_record() {
+    for failure in ["seal", "clock", "entry"] {
+        let dir = dir(&format!("close-fails-{failure}"));
+        let mut journal = Journal::open_small(&dir, 1, settings(Some(expired()), None)).unwrap();
+        let clock = Clock::step(0);
+        let mut record = JournalRecord::new(Kind::CloseRequest, 10);
+        record.reason = b"drill".to_vec();
+        // Frames tile a segment exactly: a larger record is the one that
+        // cannot fit, so the filling always ends.
+        let mut big = record.clone();
+        big.reason = vec![b'x'; super::super::MAX_REASON];
+        while room(&journal) >= frame_length(&big) {
+            let _ = journal.append(&record, 10).unwrap();
+        }
+        let record = big;
+        let before = written(&journal);
+        let failed = journal.failed_appends();
+        match failure {
+            "seal" => fault::fail_seal(true),
+            "clock" => fault::fail_clock(true),
+            _ => fault::fail(true),
+        }
+        let refused = journal.append(&record, 11);
+        assert!(
+            matches!(refused, Err(crate::journal::JournalError::NotClosed)),
+            "{failure}: {refused:?}"
+        );
+        assert_eq!(written(&journal), before, "{failure}: nothing written");
+        // No close entry reached the ledger either (ADR-0115, point 1).
+        let entries =
+            read_entries::<_, OPERATION_LENGTH>(&mut StdDisk, &dir, OPERATIONS_FILE).unwrap();
+        assert!(
+            !entries.iter().any(|bytes| matches!(
+                Operation::decode(bytes),
+                Some(Operation::SegmentClosed { .. })
+            )),
+            "{failure}: no SegmentClosed"
+        );
+        assert!(closes(&journal).is_empty(), "{failure}");
+        assert_eq!(journal.failed_appends(), failed + 1, "{failure}");
+        drop(clock);
+        // Retried at the next append.
+        let position = journal.append(&record, 12).unwrap();
+        assert_eq!(position, SEG, "{failure}: the successor's first record");
+        assert!(closes(&journal).contains_key(&0), "{failure}: closed");
+        drop(journal);
+        cleanup(&[&dir]);
+    }
+}
+
+/// A purge never removes the record an operation id still retained is
+/// rebuilt from at start, its `ApprovalRequested`, `Submitted` or
+/// `ClusterRequest`: refused `operation_state_retained`, before and after
+/// a restart, so the id is never reused (karyos#738, karyos#739 review).
+#[test]
+fn test_journal_a_purge_keeps_the_record_of_a_retained_operation_id() {
+    for kind in [
+        Kind::ApprovalRequested,
+        Kind::Submitted,
+        Kind::ClusterRequest,
+    ] {
+        let dir = dir(&format!("retained-{}", kind.code()));
+        let copy = dir.with_extension("copy");
+        let mut journal =
+            Journal::open_small(&dir, 1, settings(Some(expired()), Some(&copy))).unwrap();
+        let mut record = JournalRecord::new(kind, 5);
+        record.operation = 51;
+        let _ = journal.append_durable(&record, 5).unwrap();
+        fill(&mut journal, 3 * SEG + SEG / 2);
+        copy_dir(&dir, &copy);
+        let retained = |operation: u64| operation == 51;
+        let refused = journal.purge_journal_retaining(1, SEG, authorised(), 2, &retained);
+        assert_eq!(reason(&refused), OPERATION_STATE_RETAINED, "{kind:?}");
+        assert_eq!(start(&journal), 0);
+        drop(journal);
+        let mut journal =
+            Journal::open_small(&dir, 3, settings(Some(expired()), Some(&copy))).unwrap();
+        let refused = journal.purge_journal_retaining(2, SEG, authorised(), 4, &retained);
+        assert_eq!(
+            reason(&refused),
+            OPERATION_STATE_RETAINED,
+            "{kind:?} restarted"
+        );
+        assert_eq!(start(&journal), 0);
+        // An id no longer retained holds nothing.
+        assert_eq!(
+            journal.purge_journal_retaining(3, SEG, authorised(), 5, &|_| false),
+            RetentionReply::Done { evidenced: true },
+            "{kind:?}"
+        );
+        assert_eq!(start(&journal), SEG);
+        cleanup(&[&dir, &copy]);
+    }
+}
+
+/// Another recording's purge intent with the same id never narrows this
+/// journal's `from` (karyos#702 review).
+#[test]
+fn test_journal_another_recordings_intent_does_not_narrow_from() {
+    let (journal, dir, copy) = filled("froms", Some(expired()));
+    let recording = journal.recording();
+    drop(journal);
+    let other = Operation::PurgeIntent {
+        id: 5,
+        recording: recording.wrapping_add(1000),
+        before: 3 * SEG,
+        operator: 1000,
+        closed_ns: 0,
+        source: PurgeSource::Operator,
+        from: 2 * SEG,
+    };
+    write_operation(&dir, &other);
+    write_operation(&dir, &intent(5, recording, SEG));
+    let journal = Journal::open_small(&dir, 2, settings(Some(expired()), Some(&copy))).unwrap();
+    assert_eq!(
+        journal.retention.as_ref().unwrap().froms.get(&5),
+        Some(&0),
+        "this journal's own intent's from"
+    );
+    drop(journal);
+    cleanup(&[&dir, &copy]);
+}
+
+/// A copy is a directory other than the live journal's, by canonical
+/// path, and two locations of one directory count once (karyos#702
+/// review).
+#[test]
+fn test_journal_a_copy_is_another_directory_counted_once() {
+    let (journal, dir, copy) = filled("self-copy", Some(expired()));
+    drop(journal);
+    // The live directory as its own copy, spelled otherwise.
+    let own = JournalRetention::default()
+        .with_policy(Some(expired()))
+        .with_copy("self".to_owned(), dir.join("."));
+    let mut journal = Journal::open_small(&dir, 2, own).unwrap();
+    let refused = journal.purge_journal(1, SEG, authorised(), 3);
+    assert_eq!(reason(&refused), "below_min_copies");
+    assert_eq!(start(&journal), 0);
+    drop(journal);
+    // One copy under two names where two are needed.
+    let two = JournalPolicy {
+        min_copies: NonZeroU32::new(2).unwrap(),
+        ..expired()
+    };
+    let link = dir.with_extension("link");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&copy, &link).unwrap();
+    let twice = JournalRetention::default()
+        .with_policy(Some(two))
+        .with_copy("vault".to_owned(), copy.clone())
+        .with_copy("mirror".to_owned(), link.clone());
+    let mut journal = Journal::open_small(&dir, 4, twice).unwrap();
+    let refused = journal.purge_journal(2, SEG, authorised(), 5);
+    assert_eq!(reason(&refused), "below_min_copies");
+    assert_eq!(start(&journal), 0);
+    drop(journal);
+    // Two directories do.
+    let other = dir.with_extension("other");
+    copy_dir(&copy, &other);
+    let distinct = JournalRetention::default()
+        .with_policy(Some(two))
+        .with_copy("vault".to_owned(), copy.clone())
+        .with_copy("mirror".to_owned(), link.clone())
+        .with_copy("other".to_owned(), other.clone());
+    let mut journal = Journal::open_small(&dir, 6, distinct).unwrap();
+    assert_eq!(
+        journal.purge_journal(3, SEG, authorised(), 7),
+        RetentionReply::Done { evidenced: true }
+    );
+    drop(journal);
+    let _ = std::fs::remove_file(&link);
+    cleanup(&[&dir, &copy, &other]);
+}
+
+/// ADR-0113 point 8 (karyos#702 review): an intent whose floor already
+/// reached its `BEFORE` is rechecked before it completes. Under a hold,
+/// or with no copy that verifies, it is not completed (no purge record)
+/// and stays pending; with the checks passing it completes. That the
+/// files left below the floor stay is the library's test,
+/// `recovery_rechecks_an_intent_whose_floor_already_reached_its_cutoff`:
+/// the journal's store drops them when it reopens.
+#[test]
+fn test_journal_recovery_rechecks_an_intent_whose_floor_reached_its_cutoff() {
+    for case in ["hold", "copies", "passes"] {
+        let (mut journal, dir, copy) = filled(&format!("floor-{case}"), Some(expired()));
+        if case == "hold" {
+            assert_eq!(
+                journal.hold_journal(),
+                RetentionReply::Done { evidenced: true }
+            );
+        }
+        let recording = journal.recording();
+        // A crash after the floor moved, before the purge was recorded.
+        let _ = journal.store_mut().purge_before(SEG).unwrap();
+        drop(journal);
+        write_operation(&dir, &intent(5, recording, SEG));
+        let copies = (case != "copies").then_some(copy.as_path());
+        let journal = Journal::open_small(&dir, 2, settings(Some(expired()), copies)).unwrap();
+        assert_eq!(start(&journal), SEG);
+        let purged = !journal.integrity().unwrap().purged.is_empty();
+        if case == "passes" {
+            assert!(!journal.purge_pending(), "completed");
+            assert!(purged, "its purge is recorded");
+        } else {
+            assert!(journal.purge_pending(), "{case}: stays pending");
+            assert!(!purged, "{case}: not completed");
+        }
+        drop(journal);
+        cleanup(&[&dir, &copy]);
+    }
 }
 
 /// ADR-0115: recovery rechecks expiry over the intent's original range;

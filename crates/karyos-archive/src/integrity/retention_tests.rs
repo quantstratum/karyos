@@ -542,6 +542,91 @@ fn a_hold_applied_before_recovery_stops_the_deletion_at_every_crash_point() {
     assert!(held_back > 0, "{held_back}");
 }
 
+/// ADR-0113 point 8 (karyos#702 review): an intent whose floor already
+/// reached its cutoff is rechecked too, holds, policy, expiry and copies:
+/// one that fails now deletes nothing more, the files a crash left below
+/// the floor stay, and the intent stays outstanding; once the recheck
+/// passes it completes and they go.
+#[test]
+fn recovery_rechecks_an_intent_whose_floor_already_reached_its_cutoff() {
+    let mut reached = 0u32;
+    for budget in 0..400 {
+        let Some(disk) = crashed_purge(budget) else {
+            break;
+        };
+        // Each case restarts from the crashed disk afresh.
+        let restarted = || disk.after_crash(Survives::Synced);
+        let probe = open(restarted());
+        if probe.retention.outstanding().is_empty() || probe.store.lowest_retained() < BEFORE {
+            continue;
+        }
+        reached += 1;
+        drop(probe);
+        let later = policy(10_000, 2);
+        let below = policy(1_000, 3);
+        for case in ["hold", "policy", "copies"] {
+            let mut archive = open(restarted());
+            let left = archive.store.files_left_below_floor().unwrap();
+            let start = archive.store.start();
+            let done_before = operations(&archive.disk)
+                .iter()
+                .filter(|op| matches!(op, Operation::PurgeDone { id: 1 }))
+                .count();
+            let (policy, refusal) = match case {
+                "hold" => {
+                    assert!(matches!(
+                        archive.retention.apply_hold(RECORDING),
+                        HoldReport::Applied { .. }
+                    ));
+                    (policy(1_000, 2), PurgeRefusal::LegalHold)
+                }
+                "policy" => (later, PurgeRefusal::NotExpired { expires_ns: 10_000 }),
+                _ => (
+                    below,
+                    PurgeRefusal::BelowMinCopies {
+                        verified: 2,
+                        required: 3,
+                    },
+                ),
+            };
+            let context = context(&policy, &archive.copies, 5_000);
+            let outcomes = archive
+                .retention
+                .recover_purges(&context, |_| true, &mut archive.store, &mut archive.journal)
+                .unwrap();
+            assert_eq!(outcomes, [Err(refusal)], "budget {budget} {case}");
+            assert_eq!(archive.retention.outstanding().len(), 1, "{case}: pending");
+            assert_eq!(archive.store.start(), start, "{case}");
+            assert_eq!(
+                archive.store.files_left_below_floor().unwrap(),
+                left,
+                "budget {budget} {case}: nothing more deleted"
+            );
+            let done = operations(&archive.disk)
+                .iter()
+                .filter(|op| matches!(op, Operation::PurgeDone { id: 1 }))
+                .count();
+            assert_eq!(done, done_before, "{case}: not completed");
+        }
+        // The recheck passes: completed, the files left below the floor
+        // removed.
+        let mut archive = open(restarted());
+        let policy = policy(1_000, 2);
+        let context = context(&policy, &archive.copies, 5_000);
+        let outcomes = archive
+            .retention
+            .recover_purges(&context, |_| true, &mut archive.store, &mut archive.journal)
+            .unwrap();
+        assert!(
+            matches!(outcomes[..], [Ok(_)]),
+            "budget {budget}: {outcomes:?}"
+        );
+        assert!(archive.retention.outstanding().is_empty());
+        assert!(archive.store.files_left_below_floor().unwrap().is_empty());
+    }
+    assert!(reached > 0, "no crash left the floor at the cutoff");
+}
+
 #[test]
 fn without_a_hold_recovery_completes_the_purge_at_every_crash_point() {
     for budget in 0..400 {

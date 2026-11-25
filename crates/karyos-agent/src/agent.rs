@@ -603,10 +603,14 @@ impl Agent {
             relay: requester.relay,
             reason,
         };
+        // Every id used is retained: pending, within its outcome's
+        // retention, or a tombstone (karyos#738, karyos#739).
+        let used = &self.used_ids;
+        let retained = |operation: u64| used.contains(&operation);
         crate::retention::journal_command(
             self.journal.as_mut(),
             &command,
-            authorised,
+            (authorised, &retained),
             host_monotonic_ns,
         )
     }
@@ -1066,6 +1070,23 @@ impl Agent {
             });
         };
         if !matches!(entry.state, State::Pending { .. }) {
+            // The role first: a completed operation's retained outcome is
+            // only for a role that may approve it, never for any caller
+            // that knows its id (karyos#739 review). A Cluster command
+            // whose authority is not known now is refused.
+            let allowed = match &entry.request.target {
+                Target::Guard { .. } => may_reopen,
+                Target::Cluster {
+                    cluster, command, ..
+                } => self
+                    .clusters
+                    .find(cluster)
+                    .and_then(|attached| attached.authority(command))
+                    .is_some_and(|authority| clearance.allows(authority)),
+            };
+            if !allowed {
+                return ApprovalAnswer::Refused(Refusal::Forbidden);
+            }
             return Approvals::state_answer(operation, &entry.state, now, false);
         }
         let request = entry.request.clone();

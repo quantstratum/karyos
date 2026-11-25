@@ -22,11 +22,23 @@
 //!   updates and the clock is slewed, so a record is evidence for the window
 //!   right after the sample and nothing else, and a longer claim needs a new
 //!   sample;
+//! - chrony prints skew and residual frequency rounded to their last
+//!   printed digit (three decimals in ppm for `-c`): each is taken half
+//!   of that digit larger, 0.0005 ppm for three decimals, before the
+//!   growth is computed, so a value rounded down never understates it;
 //! - the source is NTP and the state comes from chrony's leap status and
 //!   stratum: "Not synchronised", stratum 0 or 16 and above are
 //!   unsynchronised, and an unsynchronised state gives no bound and no
 //!   record. A pending leap second is refused too, since the leap table
-//!   the record names announces none;
+//!   the record names announces none. So is a reference that is not an
+//!   external time source: chrony's local reference (`LOCL`, or
+//!   `127.127.1.1` in older versions), any other `127.0.0.0/8` id, or
+//!   none (id 0);
+//! - the sample time is `--sampled-at-ns`, required for a report read
+//!   from a file: only a report piped live from `chronyc` may default to
+//!   the tool's own reading of `CLOCK_REALTIME`. The growth covers the
+//!   whole span from the sample to the validity's end, so a report's age
+//!   is always counted;
 //! - the scale is stepped UTC: `CLOCK_REALTIME` counts Unix nanoseconds,
 //!   UTC without leap seconds, so its reading `r` is the UTC coordinate
 //!   `r + 4383 days` (1958-01-01 to 1970-01-01).
@@ -74,7 +86,7 @@ from chrony's tracking state.
 Usage: chronyc -c tracking | karyos-tools calibrate utc [--window-ms 10000]
            [--sampled-at-ns N] [--domain 4] [--epoch 1] [--leap-table 72]
            [--max-clock-error-ppm 1]
-       karyos-tools calibrate utc --tracking <file> ...
+       karyos-tools calibrate utc --tracking <file> --sampled-at-ns N ...
        karyos-tools calibrate realtime [--reads 4096] [--keep 25]
            [--interval-us 500] [--extension-ms 0] [--source-domain 0]
            [--domain 4] [--epoch 1]
@@ -83,16 +95,23 @@ Usage: chronyc -c tracking | karyos-tools calibrate utc [--window-ms 10000]
 and prints a UTC reference record: bound |System time| + Root delay/2 +
 Root dispersion + (Skew + |Residual freq| + maxclockerror) x window,
 chrony's own dispersion growth (maxclockerror is chrony's setting, 1 ppm
-by default), rounded up to ns, so it covers the whole window; source NTP; scale stepped UTC; valid
-from the sample time (--sampled-at-ns, CLOCK_REALTIME in ns; by default
-this tool's own reading of it, so sample chrony right before) over
---window-ms, at most 600000. The bound holds only as sampled: keep the
+by default), rounded up to ns, so it covers the whole window; Skew and
+Residual freq count half their last printed digit more (0.0005 ppm for
+three decimals); source NTP; scale stepped UTC; valid from the sample
+time (--sampled-at-ns, CLOCK_REALTIME in ns, when chronyc printed the
+report) over --window-ms, at most 600000. --sampled-at-ns is required
+with --tracking: only a report piped live from chronyc into standard
+input may leave it out, and then this tool's own reading of
+CLOCK_REALTIME is the sample time. The growth always spans the sample to
+the validity's end, so the report's age counts. The bound holds only as sampled: keep the
 window short and sample again for a longer claim. To chain it with a
 `realtime` record, their validities must overlap: sample `utc` first, or
 run `realtime` with --extension-ms; `calibrate compose <calibration>...
 <utc record>` checks that and refuses otherwise. An unsynchronised
 state (leap status \"Not synchronised\", stratum 0 or 16 and above), a
-pending leap second or a missing field prints no record.
+reference that is not external (chrony's local LOCL or 127.127.1.1, any
+127.0.0.0/8 id, or none), a pending leap second or a missing field
+prints no record.
 
 `realtime` (Linux) reads CLOCK_MONOTONIC_RAW, CLOCK_REALTIME and
 CLOCK_MONOTONIC_RAW again, --reads times, and fits them like `phc`: the
@@ -104,6 +123,8 @@ explains is refused.
 /// chrony's tracking state, as far as a UTC reference needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tracking {
+    /// The reference id, as chrony prints it in hex.
+    pub reference_id: u32,
     /// The reference's name or address.
     pub reference: String,
     /// The host's stratum.
@@ -133,7 +154,7 @@ impl Tracking {
     /// unsynchronised (no bound exists) or on overflow.
     #[must_use]
     pub fn bound_ns(&self, window_ns: u64, max_clock_error_appm: u128) -> Option<u64> {
-        if self.sync_state != SyncState::Synchronised {
+        if self.sync_state != SyncState::Synchronised || !self.external() {
             return None;
         }
         let rate = self
@@ -151,6 +172,33 @@ impl Tracking {
             .checked_add(growth)?;
         u64::try_from(total.div_ceil(1_000_000_000)).ok()
     }
+
+    /// Whether the reference is an external time source: not chrony's
+    /// local reference (`LOCL`, or `127.127.1.1` before chrony 4), no
+    /// other `127.0.0.0/8` id, and not none (id 0).
+    #[must_use]
+    pub fn external(&self) -> bool {
+        /// `LOCL`, chrony's local reference id.
+        const LOCL: u32 = u32::from_be_bytes(*b"LOCL");
+        let loopback = self.reference_id >> 24 == 127;
+        let local_name = self.reference == "LOCL" || self.reference.starts_with("127.");
+        self.reference_id != 0 && self.reference_id != LOCL && !loopback && !local_name
+    }
+}
+
+/// Half of the last printed digit of decimal `field`, in units of
+/// 10^-18: what chrony's rounding to that digit may have dropped
+/// (0.0005 for three decimals). 1 past 18 digits.
+fn half_last_digit(field: &str) -> u128 {
+    let digits = field
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    u32::try_from(digits)
+        .ok()
+        .filter(|digits| *digits < 18)
+        .and_then(|digits| 10u128.checked_pow(17 - digits))
+        .and_then(|unit| unit.checked_mul(5))
+        .unwrap_or(1)
 }
 
 /// A decimal number of seconds, as chronyc prints it (`-0.000012345`), as
@@ -206,7 +254,7 @@ pub fn parse_tracking(text: &str) -> Result<Tracking, String> {
     }
     let fields: Vec<&str> = line.trim().split(',').map(str::trim).collect();
     let [
-        _id,
+        id,
         reference,
         stratum,
         _reference_time,
@@ -241,8 +289,15 @@ pub fn parse_tracking(text: &str) -> Result<Tracking, String> {
     let root_delay_as = seconds_as(root_delay).ok_or_else(|| missing("root delay"))?;
     let root_dispersion_as =
         seconds_as(root_dispersion).ok_or_else(|| missing("root dispersion"))?;
-    let residual_appm = seconds_as(residual).ok_or_else(|| missing("residual frequency"))?;
-    let skew_appm = seconds_as(skew).ok_or_else(|| missing("skew"))?;
+    let reference_id = u32::from_str_radix(id, 16).map_err(|_| missing("reference id"))?;
+    // Printed rounded to their last digit: half of it more (karyos#749
+    // review).
+    let residual_appm = seconds_as(residual)
+        .and_then(|value| value.checked_add(half_last_digit(residual)))
+        .ok_or_else(|| missing("residual frequency"))?;
+    let skew_appm = seconds_as(skew)
+        .and_then(|value| value.checked_add(half_last_digit(skew)))
+        .ok_or_else(|| missing("skew"))?;
     let sync_state = match *leap_status {
         "Not synchronised" => SyncState::Unsynchronised,
         "Normal" | "Insert second" | "Delete second" if (1..16).contains(&stratum) => {
@@ -252,6 +307,7 @@ pub fn parse_tracking(text: &str) -> Result<Tracking, String> {
         other => return Err(format!("unknown leap status {other}")),
     };
     Ok(Tracking {
+        reference_id,
         reference: (*reference).to_owned(),
         stratum,
         system_time_as,
@@ -297,6 +353,12 @@ pub fn reference(tracking: &Tracking, settings: &UtcSettings) -> Result<UtcRefer
             tracking.leap_status, tracking.stratum
         ));
     }
+    if !tracking.external() {
+        return Err(format!(
+            "chrony's reference {} ({:08X}) is not an external time source: no bound, no record",
+            tracking.reference, tracking.reference_id
+        ));
+    }
     if tracking.leap_status != "Normal" {
         return Err(format!(
             "a leap second is pending ({}), which leap table {} does not announce: no record",
@@ -307,13 +369,16 @@ pub fn reference(tracking: &Tracking, settings: &UtcSettings) -> Result<UtcRefer
         return Err(format!("--window-ms takes 1 to {MAX_WINDOW_MS}"));
     }
     let window_ns = settings.window_ms.saturating_mul(1_000_000);
-    let bound = tracking
-        .bound_ns(window_ns, settings.max_clock_error_appm)
-        .ok_or("the bound overflows")?;
     let valid_to = settings
         .sampled_at
         .checked_add(window_ns)
         .ok_or("the validity overflows")?;
+    // The growth spans the sample to the validity's end: the report's age
+    // is in it whatever the window (karyos#749 review).
+    let grown_ns = valid_to.saturating_sub(settings.sampled_at);
+    let bound = tracking
+        .bound_ns(grown_ns, settings.max_clock_error_appm)
+        .ok_or("the bound overflows")?;
     let origin_scale_ns = settings
         .sampled_at
         .checked_add(UNIX_EPOCH_U_NS)
@@ -400,6 +465,14 @@ pub fn run_utc(
             ("--leap-table", Ok(number)) => settings.leap_table = number,
             _ => return fail(err, &format!("bad argument {arg} {value}")),
         }
+    }
+    // A saved report is as old as it is: its sample time is the caller's
+    // to give, never this tool's reading (karyos#749 review).
+    if tracking_path.is_some() && sampled_at.is_none() {
+        return fail(
+            err,
+            "--tracking needs --sampled-at-ns: a saved report is dated when chronyc printed it",
+        );
     }
     let text = match tracking_path {
         Some(path) => std::fs::read_to_string(&path).map_err(|error| format!("{path}: {error}")),

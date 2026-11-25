@@ -265,6 +265,50 @@ fn test_c_time_a_restart_from_the_log_continues_from_its_last_entry() {
     }
 }
 
+/// A tail from before C-TIME need not be ordered: over event times `10,
+/// 50, 30`, recovery's watermark is the largest surviving time, 50, never
+/// the last entry's 30, and a leader whose raw clock reads below 30 stamps
+/// 50 (ADR-0111's upgrade case).
+#[test]
+fn test_c_time_recovery_takes_the_largest_surviving_time_not_the_last() {
+    use std::path::Path;
+
+    use karyos_cluster::{Entry, RaftLog};
+    use karyos_sim::harness::core::LogView;
+    use karyos_sim::harness::node::LOG_DIR;
+    use karyos_sim::harness::workloads::geometry;
+
+    let mut log =
+        RaftLog::create(SimDisk::new(), Path::new(LOG_DIR), geometry().unwrap(), 1).unwrap();
+    let tail: Vec<Entry> = (1..=3)
+        .zip([10, 50, 30])
+        .map(|(index, event_time)| Entry {
+            index,
+            term: karyos_sim::harness::reference::TERM,
+            event_time,
+            payload: vec![u8::try_from(index).unwrap()],
+        })
+        .collect();
+    let _ = log.append(&tail).unwrap();
+    let _ = log.sync().unwrap();
+    assert_eq!(LogView::new(&mut log).watermark(), Some(50));
+    // A snapshot's log time above every entry is the watermark.
+    assert_eq!(
+        LogView::new(&mut log).with_base_time(Some(70)).watermark(),
+        Some(70)
+    );
+    let mut core = Reference::recover(LEADER, &[LEADER], &mut LogView::new(&mut log));
+    core.tick(20, &mut LogView::new(&mut log));
+    core.propose(vec![9], &mut LogView::new(&mut log)).unwrap();
+    let ready = core.ready(&mut LogView::new(&mut log)).unwrap();
+    let stamped: Vec<u64> = ready.entries.iter().map(|entry| entry.event_time).collect();
+    assert!(!stamped.is_empty(), "the proposal is appended");
+    assert!(
+        stamped.iter().all(|&time| time == 50),
+        "raw 20 stamps the surviving maximum 50: {stamped:?}"
+    );
+}
+
 /// A log empty after a snapshot comes from an install: server 2 is down
 /// while server 0 commits the first client's appends and compacts them
 /// away, comes back and installs server 0's snapshot, its log restarting

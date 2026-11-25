@@ -53,7 +53,8 @@ Usage: karyos-tools calibrate phc [--device /dev/ptp0] [--reads 4096]
            [--max-bound-ns 10000]
        karyos-tools calibrate compose <record> <record> [<record>...]
        karyos-tools calibrate append --journal <dir> [<word>...]
-       karyos-tools calibrate utc [--tracking <file>] [--window-ms 10000] ...
+       karyos-tools calibrate utc [--tracking <file> --sampled-at-ns N]
+           [--window-ms 10000] ...
        karyos-tools calibrate realtime [--reads 4096] [--domain 4] ...
 
 `utc` turns `chronyc -c tracking` into a UTC reference record for

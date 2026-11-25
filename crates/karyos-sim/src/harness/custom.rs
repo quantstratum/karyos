@@ -53,8 +53,8 @@
 //!   Its entries, proposals and a new leader's no-op alike, are stamped
 //!   with [`karyos_cluster::stamp`]: the latest reading clamped to the
 //!   log's watermark (contract C-TIME, ADR-0111), which is the last
-//!   entry's event time, the recovered log's last after a restart, or the
-//!   snapshot's log time when the log is empty after it.
+//!   entry's event time; after a restart, the largest event time of the
+//!   recovered log's entries and the snapshot's log time.
 //!
 //! **Buffers.** Entries and their vectors come from one pool per thread,
 //! shared by every node the simulation runs on it: what a follower is
@@ -626,8 +626,8 @@ impl Custom {
             sent: Vec::with_capacity(READY_MESSAGES),
             sent_after: Vec::with_capacity(READY_MESSAGES),
             now: 0,
-            // The recovered log's last entry, or the snapshot's log time
-            // when the log is empty after it.
+            // The largest event time of the recovered log's entries and
+            // the snapshot's log time.
             watermark: log.watermark().unwrap_or(0),
             ticked: None,
             received: log

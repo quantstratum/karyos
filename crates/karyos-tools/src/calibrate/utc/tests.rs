@@ -28,9 +28,10 @@ fn settings() -> UtcSettings {
     }
 }
 
-/// TRACKING's bound over 10 s: 19.4 ms as sampled plus (0.050 + 0.001 +
-/// 1) ppm of 10 s, 10.51 us.
-const BOUND_10S: u64 = 19_410_510;
+/// TRACKING's bound over 10 s: 19.4 ms as sampled plus 1.052 ppm (skew
+/// 0.0505, residual 0.0015 and 1) of 10 s, 10.52 us: skew and residual
+/// each count half their last printed digit more.
+const BOUND_10S: u64 = 19_410_520;
 
 fn key(domain: u64) -> ClockKey {
     ClockKey {
@@ -105,12 +106,13 @@ fn the_bound_grows_over_the_window_as_chrony_grows_dispersion() {
             .unwrap();
     // 1 us + 2 us + 2 us as sampled.
     assert_eq!(tracking.bound_ns(0, 0), Some(5_000));
-    // Over 1 s with no clock error: 0.51 ppm of 1 s, 510 ns.
-    assert_eq!(tracking.bound_ns(1_000_000_000, 0), Some(5_510));
-    // chrony's default maxclockerror adds 1 ppm: 1.51 us.
+    // Over 1 s with no clock error: 0.015 + 0.55 ppm of 1 s (each half
+    // its last printed digit more), 565 ns.
+    assert_eq!(tracking.bound_ns(1_000_000_000, 0), Some(5_565));
+    // chrony's default maxclockerror adds 1 ppm: 1.565 us.
     assert_eq!(
         tracking.bound_ns(1_000_000_000, DEFAULT_MAX_CLOCK_ERROR_APPM),
-        Some(6_510)
+        Some(6_565)
     );
     // A third of a nanosecond of growth rounds up.
     assert_eq!(tracking.bound_ns(1, 0), Some(5_001));
@@ -128,7 +130,7 @@ fn the_bound_grows_over_the_window_as_chrony_grows_dispersion() {
         .bound
     };
     assert_eq!(bound(10_000), BOUND_10S);
-    assert_eq!(bound(600_000), 19_400_000 + 630_600);
+    assert_eq!(bound(600_000), 19_400_000 + 631_200);
     assert!(bound(1_000) < bound(10_000) && bound(10_000) < bound(600_000));
 }
 
@@ -213,8 +215,8 @@ fn the_command_prints_a_record_append_reads() {
     );
     assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
     let printed = String::from_utf8(out).unwrap();
-    // 19.4 ms plus 1.051 ppm of 5 s.
-    assert!(printed.contains("bound 19405255 ns"), "{printed}");
+    // 19.4 ms plus 1.052 ppm of 5 s.
+    assert!(printed.contains("bound 19405260 ns"), "{printed}");
     let records =
         super::super::journal::input_records(&mut std::io::Cursor::new(printed.as_bytes()))
             .unwrap();
@@ -234,6 +236,128 @@ fn the_command_prints_a_record_append_reads() {
     assert_eq!(code, super::EXIT_ERROR);
     assert!(out.is_empty());
     assert!(String::from_utf8_lossy(&err).contains("not synchronised"));
+}
+
+/// chrony's local reference, any other loopback id, or none, is no
+/// external time source: synchronised by its leap status and stratum, it
+/// still gives no bound and no record (karyos#749 review).
+#[test]
+fn test_utc_a_local_reference_gives_no_record() {
+    let report = |id: &str, name: &str| {
+        format!("{id},{name},10,1795594149.0,0.0,0.0,0.0,1.0,0.0,0.01,0.0,0.0,64.0,Normal")
+    };
+    for (id, name) in [
+        ("4C4F434C", "LOCL"),
+        ("7F7F0101", "127.127.1.1"),
+        ("7F000001", "localhost"),
+        ("00000000", "ntp1"),
+        ("C0A80001", "LOCL"),
+    ] {
+        let tracking = parse_tracking(&report(id, name)).unwrap();
+        assert_eq!(tracking.sync_state, SyncState::Synchronised, "{id}");
+        assert!(!tracking.external(), "{id} {name}");
+        assert_eq!(tracking.bound_ns(0, 0), None, "{id}");
+        let error = reference(&tracking, &settings()).unwrap_err();
+        assert!(error.contains("not an external time source"), "{error}");
+    }
+    let external = parse_tracking(&report("C0A80001", "ntp1")).unwrap();
+    assert!(external.external());
+    assert!(reference(&external, &settings()).is_ok());
+    assert!(
+        parse_tracking(&report("LOCL", "LOCL"))
+            .unwrap_err()
+            .contains("reference id")
+    );
+}
+
+/// A saved report needs its sample time: `--tracking` without
+/// `--sampled-at-ns` is refused, and a given sample time's age is in the
+/// growth, which spans the sample to the validity's end (karyos#749
+/// review).
+#[test]
+fn test_utc_a_saved_report_needs_its_sample_time() {
+    let path = std::env::temp_dir().join(format!("karyos-utc-saved-{}", std::process::id()));
+    std::fs::write(&path, TRACKING).unwrap();
+    let file = path.to_string_lossy().into_owned();
+    let run = |args: &[&str]| {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_utc(
+            args.iter().map(std::ffi::OsString::from),
+            &mut std::io::empty(),
+            &mut out,
+            &mut err,
+        );
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    };
+    let (code, out, err) = run(&["--tracking", &file]);
+    assert_eq!(code, super::EXIT_ERROR);
+    assert!(out.is_empty());
+    assert!(err.contains("--sampled-at-ns"), "{err}");
+    let (code, out, err) = run(&[
+        "--tracking",
+        &file,
+        "--sampled-at-ns",
+        "1795594150000000000",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains(&format!("bound {BOUND_10S} ns")), "{out}");
+    let _ = std::fs::remove_file(&path);
+    // Live from standard input, the tool's own reading is the sample.
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = run_utc(
+        std::iter::empty(),
+        &mut TRACKING.as_bytes(),
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    // The growth is over the sample to the validity's end.
+    let record = reference(&parse_tracking(TRACKING).unwrap(), &settings()).unwrap();
+    let grown = record.valid_to - record.valid_from;
+    assert_eq!(
+        record.bound,
+        parse_tracking(TRACKING)
+            .unwrap()
+            .bound_ns(grown, DEFAULT_MAX_CLOCK_ERROR_APPM)
+            .unwrap()
+    );
+}
+
+/// chrony rounds skew and residual frequency to their last printed digit:
+/// each counts half that digit more, 0.0005 ppm for three decimals, so a
+/// value rounded down never understates the growth (karyos#749 review).
+#[test]
+fn test_utc_printed_rates_round_up_by_half_their_last_digit() {
+    const HALF_3: u128 = 500_000_000_000_000;
+    let rates = |residual: &str, skew: &str| {
+        let tracking = parse_tracking(&format!(
+            "C0A80001,ntp1,2,1.0,0.0,0.0,0.0,1.0,{residual},{skew},0.0,0.0,64.0,Normal"
+        ))
+        .unwrap();
+        (tracking.residual_appm, tracking.skew_appm)
+    };
+    assert_eq!(rates("0.000", "0.000"), (HALF_3, HALF_3));
+    assert_eq!(
+        rates("-0.001", "0.050"),
+        (
+            1_000_000_000_000_000 + HALF_3,
+            50_000_000_000_000_000 + HALF_3
+        )
+    );
+    assert_eq!(
+        rates("0.0", "1"),
+        (50_000_000_000_000_000, 1_500_000_000_000_000_000)
+    );
+    // Over the default 10 s window, two rates rounded down to 0.000 ppm
+    // count 0.001 ppm: 10 ns more than taken as exact.
+    let zero =
+        parse_tracking("C0A80001,ntp1,2,1.0,0.0,0.0,0.0,1.0,0.000,0.000,0.0,0.0,64.0,Normal")
+            .unwrap();
+    assert_eq!(zero.bound_ns(10_000_000_000, 0), Some(10));
 }
 
 /// Reads of a realtime clock `offset` ns ahead of the raw clock and
