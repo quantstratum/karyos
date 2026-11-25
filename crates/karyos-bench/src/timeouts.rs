@@ -95,8 +95,12 @@ pub struct Report {
     pub host: String,
     /// The other host, for a round trip.
     pub peer: Option<String>,
-    /// The timer tick, or the interval between datagrams, in microseconds.
+    /// The timer tick, or the target interval between datagrams, in
+    /// microseconds: a round trip waits for its answer before the next
+    /// datagram goes, so a run of slow answers stretches the run.
     pub period_us: u64,
+    /// A round trip's datagram size, in bytes.
+    pub size: Option<usize>,
     /// The tail of its samples.
     pub tail: Tail,
     /// Datagrams without answer (a round trip's).
@@ -110,13 +114,15 @@ impl Report {
     #[must_use]
     pub fn json(&self) -> String {
         format!(
-            "{{\"probe\":\"{}\",\"host\":\"{}\",\"peer\":{},\"period_us\":{},\"count\":{},\"p50_us\":{},\"p99_us\":{},\"p999_us\":{},\"max_us\":{},\"lost\":{},\"load1_samples\":{},\"load1_min\":{:.2},\"load1_mean\":{:.2},\"load1_max\":{:.2}}}",
+            "{{\"probe\":\"{}\",\"host\":\"{}\",\"peer\":{},\"period_us\":{},\"size\":{},\"count\":{},\"p50_us\":{},\"p99_us\":{},\"p999_us\":{},\"max_us\":{},\"lost\":{},\"load1_samples\":{},\"load1_min\":{:.2},\"load1_mean\":{:.2},\"load1_max\":{:.2}}}",
             self.probe,
             escape(&self.host),
             self.peer
                 .as_deref()
                 .map_or_else(|| "null".to_owned(), |peer| format!("\"{}\"", escape(peer))),
             self.period_us,
+            self.size
+                .map_or_else(|| "null".to_owned(), |size| size.to_string()),
             self.tail.count,
             self.tail.p50_us,
             self.tail.p99_us,
@@ -206,6 +212,7 @@ pub fn pause(run: Duration, tick: Duration) -> Report {
         host: host(),
         peer: None,
         period_us: u64::try_from(tick.as_micros()).unwrap_or(u64::MAX),
+        size: None,
         tail: Tail::of(&samples),
         lost: 0,
         load: Load::of(&loads),
@@ -309,6 +316,7 @@ pub fn rtt(to: SocketAddr, count: u64, interval: Duration, size: usize) -> io::R
         host: host(),
         peer: Some(to.to_string()),
         period_us: u64::try_from(interval.as_micros()).unwrap_or(u64::MAX),
+        size: Some(size.max(8)),
         tail: Tail::of(&samples),
         lost,
         load: Load::of(&loads),
@@ -374,6 +382,7 @@ mod tests {
         assert_eq!(report.lost, 0, "{report:?}");
         assert_eq!(report.tail.count, 50);
         assert!(report.json().contains(&format!("\"peer\":\"{address}\"")));
+        assert!(report.json().contains("\"size\":64,"));
         assert_eq!(server.join().unwrap().unwrap(), 50);
     }
 }

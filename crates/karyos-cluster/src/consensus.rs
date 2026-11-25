@@ -402,18 +402,20 @@ impl TimeoutProfile {
 
 /// One host: the members are processes on it, over loopback, the host
 /// running other load. Measured on a host under build load (one-minute load
-/// 10 to 94): no false election from 6 ticks; recovery p99 about 21 ms.
+/// 10 to 94): leader changes at 6 ticks, none from 8; recovery about
+/// 17 ms median, 22 ms worst of 40 runs.
 pub const SAME_HOST: TimeoutProfile = TimeoutProfile {
     name: "same host",
     tick_us: 1_000,
-    election_min: 12,
-    election_max: 24,
-    heartbeat: 3,
+    election_min: 16,
+    election_max: 32,
+    heartbeat: 4,
 };
 
 /// Dedicated hosts, idle but for the Cluster, on a direct link. Measured on
 /// two idle hosts over a bond (load under 1): no false election at the
-/// smallest swept value, 4 ticks; recovery p99 about 20 ms.
+/// smallest swept value, 4 ticks; recovery about 10 ms median, 15 ms
+/// worst of 40 runs.
 pub const LAN_DEDICATED: TimeoutProfile = TimeoutProfile {
     name: "LAN, dedicated hosts",
     tick_us: 1_000,
@@ -424,7 +426,8 @@ pub const LAN_DEDICATED: TimeoutProfile = TimeoutProfile {
 
 /// Hosts shared with heavy unrelated load (builds) on a switched LAN.
 /// Measured on build hosts (load up to 100): false elections up to 24
-/// ticks, none from 32; recovery p99 about 132 ms.
+/// ticks, none from 32; recovery about 100 ms median, 135 ms worst of 40
+/// runs.
 pub const LAN_SHARED: TimeoutProfile = TimeoutProfile {
     name: "LAN, shared hosts",
     tick_us: 1_000,

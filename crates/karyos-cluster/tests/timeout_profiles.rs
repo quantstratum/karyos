@@ -6,25 +6,38 @@
 //! against recovery time.
 //!
 //! **The simulation.** Three cores (`karyos_cluster::consensus::Core`) over
-//! a simulated network, in microseconds. Each node's timer fires every
-//! tick plus a pause drawn from the profile's measured pause tail; each
-//! message arrives after half a round trip drawn from its measured
-//! round-trip tail. A draw is piecewise over the measured median, p99,
-//! p99.9 and maximum, so the worst observed sample is in the model. With no
-//! fault, any election after the first is a **false election**: a leader
-//! lost to timing alone. Then the leader crashes, and the time until a
-//! surviving node leads is the **recovery**.
+//! a simulated network, in microseconds, with no client load and an empty
+//! log but the leaders' no-ops. Each node's timer fires every tick plus a
+//! pause drawn from the profile's measured pause tail: the pause delays the
+//! node's heartbeats and election checks only; its message handling and
+//! persistence are immediate. Each message arrives after half a round trip
+//! drawn from the round-trip tail, independently per message and alike on
+//! every link and in both directions (a symmetric, independent
+//! approximation: a slow leg is not told from a slow return, and no
+//! message is lost). A draw is piecewise linear over the measured median,
+//! p99, p99.9 and maximum, the maximum its last bucket's endpoint.
+//!
+//! Each run waits for its first leader, then observes a fixed window of
+//! [`WINDOW_US`] with no fault: a **leader change** is any node becoming
+//! leader, or a leader stepping down, after the first; leaderless time is
+//! summed. Then the leader crashes (messages it had in flight are dropped),
+//! and the **recovery** is the time until a surviving node leads: an
+//! election, not a committed operation.
 //!
 //! **The inputs** are the `karyos-bench timeouts` reports the profile's
 //! record cites (quantstratum-docs: karyos/environments/election-timeouts.md),
-//! each taken with its host's load: [`PROFILES`] carries them.
+//! each taken with its host's load: [`PROFILES`] carries, at each point
+//! (median, p99, p99.9, maximum), the worst over the profile's hosts,
+//! directions and payload sizes.
 //!
-//! **The rule.** A profile's default election timeout is the smallest swept
-//! value with no false election over the sweep's runs at its measured
-//! tails, doubled for what a finite measurement cannot have seen; the
-//! heartbeat is a quarter of it, and the timeout's range is
-//! `[min, 2 * min)`. [`the_defaults_follow_the_rule`] checks the shipped
-//! defaults against the rule; `sweep` (ignored, on request) prints the
+//! **The rule.** A profile's default election timeout is twice the smallest
+//! swept value whose runs show no leader change; every smaller swept value
+//! must show some, so the floor is not an accident of a non-monotone sweep,
+//! and the default is checked again on seeds the choice did not use. The
+//! doubling is a heuristic margin for what a finite measurement cannot have
+//! seen, not a bound. The heartbeat is a quarter of the default and the
+//! timeout's range is `[min, 2 * min)`. [`the_defaults_follow_the_rule`]
+//! checks the shipped defaults; `sweep` (ignored, on request) prints the
 //! table the record publishes.
 
 #![allow(
@@ -62,7 +75,9 @@ impl Tail {
             990_000..999_000 => (self.p99, self.p999, 990_000, 9_000),
             _ => (self.p999, self.max, 999_000, 1_000),
         };
-        low + (high.saturating_sub(low)) * (u - from) / span
+        // `span - 1`: the last draw of a bucket is its upper point, so the
+        // measured maximum itself is drawn.
+        low + (high.saturating_sub(low)) * (u - from) / (span - 1)
     }
 }
 
@@ -87,7 +102,8 @@ const PROFILES: [(&TimeoutProfile, Tail, Tail); 3] = [
         },
     ),
     // Dedicated, idle hosts on a direct bond (swarmer01 and swarmer02, load
-    // under 1): the worse host's pauses, the round trip at 1,200 bytes.
+    // under 1): pauses over both hosts, the round trip over both payload
+    // sizes.
     (
         &LAN_DEDICATED,
         Tail {
@@ -103,12 +119,13 @@ const PROFILES: [(&TimeoutProfile, Tail, Tail); 3] = [
             max: 2_234,
         },
     ),
-    // Hosts shared with heavy build load on a switched LAN (flumix's pauses
-    // at load 18 to 100, the xaskar to flumix round trip at 1,200 bytes).
+    // Hosts shared with heavy build load on a switched LAN: pauses over
+    // xaskar and flumix (load 9 to 100), the xaskar to flumix round trip
+    // over both payload sizes.
     (
         &LAN_SHARED,
         Tail {
-            p50: 56,
+            p50: 59,
             p99: 428,
             p999: 2_885,
             max: 26_662,
@@ -188,16 +205,26 @@ enum Event {
     Deliver { from: u64, to: u64, at: u64 },
 }
 
-/// What one run gave: elections after the first with no fault, and the
-/// recovery after the leader's crash, in microseconds.
+/// What one run gave.
+#[derive(Debug, Default)]
 struct Run {
-    false_elections: u64,
+    /// Leader changes in the window: a node becoming leader, or a leader
+    /// stepping down, after the first leader.
+    changes: u64,
+    /// Time in the window with no leader.
+    leaderless_us: u64,
+    /// Whether the window ended with a leader to crash.
+    crashed: bool,
+    /// The time from the crash until a surviving node led.
     recovery_us: Option<u64>,
 }
 
-/// One run of `profile`'s timeouts at `pause` and `rtt` tails: `steady_us`
-/// of no fault, then the leader crashes.
-fn run(profile: &TimeoutProfile, (pause, rtt): (Tail, Tail), seed: u64, steady_us: u64) -> Run {
+/// The window observed after the first leader, with no fault.
+const WINDOW_US: u64 = 60_000_000;
+
+/// One run of `profile`'s timeouts at `pause` and `rtt` tails: its first
+/// leader, [`WINDOW_US`] with no fault, then the leader's crash.
+fn run(profile: &TimeoutProfile, (pause, rtt): (Tail, Tail), seed: u64) -> Run {
     let ids = [1u64, 2, 3];
     let mut rng = Rng(seed);
     let mut cores: BTreeMap<u64, Core> = BTreeMap::new();
@@ -227,20 +254,38 @@ fn run(profile: &TimeoutProfile, (pause, rtt): (Tail, Tail), seed: u64, steady_u
         )));
         serial += 1;
     }
-    let mut leaders_seen = 0u64;
+    let mut result = Run::default();
+    // The first leader's time, once there is one: the window starts there.
+    let mut first: Option<u64> = None;
+    let mut leaderless_since: Option<u64> = None;
     let mut crashed: Option<(u64, u64)> = None;
-    let mut recovery_us = None;
-    let end = steady_us + 60_000_000;
+    let bootstrap_end = 60_000_000;
     while let Some(Reverse((now, _, event))) = queue.pop() {
-        if now > end || recovery_us.is_some() {
+        if result.recovery_us.is_some() {
             break;
         }
-        if crashed.is_none() && now >= steady_us {
-            // The leader crashes: the run measures how long until another
-            // node leads.
-            if let Some((&leader, _)) = cores.iter().find(|(_, core)| core.role() == Role::Leader) {
-                crashed = Some((leader, now));
+        if first.is_none() && now > bootstrap_end {
+            // No first leader at all: nothing to observe.
+            break;
+        }
+        if let Some(start) = first
+            && crashed.is_none()
+            && now >= start + WINDOW_US
+        {
+            if let Some(since) = leaderless_since.take() {
+                result.leaderless_us += start + WINDOW_US - since;
             }
+            // The window ends: the leader crashes, if there is one.
+            match cores.iter().find(|(_, core)| core.role() == Role::Leader) {
+                Some((&leader, _)) => {
+                    crashed = Some((leader, now));
+                    result.crashed = true;
+                }
+                None => break,
+            }
+        }
+        if crashed.is_some_and(|(_, at)| now > at + 60_000_000) {
+            break;
         }
         let down = crashed.map(|(id, _)| id);
         let (id, before, sink, incoming) = match event {
@@ -307,19 +352,30 @@ fn run(profile: &TimeoutProfile, (pause, rtt): (Tail, Tail), seed: u64, steady_u
             );
         }
         let after = cores[&id].role();
-        if after == Role::Leader && before != Role::Leader {
-            leaders_seen += 1;
-            if let Some((_, at)) = crashed {
-                recovery_us = Some(now - at);
+        let became = after == Role::Leader && before != Role::Leader;
+        let left = before == Role::Leader && after != Role::Leader;
+        if let Some((_, at)) = crashed {
+            if became {
+                result.recovery_us = Some(now - at);
+            }
+        } else if first.is_none() {
+            if became {
+                first = Some(now);
+            }
+        } else if became || left {
+            result.changes += 1;
+            let leading = cores.values().any(|core| core.role() == Role::Leader);
+            match (leading, leaderless_since) {
+                (false, None) => leaderless_since = Some(now),
+                (true, Some(since)) => {
+                    result.leaderless_us += now - since;
+                    leaderless_since = None;
+                }
+                _ => {}
             }
         }
     }
-    Run {
-        false_elections: leaders_seen
-            .saturating_sub(1)
-            .saturating_sub(u64::from(recovery_us.is_some())),
-        recovery_us,
-    }
+    result
 }
 
 type Queue = BinaryHeap<Reverse<(u64, u64, Event)>>;
@@ -352,25 +408,44 @@ fn schedule(
     queue.push(Reverse((at, key, Event::Deliver { from, to, at: key })));
 }
 
-/// The sweep's runs per candidate, and the steady time of each.
+/// The sweep's runs per candidate.
 const RUNS: u64 = 40;
-const STEADY_US: u64 = 60_000_000;
 
-/// False elections and the recovery's p99 over the sweep's runs.
-fn evaluate(profile: &TimeoutProfile, tails: (Tail, Tail), runs: u64) -> (u64, u64) {
-    let mut false_elections = 0;
+/// The seeds a choice is made on, and the hold-out ones it is checked on.
+const CHOICE: std::ops::RangeInclusive<u64> = 1..=RUNS;
+const HOLD_OUT: std::ops::RangeInclusive<u64> = 1_001..=1_000 + RUNS;
+
+/// What a candidate gave over its runs.
+#[derive(Debug, Default)]
+struct Summary {
+    changes: u64,
+    leaderless_us: u64,
+    crashes: u64,
+    recoveries: u64,
+    recovery_median_us: u64,
+    recovery_worst_us: u64,
+}
+
+/// A candidate over `seeds`.
+fn evaluate(
+    profile: &TimeoutProfile,
+    tails: (Tail, Tail),
+    seeds: std::ops::RangeInclusive<u64>,
+) -> Summary {
+    let mut summary = Summary::default();
     let mut recoveries = Vec::new();
-    for seed in 1..=runs {
-        let run = run(profile, tails, seed, STEADY_US);
-        false_elections += run.false_elections;
+    for seed in seeds {
+        let run = run(profile, tails, seed);
+        summary.changes += run.changes;
+        summary.leaderless_us += run.leaderless_us;
+        summary.crashes += u64::from(run.crashed);
         recoveries.extend(run.recovery_us);
     }
     recoveries.sort_unstable();
-    let p99 = recoveries
-        .get(recoveries.len().saturating_mul(99) / 100)
-        .copied()
-        .unwrap_or(u64::MAX);
-    (false_elections, p99)
+    summary.recoveries = recoveries.len() as u64;
+    summary.recovery_median_us = recoveries.get(recoveries.len() / 2).copied().unwrap_or(0);
+    summary.recovery_worst_us = recoveries.last().copied().unwrap_or(0);
+    summary
 }
 
 /// A candidate of `profile`'s tick: `[min, 2 * min)` and a quarter of it
@@ -387,20 +462,25 @@ fn candidate(profile: &TimeoutProfile, min: u32) -> TimeoutProfile {
 /// The swept values, in ticks.
 const SWEEP: [u32; 9] = [4, 6, 8, 12, 16, 24, 32, 48, 64];
 
-/// The smallest swept value with no false election, doubled.
+/// The smallest swept value with no leader change on the choice seeds,
+/// doubled.
+///
+/// # Panics
+///
+/// When no swept value qualifies: the profile has no measured default.
 fn rule(profile: &TimeoutProfile, tails: (Tail, Tail)) -> u32 {
     let floor = SWEEP
         .iter()
         .copied()
-        .find(|&min| evaluate(&candidate(profile, min), tails, RUNS).0 == 0)
-        .unwrap_or(*SWEEP.last().unwrap());
+        .find(|&min| evaluate(&candidate(profile, min), tails, CHOICE).changes == 0)
+        .unwrap_or_else(|| panic!("{}: no swept value is free of leader changes", profile.name));
     floor * 2
 }
 
-/// The shipped defaults follow the rule, checked without the whole sweep:
-/// each default is twice a swept floor with no false election, the swept
-/// value below the floor has some (unless the floor is the sweep's
-/// smallest), and the default itself has none and recovers.
+/// The shipped defaults follow the rule: each is twice a swept floor with
+/// no leader change, every smaller swept value has some, and the default
+/// itself has none on the choice seeds and on the hold-out ones, with a
+/// crash and a recovery in every run.
 #[test]
 fn the_defaults_follow_the_rule() {
     for (profile, pause, rtt) in PROFILES {
@@ -415,24 +495,33 @@ fn the_defaults_follow_the_rule() {
             "{}: not the rule's shape",
             profile.name
         );
-        let at = SWEEP.iter().position(|&min| min == floor);
-        let at = at.unwrap_or_else(|| panic!("{}: floor {floor} is not swept", profile.name));
+        let at = SWEEP
+            .iter()
+            .position(|&min| min == floor)
+            .unwrap_or_else(|| panic!("{}: floor {floor} is not swept", profile.name));
         assert_eq!(
-            evaluate(&candidate(profile, floor), (pause, rtt), RUNS).0,
+            evaluate(&candidate(profile, floor), (pause, rtt), CHOICE).changes,
             0,
-            "{}: false elections at the floor",
+            "{}: leader changes at the floor",
             profile.name
         );
-        if let Some(&below) = at.checked_sub(1).and_then(|at| SWEEP.get(at)) {
+        for &below in SWEEP.get(..at).unwrap_or(&[]) {
             assert!(
-                evaluate(&candidate(profile, below), (pause, rtt), RUNS).0 > 0,
-                "{}: no false election below the floor, at {below}",
+                evaluate(&candidate(profile, below), (pause, rtt), CHOICE).changes > 0,
+                "{}: no leader change below the floor, at {below}",
                 profile.name
             );
         }
-        let (false_elections, p99) = evaluate(profile, (pause, rtt), RUNS);
-        assert_eq!(false_elections, 0, "{}", profile.name);
-        assert!(p99 < u64::MAX, "{}: no recovery", profile.name);
+        for seeds in [CHOICE, HOLD_OUT] {
+            let summary = evaluate(profile, (pause, rtt), seeds.clone());
+            assert_eq!(summary.changes, 0, "{} {seeds:?}", profile.name);
+            assert_eq!(
+                (summary.crashes, summary.recoveries),
+                (RUNS, RUNS),
+                "{} {seeds:?}: a run without its crash or its recovery",
+                profile.name
+            );
+        }
     }
 }
 
@@ -441,14 +530,29 @@ fn the_defaults_follow_the_rule() {
 fn sweep() {
     for (profile, pause, rtt) in PROFILES {
         println!("{} (tick {} us):", profile.name, profile.tick_us);
-        println!("  min ticks | false elections over {RUNS} runs | recovery p99 ms");
+        println!(
+            "  min ticks | leader changes / leaderless ms over {RUNS} runs | crashes / recoveries | recovery median / worst ms"
+        );
         for min in SWEEP {
-            let (false_elections, p99) = evaluate(&candidate(profile, min), (pause, rtt), RUNS);
+            let summary = evaluate(&candidate(profile, min), (pause, rtt), CHOICE);
             println!(
-                "  {min:>9} | {false_elections:>31} | {:>15.1}",
-                p99 as f64 / 1000.0
+                "  {min:>9} | {:>14} / {:>13.1} | {:>7} / {:>10} | {:>6.1} / {:>6.1}",
+                summary.changes,
+                summary.leaderless_us as f64 / 1000.0,
+                summary.crashes,
+                summary.recoveries,
+                summary.recovery_median_us as f64 / 1000.0,
+                summary.recovery_worst_us as f64 / 1000.0
             );
         }
         println!("  rule: {}", rule(profile, (pause, rtt)));
+        let held = evaluate(profile, (pause, rtt), HOLD_OUT);
+        println!(
+            "  default {}: hold-out leader changes {}, recovery median / worst {:.1} / {:.1} ms",
+            profile.election_min,
+            held.changes,
+            held.recovery_median_us as f64 / 1000.0,
+            held.recovery_worst_us as f64 / 1000.0
+        );
     }
 }
