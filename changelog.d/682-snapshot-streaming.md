@@ -1,0 +1,3 @@
+### Added
+
+- A snapshot is written in pieces: `SnapshotStore::begin` returns a `PendingSnapshot` whose sections take their bytes in any pieces, then `SnapshotStore::publish` publishes it exactly as `write` would, or `abandon` removes it; the bytes are the same as `write`'s (karyos#682). The harness node streams a follower's install through it: the leader sends its snapshot read through a `SnapshotReader` in pieces of at most `WRITE_CHUNK`, the follower writes each into its store as it arrives, and a gap drops the transfer for the leader to ask again. The node compacts on the store's own `SnapshotConfig` (its entry and byte triggers, its two kept snapshots and its catch-up allowance through `log_floor`) instead of a harness rule.

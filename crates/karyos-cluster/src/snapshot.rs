@@ -39,6 +39,15 @@
 //!   was durable before its publish; one that no longer reads whole, or
 //!   whose digest fails, is reported damaged and not used. A manifest that
 //!   fails its CRC is refused.
+//! - **Streamed writes** (karyos#682). [`SnapshotStore::begin`] starts a
+//!   snapshot whose sections arrive in pieces, as a leader's install
+//!   does: [`PendingSnapshot::section`] opens each with its length and
+//!   [`PendingSnapshot::write`] takes its bytes in any pieces, appended in
+//!   writes of at most [`WRITE_CHUNK`]; [`SnapshotStore::publish`] then
+//!   closes, syncs and publishes it as [`SnapshotStore::write`] does, or
+//!   [`SnapshotStore::abandon`] removes it. The bytes on disk are the
+//!   same as [`SnapshotStore::write`]'s; an unpublished snapshot is what a
+//!   crash leaves, which recovery removes.
 //! - **Reads.** [`SnapshotStore::reader`] streams a snapshot section by
 //!   section into the caller's buffer, and [`SnapshotStore::open`] and
 //!   [`SnapshotStore::verify`] check one the same way: a section's bytes
@@ -392,6 +401,11 @@ pub enum SnapshotError {
     /// An earlier failure: reopen the store.
     #[error("the snapshot store failed; reopen it")]
     Failed,
+    /// A streamed snapshot published before its sections were whole, or
+    /// written past a section's length, or after one of its writes
+    /// failed: it is not published.
+    #[error("the streamed snapshot is incomplete")]
+    Incomplete,
     /// Ids ran out.
     #[error("snapshot ids exhausted")]
     Exhausted,
@@ -548,6 +562,13 @@ impl<D: Disk + Clone> SnapshotStore<D> {
             length,
             digest,
         };
+        self.publish_info(info)
+    }
+
+    /// Publishes `info`, whose bytes are durable, and purges what the
+    /// manifest no longer keeps; `failed` is set while it runs.
+    fn publish_info(&mut self, info: SnapshotInfo) -> Result<SnapshotInfo, SnapshotError> {
+        self.failed = true;
         let mut kept = self.kept.clone();
         kept.push(info);
         let keep = usize::try_from(self.config.keep).unwrap_or(usize::MAX);
@@ -570,6 +591,106 @@ impl<D: Disk + Clone> SnapshotStore<D> {
         }
         self.failed = false;
         Ok(info)
+    }
+
+    /// Starts a snapshot including log index `index` of term `term` whose
+    /// sections are written in pieces ([`PendingSnapshot`]); nothing is
+    /// published until [`SnapshotStore::publish`].
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError::NotNewer`] and [`SnapshotError::Failed`], which
+    /// change nothing; [`SnapshotError::Exhausted`]; the store's and the
+    /// disk's errors.
+    pub fn begin(&mut self, index: u64, term: u64) -> Result<PendingSnapshot<D>, SnapshotError> {
+        if self.failed {
+            return Err(SnapshotError::Failed);
+        }
+        if let Some(newest) = self.latest().filter(|newest| index <= newest.index) {
+            return Err(SnapshotError::NotNewer {
+                index,
+                newest: newest.index,
+            });
+        }
+        let id = self.next_id;
+        self.next_id = id.checked_add(1).ok_or(SnapshotError::Exhausted)?;
+        let store = SegmentStore::create(
+            self.disk.clone(),
+            &self.dir,
+            id,
+            self.geometry,
+            SyncPolicy::None,
+            0,
+        )?;
+        Ok(PendingSnapshot {
+            id,
+            index,
+            term,
+            store: Some(store),
+            digest: Crc32c::new(),
+            at: 0,
+            left: 0,
+            sections: 0,
+            broken: false,
+        })
+    }
+
+    /// Publishes a streamed snapshot whose sections are whole, as
+    /// [`SnapshotStore::write`] does: closed and synced, then published,
+    /// then what the manifest no longer keeps purged.
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError::Incomplete`] for one not whole, and
+    /// [`SnapshotError::NotNewer`] when a newer snapshot was published
+    /// meanwhile, both removing it and changing nothing else; then as
+    /// [`SnapshotStore::write`].
+    pub fn publish(
+        &mut self,
+        mut pending: PendingSnapshot<D>,
+    ) -> Result<SnapshotInfo, SnapshotError> {
+        if self.failed {
+            return Err(SnapshotError::Failed);
+        }
+        let newer = self
+            .latest()
+            .filter(|newest| pending.index <= newest.index)
+            .map(|newest| newest.index);
+        if pending.broken || pending.left > 0 || pending.sections == 0 || newer.is_some() {
+            let index = pending.index;
+            self.abandon(pending)?;
+            return Err(newer.map_or(SnapshotError::Incomplete, |newest| {
+                SnapshotError::NotNewer { index, newest }
+            }));
+        }
+        let Some(store) = pending.store.take() else {
+            return Err(SnapshotError::Incomplete);
+        };
+        self.failed = true;
+        let _ = store.close_synced()?;
+        self.failed = false;
+        let info = SnapshotInfo {
+            id: pending.id,
+            index: pending.index,
+            term: pending.term,
+            length: pending.at,
+            digest: pending.digest.finish(),
+        };
+        self.publish_info(info)
+    }
+
+    /// Removes a streamed snapshot that will not be published: an
+    /// install whose transfer broke off.
+    ///
+    /// # Errors
+    ///
+    /// The disk's errors; the files left are an unpublished snapshot,
+    /// which the next open removes.
+    pub fn abandon(&mut self, mut pending: PendingSnapshot<D>) -> Result<(), SnapshotError> {
+        drop(pending.store.take());
+        remove_recording(&mut self.disk, &self.dir, pending.id)?;
+        self.disk.sync_dir(&self.dir)?;
+        Ok(())
     }
 
     /// The sections of `info`, a kept snapshot, checked against its length
@@ -659,17 +780,123 @@ impl<D: Disk + Clone> SnapshotStore<D> {
 }
 
 /// A section's header.
-fn section_header(section: &Section<'_>) -> Result<[u8; SECTION_HEADER], SnapshotError> {
-    let length = u64::try_from(section.bytes.len()).map_err(|_| SegmentError::PositionOverflow)?;
+/// A snapshot written in pieces ([`SnapshotStore::begin`]), not yet
+/// published.
+#[derive(Debug)]
+pub struct PendingSnapshot<D: Disk> {
+    id: u64,
+    index: u64,
+    term: u64,
+    store: Option<SegmentStore<D>>,
+    digest: Crc32c,
+    /// Bytes written.
+    at: u64,
+    /// Bytes the current section still expects.
+    left: u64,
+    sections: u32,
+    /// A write failed or went past a section: it is never published.
+    broken: bool,
+}
+
+impl<D: Disk> PendingSnapshot<D> {
+    /// The index it includes.
+    #[must_use]
+    pub const fn index(&self) -> u64 {
+        self.index
+    }
+
+    /// Its term.
+    #[must_use]
+    pub const fn term(&self) -> u64 {
+        self.term
+    }
+
+    /// Bytes the current section still expects.
+    #[must_use]
+    pub const fn left(&self) -> u64 {
+        self.left
+    }
+
+    /// Opens the next section, of `kind`, `version` and `length` bytes,
+    /// once the previous one is whole.
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError::Incomplete`] while the previous section is not
+    /// whole, and the store's errors; any error breaks the snapshot.
+    pub fn section(
+        &mut self,
+        kind: SectionKind,
+        version: u64,
+        length: u64,
+    ) -> Result<(), SnapshotError> {
+        let result = self.open_section(kind, version, length);
+        self.broken |= result.is_err();
+        result
+    }
+
+    fn open_section(
+        &mut self,
+        kind: SectionKind,
+        version: u64,
+        length: u64,
+    ) -> Result<(), SnapshotError> {
+        if self.broken || self.left > 0 {
+            return Err(SnapshotError::Incomplete);
+        }
+        let header = header_of(kind, version, length);
+        let store = self.store.as_mut().ok_or(SnapshotError::Incomplete)?;
+        self.digest.update(&header);
+        self.at = store.append(self.at, &header)?;
+        self.left = length;
+        self.sections = self.sections.saturating_add(1);
+        Ok(())
+    }
+
+    /// Writes the next `bytes` of the current section, in A2 writes of at
+    /// most [`WRITE_CHUNK`].
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError::Incomplete`] for bytes past the section's length,
+    /// and the store's errors; any error breaks the snapshot.
+    pub fn write(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let result = self.write_bytes(bytes);
+        self.broken |= result.is_err();
+        result
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let length = u64::try_from(bytes.len()).map_err(|_| SegmentError::PositionOverflow)?;
+        if self.broken || length > self.left {
+            return Err(SnapshotError::Incomplete);
+        }
+        let store = self.store.as_mut().ok_or(SnapshotError::Incomplete)?;
+        for chunk in bytes.chunks(WRITE_CHUNK) {
+            self.digest.update(chunk);
+            self.at = store.append(self.at, chunk)?;
+        }
+        self.left -= length;
+        Ok(())
+    }
+}
+
+/// A section's header, from its parts.
+fn header_of(kind: SectionKind, version: u64, length: u64) -> [u8; SECTION_HEADER] {
     let mut header = [0u8; SECTION_HEADER];
     let (magic, rest) = header.split_at_mut(4);
     magic.copy_from_slice(&SECTION_MAGIC);
-    let (kind, rest) = rest.split_at_mut(4);
-    kind.copy_from_slice(&section.kind.code().to_le_bytes());
-    let (version, rest) = rest.split_at_mut(8);
-    version.copy_from_slice(&section.version.to_le_bytes());
+    let (kind_bytes, rest) = rest.split_at_mut(4);
+    kind_bytes.copy_from_slice(&kind.code().to_le_bytes());
+    let (version_bytes, rest) = rest.split_at_mut(8);
+    version_bytes.copy_from_slice(&version.to_le_bytes());
     rest.copy_from_slice(&length.to_le_bytes());
-    Ok(header)
+    header
+}
+
+fn section_header(section: &Section<'_>) -> Result<[u8; SECTION_HEADER], SnapshotError> {
+    let length = u64::try_from(section.bytes.len()).map_err(|_| SegmentError::PositionOverflow)?;
+    Ok(header_of(section.kind, section.version, length))
 }
 
 /// A section's header, as a reader meets it.
