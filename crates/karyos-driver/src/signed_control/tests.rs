@@ -221,7 +221,7 @@ fn a_cache_hit_resends_without_a_second_verification() {
         intake.receive(source(), &bytes, SECOND),
         Ok(Received::Fresh(_))
     ));
-    intake.applied(verified.digest, 7);
+    intake.applied(0, source(), verified.digest, 7, SECOND);
     intake.new_cycle();
     assert_eq!(
         intake.receive(source(), &bytes, 2 * SECOND).unwrap(),
@@ -258,6 +258,110 @@ fn an_authority_key_file_names_its_scope() {
     // Signed by the matching seed of the key tests.
     assert!(matches!(
         intake.receive(source(), &signed(&abort(10, 12), 10, 0, &signer(9)), 0),
+        Ok(Received::Fresh(_))
+    ));
+}
+
+/// H8 finding 6: unverified datagrams from many unknown sources can
+/// neither hold the source table for good nor take a configured peer's
+/// budget. Before the fix the first 64 sources kept their slots for the
+/// life of the intake and any later source was refused.
+#[test]
+fn unknown_sources_cannot_starve_a_configured_peer() {
+    let mut intake = SignedIntake::<u8>::new(vec![authority(true)], 0);
+    let peer: SocketAddr = "10.0.9.9:4000".parse().unwrap();
+    assert!(intake.reserve(peer, 0));
+    let forged = {
+        let mut bytes = signed(&state(10, 11, 2), 10, 0, &signer(9));
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        bytes
+    };
+    let unknown = |host: usize| SocketAddr::from(([10, 1, 0, u8::try_from(host).unwrap()], 4000));
+    // Every unknown slot taken.
+    let mut at = 0;
+    for host in 0..SOURCE_SLOTS {
+        at += SECOND / 16;
+        intake.new_cycle();
+        assert_eq!(
+            intake.receive(unknown(host), &forged, at).unwrap_err(),
+            SignedRefusal::Envelope
+        );
+    }
+    // A later source takes an idle slot instead of being refused for good.
+    let late: SocketAddr = "10.2.0.1:4000".parse().unwrap();
+    intake.new_cycle();
+    assert_eq!(
+        intake.receive(late, &forged, at).unwrap_err(),
+        SignedRefusal::Envelope
+    );
+    // A burst of unknown sources spends only the shared unknown rate.
+    let mut spent = false;
+    for host in 100..140 {
+        intake.new_cycle();
+        if intake.receive(unknown(host), &forged, at).unwrap_err() == SignedRefusal::BudgetSource {
+            spent = true;
+        }
+    }
+    assert!(spent, "the unknown sources' shared rate is spent");
+    // The peer's reserved bucket still verifies.
+    intake.new_cycle();
+    assert!(matches!(
+        intake.receive(peer, &signed(&state(10, 11, 2), 10, 1, &signer(9)), at),
+        Ok(Received::Fresh(_))
+    ));
+    // Released, the peer is an unknown source again.
+    intake.release(peer);
+    intake.new_cycle();
+    assert_eq!(
+        intake.receive(peer, &forged, at).unwrap_err(),
+        SignedRefusal::BudgetSource
+    );
+}
+
+/// H8 finding 8: a digest cache entry answers only its own ingress and
+/// source, only until its retention passes, and is dropped by `forget`.
+#[test]
+fn the_digest_cache_is_scoped_and_bounded() {
+    let mut intake = SignedIntake::<u8>::new(vec![authority(true)], 0);
+    intake.set_retention(5 * SECOND);
+    let bytes = signed(&abort(10, 0), 10, 0, &signer(9));
+    let Ok(Received::Fresh(verified)) = intake.receive_on(1, source(), &bytes, 0) else {
+        panic!("verified");
+    };
+    intake.applied(1, source(), verified.digest, 7, 0);
+    intake.new_cycle();
+    // Another ingress: no hit, verified again.
+    assert!(matches!(
+        intake.receive_on(2, source(), &bytes, SECOND),
+        Ok(Received::Fresh(_))
+    ));
+    // Another source: no hit.
+    intake.new_cycle();
+    assert!(matches!(
+        intake.receive_on(1, "10.0.0.2:4000".parse().unwrap(), &bytes, SECOND),
+        Ok(Received::Fresh(_))
+    ));
+    // Its own: a hit.
+    intake.new_cycle();
+    assert_eq!(
+        intake.receive_on(1, source(), &bytes, 2 * SECOND).unwrap(),
+        Received::Resend(7)
+    );
+    // Past the retention: verified again.
+    intake.new_cycle();
+    assert!(matches!(
+        intake.receive_on(1, source(), &bytes, 6 * SECOND),
+        Ok(Received::Fresh(_))
+    ));
+    // Forgotten: gone.
+    intake.applied(1, source(), verified.digest, 8, 6 * SECOND);
+    assert_eq!(intake.cached(), 1);
+    intake.forget(|resend| *resend == 8);
+    assert_eq!(intake.cached(), 0);
+    intake.new_cycle();
+    assert!(matches!(
+        intake.receive_on(1, source(), &bytes, 7 * SECOND),
         Ok(Received::Fresh(_))
     ));
 }

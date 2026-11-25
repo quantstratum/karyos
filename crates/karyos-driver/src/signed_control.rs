@@ -38,11 +38,24 @@ pub const VERIFY_PER_CYCLE: u32 = 1;
 pub const DRIVER_RATE: u32 = 256;
 /// Verifications per second per source address, with that burst.
 pub const SOURCE_RATE: u32 = 4;
-/// Source addresses the per-source budget tracks; a source finding no
-/// slot is dropped (fail closed).
+/// Unknown source addresses the per-source budget tracks at once; a
+/// source finding no slot, none idle long enough to be replaced, is
+/// dropped (fail closed).
 pub const SOURCE_SLOTS: usize = 64;
+/// Configured control peers (followed guard authorities, the publishers
+/// of bound authenticated images): each has a reserved bucket no unknown
+/// source can take (H8 finding 6).
+pub const PEER_SLOTS: usize = 64;
+/// Verifications per second all unknown sources share, with that burst.
+pub const UNKNOWN_RATE: u32 = 16;
+/// How long an unknown source's slot stays its own without an admitted
+/// datagram; after it another unknown source may take it.
+pub const SOURCE_IDLE_NS: u64 = 1_000_000_000;
 /// Verified datagrams the digest cache remembers.
 pub const CACHE_ENTRIES: usize = 64;
+/// How long a digest cache entry answers an identical resend, by default:
+/// the bounded retention of a terminal ACK (H8 finding 8).
+pub const CACHE_RETENTION_NS: u64 = 10_000_000_000;
 
 const NS_PER_S: u128 = 1_000_000_000;
 
@@ -104,12 +117,35 @@ pub enum BudgetRefusal {
     Sources,
 }
 
+/// A configured control peer's reserved bucket.
+#[derive(Debug, Clone, Copy)]
+struct Peer {
+    source: SocketAddr,
+    /// The configurations naming it: released at the last.
+    refs: u32,
+    bucket: Bucket,
+}
+
+/// An unknown source's bucket, replaceable once idle.
+#[derive(Debug, Clone, Copy)]
+struct Stranger {
+    source: SocketAddr,
+    bucket: Bucket,
+    /// When it was last admitted.
+    last: u64,
+}
+
 /// The verification budget of the signed domains: allocated once.
+/// Configured peers have reserved buckets; unknown sources share one
+/// aggregate rate and a bounded set of expiring buckets, so unverified
+/// traffic can neither take a peer's budget nor hold a slot forever.
 #[derive(Debug)]
 pub struct VerifyBudget {
     cycle_left: u32,
     driver: Bucket,
-    sources: Vec<(SocketAddr, Bucket)>,
+    peers: Vec<Peer>,
+    unknown: Bucket,
+    strangers: Vec<Stranger>,
 }
 
 impl VerifyBudget {
@@ -119,13 +155,47 @@ impl VerifyBudget {
         Self {
             cycle_left: VERIFY_PER_CYCLE,
             driver: Bucket::full(DRIVER_RATE, DRIVER_RATE, now),
-            sources: Vec::with_capacity(SOURCE_SLOTS),
+            peers: Vec::with_capacity(PEER_SLOTS),
+            unknown: Bucket::full(UNKNOWN_RATE, UNKNOWN_RATE, now),
+            strangers: Vec::with_capacity(SOURCE_SLOTS),
         }
     }
 
     /// A new duty cycle: its verification is available again.
     pub fn new_cycle(&mut self) {
         self.cycle_left = VERIFY_PER_CYCLE;
+    }
+
+    /// Reserves a bucket for the configured control peer `source` at
+    /// `now`; returns whether it holds one (the peer table is bounded).
+    pub fn reserve(&mut self, source: SocketAddr, now: u64) -> bool {
+        if let Some(peer) = self.peers.iter_mut().find(|peer| peer.source == source) {
+            peer.refs = peer.refs.saturating_add(1);
+            return true;
+        }
+        if self.peers.len() >= PEER_SLOTS {
+            return false;
+        }
+        self.strangers.retain(|stranger| stranger.source != source);
+        self.peers.push(Peer {
+            source,
+            refs: 1,
+            bucket: Bucket::full(SOURCE_RATE, SOURCE_RATE, now),
+        });
+        true
+    }
+
+    /// Releases one reservation of `source`; its bucket goes at the last.
+    pub fn release(&mut self, source: SocketAddr) {
+        if let Some(index) = self.peers.iter().position(|peer| peer.source == source) {
+            let last = self.peers.get_mut(index).is_some_and(|peer| {
+                peer.refs = peer.refs.saturating_sub(1);
+                peer.refs == 0
+            });
+            if last {
+                self.peers.swap_remove(index);
+            }
+        }
     }
 
     /// Takes one verification for `source` at `now`, or says why not;
@@ -141,33 +211,73 @@ impl VerifyBudget {
         if !self.driver.has(now) {
             return Err(BudgetRefusal::Driver);
         }
-        let index = match self.sources.iter().position(|(held, _)| *held == source) {
-            Some(index) => index,
-            None if self.sources.len() < SOURCE_SLOTS => {
-                self.sources
-                    .push((source, Bucket::full(SOURCE_RATE, SOURCE_RATE, now)));
-                self.sources.len() - 1
+        if let Some(peer) = self.peers.iter_mut().find(|peer| peer.source == source) {
+            if !peer.bucket.has(now) {
+                return Err(BudgetRefusal::Source);
             }
-            None => return Err(BudgetRefusal::Sources),
-        };
-        let Some((_, bucket)) = self.sources.get_mut(index) else {
-            return Err(BudgetRefusal::Sources);
-        };
-        if !bucket.has(now) {
-            return Err(BudgetRefusal::Source);
+            peer.bucket.take();
+        } else {
+            if !self.unknown.has(now) {
+                return Err(BudgetRefusal::Source);
+            }
+            let index = match self.strangers.iter().position(|held| held.source == source) {
+                Some(index) => index,
+                None => {
+                    let fresh = Stranger {
+                        source,
+                        bucket: Bucket::full(SOURCE_RATE, SOURCE_RATE, now),
+                        last: now,
+                    };
+                    if self.strangers.len() < SOURCE_SLOTS {
+                        self.strangers.push(fresh);
+                        self.strangers.len() - 1
+                    } else {
+                        let idle = self
+                            .strangers
+                            .iter()
+                            .position(|held| now.saturating_sub(held.last) >= SOURCE_IDLE_NS)
+                            .ok_or(BudgetRefusal::Sources)?;
+                        if let Some(slot) = self.strangers.get_mut(idle) {
+                            *slot = fresh;
+                        }
+                        idle
+                    }
+                }
+            };
+            let Some(stranger) = self.strangers.get_mut(index) else {
+                return Err(BudgetRefusal::Sources);
+            };
+            if !stranger.bucket.has(now) {
+                return Err(BudgetRefusal::Source);
+            }
+            stranger.bucket.take();
+            stranger.last = now;
+            self.unknown.take();
         }
-        bucket.take();
         self.driver.take();
         self.cycle_left -= 1;
         Ok(())
     }
 }
 
+/// One digest cache entry: scoped to the ingress endpoint and source it
+/// was applied from, and to a retention deadline.
+#[derive(Debug, Clone)]
+struct Entry<R> {
+    digest: [u8; 32],
+    ingress: u64,
+    source: SocketAddr,
+    expires: u64,
+    resend: R,
+}
+
 /// The SHA-256 digests of verified, applied datagrams, each with what a
-/// hit resends: bounded, preallocated, oldest replaced first.
+/// hit resends: bounded, preallocated, expired entries replaced first,
+/// then the oldest. A hit needs the same digest, ingress and source
+/// before its deadline (H8 finding 8).
 #[derive(Debug)]
 pub struct DigestCache<R: Clone> {
-    entries: Vec<([u8; 32], R)>,
+    entries: Vec<Entry<R>>,
     next: usize,
 }
 
@@ -181,23 +291,47 @@ impl<R: Clone> DigestCache<R> {
         }
     }
 
-    fn find(&self, digest: &[u8; 32]) -> Option<R> {
+    fn find(&self, digest: &[u8; 32], ingress: u64, source: SocketAddr, now: u64) -> Option<R> {
         self.entries
             .iter()
-            .find(|(held, _)| held == digest)
-            .map(|(_, resend)| resend.clone())
+            .find(|entry| {
+                entry.digest == *digest
+                    && entry.ingress == ingress
+                    && entry.source == source
+                    && now < entry.expires
+            })
+            .map(|entry| entry.resend.clone())
     }
 
-    fn insert(&mut self, digest: [u8; 32], resend: R) {
-        if self.find(&digest).is_some() {
+    fn insert(&mut self, entry: Entry<R>, now: u64) {
+        if self
+            .find(&entry.digest, entry.ingress, entry.source, now)
+            .is_some()
+        {
             return;
         }
-        if self.entries.len() < CACHE_ENTRIES {
-            self.entries.push((digest, resend));
+        if let Some(slot) = self.entries.iter_mut().find(|held| now >= held.expires) {
+            *slot = entry;
+        } else if self.entries.len() < CACHE_ENTRIES {
+            self.entries.push(entry);
         } else if let Some(slot) = self.entries.get_mut(self.next) {
-            *slot = (digest, resend);
+            *slot = entry;
             self.next = (self.next + 1) % CACHE_ENTRIES;
         }
+    }
+
+    /// Drops every entry whose resend `drop` names; allocates nothing.
+    fn forget(&mut self, mut drop: impl FnMut(&R) -> bool) {
+        self.entries.retain(|entry| !drop(&entry.resend));
+        if self.next >= self.entries.len() {
+            self.next = 0;
+        }
+    }
+
+    /// The entries held (tests).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -353,6 +487,8 @@ pub struct SignedIntake<R: Clone> {
     authorities: Vec<Authority>,
     budget: VerifyBudget,
     cache: DigestCache<R>,
+    /// How long a cache entry answers a resend.
+    retention: u64,
     refusals: [u64; SIGNED_REFUSALS],
     /// Datagrams verified.
     pub verified: u64,
@@ -368,6 +504,7 @@ impl<R: Clone> SignedIntake<R> {
             authorities,
             budget: VerifyBudget::new(now),
             cache: DigestCache::new(),
+            retention: CACHE_RETENTION_NS,
             refusals: [0; SIGNED_REFUSALS],
             verified: 0,
             resends: 0,
@@ -388,6 +525,34 @@ impl<R: Clone> SignedIntake<R> {
         self.budget.new_cycle();
     }
 
+    /// Sets how long a digest cache entry answers a resend.
+    pub fn set_retention(&mut self, retention: u64) {
+        self.retention = retention;
+    }
+
+    /// Reserves a budget bucket for the configured control peer `source`.
+    pub fn reserve(&mut self, source: SocketAddr, now: u64) -> bool {
+        self.budget.reserve(source, now)
+    }
+
+    /// Releases a reservation of `source`.
+    pub fn release(&mut self, source: SocketAddr) {
+        self.budget.release(source);
+    }
+
+    /// Drops the digest cache entries whose resend `drop` names: on
+    /// binding replacement and key withdrawal.
+    pub fn forget(&mut self, drop: impl FnMut(&R) -> bool) {
+        self.cache.forget(drop);
+    }
+
+    /// The digest cache entries held (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn cached(&self) -> usize {
+        self.cache.len()
+    }
+
     /// The refusals for `reason`.
     #[must_use]
     pub fn refusals(&self, reason: SignedRefusal) -> u64 {
@@ -406,7 +571,23 @@ impl<R: Clone> SignedIntake<R> {
         datagram: &[u8],
         now: u64,
     ) -> Result<Received<R>, SignedRefusal> {
-        let result = self.receive_uncounted(source, datagram, now);
+        self.receive_on(0, source, datagram, now)
+    }
+
+    /// [`Self::receive`] on the ingress endpoint `ingress`: a digest cache
+    /// hit needs the entry's own ingress and source.
+    ///
+    /// # Errors
+    ///
+    /// The [`SignedRefusal`], counted; nothing else changes.
+    pub fn receive_on(
+        &mut self,
+        ingress: u64,
+        source: SocketAddr,
+        datagram: &[u8],
+        now: u64,
+    ) -> Result<Received<R>, SignedRefusal> {
+        let result = self.receive_uncounted(ingress, source, datagram, now);
         if let Err(reason) = result
             && let Some(count) = self.refusals.get_mut(reason as usize)
         {
@@ -417,6 +598,7 @@ impl<R: Clone> SignedIntake<R> {
 
     fn receive_uncounted(
         &mut self,
+        ingress: u64,
         source: SocketAddr,
         datagram: &[u8],
         now: u64,
@@ -434,7 +616,7 @@ impl<R: Clone> SignedIntake<R> {
         self.budget.admit(source, now)?;
         // 2. The digest cache.
         let digest: [u8; 32] = Sha256::digest(datagram).into();
-        if let Some(resend) = self.cache.find(&digest) {
+        if let Some(resend) = self.cache.find(&digest, ingress, source, now) {
             self.resends = self.resends.saturating_add(1);
             return Ok(Received::Resend(resend));
         }
@@ -494,6 +676,10 @@ impl<R: Clone> SignedIntake<R> {
                 if !authority.abort {
                     return Err(SignedRefusal::NoAbortPermission);
                 }
+                // A nonzero guard must be one the key serves; guard 0 (a
+                // reason other than GUARD_CLOSED) passes here only to the
+                // target image's admitted abort scope, which binds the
+                // authority and guard of that publication (ADR-0118).
                 if abort.guard_id != 0 && !authority.guards.contains(&abort.guard_id) {
                     return Err(SignedRefusal::WrongGuard);
                 }
@@ -508,9 +694,24 @@ impl<R: Clone> SignedIntake<R> {
     }
 
     /// Records a verified datagram's digest once its state change is made,
-    /// with what a resend of it resends.
-    pub fn applied(&mut self, digest: [u8; 32], resend: R) {
-        self.cache.insert(digest, resend);
+    /// with what a resend of it from `source` on `ingress` resends until
+    /// the retention passes.
+    pub fn applied(
+        &mut self,
+        ingress: u64,
+        source: SocketAddr,
+        digest: [u8; 32],
+        resend: R,
+        now: u64,
+    ) {
+        let entry = Entry {
+            digest,
+            ingress,
+            source,
+            expires: now.saturating_add(self.retention),
+            resend,
+        };
+        self.cache.insert(entry, now);
     }
 }
 

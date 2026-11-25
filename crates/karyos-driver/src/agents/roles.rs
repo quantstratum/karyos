@@ -295,6 +295,13 @@ pub struct ReceiverCounters {
     pub abort_acks_sent: u64,
     /// SESSION_ABORT_ACKs resent for an identical SESSION_ABORT.
     pub abort_acks_resent: u64,
+    /// Verified SESSION_ABORTs refused by the target image's abort scope:
+    /// a signer or guard other than the one admitted with the publication,
+    /// or a publication admitted with no remote abort (ADR-0118).
+    pub aborts_out_of_scope: u64,
+    /// DATA, heartbeats and sender controls of an aborted image dropped:
+    /// it is terminal from the abort on.
+    pub data_after_abort: u64,
     /// GUARD STATE or STATUS accepted by a followed guard.
     pub guard_changes: u64,
     /// GUARD STATE or STATUS a followed guard refused (by reason on the
@@ -490,6 +497,18 @@ pub struct SenderCounters {
     pub aborts_sent: u64,
     /// SESSION_ABORT_ACKs verified in domain 4.
     pub abort_acks: u64,
+    /// SESSION_ABORTs resent, identical, on the backoff schedule.
+    pub aborts_resent: u64,
+    /// Pending aborts completed by a valid ACK and retired.
+    pub aborts_completed: u64,
+    /// Pending aborts past their expiry with no valid ACK: the session is
+    /// reported interrupted and the record retired.
+    pub aborts_interrupted: u64,
+    /// Verified ACKs that do not match the pending abort (epoch, lane
+    /// count, or a position beyond what was submitted): dropped.
+    pub abort_acks_invalid: u64,
+    /// Verified ACKs with no pending abort (duplicates after completion).
+    pub abort_acks_unmatched: u64,
     /// Raw datagrams (sealed or signed controls) sent.
     pub raw_sent: u64,
     /// Idle heartbeats submitted: header-only DATA frames of established
@@ -1000,6 +1019,9 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// the file epoch the last key application found for it (H8 finding
     /// 4): [`ReceiverRole::apply_keys`] rebuilds the trusted list from them.
     authority_keys: Vec<(u32, Option<u32>)>,
+    /// The remote abort each authenticated subscription admits, by
+    /// endpoint and stream: copied to each image at admission.
+    abort_scopes: Vec<(EndpointId, i32, AbortScope)>,
     /// The guards of other drivers this one follows.
     remote_guards: Vec<FollowedGuard>,
     /// Their durable epoch marks.
@@ -1630,8 +1652,12 @@ struct Installed<T: StreamTerms = HeapTerms> {
     /// otherwise.
     enc_seal: Option<SharedSealer>,
     /// The `guard_epoch` of the SESSION_ABORT applied to it: a second one
-    /// changes nothing.
+    /// changes nothing, and from it on the image is terminal to DATA,
+    /// heartbeats, sender controls and liveness evidence.
     aborted: Option<u64>,
+    /// The remote abort its publication admits, bound at admission; `None`
+    /// refuses every remote abort (ADR-0118).
+    abort_scope: Option<AbortScope>,
 }
 
 /// One lane's NAK in flight: its report slot (the RTTM probe's contract:
@@ -1938,8 +1964,11 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     publication_auth: Vec<PublicationAuth>,
     /// The encrypted publications' keys (ADR-0114).
     enc: publish_enc::SenderEnc,
-    /// SESSION_ABORTs requested, sent at the next duty.
-    aborts: Vec<RequestedAbort>,
+    /// The incarnations in `Aborting`, sent and resent at each duty.
+    aborts: Vec<PendingAbort>,
+    /// How long an abort waits for its ACK before the session is reported
+    /// interrupted: the image liveness timeout (design G3).
+    abort_expiry: u64,
     /// The last SESSION_ABORT_ACK verified (tests).
     #[cfg(test)]
     last_abort_ack: Option<karyos_protocol::network::authenticated::AbortAck>,
@@ -2138,6 +2167,7 @@ pub(super) fn roles<T: StreamTerms>(
             publication_auth: Vec::new(),
             enc: publish_enc::SenderEnc::default(),
             aborts: Vec::with_capacity(config.publications),
+            abort_expiry: config.image_liveness_timeout,
             #[cfg(test)]
             last_abort_ack: None,
             #[cfg(test)]
@@ -2268,6 +2298,7 @@ pub(super) fn roles<T: StreamTerms>(
             verified_setup: false,
             signed: None,
             authority_keys: Vec::new(),
+            abort_scopes: Vec::new(),
             remote_guards: Vec::new(),
             guard_marks: None,
             guard_authority: None,
@@ -2989,7 +3020,19 @@ impl<T: StreamTerms> ReceiverRole<T> {
             .iter()
             .map(|authority| (authority.key_id(), None))
             .collect();
-        self.signed = Some(Box::new(SignedIntake::new(authorities, now)));
+        let mut intake = SignedIntake::new(authorities, now);
+        intake.set_retention(self.liveness_timeout);
+        for followed in &self.remote_guards {
+            let _ = intake.reserve(followed.authority, now);
+        }
+        self.signed = Some(Box::new(intake));
+    }
+
+    /// Admits remote aborts of the authenticated subscription to
+    /// `stream_id` on `endpoint` from `scope` only (tests).
+    #[cfg(test)]
+    pub(super) fn permit_abort(&mut self, endpoint: EndpointId, stream_id: i32, scope: AbortScope) {
+        self.abort_scopes.push((endpoint, stream_id, scope));
     }
 
     /// Applies the key store's current key set to every live key of the
@@ -3044,6 +3087,9 @@ impl<T: StreamTerms> ReceiverRole<T> {
         marks: Box<dyn MarkStore + Send>,
         mirror: Option<Arc<karyos_client::HeapWords>>,
     ) {
+        if let Some(intake) = self.signed.as_deref_mut() {
+            let _ = intake.reserve(authority, 0);
+        }
         self.remote_guards.push(FollowedGuard {
             guard,
             receiver_id,
@@ -3113,6 +3159,13 @@ impl<T: StreamTerms> ReceiverRole<T> {
             .iter_mut()
             .find(|image| image.slot == slot)
             .ok_or(KeyError::NoKey)?;
+        image.abort_scope = self
+            .abort_scopes
+            .iter()
+            .find(|(endpoint, stream, _)| {
+                (*endpoint, *stream) == (image.key.endpoint, image.key.alias.stream_id)
+            })
+            .map(|(_, _, scope)| *scope);
         let sender = Party::Sender {
             identity: image.identity,
             lane_count: image.lane_count,
@@ -3760,6 +3813,23 @@ impl<T: StreamTerms> ReceiverRole<T> {
         let Ok(enc_seal) = self.enc_keys(&key, identity, installed, named, chain.nonce, now) else {
             return Err(Some(chain.retire));
         };
+        // The remote abort its publication admits, bound now (ADR-0118);
+        // an authenticated image's binding replaces any cached ACK of an
+        // earlier one, and its publisher holds a reserved verify budget.
+        let abort_scope = auth.as_ref().and_then(|_| {
+            self.abort_scopes
+                .iter()
+                .find(|(endpoint, stream, _)| {
+                    (*endpoint, *stream) == (key.endpoint, key.alias.stream_id)
+                })
+                .map(|(_, _, scope)| *scope)
+        });
+        if auth.is_some()
+            && let Some(intake) = self.signed.as_deref_mut()
+        {
+            intake.forget(|resend| resend.binds(key));
+            let _ = intake.reserve(key.source, now);
+        }
         self.images.push(Installed {
             slot: installed,
             owner,
@@ -3811,6 +3881,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             auth,
             enc_seal,
             aborted: None,
+            abort_scope,
         });
         Ok(link)
     }
@@ -4414,6 +4485,11 @@ impl<T: StreamTerms> ReceiverRole<T> {
     /// `RetireImage` is posted into its reserved unit, `complete` when
     /// every lane reached its EOS bound through a complete prefix.
     fn retire(&mut self, sessions: &SessionEnd<T>, image: Installed<T>, complete: bool, now: u64) {
+        if image.auth.is_some()
+            && let Some(intake) = self.signed.as_deref_mut()
+        {
+            intake.release(image.key.source);
+        }
         let Installed {
             slot,
             owner,
@@ -5273,6 +5349,15 @@ impl<T: StreamTerms> Intake<'_, T> {
                 .iter()
                 .position(|image| image.slot == slot && role.sessions.is_active(slot))
         });
+        if found
+            .and_then(|index| role.images.get(index))
+            .is_some_and(|image| image.aborted.is_some())
+        {
+            // Terminal since its abort: queued or late DATA and heartbeats
+            // move nothing, not even liveness.
+            role.count(|c| &mut c.data_after_abort);
+            return;
+        }
         let Some(image) = found.and_then(|index| role.images.get_mut(index)) else {
             role.count(|c| &mut c.data_unbound);
             #[cfg(test)]
@@ -6074,6 +6159,36 @@ struct AckResend {
     sealer: SharedSealer,
 }
 
+impl AckResend {
+    /// Whether this resend answers the binding `key`.
+    fn binds(&self, key: BindingKey) -> bool {
+        self.endpoint == key.endpoint
+            && self.destination == key.source
+            && self.ack.alias == key.alias
+    }
+}
+
+/// The remote abort a publication admits (ADR-0118): only the authority
+/// that guards it, `authority_id` for `guard_id` (nonzero). A
+/// GUARD_CLOSED abort names that guard; another reason names it or 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AbortScope {
+    pub(super) authority_id: u64,
+    pub(super) guard_id: u64,
+}
+
+impl AbortScope {
+    /// Whether `abort` is within this scope.
+    fn admits(self, abort: &karyos_protocol::network::authenticated::SessionAbort) -> bool {
+        use karyos_protocol::network::authenticated::GUARD_CLOSED;
+
+        self.guard_id != 0
+            && abort.authority_id == self.authority_id
+            && (abort.guard_id == self.guard_id
+                || (abort.guard_id == 0 && abort.reason != GUARD_CLOSED))
+    }
+}
+
 /// The SESSION_ABORT_ACK of `image` aborted at `guard_epoch`, with its
 /// lanes' delivered prefix and unresolved end; `None` for a trusted
 /// image, whose ACK could not be sealed (fail closed).
@@ -6139,13 +6254,32 @@ struct FollowedGuard {
     mirror: Option<Arc<karyos_client::HeapWords>>,
 }
 
-/// A SESSION_ABORT requested of a publication.
-#[derive(Debug, Clone, Copy)]
-struct RequestedAbort {
+/// The first SESSION_ABORT resend's delay (design G3,
+/// `abort_resend_initial`).
+const ABORT_RESEND_INITIAL_NS: u64 = 10_000_000;
+/// The largest resend delay (design G3, `abort_resend_max`).
+const ABORT_RESEND_MAX_NS: u64 = 1_000_000_000;
+
+/// A publication incarnation in `Aborting` (guards-and-abort.md, Session
+/// abort; H8 finding 5): the abort it carries, signed once, resent
+/// identically on the G3 backoff until a valid ACK completes it or its
+/// expiry reports it interrupted. One per incarnation, bounded by the
+/// publications.
+#[derive(Debug)]
+struct PendingAbort {
     endpoint: EndpointId,
     alias: Alias,
-    reason: u16,
+    identity: Identity,
+    guard_id: u64,
     guard_epoch: u64,
+    /// The signed datagram every send repeats.
+    bytes: SealedBytes,
+    /// When it was first submitted; `None` until then.
+    first: Option<u64>,
+    /// When the next send is due.
+    next_at: u64,
+    /// The delay after the next send.
+    backoff: u64,
 }
 
 /// The alias of a frame a sender authenticates in domain 1 that names an
@@ -6302,6 +6436,17 @@ impl<T: StreamTerms> Intake<'_, T> {
             self.role.count(|c| &mut c.auth_unbound);
             return;
         };
+        // An aborted image is terminal: nothing it receives is committed,
+        // delivered or acted on (H8 finding 2).
+        if self
+            .role
+            .images
+            .get(index)
+            .is_some_and(|image| image.aborted.is_some())
+        {
+            self.role.count(|c| &mut c.data_after_abort);
+            return;
+        }
         let checked = match checked {
             Ok(checked) => checked,
             Err(refusal) => {
@@ -6387,7 +6532,8 @@ impl<T: StreamTerms> Intake<'_, T> {
             self.role.count(|c| &mut c.signed_unconfigured);
             return;
         };
-        let verified = match intake.receive(source, bytes, now) {
+        let ingress = u64::from(self.endpoint.0);
+        let verified = match intake.receive_on(ingress, source, bytes, now) {
             Ok(Received::Fresh(verified)) => verified,
             Ok(Received::Resend(resend)) => {
                 if self.send_abort_ack(resend) {
@@ -6411,6 +6557,23 @@ impl<T: StreamTerms> Intake<'_, T> {
                             && image.aborted.is_none()
                     })
                 });
+                // The scope check, before any state changes: only the
+                // authority admitted with this publication, under its
+                // guard (ADR-0118).
+                if let Some(index) = index
+                    && !self.role.images.get(index).is_some_and(|image| {
+                        image.abort_scope.is_some_and(|scope| scope.admits(&abort))
+                    })
+                {
+                    self.role.count(|c| &mut c.aborts_out_of_scope);
+                    return;
+                }
+                // What this path's queue already holds was verified before
+                // the abort: it is delivered first and counts in the ACK;
+                // anything after, here or on another path, is dropped.
+                if index.is_some() {
+                    self.drain_own_queue();
+                }
                 let resend = index.and_then(|index| {
                     let image = self.role.images.get_mut(index)?;
                     image.aborted = Some(abort.guard_epoch);
@@ -6425,7 +6588,7 @@ impl<T: StreamTerms> Intake<'_, T> {
                     self.role.count(|c| &mut c.abort_acks_sent);
                 }
                 if let Some(intake) = self.role.signed.as_deref_mut() {
-                    intake.applied(verified.digest, resend);
+                    intake.applied(ingress, source, verified.digest, resend, now);
                 }
             }
             AuthControl::State(state) => {
@@ -6705,6 +6868,28 @@ impl<T: StreamTerms> SenderRole<T> {
         &self,
     ) -> Option<karyos_protocol::network::authenticated::AbortAck> {
         self.last_abort_ack
+    }
+
+    /// The incarnations in `Aborting` (tests).
+    #[cfg(test)]
+    pub(super) fn pending_aborts(&self) -> usize {
+        self.aborts.len()
+    }
+
+    /// Sets the abort expiry (tests).
+    #[cfg(test)]
+    pub(super) fn set_abort_expiry(&mut self, expiry: u64) {
+        self.abort_expiry = expiry;
+    }
+
+    /// Handles a verified SESSION_ABORT_ACK as the duty does (tests).
+    #[cfg(test)]
+    pub(super) fn abort_acked_for(
+        &mut self,
+        endpoint: EndpointId,
+        ack: &karyos_protocol::network::authenticated::AbortAck,
+    ) {
+        self.abort_acked(endpoint, ack);
     }
 
     /// The bytes of the last SESSION_ABORT sent (tests).
@@ -7589,10 +7774,14 @@ impl<T: StreamTerms> SenderRole<T> {
     }
 
     /// Requests a SESSION_ABORT of the authenticated publication `alias` on
-    /// `endpoint`, signed by its abort authority and sent to each of its
-    /// bound receivers at the next duty (ADR-0086 domain 3; design
-    /// section 5). Returns whether it was taken: only for a publication
-    /// with an abort authority, and `reason` and `guard_epoch` at least 1.
+    /// `endpoint`, for the close of `guard_id` (nonzero for GUARD_CLOSED)
+    /// at the applied `guard_epoch`, signed once by its abort authority and
+    /// sent to each of its bound receivers from the next duty on, resent
+    /// identically until acknowledged or expired (ADR-0086 domain 3;
+    /// design section 5 and G3). Returns whether it was taken: only for a
+    /// publication with an abort authority and an identity, a body that
+    /// encodes, and no abort of that incarnation already pending (a
+    /// repeated identical request is taken without a second record).
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "no authenticated channel opens yet")
@@ -7602,80 +7791,169 @@ impl<T: StreamTerms> SenderRole<T> {
         endpoint: EndpointId,
         alias: Alias,
         reason: u16,
+        guard_id: u64,
         guard_epoch: u64,
     ) -> bool {
-        let can = self
-            .publication_auth_index(endpoint, alias)
-            .and_then(|index| self.publication_auth.get(index))
-            .is_some_and(|auth| auth.abort.is_some());
-        if !can || reason == 0 || guard_epoch == 0 || self.aborts.len() >= self.aborts.capacity() {
+        use karyos_protocol::network::authenticated::SessionAbort;
+
+        let Some(identity) = self.sessions.identity(endpoint, alias) else {
+            return false;
+        };
+        if let Some(held) = self
+            .aborts
+            .iter()
+            .find(|held| (held.endpoint, held.alias, held.identity) == (endpoint, alias, identity))
+        {
+            return (held.guard_id, held.guard_epoch) == (guard_id, guard_epoch);
+        }
+        if reason == 0 || guard_epoch == 0 || self.aborts.len() >= self.aborts.capacity() {
             return false;
         }
-        self.aborts.push(RequestedAbort {
+        let mut bytes =
+            [0u8; karyos_protocol::network::MAX_CONTROL_LENGTH + crate::wire_auth::ENVELOPE_LEN];
+        let signed = self
+            .publication_auth_index(endpoint, alias)
+            .and_then(|index| self.publication_auth.get_mut(index))
+            .and_then(|auth| auth.abort.as_mut())
+            .and_then(|authority| {
+                let abort = SessionAbort {
+                    alias,
+                    identity,
+                    authority_id: authority.authority_id,
+                    guard_id,
+                    guard_epoch,
+                    reason,
+                };
+                authority.sign(&abort, &mut bytes)
+            });
+        let Some(bytes) = signed
+            .and_then(|length| bytes.get(..length))
+            .and_then(SealedBytes::copy)
+        else {
+            self.count(|c| &mut c.seal_failures);
+            return false;
+        };
+        self.aborts.push(PendingAbort {
             endpoint,
             alias,
-            reason,
+            identity,
+            guard_id,
             guard_epoch,
+            bytes,
+            first: None,
+            next_at: 0,
+            backoff: ABORT_RESEND_INITIAL_NS,
         });
         true
     }
 
-    /// Signs and sends the requested SESSION_ABORTs.
-    fn send_aborts<O: SocketOps>(&mut self, halves: &mut [(EndpointId, Half<O>)]) {
-        use karyos_protocol::network::authenticated::SessionAbort;
-
-        while let Some(request) = self.aborts.pop() {
-            let Some(identity) = self.sessions.identity(request.endpoint, request.alias) else {
+    /// Sends each pending SESSION_ABORT that is due at `now` to its
+    /// publication's bound receivers, identical bytes each time, and
+    /// retires those past their expiry as interrupted. A send not
+    /// submitted is retried at the next duty, never dropped.
+    fn send_aborts<O: SocketOps>(&mut self, halves: &mut [(EndpointId, Half<O>)], now: u64) {
+        let mut at = 0;
+        while let Some(pending) = self.aborts.get(at) {
+            if pending
+                .first
+                .is_some_and(|first| age_ns(now, first) >= self.abort_expiry)
+            {
+                self.aborts.swap_remove(at);
+                self.count(|c| &mut c.aborts_interrupted);
                 continue;
-            };
-            let Some(index) = self.publication_auth_index(request.endpoint, request.alias) else {
+            }
+            if now < pending.next_at {
+                at += 1;
                 continue;
-            };
-            for at in 0..self.bindings.len() {
-                let Some(binding) = self.bindings.get(at) else {
+            }
+            let (endpoint, alias, bytes, resend) = (
+                pending.endpoint,
+                pending.alias,
+                pending.bytes,
+                pending.first.is_some(),
+            );
+            let mut submitted = false;
+            for index in 0..self.bindings.len() {
+                let Some(binding) = self.bindings.get(index) else {
                     break;
                 };
-                if binding.endpoint != request.endpoint || binding.alias != request.alias {
+                if binding.endpoint != endpoint || binding.alias != alias {
                     continue;
                 }
                 let destination = binding.source();
-                let mut bytes = [0u8; karyos_protocol::network::MAX_CONTROL_LENGTH
-                    + crate::wire_auth::ENVELOPE_LEN];
-                let signed = self
-                    .publication_auth
-                    .get_mut(index)
-                    .and_then(|auth| auth.abort.as_mut())
-                    .and_then(|authority| {
-                        let abort = SessionAbort {
-                            alias: request.alias,
-                            identity,
-                            authority_id: authority.authority_id,
-                            guard_id: 0,
-                            guard_epoch: request.guard_epoch,
-                            reason: request.reason,
-                        };
-                        authority.sign(&abort, &mut bytes)
-                    });
-                let Some(length) = signed else {
-                    self.count(|c| &mut c.seal_failures);
-                    continue;
-                };
-                let Some(sealed) = bytes.get(..length) else {
-                    continue;
-                };
                 if self
-                    .send_raw(halves, request.endpoint, destination, sealed)
+                    .send_raw(halves, endpoint, destination, bytes.get())
                     .submitted()
                 {
-                    self.count(|c| &mut c.aborts_sent);
+                    submitted = true;
                 }
                 #[cfg(test)]
                 {
-                    self.last_abort = SealedBytes::copy(sealed)
-                        .map(|bytes| (request.endpoint, destination, bytes));
+                    self.last_abort = Some((endpoint, destination, bytes));
                 }
             }
+            if submitted {
+                if resend {
+                    self.count(|c| &mut c.aborts_resent);
+                } else {
+                    self.count(|c| &mut c.aborts_sent);
+                }
+                if let Some(pending) = self.aborts.get_mut(at) {
+                    pending.first.get_or_insert(now);
+                    pending.next_at = now.saturating_add(pending.backoff);
+                    pending.backoff = pending
+                        .backoff
+                        .checked_mul(2)
+                        .unwrap_or(ABORT_RESEND_MAX_NS)
+                        .min(ABORT_RESEND_MAX_NS);
+                }
+            }
+            at += 1;
         }
+    }
+
+    /// A verified SESSION_ABORT_ACK of `alias` on `endpoint`: valid only
+    /// against its pending abort, with that epoch, the bound lane count,
+    /// and each lane's range within what was submitted on the lane; a
+    /// valid one completes and retires the abort.
+    fn abort_acked(
+        &mut self,
+        endpoint: EndpointId,
+        ack: &karyos_protocol::network::authenticated::AbortAck,
+    ) {
+        let Some(at) = self.aborts.iter().position(|pending| {
+            (pending.endpoint, pending.alias, pending.identity)
+                == (endpoint, ack.alias, ack.identity)
+        }) else {
+            self.count(|c| &mut c.abort_acks_unmatched);
+            return;
+        };
+        let epoch = self
+            .aborts
+            .get(at)
+            .is_some_and(|pending| pending.guard_epoch == ack.guard_epoch);
+        let lanes = self
+            .publications
+            .iter()
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == ack.alias)
+            .is_some_and(|outbound| {
+                let readers = outbound.readers();
+                readers.len() == ack.lanes.as_slice().len()
+                    && readers
+                        .iter()
+                        .zip(ack.lanes.as_slice())
+                        .all(|(reader, lane)| {
+                            let submitted = reader.position().max(reader.sent_position());
+                            lane.delivered <= lane.unresolved_end
+                                && lane.unresolved_end <= submitted
+                        })
+            });
+        if !(epoch && lanes) {
+            self.count(|c| &mut c.abort_acks_invalid);
+            return;
+        }
+        self.aborts.swap_remove(at);
+        self.count(|c| &mut c.aborts_completed);
     }
 
     /// Sends prepared datagram bytes (a sealed or signed control) on
@@ -7798,7 +8076,7 @@ impl<T: StreamTerms> SenderRole<T> {
                 {
                     self.last_abort_ack = Some(ack);
                 }
-                let _ = ack;
+                self.abort_acked(endpoint, &ack);
                 None
             }
             Some(Err(reason)) => {
@@ -8103,7 +8381,7 @@ impl<T: StreamTerms> SenderRole<T> {
             self.count(|c| &mut c.removed_unrecorded);
         }
         self.close_removed(halves, now);
-        self.send_aborts(halves);
+        self.send_aborts(halves, now);
         self.naks_this_cycle = 0;
         // Bindings past their lifetime go even when nothing arrives.
         self.expire_bindings(now);
