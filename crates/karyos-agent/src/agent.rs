@@ -308,8 +308,28 @@ impl Agent {
         let (mut journal, journal_error) = match config.journal.as_deref() {
             None => (None, None),
             Some(dir) => match Journal::open_with(dir, start, config.journal_retention.clone()) {
-                Ok(journal) => (Some(journal), None),
-                Err(error) => (None, Some(error.to_string())),
+                Ok(mut journal) => {
+                    // An earlier start that could not open the journal is
+                    // an unknown interval, from its marker (karyos#773
+                    // review); the marker goes once it is recorded.
+                    let marker = crate::journal::outage_marker(dir);
+                    if let Ok(text) = std::fs::read_to_string(&marker) {
+                        let from = text.trim().parse().unwrap_or(0);
+                        if journal.record_outage(from, start).is_ok() {
+                            let _ = std::fs::remove_file(&marker);
+                        }
+                    }
+                    (Some(journal), None)
+                }
+                Err(error) => {
+                    // Best effort: a marker that cannot be written leaves
+                    // the outage in memory only, for this run.
+                    let marker = crate::journal::outage_marker(dir);
+                    if !marker.exists() {
+                        let _ = std::fs::write(&marker, start.to_string());
+                    }
+                    (None, Some(error.to_string()))
+                }
             },
         };
         let operations = journal
@@ -1567,6 +1587,51 @@ impl Agent {
         })
     }
 
+    /// Appends a product service's record to the operations journal for
+    /// `requester` (R-CORE-42, karyos#773; [`crate::product`] states the
+    /// contract): durably when `append` waits for it, refused when the
+    /// journal cannot record it, and an import only when it names an
+    /// unknown interval the journal holds. Nothing in it is interpreted.
+    pub fn journal_append(
+        &mut self,
+        append: &crate::product::ProductAppend<'_>,
+        requester: Requester,
+    ) -> crate::product::ProductAnswer {
+        use crate::product::ProductAnswer;
+
+        let Some(journal) = self.journal.as_mut() else {
+            return ProductAnswer::JournalUnavailable;
+        };
+        if let Some(import) = append.import
+            && (import.recording != journal.recording()
+                || !journal.holds_unknown_interval(import.interval))
+        {
+            // An unavailable journal holds nothing to name.
+            if journal.unavailable() {
+                return ProductAnswer::JournalUnavailable;
+            }
+            return ProductAnswer::NotAnInterval {
+                recording: import.recording,
+                position: import.interval,
+            };
+        }
+        let now = host_monotonic_ns();
+        let record = append.record(requester, now);
+        let written = if append.waits() {
+            journal.append_durable(&record, now)
+        } else {
+            journal.append(&record, now)
+        };
+        match written {
+            Ok(position) => ProductAnswer::Journalled {
+                recording: journal.recording(),
+                position,
+                durable: append.waits(),
+            },
+            Err(_) => ProductAnswer::JournalUnavailable,
+        }
+    }
+
     /// Makes every journal record already written durable before a view
     /// is taken, so the view's `journal.head` follows every record
     /// written before it (R-CORE-14; karyos#725; [`Journal::settle`]).
@@ -1797,8 +1862,9 @@ impl Agent {
 
     /// Its capabilities for a caller who may close guards (`close`),
     /// reopen them (`reopen`), acknowledge the journal's unknown interval
-    /// (`acknowledge`) and write the join registry (`register`,
-    /// karyos#736), in [`crate::api::CAPABILITIES`] order
+    /// (`acknowledge`), write the join registry (`register`,
+    /// karyos#736) and append a product's records to the journal
+    /// (`append`, karyos#773), in [`crate::api::CAPABILITIES`] order
     /// (R-CORE-24). What this deployment does not offer is `Unavailable`,
     /// whatever the role; what it offers but the role does not allow is
     /// `Forbidden`.
@@ -1809,6 +1875,7 @@ impl Agent {
         reopen: bool,
         acknowledge: bool,
         register: bool,
+        append: bool,
     ) -> Vec<crate::api::Capability> {
         use crate::api::{CAPABILITIES, Capability, CapabilityState};
 
@@ -1854,6 +1921,9 @@ impl Agent {
                     "join-put" => (None, register),
                     // Every role reads the history the view summarises.
                     "journal-history" => (history_off, true),
+                    // A product service's records need a journal that
+                    // records (karyos#773).
+                    "journal-append" => (history_off, append),
                     // The safety path is a closer's; an administrator's
                     // change needs the journal, which the answer reports.
                     "rate-change" => (None, close || acknowledge),
@@ -2270,3 +2340,6 @@ mod tests;
 
 #[cfg(test)]
 mod approval_tests;
+
+#[cfg(test)]
+mod product_tests;

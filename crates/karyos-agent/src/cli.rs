@@ -203,7 +203,12 @@ pub fn parse(args: &[String]) -> Option<Args> {
                 let (uid, role) = value.split_once('=')?;
                 if !matches!(
                     role,
-                    "viewer" | "operator" | "risk-officer" | "administrator" | "registrar"
+                    "viewer"
+                        | "operator"
+                        | "risk-officer"
+                        | "administrator"
+                        | "registrar"
+                        | "service"
                 ) {
                     return None;
                 }
@@ -234,7 +239,12 @@ pub fn parse(args: &[String]) -> Option<Args> {
                 if !crate::api::valid_principal(name)
                     || !matches!(
                         role,
-                        "viewer" | "operator" | "risk-officer" | "administrator" | "registrar"
+                        "viewer"
+                            | "operator"
+                            | "risk-officer"
+                            | "administrator"
+                            | "registrar"
+                            | "service"
                     )
                     || principals
                         .iter()

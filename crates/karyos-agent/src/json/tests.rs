@@ -465,7 +465,8 @@ fn capability_names_are_closed_in_v1_and_extensible() {
             "clocks",
             "rate-limits",
             "cluster-command",
-            "journal-history"
+            "journal-history",
+            "journal-append"
         ]
     );
     let known = Capability {
