@@ -426,7 +426,14 @@ fn corpus<C: ConsensusCore>(
                 if bound {
                     summary.step_bound = summary.step_bound.saturating_add(1);
                 }
+                // Each run counts once per fault kind and phase, however
+                // many times its schedule applies that kind there: the
+                // manifest counts seeds, not observations.
+                let mut counted = std::collections::BTreeSet::new();
                 for fault in &faults {
+                    if !counted.insert((fault.kind(), fault.phase.name())) {
+                        continue;
+                    }
                     let slot = summary
                         .coverage
                         .entry(((*workload).to_owned(), fault.kind().to_owned()))

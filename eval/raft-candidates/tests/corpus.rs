@@ -4,7 +4,7 @@
 //! karyos#691, karyos#681; quantstratum-docs:
 //! karyos/evaluations/c5-raft-comparison-v1.md and -v2.md, Seed corpora
 //! and Hard gates): `raft` 0.7.0, `openraft` 0.10.0-alpha.37 and the
-//! custom core (ADR-0105), each over every case of W1 to W6 and every seed
+//! custom core (ADR-0105), each over every case of W2 to W6 and every seed
 //! of the corpus, through `karyos_sim::harness::corpus::run_corpus`.
 //!
 //! **Profiles.** W2 and W5 run their manifest values (W2's 10,000-entry
@@ -15,7 +15,9 @@
 //! W2's and W5's skeletons instead, for a quick look; its lines say so.
 //!
 //! **Lines.** Each core writes its own JSON lines file, one line per run,
-//! marked `"evidence":"C5 version 2"`, naming the core, its build
+//! marked `"evidence":"C5 version 2"` only in the manifest profile at a
+//! clean, known revision (`harness validation, not C5 evidence`
+//! otherwise), naming the core, its build
 //! ([`Variant`]), the profile and the `karyos` revision it ran at, with
 //! `-dirty` when the checkout had changes. A line's verdict is the
 //! harness's (`pass`, `liveness_gap`, `failed_*`, `error`,
@@ -53,7 +55,7 @@ use karyos_raft_eval::variant::{CUSTOM, Variant};
 use karyos_sim::harness::core::ConsensusCore;
 use karyos_sim::harness::corpus::{Evidence, Summary, Workload, run_corpus_with_traces};
 use karyos_sim::harness::custom::Custom;
-use karyos_sim::harness::workloads::{Case, W1, W2, W3, W4, W5, W6};
+use karyos_sim::harness::workloads::{Case, W2, W3, W4, W5, W6};
 
 /// The manifest's CI seeds.
 const CI_SEEDS: RangeInclusive<u64> = 1..=1_000;
@@ -96,9 +98,6 @@ fn revision() -> String {
     if dirty { format!("{head}-dirty") } else { head }
 }
 
-fn w1(_seed: u64) -> Vec<Case> {
-    W1::skeleton().cases()
-}
 fn w2(_seed: u64) -> Vec<Case> {
     let mut cases = W2::manifest().cases().unwrap();
     cases.push(v2::byte_case());
@@ -125,12 +124,13 @@ fn w6(_seed: u64) -> Vec<Case> {
     W6::skeleton().cases()
 }
 
-/// Every workload of the comparison, in the `manifest` profile or the
-/// skeleton one.
-fn workloads(manifest: bool) -> [Workload<'static>; 6] {
+/// The workloads of the manifest's corpora, W2 to W6 (version 1, Seed
+/// corpora), in the `manifest` profile or the skeleton one. W1 is not a
+/// corpus: its batch-16 matrix runs in its own tests, through the
+/// `Batch16` variants this runner does not use.
+fn workloads(manifest: bool) -> [Workload<'static>; 5] {
     if manifest {
         [
-            ("W1", &w1),
             ("W2", &w2),
             ("W3", &w3),
             ("W4", &w4),
@@ -139,13 +139,23 @@ fn workloads(manifest: bool) -> [Workload<'static>; 6] {
         ]
     } else {
         [
-            ("W1", &w1),
             ("W2", &w2_skeleton),
             ("W3", &w3),
             ("W4", &w4),
             ("W5", &w5_skeleton),
             ("W6", &w6),
         ]
+    }
+}
+
+/// What a run's lines are evidence of: C5 version 2 only in the
+/// manifest profile at a clean, known revision; anything else is a check
+/// of the harness, and its lines say so.
+fn evidence(profile: &str, revision: &str) -> Evidence {
+    if profile == "manifest" && revision != "unknown" && !revision.ends_with("-dirty") {
+        Evidence::C5Version2
+    } else {
+        Evidence::HarnessValidation
     }
 }
 
@@ -160,6 +170,7 @@ fn label(name: &str, variant: Variant, profile: &str, revision: &str) -> String 
 fn corpus(
     name: &str,
     core: &str,
+    evidence: Evidence,
     workloads: &[Workload<'_>],
     range: (RangeInclusive<u64>, u32),
     out: &Path,
@@ -169,9 +180,9 @@ fn corpus(
     let _ = std::fs::remove_dir_all(&traces);
     let mut writer = BufWriter::new(file);
     let summary = match name {
-        "raft" => run::<RaftRs>(core, workloads, range, &mut writer, &traces),
-        "openraft" => run::<OpenRaft>(core, workloads, range, &mut writer, &traces),
-        "custom" => run::<Custom>(core, workloads, range, &mut writer, &traces),
+        "raft" => run::<RaftRs>(core, evidence, workloads, range, &mut writer, &traces),
+        "openraft" => run::<OpenRaft>(core, evidence, workloads, range, &mut writer, &traces),
+        "custom" => run::<Custom>(core, evidence, workloads, range, &mut writer, &traces),
         _ => panic!("unknown core {name}: raft, openraft or custom"),
     };
     writer.flush().unwrap();
@@ -181,12 +192,13 @@ fn corpus(
 
 fn run<C: ConsensusCore>(
     core: &str,
+    evidence: Evidence,
     workloads: &[Workload<'_>],
     range: (RangeInclusive<u64>, u32),
     out: &mut impl std::io::Write,
     traces: &Path,
 ) -> Summary {
-    run_corpus_with_traces::<C>(core, Evidence::C5Version2, workloads, range, out, traces).unwrap()
+    run_corpus_with_traces::<C>(core, evidence, workloads, range, out, traces).unwrap()
 }
 
 /// A core's build by name.
@@ -227,7 +239,14 @@ fn the_c5_version_2_corpus_over_every_core() {
             seeds.end()
         ));
         let start = Instant::now();
-        let summary = corpus(name, &core, &workloads, (seeds.clone(), repetitions), &out);
+        let summary = corpus(
+            name,
+            &core,
+            evidence(&profile, &revision),
+            &workloads,
+            (seeds.clone(), repetitions),
+            &out,
+        );
         println!(
             "c5 v2 corpus: {core}, seeds {seeds:?}, repetitions {repetitions}{}, runs {}, passed {}, liveness gaps {}, step bound {}, failed {}, errors {}, not demonstrated {}, {:.1} s, {}",
             if repetitions < 2 {
@@ -270,7 +289,8 @@ fn field<'a>(line: &'a str, name: &str) -> &'a str {
 }
 
 /// The runner on one seed of W5's skeleton for every core: one line per
-/// case and core, in order, each marked C5 version 2 evidence, naming its
+/// case and core, in order, each marked harness validation (a skeleton
+/// run is never C5 evidence), naming its
 /// core, build, profile and revision, its workload, case and seed, and a
 /// verdict of the harness's; the custom core's W5 runs are never errors.
 #[test]
@@ -283,13 +303,24 @@ fn every_core_writes_one_marked_line_per_run() {
     for (name, variant) in CORES {
         let out = dir.join(format!("c5-v2-check-{name}.jsonl"));
         let core = label(name, variant, "skeleton", &revision);
-        let summary = corpus(name, &core, &workloads, (1..=1, 1), &out);
+        let summary = corpus(
+            name,
+            &core,
+            evidence("skeleton", &revision),
+            &workloads,
+            (1..=1, 1),
+            &out,
+        );
         assert_eq!(summary.runs, u64::try_from(cases.len()).unwrap(), "{name}");
         let text = std::fs::read_to_string(&out).unwrap();
         let lines: Vec<_> = text.lines().collect();
         assert_eq!(lines.len(), cases.len(), "{name}");
         for (line, case) in lines.iter().zip(&cases) {
-            assert_eq!(field(line, "evidence"), "\"C5 version 2\"", "{line}");
+            assert_eq!(
+                field(line, "evidence"),
+                "\"harness validation, not C5 evidence\"",
+                "{line}"
+            );
             assert_eq!(field(line, "core"), format!("\"{core}\""), "{line}");
             assert_eq!(field(line, "workload"), "\"W5\"", "{line}");
             assert_eq!(field(line, "case"), format!("\"{}\"", case.name), "{line}");
@@ -336,4 +367,26 @@ fn the_manifest_profile_runs_the_frozen_cases() {
     );
     assert_eq!(w5(1), W5::manifest().cases().unwrap());
     assert_ne!(w5(1), w5_skeleton(1));
+    assert_eq!(
+        workloads(true).map(|(name, _)| name),
+        ["W2", "W3", "W4", "W5", "W6"]
+    );
+}
+
+/// Only a manifest run at a clean, known revision is C5 version 2
+/// evidence.
+#[test]
+fn only_a_clean_manifest_run_is_c5_evidence() {
+    assert_eq!(evidence("manifest", "0034dca0a1b2"), Evidence::C5Version2);
+    for (profile, revision) in [
+        ("skeleton", "0034dca0a1b2"),
+        ("manifest", "0034dca0a1b2-dirty"),
+        ("manifest", "unknown"),
+    ] {
+        assert_eq!(
+            evidence(profile, revision),
+            Evidence::HarnessValidation,
+            "{profile} {revision}"
+        );
+    }
 }

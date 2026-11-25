@@ -144,13 +144,19 @@ fn field<'a>(line: &'a str, name: &str) -> &'a str {
 }
 
 /// Each fault a run applies is in its line with its step and phase, and
-/// the summary counts it by kind and phase: a crash at step 1 falls
-/// before the first commit, one late in the run after the last.
+/// the summary counts the runs that reached each kind in each phase,
+/// once a run however often it applies the kind there: a crash at step
+/// 1 falls before the first commit, one late in the run after the last.
 #[test]
 fn every_fault_is_covered_by_its_phase() {
     use crate::harness::workloads::Action;
     let mut case = W1::skeleton().cases()[0].clone();
-    case.schedule = vec![(1, Action::Crash(2)), (2, Action::Restart(2))];
+    // Two crashes before the first commit count the run once there.
+    case.schedule = vec![
+        (1, Action::Crash(2)),
+        (2, Action::Restart(2)),
+        (3, Action::Crash(1)),
+    ];
     let mut late = case.clone();
     late.name.push_str(" late");
     late.schedule = vec![(late.steps - 1, Action::Crash(2))];
@@ -169,7 +175,7 @@ fn every_fault_is_covered_by_its_phase() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(
         field(lines[0], "coverage"),
-        "[{\"step\":1,\"fault\":\"Crash(2)\",\"phase\":\"before_first_commit\"},{\"step\":2,\"fault\":\"Restart(2)\",\"phase\":\"before_first_commit\"}]"
+        "[{\"step\":1,\"fault\":\"Crash(2)\",\"phase\":\"before_first_commit\"},{\"step\":2,\"fault\":\"Restart(2)\",\"phase\":\"before_first_commit\"},{\"step\":3,\"fault\":\"Crash(1)\",\"phase\":\"before_first_commit\"}]"
     );
     assert!(
         field(lines[1], "coverage").contains("\"phase\":\"after_last_commit\""),
