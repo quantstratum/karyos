@@ -159,7 +159,11 @@ fn privileged_etf_drops_are_caught_up_or_gapped() {
         (1, 1),
         "{counts:?}, got {got:?}"
     );
-    assert_eq!((counts.caught_up, counts.gaps), (0, 0), "{counts:?}");
+    assert_eq!(
+        (counts.caught_up, counts.gaps, counts.late_drop_reports),
+        (0, 0, 0),
+        "{counts:?}"
+    );
     assert_eq!(
         sealed,
         Some(karyos_sys::log_buffer::SealReason::DeadlineMissed)

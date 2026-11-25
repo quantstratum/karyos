@@ -1747,3 +1747,55 @@ fn an_etf_drop_under_cancel_aborts_the_lane() {
         assert_eq!(f.path.deadline_unreported(), None, "reported once");
     }
 }
+
+/// Codex review of #1267 (P1): under cancel-on-deadline a drop report
+/// whose entry already expired still aborts the lane: the qdisc did drop
+/// the datagram.
+#[test]
+fn a_late_drop_report_under_cancel_still_aborts() {
+    let mut f = EtfFixture::with(true, true);
+    let past = 100 + 50 + super::etf::EXPIRY_MARGIN + 1;
+    f.serve(past);
+    assert_eq!(f.counts().expired, 1);
+    f.drop_report(100);
+    f.serve(past + 1);
+    assert_eq!(f.counts().late_drop_reports, 1);
+    assert_eq!(f.path.deadline_unreported(), Some(0));
+    assert_eq!(f.path.timed_counts().unwrap().deadline_aborts, 1);
+}
+
+/// Codex review of #1267 (P2): a lane that missed its deadline stages
+/// nothing more, and the heads still queued on it are returned, counted
+/// dropped, so its TX slots are freed.
+#[test]
+fn a_missed_lane_returns_its_queued_heads_and_stages_nothing() {
+    use karyos_sys::log_buffer::ScheduledOutcome;
+
+    let mut f = EtfFixture::with(false, true);
+    // A second message, staged but not eligible before 150.
+    assert!(matches!(
+        f._log.publications[0]
+            .append_scheduled(&[8; 100], AppendOptions::default(), 200)
+            .unwrap(),
+        ScheduledOutcome::Append(karyos_sys::log_buffer::AppendOutcome::Appended { .. })
+    ));
+    f.serve(55);
+    assert_eq!(f.path.sender.pending(0), Some(1), "queued, waiting");
+    // The first message's drop aborts the lane in the next duty.
+    f.drop_report(100);
+    f.serve(60);
+    assert_eq!(f.path.deadline_unreported(), Some(0));
+    assert_eq!(f.path.sender.pending(0), Some(0), "returned");
+    assert_eq!(f.path.timed_counts().unwrap().dropped, 1);
+    // A third message is never read.
+    assert!(matches!(
+        f._log.publications[0]
+            .append_scheduled(&[7; 100], AppendOptions::default(), 300)
+            .unwrap(),
+        ScheduledOutcome::Append(karyos_sys::log_buffer::AppendOutcome::Appended { .. })
+    ));
+    let staged = f.path.counters().staged;
+    f.serve(260);
+    assert_eq!(f.path.counters().staged, staged, "nothing more staged");
+    assert_eq!(f.observer.etf_send_calls(), 1);
+}

@@ -1015,6 +1015,48 @@ impl<T: StreamTerms> Outbound<T> {
         }
     }
 
+    /// Returns, through the timed gate, the heads still queued on each lane
+    /// that missed its deadline under cancel-on-deadline (ADR-0109 point
+    /// 8): they will never be sent, so their TX slots and their schedule
+    /// entries are freed, each counted dropped. A lane its guard aborts is
+    /// [`Self::cancel_aborted`]'s.
+    fn cancel_missed<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) {
+        let Self {
+            guard,
+            sender,
+            tracks,
+            readers,
+            counters,
+            timed: Some(timed),
+            ..
+        } = self
+        else {
+            return;
+        };
+        for lane in 0..readers.len() {
+            let guarded = guard
+                .as_deref()
+                .is_some_and(|guard| LaneGate::aborting(guard, lane));
+            if guarded
+                || !timed.state.deadline_missed(lane)
+                || sender.pending(lane).unwrap_or(0) == 0
+            {
+                continue;
+            }
+            let mut gate = DataGate {
+                lanes: tracks,
+                held: false,
+                guard: guard.as_deref_mut(),
+            };
+            if sender
+                .cancel(tx, lane, &mut timed.state.view(&mut gate))
+                .is_err()
+            {
+                counters.bump(|c| &mut c.queue_failures, 1);
+            }
+        }
+    }
+
     /// The guard's between gates step at `now`, for a publication not
     /// served this cycle (not established yet): a close applies and its
     /// applied epoch is published all the same.
@@ -1696,11 +1738,13 @@ impl<T: StreamTerms> Outbound<T> {
                 for entry in drops.reports.iter().take(drained) {
                     match *entry {
                         ErrEntry::Txtime { txtime_ns, .. } => {
-                            // Under cancel-on-deadline a drop is a miss the
-                            // sender saw: the lane aborts (ADR-0109 point 8).
-                            if drops.ledger.drained(lane, txtime_ns) > 0
-                                && let Some(timed) = self.timed.as_deref_mut()
-                            {
+                            let _ = drops.ledger.drained(lane, txtime_ns);
+                            // Under cancel-on-deadline every drop report is
+                            // a miss the sender saw, a late one too (its
+                            // entry expired, but the qdisc did drop it): the
+                            // lane aborts (ADR-0109 point 8). On any other
+                            // lane `miss` changes nothing.
+                            if let Some(timed) = self.timed.as_deref_mut() {
                                 let aborting = self
                                     .guard
                                     .as_deref()
@@ -1870,6 +1914,7 @@ impl<T: StreamTerms> Outbound<T> {
             guard.between_gates();
         }
         self.cancel_aborted(tx);
+        self.cancel_missed(tx);
         // After the cancel, whose returned heads end their messages too.
         self.release_ended();
         self.handle_failure(tx, report.failure);
@@ -2255,6 +2300,16 @@ impl<T: StreamTerms> Outbound<T> {
                 .guard
                 .as_deref()
                 .is_some_and(|guard| guard.aborting(lane))
+            {
+                break;
+            }
+            // Nor does a timed lane that missed its deadline under
+            // cancel-on-deadline: its incarnation is aborted (ADR-0109
+            // point 8).
+            if self
+                .timed
+                .as_deref()
+                .is_some_and(|timed| timed.state.deadline_missed(lane))
             {
                 break;
             }
