@@ -333,3 +333,319 @@ fn the_buffers_hold_to_the_bounds_the_limits_give() {
         }
     }
 }
+
+/// What [`model_violation`] tracks of one server.
+#[derive(Default, Clone)]
+struct Server {
+    /// Its log as written: index to term.
+    log: std::collections::BTreeMap<u64, u64>,
+    /// Its latest snapshot base, (index, term): below it the snapshot
+    /// holds the state.
+    base: (u64, u64),
+    /// Its commit index since it last started.
+    committed: Option<u64>,
+}
+
+/// The custom core's model invariants (`crates/karyos-cluster/tests/
+/// consensus_model.rs`), checked on a harness history, event by event
+/// (C5 version 2, the custom core's trace checking; ADR-0105, decision 4):
+///
+/// - **Election safety**: at most one server leads a term
+///   ([`Observation::Leading`], recorded when a server first leads one).
+/// - **Log matching**: when a server writes an entry another server holds
+///   with the same term, both logs agree on every entry before it, above
+///   both snapshot bases.
+/// - **Leader completeness**: a server that starts to lead holds every
+///   entry applied anywhere before, above its snapshot base, with its term.
+/// - **State machine safety**: every server applies the same entry
+///   (index, term and command) at an index.
+/// - **Commit monotone**: a server's commit index never moves back while
+///   it is up.
+/// - **Persist then send**: a message that waited for persistence leaves
+///   only once what its Ready appended is durable and its hard state is
+///   the stored one.
+fn model_violation(observations: &[Observation]) -> Option<String> {
+    use karyos_sim::harness::core::Step;
+    use std::collections::BTreeMap;
+    let mut servers: BTreeMap<u32, Server> = BTreeMap::new();
+    let mut leaders: BTreeMap<u64, u32> = BTreeMap::new();
+    let mut applied: BTreeMap<u64, (u64, Vec<u8>)> = BTreeMap::new();
+    for observation in observations {
+        match observation {
+            Observation::Leading { node, term } => {
+                let first = *leaders.entry(*term).or_insert(*node);
+                if first != *node {
+                    return Some(format!("two leaders in term {term}: {first} and {node}"));
+                }
+                let server = servers.entry(*node).or_default();
+                for (index, (term_applied, _)) in &applied {
+                    if *index > server.base.0 && server.log.get(index) != Some(term_applied) {
+                        return Some(format!(
+                            "leader {node} of term {term} lacks applied entry {index} of term {term_applied}"
+                        ));
+                    }
+                }
+            }
+            Observation::Drive {
+                node,
+                step:
+                    Step::Persisted {
+                        truncated_from,
+                        appended,
+                        ..
+                    },
+            } => {
+                let mine = servers.entry(*node).or_default();
+                if let Some(from) = truncated_from {
+                    let _ = mine.log.split_off(from);
+                }
+                for &(index, term) in appended {
+                    let _ = mine.log.insert(index, term);
+                }
+                let mine = mine.clone();
+                for &(index, term) in appended {
+                    for (other, theirs) in &servers {
+                        if other == node || theirs.log.get(&index) != Some(&term) {
+                            continue;
+                        }
+                        let floor = mine.base.0.max(theirs.base.0);
+                        let differs = (floor + 1..index).find(|at| {
+                            matches!((mine.log.get(at), theirs.log.get(at)), (Some(a), Some(b)) if a != b)
+                        });
+                        if let Some(at) = differs {
+                            return Some(format!(
+                                "log matching broken between {node} and {other}: equal at {index}, not at {at}"
+                            ));
+                        }
+                    }
+                }
+            }
+            Observation::Recovered { node, entries, .. } => {
+                let server = servers.entry(*node).or_default();
+                server.log = entries.iter().copied().collect();
+                server.committed = None;
+            }
+            Observation::Crashed { node } => {
+                servers.entry(*node).or_default().committed = None;
+            }
+            Observation::Installed { node, base, .. }
+            | Observation::Compacted { node, base, .. } => {
+                let server = servers.entry(*node).or_default();
+                if matches!(observation, Observation::Installed { .. })
+                    && server.log.get(&base.index) != Some(&base.term)
+                {
+                    server.log.clear();
+                }
+                server.log = std::mem::take(&mut server.log)
+                    .into_iter()
+                    .filter(|(index, _)| *index > base.index)
+                    .collect();
+                server.base = server.base.max((base.index, base.term));
+            }
+            Observation::Positions { node, positions } => {
+                let server = servers.entry(*node).or_default();
+                if let (Some(before), Some(now)) = (server.committed, positions.committed)
+                    && now < before
+                {
+                    return Some(format!("{node}'s commit moved back from {before} to {now}"));
+                }
+                if positions.committed.is_some() {
+                    server.committed = positions.committed;
+                }
+            }
+            Observation::Applied { node, entry, .. } => {
+                let seen = applied
+                    .entry(entry.index)
+                    .or_insert((entry.term, entry.payload.clone()));
+                if *seen != (entry.term, entry.payload.clone()) {
+                    return Some(format!("{node} applied another entry at {}", entry.index));
+                }
+            }
+            Observation::Released { node, release, .. } => {
+                if release.needs.is_some() && release.durable < release.needs {
+                    return Some(format!(
+                        "{node} sent before {:?} was durable",
+                        release.needs
+                    ));
+                }
+                if release.needs_state.is_some() && release.stored_state != release.needs_state {
+                    return Some(format!("{node} sent before its hard state was stored"));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The custom core's W1 to W6 histories keep the model's invariants on
+/// every seed, W5's through snapshots (each compacts or installs); and each
+/// invariant catches its violation, injected into a valid history.
+#[test]
+fn the_harness_histories_keep_the_model_invariants() {
+    use karyos_sim::harness::workloads::W5;
+    let mut cases = W1::skeleton().cases();
+    cases.extend(W2::skeleton().cases().unwrap());
+    cases.extend(W3::skeleton().cases());
+    let snapshots: Vec<_> = W5::skeleton()
+        .cases()
+        .unwrap()
+        .into_iter()
+        .filter(|case| case.handover.is_none())
+        .collect();
+    cases.extend(snapshots.iter().cloned());
+    cases.push(W5::manifest().lost_reply_whoever_leads());
+    cases.extend(W6::skeleton().cases());
+    let mut sample = None;
+    for seed in SEEDS {
+        let mut all = cases.clone();
+        all.extend(W4::skeleton(seed).cases());
+        for case in &all {
+            let outcome = workloads::run::<Custom>(case, seed).unwrap();
+            assert_eq!(
+                model_violation(&outcome.observations),
+                None,
+                "{} seed {seed}",
+                case.name
+            );
+            if snapshots.iter().any(|snapshot| snapshot.name == case.name) {
+                assert!(
+                    outcome.observations.iter().any(|observation| matches!(
+                        observation,
+                        Observation::Compacted { .. } | Observation::Installed { .. }
+                    )),
+                    "{} seed {seed}: no snapshot",
+                    case.name
+                );
+            }
+            if case.name.starts_with("W1") {
+                sample.get_or_insert(outcome);
+            }
+        }
+    }
+    let valid = sample.unwrap().observations;
+    let broken = |change: &dyn Fn(&mut Vec<Observation>)| {
+        let mut observations = valid.clone();
+        change(&mut observations);
+        model_violation(&observations).unwrap_or_default()
+    };
+    let first = |pick: &dyn Fn(&Observation) -> bool| valid.iter().position(pick).unwrap();
+    // A second leader of a term already led.
+    let led = first(&|o| matches!(o, Observation::Leading { .. }));
+    assert!(
+        broken(&|o| {
+            if let Observation::Leading { node, term } = o[led].clone() {
+                o.insert(
+                    led + 1,
+                    Observation::Leading {
+                        node: node + 1,
+                        term,
+                    },
+                );
+            }
+        })
+        .contains("two leaders")
+    );
+    // A server writing an entry another holds, over a different prefix.
+    let written = first(&|o| {
+        matches!(o, Observation::Drive { step: karyos_sim::harness::core::Step::Persisted { appended, .. }, .. }
+            if appended.iter().any(|(index, _)| *index >= 2))
+    });
+    assert!(
+        broken(&|o| {
+            if let Observation::Drive {
+                step:
+                    karyos_sim::harness::core::Step::Persisted {
+                        appended,
+                        persisted,
+                        ..
+                    },
+                ..
+            } = o[written].clone()
+                && let Some(&(index, term)) = appended.iter().find(|(index, _)| *index >= 2)
+            {
+                o.insert(
+                    written + 1,
+                    Observation::Drive {
+                        node: 99,
+                        step: karyos_sim::harness::core::Step::Persisted {
+                            persisted,
+                            truncated_from: None,
+                            appended: vec![(index - 1, term + 1_000), (index, term)],
+                        },
+                    },
+                );
+            }
+        })
+        .contains("log matching")
+    );
+    // A leader missing an entry applied before it leads.
+    let applied = first(&|o| matches!(o, Observation::Applied { .. }));
+    assert!(
+        broken(&|o| o.insert(
+            applied + 1,
+            Observation::Leading {
+                node: 99,
+                term: u64::MAX
+            }
+        ))
+        .contains("lacks applied entry")
+    );
+    // Another command applied at an index.
+    assert!(
+        broken(&|o| {
+            if let Observation::Applied {
+                node,
+                entry,
+                applying,
+                response,
+            } = o[applied].clone()
+            {
+                let mut other = entry;
+                other.payload.push(0xFF);
+                o.insert(
+                    applied + 1,
+                    Observation::Applied {
+                        node: node + 1,
+                        entry: other,
+                        applying,
+                        response,
+                    },
+                );
+            }
+        })
+        .contains("applied another entry")
+    );
+    // A commit moving back on a server that stayed up.
+    let position = first(
+        &|o| matches!(o, Observation::Positions { positions, .. } if positions.committed.is_some_and(|c| c > 0)),
+    );
+    assert!(
+        broken(&|o| {
+            if let Observation::Positions { node, positions } = o[position].clone() {
+                let mut back = positions;
+                back.committed = back.committed.map(|c| c - 1);
+                o.insert(
+                    position + 1,
+                    Observation::Positions {
+                        node,
+                        positions: back,
+                    },
+                );
+            }
+        })
+        .contains("moved back")
+    );
+    // A message released before what it waited for was durable.
+    let released = first(
+        &|o| matches!(o, Observation::Released { release, .. } if release.needs.is_some_and(|n| n > 0)),
+    );
+    assert!(
+        broken(&|o| {
+            if let Observation::Released { release, .. } = &mut o[released] {
+                release.durable = release.needs.map(|n| n - 1);
+            }
+        })
+        .contains("sent before")
+    );
+}

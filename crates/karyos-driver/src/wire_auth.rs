@@ -35,6 +35,9 @@ use zeroize::Zeroizing;
 
 use crate::wire_keys::{Context, KEY_LEN, KeyFile, Material, Purpose, Scope};
 
+/// Bytes the envelope adds to a datagram: the 32-byte header and the
+/// 16-byte tag (ADR-0086 section 5, `E`).
+pub const ENVELOPE_LEN: usize = HEADER_LEN + karyos_protocol::protection::hmac_sha256::TAG_LEN;
 /// The HMAC-SHA-256 usage limit: tags per key (manifest 4.3).
 pub const TAG_CAP: u64 = 1 << 48;
 /// Where a sender moves to the next in-band key epoch: 75% of
@@ -277,10 +280,35 @@ impl Sealer {
         })
     }
 
+    /// The domain this sealer tags in: 1 for a sender, 4 for a receiver.
+    #[must_use]
+    pub fn domain(&self) -> Domain {
+        self.party.domain()
+    }
+
+    /// The party, and so the establishment, its key was derived for.
+    #[must_use]
+    pub fn party(&self) -> Party {
+        self.party
+    }
+
     /// The in-band key epoch the next datagram carries.
     #[must_use]
     pub fn party_epoch(&self) -> u8 {
         self.party_epoch
+    }
+
+    /// Whether [`Sealer::seal`] can seal one more datagram: false once the
+    /// usage limit is reached with no in-band epoch left. A sender asks
+    /// before it reads anything it would then have to drop.
+    #[must_use]
+    pub fn can_seal(&self) -> bool {
+        let seq = self.profile.next_seq();
+        if seq >= ROTATE_AT {
+            self.party_epoch < u8::MAX
+        } else {
+            seq < TAG_CAP
+        }
     }
 
     /// Seals the first `frames` bytes of `datagram` with a fresh envelope
@@ -596,6 +624,7 @@ impl Slot {
 /// challenge transcript (ADR-0086 sections 6 and 7), and `envelope_seq` is
 /// a per-start counter.
 pub struct Proof {
+    kind: ProofKind,
     key_id: u32,
     /// The current file epoch of the key, from the durable lineage: only a
     /// proof under it may bind.
@@ -710,6 +739,7 @@ impl Proof {
         current: u32,
     ) -> Result<Self, KeyError> {
         let mut proof = Self {
+            kind,
             key_id: 0,
             current,
             signing: None,
@@ -737,6 +767,12 @@ impl Proof {
             return Err(KeyError::NoKey);
         }
         Ok(proof)
+    }
+
+    /// The domain this proof tags in: 5 for SETUP, 6 for RSP_SETUP.
+    #[must_use]
+    pub fn domain(&self) -> Domain {
+        self.kind.domain()
     }
 
     /// Seals the first `frames` bytes of `datagram` under the signing key.

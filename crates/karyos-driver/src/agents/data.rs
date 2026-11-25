@@ -324,6 +324,13 @@ pub struct OutboundCounters {
     /// Cycles whose first sends waited for a configured required member's
     /// join.
     pub not_joined: u64,
+    /// Times an authenticated lane's staging stopped because it could not
+    /// seal: no session key yet, or the key's usage limit reached
+    /// (ADR-0086 section 6; manifest 4.3). Nothing is read or sent.
+    pub seal_waits: u64,
+    /// Datagrams read but not sealed: an invariant failure, the frames
+    /// left as a gap the receiver repairs, as a failed commit's.
+    pub seal_failures: u64,
     /// Traced frames not recorded: their EXT did not decode or did not fit
     /// their frame (NT-2).
     pub trace_invalid: u64,
@@ -419,6 +426,8 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     /// The traced frames of the datagram being staged (allocated at
     /// construction, for the most one datagram can hold).
     picked: Vec<(TraceExtension, u64)>,
+    /// How its sender frames are authenticated (domain 1, ADR-0086).
+    auth: SenderAuth,
     /// The redundant paths of a routed publication ([`Outbound::new_routed`]).
     routed: Option<Box<routed::Routed>>,
     /// The destinations of a multi-destination publication
@@ -673,6 +682,7 @@ impl<T: StreamTerms> Outbound<T> {
             routed: None,
             fanout: None,
             registration: None,
+            auth: SenderAuth::Off,
             route: None,
             idle_since: [None; 4],
             open_tried: None,
@@ -863,12 +873,16 @@ impl<T: StreamTerms> Outbound<T> {
         if self.fanout.is_some() {
             return self.enable_fanout_repair(config, term_length, identity);
         }
-        self.repair = Some(Box::new(RepairPath::new(
+        let mut repair = RepairPath::new(
             config,
             self.drr,
             self.mtu,
             (term_length, self.alias, identity),
-        )?));
+        )?;
+        if self.authenticated() {
+            repair.reserve_envelope(crate::wire_auth::ENVELOPE_LEN);
+        }
+        self.repair = Some(Box::new(repair));
         Ok(())
     }
 
@@ -1125,6 +1139,10 @@ impl<T: StreamTerms> Outbound<T> {
                 *closed = LaneGate::aborting(&*guard, lane);
             }
         }
+        // An authenticated publication repairs only under its sealer.
+        if !self.auth.ready() {
+            return 0;
+        }
         let Some(repair) = self.repair.as_deref_mut() else {
             return 0;
         };
@@ -1134,6 +1152,7 @@ impl<T: StreamTerms> Outbound<T> {
             (&sent_high, &closed),
             budget,
             now,
+            self.auth.sealer(),
         );
         let frames = report
             .lanes
@@ -2058,13 +2077,22 @@ impl<T: StreamTerms> Outbound<T> {
             // A timed lane sends one frame per datagram: the first frame's
             // length, from a read that copies nothing and moves nothing,
             // bounds the copy, so each head waits for its own time only.
+            // An authenticated lane stages only what it can seal, decided
+            // before any read moves the cursor. Its frames fit the inner
+            // budget, the MTU less the envelope, which the log was sized
+            // for (ADR-0086 section 5); the datagram is the whole MTU.
+            if !self.auth.ready() {
+                self.counters.bump(|c| &mut c.seal_waits, 1);
+                break;
+            }
+            let inner_mtu = self.mtu.saturating_sub(self.auth.envelope());
             let timed = self
                 .timed
                 .as_deref()
                 .is_some_and(|timed| matches!(timed.consumers.get(lane), Some(Some(_))));
             let cap = if timed {
                 match reader.read_committed(from, ReadOrigin::Cursor, &mut []) {
-                    Err(ReadError::TooSmall { needed }) => needed.min(self.mtu),
+                    Err(ReadError::TooSmall { needed }) => needed.min(inner_mtu),
                     Ok(ReadOutcome::Pending) | Err(ReadError::Retry) => break,
                     Ok(_) | Err(_) => {
                         self.counters.bump(|c| &mut c.read_errors, 1);
@@ -2072,7 +2100,7 @@ impl<T: StreamTerms> Outbound<T> {
                     }
                 }
             } else {
-                self.mtu
+                inner_mtu
             };
             let Ok(mut frame) = tx.claim_tx(queue, self.mtu) else {
                 break;
@@ -2154,6 +2182,19 @@ impl<T: StreamTerms> Outbound<T> {
             } else {
                 messages_started(frame.bytes_mut().get(..len).unwrap_or_default())
             };
+            // The log's charge stays the inner frames'; the datagram is
+            // the sealed one.
+            let inner_len = len;
+            let Some(len) = self.auth.seal(frame.bytes_mut(), len) else {
+                self.counters.bump(|c| &mut c.seal_failures, 1);
+                if traced.is_some() && !remember_unpicked(&mut self.traced, lane, from, next) {
+                    self.counters.bump(|c| &mut c.trace_unpicked, 1);
+                }
+                if let Some((_, true)) = schedule {
+                    self.timed_message_lost(lane);
+                }
+                break;
+            };
             let token = SenderToken::new(self.next_token);
             self.next_token = self.next_token.checked_add(1).ok_or(overflow.clone())?;
             let Ok(ticket) = frame.commit(Commit {
@@ -2201,7 +2242,7 @@ impl<T: StreamTerms> Outbound<T> {
                         staged_head,
                         GateHead {
                             token,
-                            length: u64::from(len16),
+                            length: u64::try_from(inner_len).unwrap_or(u64::MAX),
                             messages,
                             start: from,
                             end: next,
@@ -2357,6 +2398,25 @@ pub(crate) mod testing {
         /// A concurrent log's handles, per lane ([`outbound_concurrent`]);
         /// `publications` is then empty.
         pub(crate) concurrent: Vec<Vec<ConcurrentPublication<Arc<LogBuffer>>>>,
+    }
+
+    std::thread_local! {
+        /// The next [`build`]'s datagram MTU, when it differs from its log's.
+        static WIRE_MTU: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// [`outbound`] whose datagram MTU is `wire`, its log's `term.mtu`
+    /// being the inner budget: an authenticated channel's publication.
+    pub(crate) fn outbound_wire(
+        endpoint: EndpointId,
+        alias: Alias,
+        destination: SocketAddr,
+        term: TermParams,
+        wire: u32,
+        reliable: bool,
+    ) -> (Box<Outbound>, TestLog) {
+        WIRE_MTU.with(|cell| cell.set(Some(wire)));
+        outbound(endpoint, alias, destination, term, 1, reliable)
     }
 
     /// A publication of `lanes` lanes with `term`, read for `alias` on
@@ -2547,7 +2607,10 @@ pub(crate) mod testing {
             log.conductors.push(conductor);
             log.lanes.push(buffer);
         }
-        let quanta = vec![u64::from(term.mtu) * 4; usize::from(lanes)];
+        // The datagram MTU: the log's, or a larger one whose envelope the
+        // log leaves room for (an authenticated channel's, tests).
+        let wire = WIRE_MTU.with(|wire| wire.take()).unwrap_or(term.mtu);
+        let quanta = vec![u64::from(wire) * 4; usize::from(lanes)];
         let outbound = match routes {
             Some(routes) => Outbound::new_routed(
                 routes,
@@ -2563,7 +2626,7 @@ pub(crate) mod testing {
                 destination,
                 readers,
                 &Lanes::new(&quanta).unwrap(),
-                term.mtu,
+                wire,
                 reliable,
             ),
         }
@@ -2651,6 +2714,10 @@ pub(crate) use fanout::destination_share;
 mod heartbeat;
 mod removal;
 mod routed;
+mod sealing;
+
+pub use sealing::AuthUnsupported;
+use sealing::SenderAuth;
 
 pub use fanout::{
     DEFAULT_MAX_DESTINATIONS, DESTINATION_FAULT_LIMIT, DestinationChange, DestinationRemoval,

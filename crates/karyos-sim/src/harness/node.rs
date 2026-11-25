@@ -896,6 +896,15 @@ pub enum Observation {
         /// The log's error.
         error: String,
     },
+    /// A server's core led a term for the first time (karyos#691: the
+    /// custom core's trace checking sees every election, not only those
+    /// whose leader commits).
+    Leading {
+        /// The server.
+        node: NodeId,
+        /// The term it leads.
+        term: u64,
+    },
     /// A server's commit index moved.
     Commit {
         /// The server.
@@ -1304,6 +1313,8 @@ pub struct ServerNode<C: ConsensusCore> {
     /// Requests this server took, by client and sequence: it answers them.
     pending: BTreeSet<(NodeId, u64)>,
     commit: Option<u64>,
+    /// The highest term its core was seen to lead ([`Observation::Leading`]).
+    led: Option<u64>,
     /// The configuration last recorded.
     configuration: Option<Configuration>,
     /// Why the disk cannot come back, when its crash could not be taken.
@@ -1468,6 +1479,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             service: TestService::default(),
             pending: BTreeSet::new(),
             commit,
+            led: None,
             configuration: None,
             lost: None,
             recorder,
@@ -1517,6 +1529,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             service: TestService::default(),
             pending: BTreeSet::new(),
             commit: None,
+            led: None,
             configuration: None,
             lost: None,
             recorder,
@@ -2049,6 +2062,13 @@ impl<C: ConsensusCore> ServerNode<C> {
         {
             let entry_term = configuration.index.and_then(|index| log.term(index));
             self.record_configuration(configuration, entry_term);
+        }
+        if core.leads() && self.led < Some(core.term()) {
+            self.led = Some(core.term());
+            self.observe(Observation::Leading {
+                node,
+                term: core.term(),
+            });
         }
         let committed = core.committed();
         if committed > self.commit
