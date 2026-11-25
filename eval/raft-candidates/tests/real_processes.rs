@@ -304,9 +304,13 @@ fn run_once(core: &str, nodes: u32) -> Result<Vec<Probe>, String> {
         let output = child.wait_with_output().unwrap();
         if output.status.success() {
             let stdout = String::from_utf8(output.stdout).unwrap();
-            let (applied, probe) = stdout.trim().split_once('\n').unwrap();
-            reports.push(applied.to_owned());
-            probes.push(probe_of(probe));
+            // Exactly its two lines: anything else on a node's stdout (a
+            // stray print in a core or adapter) is a failure, not noise
+            // to skip (the debug prints left in harness::custom).
+            let lines: Vec<&str> = stdout.trim().lines().collect();
+            assert_eq!(lines.len(), 2, "a node's stdout: {stdout}");
+            reports.push(lines[0].to_owned());
+            probes.push(probe_of(lines[1]));
         } else if failed.as_ref().is_none_or(String::is_empty) {
             failed = Some(String::from_utf8_lossy(&output.stderr).into_owned());
         }

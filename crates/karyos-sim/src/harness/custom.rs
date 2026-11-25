@@ -74,24 +74,6 @@
 //! [`TransferRefused::Unsupported`](super::core::TransferRefused::Unsupported); C5 version 2's W5 retry changes the
 //! leader by a crash, which needs no handover.
 
-thread_local! { /// Debug.
-pub static DBG_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-macro_rules! DBG {
-    ($name:expr, $body:block) => {{
-        #[cfg(feature = "alloc-probe")]
-        {
-            let (r, n) = karyos_sys::alloc_count::count_allocations(|| $body);
-            if n > 0 && DBG_ARMED.with(|a| a.get()) {
-                println!("DBG {} {}", $name, n);
-            }
-            r
-        }
-        #[cfg(not(feature = "alloc-probe"))]
-        {
-            $body
-        }
-    }};
-}
 use std::cell::RefCell;
 
 use karyos_cluster::consensus::{
@@ -936,11 +918,8 @@ impl ConsensusCore for Custom {
 
     fn ready_into(&mut self, out: &mut ReadyBuf<Message>, log: &mut LogView<'_>) -> bool {
         // What the node is done with goes back to the thread's pool.
-        if self.core.commit() > 16 {
-            DBG_ARMED.with(|a| a.set(true));
-        }
-        DBG!("take_spare", { out.take_spare(&mut self.spare) });
-        DBG!("release", { release(&mut self.spare) });
+        out.take_spare(&mut self.spare);
+        release(&mut self.spare);
         // The node's vectors, grown to the reserved ones' size once.
         let (ready, reserved) = (&mut out.ready, &mut self.reserved);
         if ready.messages.capacity() < reserved.messages.capacity() {
@@ -958,10 +937,8 @@ impl ConsensusCore for Custom {
         if ready.snapshot_to.capacity() < reserved.snapshot_to.capacity() {
             std::mem::swap(&mut ready.snapshot_to, &mut reserved.snapshot_to);
         }
-        DBG!("messages", {
-            out.ready.messages.append(&mut self.outgoing)
-        });
-        DBG!("after", { out.ready.after_persist.append(&mut self.after) });
+        out.ready.messages.append(&mut self.outgoing);
+        out.ready.after_persist.append(&mut self.after);
         out.ready.snapshot_to.append(&mut self.snapshot_to);
         // Committed entries, written or in this Ready, from the last
         // handed out, as many as the duty's reads cover: `drive` applies
@@ -973,12 +950,12 @@ impl ConsensusCore for Custom {
             // At most a Ready's bound: the rest in the next.
             let most = (commit - self.handed)
                 .min(u64::try_from(self.bounds.committed).unwrap_or(u64::MAX));
-            let filled = DBG!("fill", { self.fill(log, (first, most), &mut committed) });
+            let filled = self.fill(log, (first, most), &mut committed);
             self.handed = self.handed.saturating_add(filled);
             out.ready.committed = committed;
         }
         out.ready.truncate_from = self.truncate.take();
-        DBG!("entries", { out.ready.entries.append(&mut self.pending) });
+        out.ready.entries.append(&mut self.pending);
         if self.dirty {
             self.dirty = false;
             let commit = self.core.commit();
