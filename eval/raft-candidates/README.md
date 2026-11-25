@@ -66,7 +66,7 @@ directory); `make raft-eval` runs `--locked` and fails otherwise
 | Restart of a leader | the durable vote is C4's `HardState`, which has no place for OpenRaft's `committed` bit, so `enable_leader_restore` is off: a restarted leader always stands for a new election, as in standard Raft (a finding for the comparison) |
 | Allocation | **fails the gate**, measured in the simulator only, at head 44dc4c88 (`tests/allocation.rs`, studiom4): W1, 32 clients, seed 1: 114 entries past the warm-up, 38,853 allocations and 32,521 frees, 341 and 286 per entry. All of OpenRaft's tasks run on the calling thread inside the core's calls, so the probe counts them. It also counts the adapter's request encoding in `step`, where `Request::eq` serializes both requests (`openraft_wire::request_bytes`) to correlate an answer; it does not count the real-process path's datagram framing and decoding. The figure moves with the adapter: earlier heads measured 44,710 and 41,035 allocations |
 | Adapter settings | RPC answers wait at least 30 ticks, the longest election timeout (OpenRaft's sequential append stream does not time an RPC out, and its own 5-tick TTL is shorter than a round trip on the slower links); retries back off 5, 10, 20 then up to 30 ticks, scaled to the 5-tick heartbeat instead of OpenRaft's 200 ms default. The same for every workload |
-| Real processes | demonstrated: three `raft-eval-node openraft` processes run `OpenRaft`, unchanged, on its executor inside the core's calls (no runtime of the process's own), over real files and UDP; its RPCs are encoded by the adapter (`openraft_wire`), since OpenRaft's `serde` feature is not admitted. They elect a leader and apply the same 20 commands in the same order |
+| Real processes | demonstrated for every variant (C5 v2, "Processes"; karyos#691): `raft-eval-node` servers and `raft-eval-client` clients run raft-rs, OpenRaft (on its executor, inside the core's calls, its RPCs encoded by `openraft_wire` since OpenRaft's `serde` feature is not admitted) and the custom core (`custom_wire`) over real files, UDP between servers and TCP from clients. `tests/real_processes.rs` runs W1 on 3 and 5 processes and W2 on 3, each judged by `workloads::pass` over the merged, stamped histories (Linux: one host's `CLOCK_MONOTONIC`), and a 3- and 5-process smoke run of every variant on every platform, judged per server; each run reports the allocation probe per stage |
 
 ## Findings, W2 and W5 on both adapters (karyos#679)
 
@@ -86,6 +86,21 @@ candidate (the parameters are plan issue 062's to freeze).
 | W5 snapshot cases | `NotYet`: no compaction or install through the core; refused as `Unsupported`, follow-up plan issue 065 | the same |
 | W5 lost reply, leader change, retry | runs, keeps safety, **retry not shown**: the frozen schedule assumes the reference's leader, server 0 from step 0; moved 30 steps later it shows the retry | runs, keeps safety, **retry not shown**: OpenRaft's first leader need not be server 0 |
 | Reproducibility | every W2 case reproduces from its seed, asserted | the same |
+
+**The custom core (ADR-0105).** W5's install part, `NotYet` for both
+candidates above, runs through the custom core, which compacts, installs
+and recovers over a snapshot (karyos#682): every W5 snapshot case passes on
+every seed, each with a compaction, and only version 1's handover retry is
+not demonstrated, since the core takes no handover
+(`crates/karyos-sim/tests/custom.rs`,
+`w5_snapshots_pass_and_the_handover_retry_is_not_demonstrated`); version 2's
+retry relative to whoever leads is its own case
+(`lost_reply_whoever_leads`). W2 under declared limits passes
+(`tests/workloads.rs`, `custom_w2_honours_its_limits`), and the v2 byte
+case reaches its bound within the cap (`tests/w2_bytes.rs`). On real
+processes every W2 case passes for all three variants, raft-rs and
+OpenRaft refusing the v2 byte case with a typed `InFlightBytes`
+(`tests/real_processes.rs`, `w2_full`).
 
 **Inputs to the C5 decision (karyos#691).** Weigh, besides the gates
 above: the in-flight caps are **strict on neither candidate**: not on
@@ -114,7 +129,7 @@ karyos#975 (the first two).
 | `CommittedTruncated` | yes (karyos#976): a server that never stores a commit, so C4's log has none to refuse, truncates entries the cluster applied. The run's first verdict is the contract breach that follows (its next append is not the next index), so the test asks `durable_kept` directly over the same run's observations | |
 | `Undecided`, `MalformedHistory` | no | properties of C3 and of the client history the harness records, not of a core |
 | `Unverified` | no | a run property (a crashed server never restarted), set by the case, not the core |
-| `QuorumOfVoters`, `ConfigurationNotFromLog`, `ConfigurationConflict`, `LearnerBehind` | no | membership changes: neither adapter takes a configuration change yet; they become reachable with the membership work held behind the core selection (#681 and the M04/M05 membership items) |
+| `QuorumOfVoters`, `ConfigurationNotFromLog`, `ConfigurationConflict`, `LearnerBehind` | no | membership changes: ADR-0105 excludes them from the custom core, and neither candidate adapter takes a configuration change, so no core under evaluation can be driven to break them; they become reachable with dynamic membership (#711, with its own ADR) |
 | `StandbyEffect`, `ReplyAfterFencing`, `OldGenerationReply`, `FeedMismatch`, `VerifiedLost`, `GapMisreported`, `GenerationBack` | no | the standby, lease and promotion path (W6) runs the harness's primary/standby feed and fencing around the core, not inside it; a core-side mutant cannot change what the feed or the lease releases |
 
 ## Amendment: RUSTSEC-2026-0543 (`chrono` unmaintained), karyos#690
