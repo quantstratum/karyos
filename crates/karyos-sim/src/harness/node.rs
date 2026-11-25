@@ -84,6 +84,11 @@ pub const SNAPSHOT_WINDOW: u64 = 4;
 /// Ticks a follower's transfer may go without a piece before it is
 /// dropped: its leader asks again, and a stale one goes.
 pub const SNAPSHOT_STALL: u64 = 2_000;
+/// Ticks a leader's transfer may go without its window moving before the
+/// core's next ask starts it again: a piece lost, or sent to a follower
+/// that was down. Well under [`SNAPSHOT_STALL`], so a follower that comes
+/// back is served again long before it would give up.
+pub const SNAPSHOT_RETRY: u64 = 200;
 
 /// A case's log compaction (W5), driven by the snapshot store's own
 /// policy ([`SnapshotConfig`]; karyos#682): a snapshot is due after
@@ -1952,7 +1957,7 @@ impl<C: ConsensusCore> ServerNode<C> {
     /// snapshot, streamed from its store as `to` acknowledges it. A
     /// transfer of that snapshot already moving goes on, however often the
     /// core asks; a new one starts only for a newer snapshot, or when the
-    /// last has gone [`SNAPSHOT_STALL`] ticks without an acknowledgement.
+    /// last has gone [`SNAPSHOT_RETRY`] ticks without an acknowledgement.
     fn send_snapshot(&mut self, to: NodeId, term: u64, out: &mut Outbox<Wire<C::Message>>) {
         let Some(store) = self.snapshots.as_ref() else {
             return;
@@ -1962,7 +1967,7 @@ impl<C: ConsensusCore> ServerNode<C> {
         };
         if self.outgoing.get(&to).is_some_and(|outgoing| {
             outgoing.base.index == info.index
-                && self.now.saturating_sub(outgoing.moved) <= SNAPSHOT_STALL
+                && self.now.saturating_sub(outgoing.moved) <= SNAPSHOT_RETRY
         }) {
             return;
         }
@@ -2061,7 +2066,7 @@ impl<C: ConsensusCore> ServerNode<C> {
     /// A follower's acknowledgement: the window moves, and a transfer ends
     /// only once the follower has installed it. One received whole but not
     /// installed (its check or its install failed) waits, and once it has
-    /// gone [`SNAPSHOT_STALL`] ticks without moving the core's next ask
+    /// gone [`SNAPSHOT_RETRY`] ticks without moving the core's next ask
     /// starts it again.
     fn snapshot_acked(
         &mut self,
