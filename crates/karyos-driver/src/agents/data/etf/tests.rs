@@ -155,11 +155,16 @@ fn pending_catch_ups_stay_within_their_allocation() {
     for index in 0..(capacity as u64 + 5) {
         let start = index * 100;
         assert!(
-            ranges.iter().any(|(from, to)| *from <= start && start + 10 <= *to),
+            ranges
+                .iter()
+                .any(|(from, to)| *from <= start && start + 10 <= *to),
             "{start} is covered: {ranges:?}"
         );
     }
-    let ordered = ranges.iter().zip(ranges.iter().skip(1)).all(|(a, b)| a.1 < b.0);
+    let ordered = ranges
+        .iter()
+        .zip(ranges.iter().skip(1))
+        .all(|(a, b)| a.1 < b.0);
     assert!(ordered, "{ranges:?}");
 }
 
