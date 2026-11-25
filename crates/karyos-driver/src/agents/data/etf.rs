@@ -30,7 +30,9 @@
 //!   job, one at a time per lane, [`EtfLedger::take_catch_up`], and what a
 //!   job did not send goes back, [`EtfLedger::give_back`]); one of an
 //!   unreliable lane is a gap at the receiver, counted in
-//!   [`EtfCounts::gaps`].
+//!   [`EtfCounts::gaps`]. Under cancel-on-deadline a drop is neither: it
+//!   aborts the lane's incarnation ([`EtfCounts::aborts`]), and its sender
+//!   marks the lane missed for the conductor to seal.
 //!
 //! It allocates only in [`EtfLedger::new`].
 
@@ -66,6 +68,8 @@ pub struct EtfCounts {
     pub gaps: u64,
     /// Dropped ranges of a reliable lane handed to a catch-up.
     pub caught_up: u64,
+    /// Drops under cancel-on-deadline: each aborts its lane.
+    pub aborts: u64,
     /// Entries retired as sent at expiry.
     pub expired: u64,
     /// Reports naming a time no entry holds (ADR-0109 point 7).
@@ -113,6 +117,8 @@ pub struct EtfLedger {
     lanes: Vec<EtfLane>,
     bound: usize,
     reliable: bool,
+    /// Cancel-on-deadline: a drop aborts the lane.
+    cancel: bool,
     /// `advance + margin`: an entry expires that long after its time.
     expiry: u64,
     /// Late reports not yet posted, oldest first.
@@ -126,10 +132,11 @@ pub struct EtfLedger {
 
 impl EtfLedger {
     /// A ledger of `lanes` lanes, each holding up to `bound` entries (the
-    /// lane's schedule capacity), of a `reliable` publication whose
-    /// declared advance is `advance`. Allocates here only.
+    /// lane's schedule capacity), of a `reliable` publication, under
+    /// cancel-on-deadline when `cancel`, whose declared advance is
+    /// `advance`. Allocates here only.
     #[must_use]
-    pub fn new(lanes: usize, bound: usize, reliable: bool, advance: u64) -> Self {
+    pub fn new(lanes: usize, bound: usize, (reliable, cancel): (bool, bool), advance: u64) -> Self {
         Self {
             lanes: (0..lanes)
                 .map(|_| EtfLane {
@@ -139,6 +146,7 @@ impl EtfLedger {
                 .collect(),
             bound,
             reliable,
+            cancel,
             expiry: advance.saturating_add(EXPIRY_MARGIN),
             late: VecDeque::with_capacity(DRAIN_BATCH),
             late_bound: DRAIN_BATCH,
@@ -215,7 +223,9 @@ impl EtfLedger {
             let _ = state.in_flight.remove(index);
             dropped = dropped.saturating_add(1);
             bump(&mut self.counts.dropped, &mut self.counts.overflows);
-            if self.reliable {
+            if self.cancel {
+                bump(&mut self.counts.aborts, &mut self.counts.overflows);
+            } else if self.reliable {
                 insert_merged(&mut state.catch_ups, (entry.start, entry.end));
                 bump(&mut self.counts.caught_up, &mut self.counts.overflows);
             } else {

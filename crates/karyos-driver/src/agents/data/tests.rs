@@ -1429,6 +1429,7 @@ fn an_etf_head_goes_early_with_its_time_in_tai() {
             delta_ns: 20,
         },
         50,
+        false,
     );
     path.set_monotonic(monotonic);
     assert!(matches!(
@@ -1493,6 +1494,10 @@ fn etf_monotonic() -> u64 {
 
 impl EtfFixture {
     fn new(reliable: bool) -> Self {
+        Self::with(reliable, false)
+    }
+
+    fn with(reliable: bool, cancel_on_deadline: bool) -> Self {
         use karyos_io::backend::EtfQueue;
         use karyos_protocol::network::Identity;
         use karyos_sys::log_buffer::ScheduledOutcome;
@@ -1531,6 +1536,7 @@ impl EtfFixture {
         };
         let policy = LatePolicy {
             advance: 50,
+            cancel_on_deadline,
             ..LatePolicy::default()
         };
         path.set_timed(&[policy], vec![None], 0).unwrap();
@@ -1541,6 +1547,7 @@ impl EtfFixture {
                 delta_ns: 20,
             },
             50,
+            cancel_on_deadline,
         );
         path.set_monotonic(etf_monotonic);
         if reliable {
@@ -1713,4 +1720,26 @@ fn an_expired_entry_is_retired_and_a_later_report_is_late() {
         true
     });
     assert_eq!(again, 1);
+}
+
+/// ADR-0109 point 8 (#625): under cancel-on-deadline an etf drop is a
+/// miss the sender saw: nothing is caught up, the lane aborts (counted
+/// once), and it is reported once for the conductor to seal.
+#[test]
+fn an_etf_drop_under_cancel_aborts_the_lane() {
+    for reliable in [true, false] {
+        let mut f = EtfFixture::with(reliable, true);
+        assert_eq!(f.path.deadline_unreported(), None);
+        f.drop_report(100);
+        f.serve(60);
+        f.serve(61);
+        let counts = f.counts();
+        assert_eq!((counts.dropped, counts.aborts), (1, 1), "{counts:?}");
+        assert_eq!((counts.caught_up, counts.gaps), (0, 0), "{counts:?}");
+        assert_eq!(f.data_sent_again(), 0, "nothing resubmitted");
+        assert_eq!(f.path.timed_counts().unwrap().deadline_aborts, 1);
+        assert_eq!(f.path.deadline_unreported(), Some(0));
+        f.path.deadline_reported(0);
+        assert_eq!(f.path.deadline_unreported(), None, "reported once");
+    }
 }

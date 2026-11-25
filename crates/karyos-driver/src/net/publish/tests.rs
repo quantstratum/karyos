@@ -2476,9 +2476,7 @@ fn a_timed_network_publication_refuses_what_it_does_not_support() {
         ..unreliable.clone()
     };
     let tai = ScheduleOptions::default().with_domain(ClockDomain::Tai);
-    let cancel = ScheduleOptions::default().with_cancel_on_deadline(true);
     let cases = vec![
-        (unreliable.clone(), cancel, Unsupported::CancelOnDeadline),
         // Refused before anything platform-specific: on every platform.
         (unreliable.clone(), tai, Unsupported::TaiDomain),
         (routed, ScheduleOptions::default(), Unsupported::Routed),
@@ -2507,6 +2505,17 @@ fn a_timed_network_publication_refuses_what_it_does_not_support() {
         driver.free_retired_streams();
         assert!(driver.streams.is_empty(), "{reason:?}");
     }
+    // Cancel-on-deadline is accepted (ADR-0109 point 8): a missed deadline
+    // is sealed by the conductor.
+    let mut config = aggregate(11, 1);
+    config.stream.buffer.schedule_capacity = 4;
+    let cancel = driver.add_timed_network_publication(
+        config,
+        &unreliable,
+        None,
+        ScheduleOptions::default().with_cancel_on_deadline(true),
+    );
+    assert!(cancel.is_ok(), "{cancel:?}");
     // A reliable channel is accepted (PR1b).
     let mut config = aggregate(12, 1);
     config.stream.buffer.schedule_capacity = 4;

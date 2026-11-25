@@ -5919,8 +5919,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// first reason), counted, and logged with its holder; a remote holder
     /// is retired as faulty, an in-process one gets only the seal. A report
     /// for a lane gone or reincarnated since is dropped, and every dropped
-    /// report counts in `schedule violations dropped`. Returns how many
-    /// lanes it sealed.
+    /// report counts in `schedule violations dropped`. A missed deadline
+    /// under cancel-on-deadline (ADR-0109 point 8) comes the same way and
+    /// is sealed with `SealReason::DeadlineMissed` instead (a lane already
+    /// sealed keeps its first reason), with no fault and no log record.
+    /// Returns how many lanes it sealed for a violation.
     fn apply_schedule_violations(&mut self) -> usize {
         let mut sealed = 0usize;
         while let Some(violation) = self
@@ -5943,6 +5946,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 continue;
             };
             let id = found.id;
+            // A missed deadline under cancel-on-deadline aborts the
+            // incarnation (G7, ADR-0109 point 8): sealed `DeadlineMissed`,
+            // and nobody breached anything.
+            // The sender counted the abort in the lane's `deadline aborts`.
+            if violation.deadline {
+                let _ = crate::timed_gate::seal_deadline_missed(&mut found.conductor);
+                continue;
+            }
             if found.conductor.seal_state() == karyos_sys::log_buffer::SealState::Active
                 && found
                     .conductor
