@@ -352,6 +352,87 @@ pub struct NotLeader {
     pub leader: Option<u64>,
 }
 
+/// An election-timeout profile for one deployment (ADR-0039; ADR-0105,
+/// decision 5): the timer tick its driver runs the core at, and the
+/// election timeout's range and the heartbeat in ticks. Each profile's
+/// values are chosen by the rule in `tests/timeout_profiles.rs` from its
+/// deployment's measured process pauses and network round trips
+/// (quantstratum-docs: karyos/environments/election-timeouts.md), which
+/// also states each one's false elections and recovery time; no value
+/// holds outside its stated deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeoutProfile {
+    /// The deployment it is for.
+    pub name: &'static str,
+    /// The driver's timer tick, in microseconds.
+    pub tick_us: u64,
+    /// The shortest election timeout, in ticks.
+    pub election_min: u32,
+    /// The election timeout's exclusive upper bound, in ticks.
+    pub election_max: u32,
+    /// A leader's heartbeat, in ticks.
+    pub heartbeat: u32,
+}
+
+impl TimeoutProfile {
+    /// A configuration for node `id` of `voters` under this profile, with
+    /// appends of at most `batch` entries and the election draw's `seed`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Config::new`].
+    pub fn config(
+        &self,
+        id: u64,
+        voters: &[u64],
+        batch: u64,
+        seed: u64,
+    ) -> Result<Config, ConfigError> {
+        Config::new(
+            id,
+            voters,
+            self.election_min,
+            self.election_max,
+            self.heartbeat,
+            batch,
+            seed,
+        )
+    }
+}
+
+/// One host: the members are processes on it, over loopback, the host
+/// running other load. Measured on a host under build load (one-minute load
+/// 10 to 94): no false election from 6 ticks; recovery p99 about 21 ms.
+pub const SAME_HOST: TimeoutProfile = TimeoutProfile {
+    name: "same host",
+    tick_us: 1_000,
+    election_min: 12,
+    election_max: 24,
+    heartbeat: 3,
+};
+
+/// Dedicated hosts, idle but for the Cluster, on a direct link. Measured on
+/// two idle hosts over a bond (load under 1): no false election at the
+/// smallest swept value, 4 ticks; recovery p99 about 20 ms.
+pub const LAN_DEDICATED: TimeoutProfile = TimeoutProfile {
+    name: "LAN, dedicated hosts",
+    tick_us: 1_000,
+    election_min: 8,
+    election_max: 16,
+    heartbeat: 2,
+};
+
+/// Hosts shared with heavy unrelated load (builds) on a switched LAN.
+/// Measured on build hosts (load up to 100): false elections up to 24
+/// ticks, none from 32; recovery p99 about 132 ms.
+pub const LAN_SHARED: TimeoutProfile = TimeoutProfile {
+    name: "LAN, shared hosts",
+    tick_us: 1_000,
+    election_min: 64,
+    election_max: 128,
+    heartbeat: 16,
+};
+
 /// A core's configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
