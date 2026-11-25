@@ -285,22 +285,45 @@ fn from_raft_into<M>(out: &mut ReadyBuf<M>, entry: &eraftpb::Entry) -> Entry {
 /// only when this holds. Entries past the log (a leader's own, sent
 /// before its persistence) are no log read; a read the budget cut short,
 /// a read error or a mismatch is not a read back.
-pub(crate) fn read_back(sent: &[Entry], log: &mut LogView<'_>) -> bool {
+pub(crate) fn read_back(sent: &[Entry], log: &mut LogView<'_>, reads: &mut ReadBack) -> bool {
     let (Some(first), Some(last)) = (sent.first(), sent.last()) else {
         return true;
     };
     let Some(end) = last.index.checked_add(1) else {
         return false;
     };
-    let Ok(read) = log.entries(first.index..end, u64::MAX) else {
+    // The borrowed read, into the adapter's kept buffers (C5 v2,
+    // "Borrowed forms": no variant is charged for the owned vectors of
+    // `LogView::entries`).
+    if log
+        .entries_into(
+            first.index..end,
+            u64::MAX,
+            &mut reads.read,
+            &mut reads.window,
+        )
+        .is_err()
+    {
         return false;
-    };
+    }
+    let read = &reads.read;
     let matches = read.iter().zip(sent).all(|(logged, sent)| logged == sent);
     // Every entry past what was read must be one the log does not hold
     // yet: a shorter read cut by the budget is not a read back.
     let unread = sent.get(read.len()).map(|entry| entry.index);
     let held = unread.is_some_and(|index| log.last_index().is_some_and(|last| index <= last));
     matches && !held
+}
+
+/// The buffers of [`read_back`], kept by an adapter across duties: the
+/// entries read back and the log's read window, reused by
+/// `LogView::entries_into` once they fit (C5 v2, "Borrowed forms").
+#[derive(Debug, Default)]
+pub(crate) struct ReadBack {
+    /// The entries the last read back took from the log.
+    read: Vec<Entry>,
+    /// The log's read window.
+    window: Vec<u8>,
 }
 
 /// The W1 payload [`RaftRsBatch16`]'s byte cap is sized for (W1's
@@ -390,6 +413,8 @@ pub struct RaftCore<const PRE_VOTE: bool, const BATCH: u64 = 0> {
     now: u64,
     /// The declared limits (W2), when started with them.
     limits: Option<Limits>,
+    /// The kept buffers of the metered read back ([`read_back`]).
+    reads: ReadBack,
 }
 
 impl<const PRE_VOTE: bool, const BATCH: u64> std::fmt::Debug for RaftCore<PRE_VOTE, BATCH> {
@@ -432,19 +457,25 @@ impl<const PRE_VOTE: bool, const BATCH: u64> RaftCore<PRE_VOTE, BATCH> {
     /// it is held back this duty, as a lost message, and raft-rs resends
     /// it. Entries the log does not hold yet (a leader's own, sent before
     /// its persistence) are not a log read. Unmetered, `messages` as is.
-    fn meter(&self, messages: &mut Vec<(NodeId, eraftpb::Message)>, log: &mut LogView<'_>) {
-        if self.limits.is_some() {
-            messages.retain(|(_, message)| Self::read_back(message, log));
+    fn meter(
+        limited: bool,
+        reads: &mut ReadBack,
+        messages: &mut Vec<(NodeId, eraftpb::Message)>,
+        log: &mut LogView<'_>,
+    ) {
+        if limited {
+            messages.retain(|(_, message)| Self::read_back(message, log, reads));
         }
     }
 
-    /// Whether `message`'s logged entries were read back through `log`.
-    fn read_back(message: &eraftpb::Message, log: &mut LogView<'_>) -> bool {
+    /// Whether `message`'s logged entries were read back through `log`,
+    /// into the kept `reads`.
+    fn read_back(message: &eraftpb::Message, log: &mut LogView<'_>, reads: &mut ReadBack) -> bool {
         if message.get_msg_type() != eraftpb::MessageType::MsgAppend {
             return true;
         }
         let sent: Vec<Entry> = message.entries.iter().map(from_raft).collect();
-        read_back(&sent, log)
+        read_back(&sent, log, reads)
     }
 
     /// Stops the core: a mirror write failed, so raft-rs's view of its
@@ -532,6 +563,7 @@ impl<const PRE_VOTE: bool, const BATCH: u64> ConsensusCore for RaftCore<PRE_VOTE
             last_tick: None,
             now: 0,
             limits: None,
+            reads: ReadBack::default(),
         }
     }
 
@@ -554,6 +586,7 @@ impl<const PRE_VOTE: bool, const BATCH: u64> ConsensusCore for RaftCore<PRE_VOTE
             last_tick: None,
             now: 0,
             limits: Some(*limits),
+            reads: ReadBack::default(),
         })
     }
 
@@ -610,7 +643,12 @@ impl<const PRE_VOTE: bool, const BATCH: u64> ConsensusCore for RaftCore<PRE_VOTE
     fn ready_into(&mut self, out: &mut ReadyBuf<Self::Message>, log: &mut LogView<'_>) -> bool {
         if let Some((mut light, hard_state)) = self.light.take() {
             push_messages(&mut out.ready.messages, light.take_messages());
-            self.meter(&mut out.ready.messages, log);
+            Self::meter(
+                self.limits.is_some(),
+                &mut self.reads,
+                &mut out.ready.messages,
+                log,
+            );
             out.ready.hard_state = hard_state;
             for entry in &light.take_committed_entries() {
                 let entry = from_raft_into(out, entry);
@@ -631,9 +669,10 @@ impl<const PRE_VOTE: bool, const BATCH: u64> ConsensusCore for RaftCore<PRE_VOTE
         let mut raw = node.ready();
         let first = raw.entries().first().map(|entry| entry.index);
         push_messages(&mut out.ready.messages, raw.take_messages());
-        self.meter(&mut out.ready.messages, log);
+        let limited = self.limits.is_some();
+        Self::meter(limited, &mut self.reads, &mut out.ready.messages, log);
         push_messages(&mut out.ready.after_persist, raw.take_persisted_messages());
-        self.meter(&mut out.ready.after_persist, log);
+        Self::meter(limited, &mut self.reads, &mut out.ready.after_persist, log);
         out.ready.truncate_from = first.filter(|first| mirrored.is_some_and(|last| *first <= last));
         for entry in raw.entries() {
             let entry = from_raft_into(out, entry);
@@ -891,28 +930,66 @@ mod tests {
         let budget = ReadBudget::new();
         // Both logged entries within the budget: sent, and charged.
         budget.refill(2 * span);
+        let mut reads = ReadBack::default();
         let mut view = LogView::metered(&mut log, Some(&budget));
-        assert!(RaftRs::read_back(&append(&[entry(1), entry(2)]), &mut view));
+        assert!(RaftRs::read_back(
+            &append(&[entry(1), entry(2)]),
+            &mut view,
+            &mut reads
+        ));
         assert_eq!(budget.left(), 0);
+        // The borrowed read keeps its buffers: a second read back of the
+        // same entries reuses them, with no new vector (C5 v2, "Borrowed
+        // forms").
+        let kept = (
+            reads.read.as_ptr(),
+            reads.read.capacity(),
+            reads.window.as_ptr(),
+        );
+        assert!(kept.1 >= 2);
+        budget.refill(2 * span);
+        let mut view = LogView::metered(&mut log, Some(&budget));
+        assert!(RaftRs::read_back(
+            &append(&[entry(1), entry(2)]),
+            &mut view,
+            &mut reads
+        ));
+        assert_eq!(
+            (
+                reads.read.as_ptr(),
+                reads.read.capacity(),
+                reads.window.as_ptr()
+            ),
+            kept
+        );
         // One entry's budget for two logged entries: held back.
         budget.refill(span);
         let mut view = LogView::metered(&mut log, Some(&budget));
         assert!(!RaftRs::read_back(
             &append(&[entry(1), entry(2)]),
-            &mut view
+            &mut view,
+            &mut reads
         ));
         // Nothing left: held back, nothing read.
         budget.refill(0);
         let mut view = LogView::metered(&mut log, Some(&budget));
-        assert!(!RaftRs::read_back(&append(&[entry(2)]), &mut view));
+        assert!(!RaftRs::read_back(
+            &append(&[entry(2)]),
+            &mut view,
+            &mut reads
+        ));
         // A leader's fresh entry, past the log: no read, sent.
-        assert!(RaftRs::read_back(&append(&[entry(3)]), &mut view));
+        assert!(RaftRs::read_back(
+            &append(&[entry(3)]),
+            &mut view,
+            &mut reads
+        ));
         // An entry that differs from the log's: held back.
         budget.refill(span);
         let mut view = LogView::metered(&mut log, Some(&budget));
         let mut other = entry(1);
         other.payload = vec![8; 100];
-        assert!(!RaftRs::read_back(&append(&[other]), &mut view));
+        assert!(!RaftRs::read_back(&append(&[other]), &mut view, &mut reads));
     }
 
     #[test]

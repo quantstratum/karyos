@@ -781,6 +781,9 @@ pub struct OpenRaftCore<const PRE_VOTE: bool, const BATCH: u64 = 0> {
     overruns: u64,
     /// The declared limits (W2), when started with them.
     limits: Option<Limits>,
+    /// The kept buffers of the metered read back
+    /// ([`crate::raft_rs::read_back`]).
+    reads: crate::raft_rs::ReadBack,
 }
 
 /// `openraft` with pre-vote on: the evaluated core.
@@ -942,6 +945,7 @@ impl<const PRE_VOTE: bool, const BATCH: u64> OpenRaftCore<PRE_VOTE, BATCH> {
             out: false,
             overruns: 0,
             limits: limits.copied(),
+            reads: crate::raft_rs::ReadBack::default(),
         };
         let Some(config) = Self::config(limits).filter(|_| readable) else {
             return core;
@@ -1196,13 +1200,14 @@ impl<const PRE_VOTE: bool, const BATCH: u64> ConsensusCore for OpenRaftCore<PRE_
         // one held back is lost to its peer, and its RPC times out and is
         // retried, as after a loss on the network.
         if self.limits.is_some() {
+            let reads = &mut self.reads;
             out.ready.messages.retain(|(_, message)| match message {
                 Message::Request {
                     request: Request::Append(rpc),
                     ..
                 } => {
                     let sent: Option<Vec<Entry>> = rpc.entries.iter().map(to_harness).collect();
-                    sent.is_some_and(|sent| crate::raft_rs::read_back(&sent, log))
+                    sent.is_some_and(|sent| crate::raft_rs::read_back(&sent, log, reads))
                 }
                 _ => true,
             });
