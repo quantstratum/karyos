@@ -2997,8 +2997,10 @@ impl<T: StreamTerms> ReceiverRole<T> {
     /// design wire-key-files section 2.3): each authenticated
     /// subscription's proofs and prototypes, each authenticated image's
     /// verifier (windows kept only for retained file epochs) and sealer
-    /// (withdrawn for every holder, cached SESSION_ABORT_ACKs included,
-    /// once its pairwise file no longer signs), and the authorities of the
+    /// (for every holder, cached SESSION_ABORT_ACKs included: re-keyed to
+    /// the new pairwise signing file on a routine rotation, with no
+    /// re-establishment; withdrawn once its file is revoked, expired or no
+    /// longer verifies), and the authorities of the
     /// signed domains, whose digest cache is emptied when they change. A
     /// disabled store names no key, so every authenticated path stops.
     ///
@@ -3014,7 +3016,14 @@ impl<T: StreamTerms> ReceiverRole<T> {
             if let Some(auth) = image.auth.as_deref_mut() {
                 auth.apply_keys(keys);
             }
+            // The encrypted image's domain 4 sealer, shared with the
+            // sender agent: withdrawn for every holder once its key is
+            // revoked or expired.
+            if let Some(seal) = image.enc_seal.as_mut() {
+                seal.apply_keys(keys);
+            }
         }
+        self.enc.apply_keys(keys);
         if let Some(signed) = self.signed.as_deref_mut()
             && let Some(authorities) = receive_auth::authorities_for(keys, &mut self.authority_keys)
         {
@@ -7718,9 +7727,12 @@ impl<T: StreamTerms> SenderRole<T> {
     /// wire-key-files section 2.3): each authenticated publication's SETUP
     /// proof, prototypes, receivers' verifiers (windows kept only for
     /// retained file epochs) and abort authority, and its installed session
-    /// sealer, which is withdrawn once its channel file no longer signs:
-    /// the publication then sends nothing until a new establishment keys
-    /// it again (fail closed). A disabled store names no key, so every
+    /// sealer, which on a routine rotation moves to the new channel signing
+    /// file under the same establishment (ADR-0086 section 7 overlap; no
+    /// re-establishment), and is withdrawn once its file is revoked,
+    /// expired or no longer verifies: the publication then sends nothing
+    /// until a new establishment keys it again (fail closed). A disabled
+    /// store names no key, so every
     /// authenticated publication stops.
     ///
     /// Called after each `KeyStore::reload` and on each clock tick, for
@@ -7728,14 +7740,13 @@ impl<T: StreamTerms> SenderRole<T> {
     /// exists yet: no authenticated channel can open, and the reload timer
     /// is wired with that enablement.
     pub fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        self.enc.apply_keys(keys);
         for auth in &mut self.publication_auth {
             auth.apply_keys(keys);
-            let signing = keys.signing(auth.channel_key_id());
-            for outbound in &mut self.publications {
-                if outbound.serves(auth.endpoint) && outbound.alias() == auth.alias {
-                    outbound.withdraw_sealer_unless(signing);
-                }
-            }
+        }
+        // Each installed session sealer, of either class.
+        for outbound in &mut self.publications {
+            outbound.follow_keys(keys);
         }
     }
 

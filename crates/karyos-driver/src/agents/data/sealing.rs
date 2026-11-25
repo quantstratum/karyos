@@ -89,7 +89,8 @@ impl SenderAuth {
             Self::Pending | Self::EncPending => false,
             Self::Sealing(sealer) => sealer.can_seal(),
             // It rolls its epoch itself; a seal it refuses sends nothing.
-            Self::Encrypting(_) => true,
+            // A withdrawn sealer (H8 finding 4) seals nothing.
+            Self::Encrypting(sealer) => !sealer.is_withdrawn(),
         }
     }
 
@@ -205,23 +206,32 @@ impl<T: StreamTerms> Outbound<T> {
         }
     }
 
-    /// Withdraws the installed sealer unless it still seals under
-    /// `signing`, the file the key store now names to sign for its
-    /// `key_id` (H8 finding 4): its key is erased and the publication
-    /// sends nothing, as before its establishment, until a new
-    /// establishment installs a sealer of the current key. Returns whether
-    /// one was withdrawn.
-    pub(crate) fn withdraw_sealer_unless(
-        &mut self,
-        signing: Option<&crate::wire_keys::KeyFile>,
-    ) -> bool {
-        match &self.auth {
-            SenderAuth::Sealing(sealer) if !sealer.signs_under(signing) => {
-                // Dropping the box erases the key.
-                self.auth = SenderAuth::Pending;
-                true
+    /// Applies the key store's current key set to the installed session
+    /// sealer of either class (H8 finding 4, ADR-0086 section 7). An
+    /// authenticated one is kept while its channel
+    /// file signs; on a routine file epoch rotation, while its own file
+    /// still verifies through the overlap, re-keyed to the new signing
+    /// file under the same establishment (no re-establishment; the new key
+    /// starts its own sequence); otherwise (revoked, expired, no longer
+    /// verifying, or the store disabled) dropped, which erases it, and the
+    /// publication sends nothing until a new establishment keys it again.
+    pub(crate) fn follow_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        match &mut self.auth {
+            SenderAuth::Sealing(sealer) => {
+                sealer.follow(keys);
+                if !sealer.can_seal() {
+                    // Dropping the box erases the key.
+                    self.auth = SenderAuth::Pending;
+                }
             }
-            SenderAuth::Off | SenderAuth::Pending | SenderAuth::Sealing(_) => false,
+            // An encrypted publication's domain 1 sealer: withdrawn, its
+            // key erased in place, once its key epoch is revoked or
+            // expired. It stays installed as a tombstone: it seals nothing,
+            // and a sealer of the same establishment (salt) is refused, so
+            // no sequence ever restarts under its key; only a new
+            // establishment replaces it.
+            SenderAuth::Encrypting(sealer) => sealer.apply_keys(keys),
+            SenderAuth::Off | SenderAuth::Pending | SenderAuth::EncPending => {}
         }
     }
 

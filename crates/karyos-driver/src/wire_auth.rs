@@ -379,6 +379,23 @@ impl Sealer {
         Self::new(file, self.party, self.alias)
     }
 
+    /// Follows the store's key set as a live session sealer (ADR-0086
+    /// section 7, design wire-key-files section 2.3): see [`key_move`].
+    /// Kept while its file still signs; re-keyed to the new signing file,
+    /// under the same party and so the same establishment, from in-band
+    /// epoch 0 and sequence 0, when the key rotated to a newer file epoch
+    /// and its own still verifies (the overlap); withdrawn otherwise.
+    pub fn follow(&mut self, keys: &dyn KeySet) {
+        match key_move(self.key_ref(), keys) {
+            KeyMove::Keep => {}
+            KeyMove::Rekey(file) => match self.rekeyed(file) {
+                Ok(rekeyed) => *self = rekeyed,
+                Err(_) => self.withdraw(),
+            },
+            KeyMove::Withdraw => self.withdraw(),
+        }
+    }
+
     /// Withdraws the key (H8 finding 4): the secret and the session
     /// profile are erased and it never seals again, so its publication or
     /// image stops sending (fail closed) until a new sealer is made.
@@ -893,6 +910,42 @@ pub trait KeySet {
     fn verifying(&self, key_id: u32) -> [Option<&KeyFile>; MAX_FILE_EPOCHS];
     /// The current file epoch of `key_id` from the durable lineage.
     fn current_epoch(&self, key_id: u32) -> Option<u32>;
+}
+
+/// What a live sealer under the file `(key_id, file_epoch)` does with a
+/// key set.
+#[derive(Debug, Clone, Copy)]
+pub enum KeyMove<'a> {
+    /// Its file still signs.
+    Keep,
+    /// A routine rotation: a newer file epoch signs and its own still
+    /// verifies through the overlap (ADR-0086 section 7). It moves to the
+    /// new file without re-establishment.
+    Rekey(&'a KeyFile),
+    /// Its file was revoked, expired, no longer verifies, or the store is
+    /// disabled: it stops (fail closed).
+    Withdraw,
+}
+
+/// What a live sealer under `key` (its `key_id` and file epoch) does with
+/// `keys`: see [`KeyMove`].
+#[must_use]
+pub fn key_move(key: (u32, u32), keys: &dyn KeySet) -> KeyMove<'_> {
+    let (key_id, epoch) = key;
+    match keys.signing(key_id) {
+        Some(file) if file.file_epoch == epoch => KeyMove::Keep,
+        Some(file)
+            if file.file_epoch > epoch
+                && keys
+                    .verifying(key_id)
+                    .iter()
+                    .flatten()
+                    .any(|held| held.file_epoch == epoch) =>
+        {
+            KeyMove::Rekey(file)
+        }
+        Some(_) | None => KeyMove::Withdraw,
+    }
 }
 
 /// A [`crate::wire_keys::store::KeyStore`]'s key set at the wall clock

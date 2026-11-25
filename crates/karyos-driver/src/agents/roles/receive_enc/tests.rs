@@ -548,3 +548,86 @@ fn a_solicit_goes_sealed_in_domain_6_with_its_trailer() {
     let mut role = rig().role;
     assert_eq!(seal_with(&mut role, &solicit(unbound)), None);
 }
+
+fn second_epoch() -> KeyFile {
+    let mut second = channel(0x55);
+    second.file_epoch = 2;
+    second
+}
+
+/// The envelope sequence of a sealed control.
+fn sequence_of(sealer: &mut SharedSealer) -> u64 {
+    use crate::agents::control::ControlSeal;
+
+    let mut bytes = vec![0_u8; MAX_SEALED];
+    let length = announce().encode(&mut bytes).unwrap();
+    let sealed = sealer.seal_control(&mut bytes, length).unwrap();
+    crate::wire_enc::header(&bytes[..sealed]).unwrap().seq
+}
+
+/// H8 finding 4 and ADR-0114 nonces: dropping a file a domain 6 sealer
+/// does not use (here the previous channel epoch) leaves the sealer as it
+/// is, so the next SOLICIT continues its sequence; nothing is rebuilt.
+#[test]
+fn an_unrelated_dropped_file_keeps_the_rsp_sequence() {
+    use crate::wire_auth::FixedKeys;
+
+    let (_, mut role): (_, super::super::ReceiverRole) =
+        super::super::roles(&AgentConfig::default()).unwrap();
+    role.enc.subscribe(
+        SubscriptionEnc::new(
+            EndpointId(1),
+            6,
+            &[&channel(0x11), &second_epoch()],
+            &[&pairwise()],
+            66,
+        )
+        .unwrap(),
+    );
+    let target = publication_of(&IDENTITY);
+    let mut sealer = role.enc.subscriptions[0]
+        .rsp_sealer(target, ALIAS, [4; 16])
+        .unwrap();
+    assert_eq!(sequence_of(&mut sealer), 0);
+    role.enc.apply_keys(&FixedKeys {
+        files: vec![second_epoch(), pairwise()],
+    });
+    let mut again = role.enc.subscriptions[0]
+        .rsp_sealer(target, ALIAS, [4; 16])
+        .unwrap();
+    assert_eq!(sequence_of(&mut again), 1, "the sequence continues");
+    assert_eq!(role.enc.subscriptions[0].rsp.len(), 1);
+}
+
+/// H8 finding 4 and ADR-0114 nonces: a domain 6 sealer whose own pairwise
+/// file was dropped is withdrawn and kept as a tombstone: the same target
+/// and boot id get it again, which seals nothing, and it is never rebuilt
+/// with its sequence restarted under the same key and party.
+#[test]
+fn a_withdrawn_rsp_sealer_is_never_rebuilt() {
+    use crate::agents::control::ControlSeal;
+    use crate::wire_auth::FixedKeys;
+
+    let (_, mut role): (_, super::super::ReceiverRole) =
+        super::super::roles(&AgentConfig::default()).unwrap();
+    role.enc.subscribe(
+        SubscriptionEnc::new(EndpointId(1), 6, &[&channel(0x11)], &[&pairwise()], 66).unwrap(),
+    );
+    let target = publication_of(&IDENTITY);
+    let mut sealer = role.enc.subscriptions[0]
+        .rsp_sealer(target, ALIAS, [4; 16])
+        .unwrap();
+    assert_eq!(sequence_of(&mut sealer), 0);
+    role.enc.apply_keys(&FixedKeys {
+        files: vec![channel(0x11)],
+    });
+    for _ in 0..2 {
+        let mut again = role.enc.subscriptions[0]
+            .rsp_sealer(target, ALIAS, [4; 16])
+            .unwrap();
+        let mut bytes = vec![0_u8; MAX_SEALED];
+        let length = announce().encode(&mut bytes).unwrap();
+        assert!(again.seal_control(&mut bytes, length).is_none());
+    }
+    assert_eq!(role.enc.subscriptions[0].rsp.len(), 1, "no rebuild");
+}

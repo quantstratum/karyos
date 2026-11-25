@@ -459,6 +459,16 @@ pub trait ControlSeal {
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize>;
     /// Withdraws and erases its key: it seals nothing again (H8 finding 4).
     fn withdraw(&mut self);
+    /// Re-keys it to `file` after a routine file epoch rotation, under the
+    /// same party. The default withdraws (fail closed): a sealer that
+    /// cannot move to another file never keeps the old key.
+    fn rekey(&mut self, file: &crate::wire_keys::KeyFile) {
+        let _ = file;
+        self.withdraw();
+    }
+    /// Applies the key store's current key set (H8 finding 4): withdrawn
+    /// once its key is revoked, expired or no longer verifies.
+    fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet);
 }
 
 impl ControlSeal for Sealer {
@@ -473,6 +483,17 @@ impl ControlSeal for Sealer {
     fn withdraw(&mut self) {
         Sealer::withdraw(self);
     }
+
+    fn rekey(&mut self, file: &crate::wire_keys::KeyFile) {
+        match self.rekeyed(file) {
+            Ok(rekeyed) => *self = rekeyed,
+            Err(_) => Sealer::withdraw(self),
+        }
+    }
+
+    fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        self.follow(keys);
+    }
 }
 
 /// An image's session [`Sealer`], shared between the receiver agent, which
@@ -483,6 +504,9 @@ impl ControlSeal for Sealer {
 pub struct SharedSealer {
     sealer: Arc<Mutex<dyn ControlSeal + Send>>,
     domain: Domain,
+    /// Set once the key is withdrawn: no holder seals again, whatever the
+    /// shared sealer can erase itself (H8 finding 4).
+    withdrawn: Arc<core::sync::atomic::AtomicBool>,
 }
 
 impl core::fmt::Debug for SharedSealer {
@@ -501,6 +525,7 @@ impl SharedSealer {
         Self {
             sealer: Arc::new(Mutex::new(sealer)),
             domain,
+            withdrawn: Arc::default(),
         }
     }
 
@@ -511,6 +536,7 @@ impl SharedSealer {
         Self {
             sealer: Arc::new(Mutex::new(seal)),
             domain,
+            withdrawn: Arc::default(),
         }
     }
 
@@ -522,6 +548,7 @@ impl SharedSealer {
         Self {
             sealer: Arc::new(Mutex::new(proof)),
             domain,
+            withdrawn: Arc::default(),
         }
     }
 }
@@ -532,6 +559,9 @@ impl ControlSeal for SharedSealer {
     }
 
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
+        if self.withdrawn.load(core::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
         self.sealer.lock().ok()?.seal_control(buffer, frames)
     }
 
@@ -539,10 +569,28 @@ impl ControlSeal for SharedSealer {
     /// controls, its repairs and any cached SESSION_ABORT_ACK resend all
     /// seal nothing again. A poisoned lock is still withdrawn.
     fn withdraw(&mut self) {
+        self.withdrawn
+            .store(true, core::sync::atomic::Ordering::Release);
         self.sealer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .withdraw();
+    }
+
+    /// Re-keys the shared key for every holder at once.
+    fn rekey(&mut self, file: &crate::wire_keys::KeyFile) {
+        self.sealer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rekey(file);
+    }
+
+    /// Applies the key set to the shared key for every holder at once.
+    fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        self.sealer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .apply_keys(keys);
     }
 }
 
@@ -556,6 +604,16 @@ impl ControlSeal for Proof {
     }
 
     fn withdraw(&mut self) {
+        Proof::withdraw(self);
+    }
+
+    /// A shared proof is a short-lived clone: it is withdrawn, and the
+    /// next one comes from the re-keyed original.
+    fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        self.apply(keys);
+    }
+
+    fn rekey(&mut self, _file: &crate::wire_keys::KeyFile) {
         Proof::withdraw(self);
     }
 }

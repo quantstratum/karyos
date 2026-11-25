@@ -147,6 +147,21 @@ impl PublicationEnc {
         })
     }
 
+    /// Applies the key store's current key set (H8 finding 4): the files
+    /// no longer named are erased; the domain 5 sealer and the bound
+    /// receiver's domain 4 opener are withdrawn once their key epoch or a
+    /// pairwise file is revoked or expired, so the publication neither
+    /// announces nor accepts its receiver's controls (fail closed). Its
+    /// domain 1 sealer is the `Outbound`'s ([`super::SenderRole::apply_keys`]).
+    pub(crate) fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        self.keys.retain(keys);
+        self.pairwise.retain(keys);
+        self.setup.apply_keys(keys);
+        if let Some(bound) = self.bound.as_mut() {
+            bound.opener.apply_keys(keys);
+        }
+    }
+
     /// Opens `datagram`, an envelope for this publication, into `out`
     /// before any inner frame is read, and returns its control. The
     /// reason of a refusal is counted and nothing else changes.
@@ -401,6 +416,14 @@ pub(crate) struct SenderEnc {
 }
 
 impl SenderEnc {
+    /// Applies the key store's current key set to every encrypted
+    /// publication (H8 finding 4): see [`PublicationEnc::apply_keys`].
+    pub(crate) fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        for publication in &mut self.publications {
+            publication.apply_keys(keys);
+        }
+    }
+
     /// Makes the publication `publication` names encrypted (tests); its
     /// `Outbound` must have been made encrypted too.
     #[cfg(test)]

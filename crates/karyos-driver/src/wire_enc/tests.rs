@@ -809,3 +809,114 @@ fn sealing_and_opening_allocate_nothing() {
     assert_eq!(result, Ok(true));
     assert_eq!(allocations, 0);
 }
+
+/// H8 finding 4: a withdrawn sealer erases its key in place and never
+/// seals again, not even after a roll, which it refuses too.
+#[test]
+fn a_withdrawn_sealer_never_seals_again_even_after_a_roll() {
+    let mut sealer = sender();
+    let _ = seal(&mut sealer, &frame(DATA));
+    sealer.withdraw();
+    assert!(sealer.is_withdrawn());
+    assert_eq!(sealer.key().context().domain, Domain::Setup, "replaced");
+    sealer.roll_now();
+    let mut bytes = vec![0_u8; MAX_SEALED];
+    bytes[..32].copy_from_slice(&frame(DATA));
+    assert!(matches!(
+        sealer.seal(&mut bytes, 32),
+        Err(EncSendError::Withdrawn)
+    ));
+    assert!(!DatagramSeal::can_seal(&sealer));
+}
+
+/// H8 finding 4: a withdrawn opener opens nothing, under its current
+/// epoch or the next, and refuses a resynchronisation.
+#[test]
+fn a_withdrawn_opener_never_opens_again() {
+    let mut sealer = sender();
+    let mut opener = opener();
+    let mut channel = EncChannel::default();
+    assert!(open(&mut opener, &mut channel, &seal(&mut sealer, &frame(DATA))).is_ok());
+    let current = seal(&mut sealer, &frame(DATA));
+    sealer.roll_now();
+    let next = seal(&mut sealer, &frame(DATA));
+    opener.withdraw();
+    assert!(opener.is_withdrawn());
+    assert_eq!(
+        open(&mut opener, &mut channel, &current),
+        Err(EncRejection::Epoch)
+    );
+    assert_eq!(
+        open(&mut opener, &mut channel, &next),
+        Err(EncRejection::Epoch)
+    );
+    assert_eq!(
+        opener.resync(1, 5, clock()),
+        Err(EncRejection::ResyncRefused)
+    );
+}
+
+/// H8 finding 4: applying a key set that no longer names the key epoch
+/// in use (revoked, expired, or the store disabled) withdraws the sealer
+/// and the opener; a receiver-domain sealer is withdrawn once its
+/// pairwise file is gone; an unchanged set changes nothing.
+#[test]
+fn a_revoked_key_withdraws_the_sealer_and_the_opener() {
+    use crate::wire_auth::FixedKeys;
+
+    let mut sealer = sender();
+    let mut opener = opener();
+    let same = FixedKeys {
+        files: vec![channel_file(1, 0x11)],
+    };
+    sealer.apply_keys(&same);
+    opener.apply_keys(&same);
+    assert!(!sealer.is_withdrawn() && !opener.is_withdrawn());
+    let mut channel = EncChannel::default();
+    assert!(open(&mut opener, &mut channel, &seal(&mut sealer, &frame(DATA))).is_ok());
+    sealer.apply_keys(&FixedKeys::default());
+    opener.apply_keys(&FixedKeys::default());
+    assert!(sealer.is_withdrawn() && opener.is_withdrawn());
+    let mut receiver = EncSealer::new(
+        &keys(),
+        Some(&pairs(0x22)),
+        context(Domain::Receiver),
+        clock,
+    )
+    .unwrap();
+    receiver.apply_keys(&same);
+    assert!(receiver.is_withdrawn(), "its pairwise file is gone");
+}
+
+/// H8 finding 4: the erase is infallible whatever domain is current: a
+/// bootstrap (domain 5) and a domain 6 sealer both overwrite their key in
+/// place with the zero key under the checked bootstrap context, its
+/// counters from 0, and seal nothing again.
+#[test]
+fn withdraw_erases_under_a_bootstrap_or_domain_6_context() {
+    let mut setup = EncSealer::new(&keys(), None, context(Domain::Setup), clock).unwrap();
+    let _ = seal(&mut setup, &frame(0x0E));
+    let mut rsp = EncSealer::new(
+        &keys(),
+        Some(&pairs(0x22)),
+        context(Domain::RspSetup),
+        clock,
+    )
+    .unwrap();
+    let _ = seal(&mut rsp, &frame(0x0E));
+    for sealer in [&mut setup, &mut rsp] {
+        assert_eq!(sealer.key().next_seq(), 1);
+        sealer.withdraw();
+        let erased = sealer.key().context();
+        assert_eq!(
+            (erased.domain, erased.receiver, erased.salt),
+            (Domain::Setup, None, Salt::Empty)
+        );
+        assert_eq!(sealer.key().next_seq(), 0, "overwritten in place");
+        let mut bytes = vec![0_u8; MAX_SEALED];
+        assert!(matches!(
+            sealer.seal(&mut bytes, 32),
+            Err(EncSendError::Withdrawn)
+        ));
+    }
+}

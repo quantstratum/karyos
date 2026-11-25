@@ -271,12 +271,6 @@ impl PublicationAuth {
         self.clock = clock;
     }
 
-    /// The channel key's `key_id`: its signing file is the one the
-    /// session's domain 1 sealer must still be under.
-    pub(crate) fn channel_key_id(&self) -> u32 {
-        self.setup.key_id()
-    }
-
     /// Applies the store's current key set (H8 finding 4), as one change to
     /// every key the publication holds: the SETUP proof and the domain 1
     /// prototype follow the channel signing key (re-keyed, or withdrawn
@@ -943,5 +937,113 @@ mod tests {
         assert!(auth.sealer(party).is_err());
         let mut bytes = vec![0u8; 64 + ENVELOPE_LEN];
         assert!(auth.setup.seal(&mut bytes, 8).is_err());
+    }
+
+    /// A channel key file of `epoch` (key 3).
+    fn channel_epoch(epoch: u32, fill: char) -> KeyFile {
+        let secret: String = core::iter::repeat_n(fill, 64).collect();
+        key(
+            &format!("3-{epoch}.key"),
+            &format!(
+                "format=karyos-wire-key-v1\nkey_id=3\nfile_epoch={epoch}\npurpose=channel\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret={secret}\nchannel_id=7\nstream_id=6\n"
+            ),
+        )
+    }
+
+    /// ADR-0086 section 7, a routine file epoch rotation of both keys:
+    /// while the previous epochs still verify (the overlap), the session's
+    /// domain 1 sealer and the image's domain 4 sealer move to the new
+    /// signing files under the same establishment, so DATA and SMs keep
+    /// flowing with no re-establishment, and datagrams sealed before the
+    /// move still verify; once the overlap ends the previous epochs stop
+    /// verifying while the session goes on.
+    #[test]
+    fn a_rotation_keeps_the_session_delivering_in_both_directions() {
+        use crate::agents::control::ControlSeal;
+        use crate::agents::roles::receive_auth::ImageAuth;
+        use crate::wire_auth::FixedKeys;
+
+        let c1 = channel_epoch(1, '1');
+        let p1 = pairwise(1, '2');
+        let mut auth =
+            PublicationAuth::new(EndpointId(1), ALIAS, IDENTITY, 1, &c1, &[&p1]).unwrap();
+        auth.set_clock(|| 1_000);
+        let Ok(Opened::RspSetup(_, establishing)) =
+            open(&mut auth, &challenge(&p1, [1, 1], [9, 9]))
+        else {
+            panic!("the receiver binds");
+        };
+        let mut session = auth.sealer(establishing.party).unwrap();
+        let receiver = Party::Receiver {
+            identity: IDENTITY,
+            receiver_boot_id: [1, 1],
+            receiver_id: 66,
+        };
+        let mut image = ImageAuth::new([&c1], &p1, establishing.party, receiver, ALIAS).unwrap();
+        image.set_clock(|| 1_000);
+        let mut image_sealer = image.sealer();
+        let data = |sealer: &mut Sealer| {
+            let mut bytes = vec![0u8; 8 + ENVELOPE_LEN];
+            let length = sealer.seal(&mut bytes, 8).unwrap();
+            bytes.truncate(length);
+            bytes
+        };
+        let sm_from_image = |sealer: &mut crate::agents::control::SharedSealer| {
+            sealed(&status([1, 1]), |bytes, length| {
+                sealer.seal_control(bytes, length).unwrap()
+            })
+        };
+        let deliver = |image: &mut ImageAuth, bytes: &[u8]| {
+            let checked = image.check(bytes, 1_000)?;
+            image.commit(checked, 1_000)
+        };
+        assert!(deliver(&mut image, &data(&mut session)).is_ok());
+        assert!(matches!(
+            open(&mut auth, &sm_from_image(&mut image_sealer)),
+            Ok(Opened::Receiver(_))
+        ));
+        let late_data = data(&mut session);
+        let late_sm = sm_from_image(&mut image_sealer);
+        // Sealed under epoch 1, first seen after the overlap.
+        let stale_data = data(&mut session);
+        // The rotation: epoch 2 signs, epoch 1 still verifies.
+        let overlap = FixedKeys {
+            files: vec![
+                channel_epoch(1, '1'),
+                channel_epoch(2, '7'),
+                pairwise(1, '2'),
+                pairwise(2, '4'),
+            ],
+        };
+        auth.apply_keys(&overlap);
+        image.apply_keys(&overlap);
+        session.follow(&overlap);
+        assert_eq!(session.key_ref(), (3, 2));
+        assert_eq!(image.sealer_key(), (9, 2));
+        assert!(!image.withdrawn());
+        // Both directions keep flowing under the new keys, with no new
+        // establishment, and the old epoch's in-flight datagrams verify.
+        let new_data = data(&mut session);
+        assert!(deliver(&mut image, &new_data).is_ok());
+        let new_sm = sm_from_image(&mut image_sealer);
+        assert!(matches!(open(&mut auth, &new_sm), Ok(Opened::Receiver(_))));
+        assert!(deliver(&mut image, &late_data).is_ok());
+        assert!(matches!(open(&mut auth, &late_sm), Ok(Opened::Receiver(_))));
+        // The overlap ends: epoch 1 no longer verifies, the session goes on.
+        let after = FixedKeys {
+            files: vec![channel_epoch(2, '7'), pairwise(2, '4')],
+        };
+        auth.apply_keys(&after);
+        image.apply_keys(&after);
+        session.follow(&after);
+        assert!(!image.withdrawn());
+        assert!(deliver(&mut image, &stale_data).is_err());
+        assert!(deliver(&mut image, &data(&mut session)).is_ok());
+        assert!(matches!(
+            open(&mut auth, &sm_from_image(&mut image_sealer)),
+            Ok(Opened::Receiver(_))
+        ));
+        let mut old_receiver = receiver_sealer(&p1, [1, 1]);
+        assert!(open(&mut auth, &sm(&mut old_receiver, &status([1, 1]))).is_err());
     }
 }

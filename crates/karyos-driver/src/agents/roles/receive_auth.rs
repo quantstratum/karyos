@@ -363,21 +363,38 @@ impl ImageAuth {
     /// Applies the store's current key set (H8 finding 4): the domain 1
     /// verifier keeps the windows of the channel file epochs that still
     /// verify and erases the rest, and an expired previous in-band epoch
-    /// is erased; the domain 4 sealer, shared with the sender agent and
-    /// any cached SESSION_ABORT_ACK, is withdrawn for every holder once
-    /// its pairwise file no longer signs, and stays withdrawn: the image
-    /// sends nothing until it is established again (fail closed).
+    /// is erased. The domain 4 sealer, shared with the sender agent and
+    /// any cached SESSION_ABORT_ACK, follows [`crate::wire_auth::key_move`]
+    /// for every holder at once: on a routine rotation it moves to the new
+    /// pairwise signing file under the same establishment; once its file
+    /// is revoked, expired or no longer verifies (or the store is
+    /// disabled) it is withdrawn and stays withdrawn: the image sends
+    /// nothing until it is established again (fail closed).
     pub(crate) fn apply_keys(&mut self, keys: &dyn KeySet) {
+        use crate::wire_auth::{KeyMove, key_move};
+
         self.verifier.apply(keys);
         self.verifier.tick(self.now());
         if self.withdrawn {
             return;
         }
-        let signing = keys.signing(self.sealer_key.0);
-        if signing.map(|file| (file.key_id, file.file_epoch)) != Some(self.sealer_key) {
-            self.sealer.withdraw();
-            self.withdrawn = true;
+        match key_move(self.sealer_key, keys) {
+            KeyMove::Keep => {}
+            KeyMove::Rekey(file) => {
+                self.sealer.rekey(file);
+                self.sealer_key = (file.key_id, file.file_epoch);
+            }
+            KeyMove::Withdraw => {
+                self.sealer.withdraw();
+                self.withdrawn = true;
+            }
         }
+    }
+
+    /// The `key_id` and file epoch its domain 4 sealer is under (tests).
+    #[cfg(test)]
+    pub(crate) fn sealer_key(&self) -> (u32, u32) {
+        self.sealer_key
     }
 
     /// Whether its sealer was withdrawn by a key reload.
@@ -556,9 +573,9 @@ mod tests {
         });
         assert!(!auth.withdrawn());
         assert!(held.seal_control(&mut buffer, 8).is_some());
-        // The pairwise key moved to epoch 2: epoch 1 no longer signs.
+        // Epoch 1 revoked while epoch 2 signs: it no longer verifies.
         auth.apply_keys(&FixedKeys {
-            files: vec![channel(1), pairwise(1), pairwise(2)],
+            files: vec![channel(1), pairwise(2)],
         });
         assert!(auth.withdrawn());
         assert!(held.seal_control(&mut buffer, 8).is_none());

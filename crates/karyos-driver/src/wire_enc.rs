@@ -248,6 +248,8 @@ pub enum EncKeyError {
 
 /// One secret of a `profile_id=16` file and its file epoch.
 struct Secret {
+    /// The `key_id` of its file, to follow the key store (H8 finding 4).
+    key_id: u32,
     epoch: u32,
     secret: Zeroizing<[u8; KEY_LEN]>,
 }
@@ -263,6 +265,7 @@ impl core::fmt::Debug for Secret {
 impl Clone for Secret {
     fn clone(&self) -> Self {
         Self {
+            key_id: self.key_id,
             epoch: self.epoch,
             secret: Zeroizing::new(*self.secret),
         }
@@ -274,11 +277,50 @@ fn secret_of(file: &KeyFile, purpose: Purpose) -> Result<Secret, EncKeyError> {
         .map_err(|_| EncKeyError::Class)?;
     match &file.material {
         Material::Secret(secret) => Ok(Secret {
+            key_id: file.key_id,
             epoch: file.file_epoch,
             secret: Zeroizing::new(**secret),
         }),
         Material::Public(_) => Err(EncKeyError::Class),
     }
+}
+
+/// Whether the key set still names `secret`'s file among those that
+/// verify its `key_id` (H8 finding 4).
+fn still_verifies(secret: &Secret, keys: &dyn crate::wire_auth::KeySet) -> bool {
+    keys.verifying(secret.key_id)
+        .iter()
+        .flatten()
+        .any(|file| file.file_epoch == secret.epoch)
+}
+
+/// The context a withdrawn sealer or opener erases its keys under (H8
+/// finding 4): a bootstrap context of the same key epoch and publication,
+/// with no receiver, salt or pairwise key. It is checked when the sealer
+/// or opener is made, so the erasing re-key cannot be refused: the old key
+/// is overwritten in place, whatever domain was current (a bootstrap or
+/// domain 6 one included), and never survives a withdrawal. The erased key
+/// is never used: a withdrawn sealer or opener refuses before any key is
+/// read.
+fn erase_context(context: &KeyContext) -> Result<KeyContext, ContextError> {
+    let erase = KeyContext {
+        domain: Domain::Setup,
+        party_epoch: 0,
+        receiver: None,
+        salt: Salt::Empty,
+        ..*context
+    };
+    erase.validate()?;
+    Ok(erase)
+}
+
+/// Overwrites `key` in place with the all-zero key under `erase`, a
+/// context [`erase_context`] checked: the re-key's every condition then
+/// holds (a non-empty key, a valid bootstrap context, no pairwise key for
+/// a non-receiver domain), so it always takes effect.
+fn erase(key: &mut AesGcmSiv, erase: KeyContext) {
+    let erased = key.rekey(&[0; KEY_LEN], erase, &[]);
+    debug_assert!(erased.is_ok(), "the erase context was checked");
 }
 
 /// The channel key files of an `encrypted` channel: the `IKM` of every
@@ -323,6 +365,22 @@ impl ChannelKeys {
             .map(|file| file.epoch)
             .max()
             .unwrap_or(0)
+    }
+
+    /// Drops, and so erases, every file the key set no longer names to
+    /// verify (revoked, expired, or the store disabled; H8 finding 4).
+    /// Returns whether one was dropped.
+    pub fn retain(&mut self, keys: &dyn crate::wire_auth::KeySet) -> bool {
+        let mut dropped = false;
+        for slot in &mut self.files {
+            if slot
+                .take_if(|secret| !still_verifies(secret, keys))
+                .is_some()
+            {
+                dropped = true;
+            }
+        }
+        dropped
     }
 
     /// The `IKM` of `key_epoch`, if held.
@@ -394,6 +452,40 @@ impl PairwiseFiles {
             }
         }
         Ok(Self { files: slots })
+    }
+
+    /// Drops, and so erases, every file the key set no longer names to
+    /// verify (H8 finding 4). Returns whether one was dropped.
+    pub fn retain(&mut self, keys: &dyn crate::wire_auth::KeySet) -> bool {
+        let mut dropped = false;
+        for slot in &mut self.files {
+            if slot
+                .take_if(|file| !still_verifies(&file.secret, keys))
+                .is_some()
+            {
+                dropped = true;
+            }
+        }
+        dropped
+    }
+
+    /// The epochs held for `receiver_id`, highest first.
+    fn epochs_of(&self, receiver_id: u64) -> [Option<u32>; 2] {
+        let mut out: [Option<u32>; 2] = [None, None];
+        for file in self
+            .files
+            .iter()
+            .flatten()
+            .filter(|file| file.receiver_id == receiver_id)
+        {
+            let epoch = Some(file.secret.epoch);
+            out = match out {
+                [None, _] => [epoch, None],
+                [Some(first), _] if file.secret.epoch > first => [epoch, Some(first)],
+                [first, _] => [first, epoch],
+            };
+        }
+        out
     }
 
     /// Whether a file names `receiver_id`.
@@ -694,6 +786,9 @@ pub enum EncSendError {
     /// The next epoch could not be derived.
     #[error(transparent)]
     Key(#[from] EncKeyError),
+    /// The key was withdrawn by a key reload (H8 finding 4).
+    #[error("the key was withdrawn")]
+    Withdrawn,
 }
 
 /// One encrypting party in one domain (section 5): its key, rolled to the
@@ -708,6 +803,11 @@ pub struct EncSealer {
     derived_ns: u64,
     rate_interval: AtomicU64,
     clock: fn() -> u64,
+    /// The checked context its key is erased under on withdrawal.
+    erase: KeyContext,
+    /// Withdrawn by a key reload (H8 finding 4): checked first by every
+    /// seal, roll and re-key, so it never seals again.
+    withdrawn: bool,
 }
 
 impl core::fmt::Debug for EncSealer {
@@ -740,7 +840,57 @@ impl EncSealer {
             derived_ns: clock(),
             rate_interval: AtomicU64::new(0),
             clock,
+            erase: erase_context(&context)?,
+            withdrawn: false,
         })
+    }
+
+    /// Withdraws it (H8 finding 4): its key files are dropped and its key
+    /// is replaced in place, both erased on drop, and every later seal,
+    /// roll or re-key is refused with [`EncSendError::Withdrawn`].
+    pub fn withdraw(&mut self) {
+        self.withdrawn = true;
+        self.keys.files = [None, None];
+        self.pairwise = None;
+        erase(&mut self.key, self.erase);
+    }
+
+    /// Whether it was withdrawn.
+    #[must_use]
+    pub fn is_withdrawn(&self) -> bool {
+        self.withdrawn
+    }
+
+    /// Applies the key store's current key set (H8 finding 4): files no
+    /// longer named are erased, and once its own key epoch, or any of its
+    /// pairwise files, is revoked or expired it is withdrawn (fail
+    /// closed).
+    pub fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        if self.withdrawn {
+            return;
+        }
+        // Only its own key matters: the channel file of its key epoch and,
+        // in a receiver domain, the pairwise file that seals (the highest
+        // epoch of its receiver). An unrelated file dropped leaves it, and
+        // its sequence, as it is: a rebuilt sealer would reuse nonces.
+        let epoch = self.key.context().key_epoch;
+        let sealing = self.key.context().receiver.and_then(|receiver| {
+            let [highest, _] = self.pairwise.as_ref()?.epochs_of(receiver.receiver_id);
+            highest.map(|epoch| (receiver.receiver_id, epoch))
+        });
+        self.keys.retain(keys);
+        if let Some(pairwise) = self.pairwise.as_mut() {
+            pairwise.retain(keys);
+        }
+        let pairwise_lost = sealing.is_some_and(|(receiver_id, epoch)| {
+            !self
+                .pairwise
+                .as_ref()
+                .is_some_and(|pairwise| pairwise.epochs_of(receiver_id).contains(&Some(epoch)))
+        });
+        if pairwise_lost || self.keys.ikm(epoch).is_none() {
+            self.withdraw();
+        }
     }
 
     /// The current key's context.
@@ -780,6 +930,9 @@ impl EncSealer {
 
     /// Moves to the next `party_epoch` under the same `key_epoch`.
     fn roll(&mut self, now_ns: u64) -> Result<(), EncSendError> {
+        if self.withdrawn {
+            return Err(EncSendError::Withdrawn);
+        }
         let mut next = *self.key.context();
         next.party_epoch = next
             .party_epoch
@@ -817,6 +970,9 @@ impl EncSealer {
     ///
     /// [`EncSendError`]; nothing is written.
     pub fn seal(&mut self, datagram: &mut [u8], frames: usize) -> Result<usize, EncSendError> {
+        if self.withdrawn {
+            return Err(EncSendError::Withdrawn);
+        }
         let now_ns = (self.clock)();
         if self.domain().is_bootstrap() {
             self.charge_bootstrap(now_ns)?;
@@ -868,9 +1024,10 @@ impl DatagramSeal for crate::wire_auth::Sealer {
 }
 
 impl DatagramSeal for EncSealer {
-    /// It rolls its epoch itself; a seal it refuses sends nothing.
+    /// It rolls its epoch itself; a seal it refuses sends nothing. A
+    /// withdrawn one never seals.
     fn can_seal(&self) -> bool {
-        true
+        !self.withdrawn
     }
 
     fn envelope(&self) -> usize {
@@ -924,6 +1081,11 @@ pub struct EncOpener {
     /// A second key made at construction: the first promotion's recycled
     /// slot, before any previous epoch exists to recycle.
     spare: Option<AesGcmSiv>,
+    /// The checked context its keys are erased under on withdrawal.
+    erase: KeyContext,
+    /// Withdrawn by a key reload (H8 finding 4): checked first by every
+    /// open, resynchronisation and re-key, so it never opens again.
+    withdrawn: bool,
 }
 
 impl core::fmt::Debug for EncOpener {
@@ -969,7 +1131,73 @@ impl EncOpener {
             previous: None,
             scratch,
             spare: Some(spare),
+            erase: erase_context(&context)?,
+            withdrawn: false,
         })
+    }
+
+    /// Withdraws it (H8 finding 4): its key files, previous and spare keys
+    /// are dropped and its current and scratch keys replaced in place, all
+    /// erased on drop; every later open is refused with
+    /// [`EncRejection::Epoch`] and every resynchronisation with
+    /// [`EncRejection::ResyncRefused`].
+    pub fn withdraw(&mut self) {
+        self.withdrawn = true;
+        self.keys.files = [None, None];
+        self.pairwise = None;
+        self.previous = None;
+        self.spare = None;
+        erase(&mut self.current.key, self.erase);
+        erase(&mut self.scratch, self.erase);
+    }
+
+    /// Whether it was withdrawn.
+    #[must_use]
+    pub fn is_withdrawn(&self) -> bool {
+        self.withdrawn
+    }
+
+    /// Applies the key store's current key set (H8 finding 4): files no
+    /// longer named are erased; a previous epoch whose file is gone is
+    /// dropped; once its current key epoch, or any of its pairwise files,
+    /// is revoked or expired it is withdrawn (fail closed).
+    pub fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        if self.withdrawn {
+            return;
+        }
+        // Every pairwise file of its receiver verifies a trailer, so losing
+        // any of them withdraws it; another receiver's file does not.
+        let receiver = self.current.key.context().receiver;
+        let held = receiver.and_then(|receiver| {
+            Some((
+                receiver.receiver_id,
+                self.pairwise.as_ref()?.epochs_of(receiver.receiver_id),
+            ))
+        });
+        self.keys.retain(keys);
+        if let Some(pairwise) = self.pairwise.as_mut() {
+            pairwise.retain(keys);
+        }
+        let pairwise_lost = held.is_some_and(|(receiver_id, held)| {
+            let now = self
+                .pairwise
+                .as_ref()
+                .map_or([None, None], |pairwise| pairwise.epochs_of(receiver_id));
+            held.iter()
+                .flatten()
+                .any(|epoch| !now.contains(&Some(*epoch)))
+        });
+        if pairwise_lost || self.keys.ikm(self.epochs().0).is_none() {
+            self.withdraw();
+            return;
+        }
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|(slot, _)| self.keys.ikm(slot.key.context().key_epoch).is_none())
+        {
+            self.previous = None;
+        }
     }
 
     /// The current epoch pair.
@@ -1061,6 +1289,10 @@ impl EncOpener {
         now_ns: u64,
         inner: impl FnOnce(&[u8]) -> Result<(), EncRejection>,
     ) -> Result<Accepted, EncRejection> {
+        if self.withdrawn {
+            zeroize::Zeroize::zeroize(out);
+            return Err(EncRejection::Epoch);
+        }
         let header = header(datagram)?;
         let selected = self.select(&header, rate, now_ns)?;
         if selected == Selected::Next {
@@ -1115,6 +1347,9 @@ impl EncOpener {
         party_epoch: u16,
         now_ns: u64,
     ) -> Result<(), EncRejection> {
+        if self.withdrawn {
+            return Err(EncRejection::ResyncRefused);
+        }
         if (key_epoch, party_epoch) < self.epochs() {
             return Err(EncRejection::ResyncRefused);
         }

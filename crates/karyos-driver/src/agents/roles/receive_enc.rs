@@ -82,6 +82,14 @@ impl ControlSeal for EncSealer {
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
         self.seal(buffer, frames).ok()
     }
+
+    fn withdraw(&mut self) {
+        EncSealer::withdraw(self);
+    }
+
+    fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        EncSealer::apply_keys(self, keys);
+    }
 }
 
 /// A control an encrypted subscription cannot seal: it is refused, never
@@ -97,6 +105,11 @@ impl ControlSeal for Refuse {
     fn seal_control(&mut self, _: &mut [u8], _: usize) -> Option<usize> {
         None
     }
+
+    /// It holds no key and seals nothing.
+    fn withdraw(&mut self) {}
+
+    fn apply_keys(&mut self, _: &dyn crate::wire_auth::KeySet) {}
 }
 
 /// An encrypted subscription's keys.
@@ -301,6 +314,28 @@ impl ReceiverEnc {
         image
             .opener
             .resync(answer.key_epoch, answer.party_epoch, now)
+    }
+
+    /// Applies the key store's current key set (H8 finding 4): each
+    /// subscription drops the files no longer named, and each of its
+    /// domain 6 sealers is withdrawn only once its own key is revoked or
+    /// expired; each image's domain 1 opener is withdrawn once its key
+    /// epoch is revoked or expired.
+    pub(crate) fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        for subscription in &mut self.subscriptions {
+            subscription.keys.retain(keys);
+            subscription.pairwise.retain(keys);
+            // Each domain 6 sealer follows its own key only, keeping its
+            // sequence; a withdrawn one stays in the table as a tombstone,
+            // so its (target, key, boot id) is refused and never rebuilt
+            // with a sequence restarted at 0 (nonce reuse).
+            for (_, _, sealer) in &mut subscription.rsp {
+                sealer.apply_keys(keys);
+            }
+        }
+        for image in &mut self.images {
+            image.opener.apply_keys(keys);
+        }
     }
 
     /// Makes a subscription encrypted (tests).

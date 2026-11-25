@@ -8113,6 +8113,85 @@ fn encrypted_rig() -> (Rig, EndpointId) {
     (rig, b)
 }
 
+/// Appends `messages` and runs the rig until they are delivered or 600
+/// rounds pass; returns what was delivered.
+fn enc_deliver(
+    rig: &mut Rig,
+    subscriber: &mut karyos_sys::log_buffer::Subscription<std::sync::Arc<LogBuffer>>,
+    messages: &[Vec<u8>],
+) -> Vec<Vec<u8>> {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    for message in messages {
+        let _ = rig.log.as_mut().unwrap().publications[0]
+            .append(message, AppendOptions::default())
+            .unwrap();
+    }
+    let mut delivered = Vec::new();
+    for _ in 0..600 {
+        rig.round(true);
+        while let Some(message) = poll_message(subscriber) {
+            delivered.push(message);
+        }
+        if delivered.len() == messages.len() {
+            break;
+        }
+    }
+    delivered
+}
+
+/// H8 finding 4: a revoked key (here every key: the store disabled) stops
+/// an encrypted publication. Its domain 1 sealer is withdrawn, its key
+/// erased, and nothing more is delivered; its bound receiver's domain 4
+/// opener is withdrawn, so no SM is accepted any more.
+#[test]
+fn a_revoked_key_stops_an_encrypted_publication() {
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, _b) = encrypted_rig();
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let first: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; 100]).collect();
+    assert_eq!(enc_deliver(&mut rig, &mut subscriber, &first), first);
+    rig.agents
+        .sender
+        .role
+        .apply_keys(&crate::wire_auth::FixedKeys::default());
+    let second: Vec<Vec<u8>> = (4..8u8).map(|i| vec![i; 100]).collect();
+    assert!(enc_deliver(&mut rig, &mut subscriber, &second).is_empty());
+    let accepted = rig.agents.sender.role.counters().sm_accepted;
+    for _ in 0..200 {
+        rig.round(true);
+    }
+    assert_eq!(rig.agents.sender.role.counters().sm_accepted, accepted);
+}
+
+/// H8 finding 4: a revoked key stops an encrypted image: its domain 1
+/// opener refuses the publisher's DATA, and its domain 4 controls (SMs),
+/// sealed by a withdrawn key shared with the sender agent, are no longer
+/// sent, so the publisher accepts none.
+#[test]
+fn a_revoked_key_stops_an_encrypted_images_controls() {
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, _b) = encrypted_rig();
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let first: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; 100]).collect();
+    assert_eq!(enc_deliver(&mut rig, &mut subscriber, &first), first);
+    rig.agents
+        .receiver
+        .role
+        .apply_keys(&crate::wire_auth::FixedKeys::default());
+    let second: Vec<Vec<u8>> = (4..8u8).map(|i| vec![i; 100]).collect();
+    assert!(enc_deliver(&mut rig, &mut subscriber, &second).is_empty());
+    let accepted = rig.agents.sender.role.counters().sm_accepted;
+    for _ in 0..200 {
+        rig.round(true);
+    }
+    assert_eq!(rig.agents.sender.role.counters().sm_accepted, accepted);
+}
+
 /// ADR-0114 sections 4 to 9 and 6b end to end on unicast (#650): the
 /// SETUP ANNOUNCE opens in domain 5, the CHALLENGE in domain 6 with its
 /// pairwise trailer, the ANSWER is an ENC ANSWER (variant 3), every DATA
