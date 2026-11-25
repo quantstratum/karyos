@@ -74,6 +74,8 @@ pub(crate) struct PublicationAuth {
     /// Refusals by reason: per publication, whose receivers each have
     /// their own key.
     pub(crate) rejections: AuthRejections,
+    /// Its abort authority, when this driver may abort its sessions.
+    pub(crate) abort: Option<AbortAuthority>,
     wall: fn() -> i64,
 }
 
@@ -84,6 +86,70 @@ pub(crate) enum Opened {
     RspSetup(Control, Establishing),
     /// An SM, NAK or RTTM REQUEST of the bound receiver.
     Receiver(Control),
+    /// A SESSION_ABORT_ACK of the bound receiver (domain 4).
+    AbortAck(karyos_protocol::network::authenticated::AbortAck),
+}
+
+/// The publication's abort authority: its Ed25519 signing key, the
+/// `key_id` and `authority_id` its file names, and the per-start envelope
+/// sequence of the signed domain (ADR-0086 section 6).
+pub(crate) struct AbortAuthority {
+    pub(crate) signer: crate::authority::Ed25519Signer,
+    pub(crate) key_id: u32,
+    pub(crate) authority_id: u64,
+    seq: u64,
+}
+
+impl core::fmt::Debug for AbortAuthority {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AbortAuthority")
+            .field("key_id", &self.key_id)
+            .field("authority_id", &self.authority_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AbortAuthority {
+    /// The authority of `signer` under `key_id` for `authority_id`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no authenticated channel opens yet")
+    )]
+    pub(crate) fn new(
+        signer: crate::authority::Ed25519Signer,
+        key_id: u32,
+        authority_id: u64,
+    ) -> Self {
+        Self {
+            signer,
+            key_id,
+            authority_id,
+            seq: 0,
+        }
+    }
+
+    /// Signs `abort` into `out` in domain 3 and returns its length; `None`
+    /// when it does not encode or fit.
+    pub(crate) fn sign(
+        &mut self,
+        abort: &karyos_protocol::network::authenticated::SessionAbort,
+        out: &mut [u8],
+    ) -> Option<usize> {
+        use karyos_protocol::network::authenticated::AuthControl;
+        use karyos_protocol::protection::signed::{SignedBinding, SignedDomain, seal_signed};
+
+        let body = AuthControl::Abort(*abort).encode(out).ok()?;
+        let binding = SignedBinding {
+            domain: SignedDomain::SessionAbort,
+            party_epoch: 0,
+            session_id: abort.alias.session_id,
+            stream_id: abort.alias.stream_id,
+            key_id: self.key_id,
+        };
+        let length = seal_signed(out, body, &binding, self.seq, &self.signer).ok()?;
+        self.seq = self.seq.checked_add(1)?;
+        Some(length)
+    }
 }
 
 /// A placeholder boot id and nonce for the prototypes, never bound.
@@ -172,6 +238,7 @@ impl PublicationAuth {
             boots: BootTable::new(receivers.len()),
             receivers,
             rejections: AuthRejections::default(),
+            abort: None,
             wall: super::receive_auth::wall_seconds,
         })
     }
@@ -229,7 +296,7 @@ impl PublicationAuth {
         if domain == Domain::RspSetup as u8 {
             self.rsp_setup(datagram, key_id, identity, lane_count)
         } else if domain == Domain::ReceiverToPublisher as u8 {
-            self.receiver(datagram, key_id)
+            self.receiver(datagram, key_id, identity)
         } else {
             Err(AuthReason::Domain)
         }
@@ -323,7 +390,12 @@ impl PublicationAuth {
         Ok(Opened::RspSetup(control, establishing(true)))
     }
 
-    fn receiver(&mut self, datagram: &[u8], key_id: u32) -> Result<Opened, AuthReason> {
+    fn receiver(
+        &mut self,
+        datagram: &[u8],
+        key_id: u32,
+        identity: Identity,
+    ) -> Result<Opened, AuthReason> {
         let now = (self.wall)();
         let receiver = self
             .receivers
@@ -345,6 +417,25 @@ impl PublicationAuth {
             receiver_boot_id: bound.boot,
             receiver_id,
         };
+        // A SESSION_ABORT_ACK decodes only here, under its domain 4 key.
+        let code = inner
+            .get(6..8)
+            .and_then(|code| code.try_into().ok())
+            .map(u16::from_le_bytes);
+        if code == Some(karyos_protocol::frame::FrameType::SessionAbortAck as u16) {
+            use karyos_protocol::network::authenticated::AuthControl;
+            let Ok(AuthControl::Ack(ack)) = AuthControl::decode(inner) else {
+                return Err(AuthReason::Inner);
+            };
+            if ack.alias != self.alias || ack.receiver != named || ack.identity != identity {
+                return Err(AuthReason::Inner);
+            }
+            bound
+                .verifier
+                .commit(checked, now)
+                .map_err(AuthReason::of)?;
+            return Ok(Opened::AbortAck(ack));
+        }
         let control = match classify(inner) {
             Ok(Datagram::Control(control)) => control,
             _ => return Err(AuthReason::Inner),

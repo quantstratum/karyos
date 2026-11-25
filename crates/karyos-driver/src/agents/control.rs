@@ -246,6 +246,16 @@ pub enum ControlItem {
         /// When the receiver took it from the backend.
         seen: u64,
     },
+    /// Prepared bytes, a sealed or signed control or a bare guard status
+    /// challenge, sent on `endpoint` to `destination` as they are.
+    Raw {
+        /// The endpoint to send on.
+        endpoint: EndpointId,
+        /// Where to.
+        destination: SocketAddr,
+        /// The datagram.
+        bytes: SealedBytes,
+    },
     /// `control` arrived on `endpoint` from `source`, for a local
     /// publication.
     Incoming {
@@ -1123,6 +1133,35 @@ impl ControlRoutes {
                 .ok_or(ControlSendError::Encode)?;
         }
         let encoded = bytes.get(..length).ok_or(ControlSendError::Encode)?;
+        self.send_bytes(tx, address, encoded, transient)
+    }
+
+    /// Sends prepared datagram bytes to `address`: a control sealed or
+    /// signed by its owner, never encoded here.
+    ///
+    /// # Errors
+    ///
+    /// As [`ControlRoutes::send`].
+    pub fn send_raw<O: SocketOps>(
+        &mut self,
+        tx: &mut SocketsTx<O>,
+        address: SocketAddr,
+        bytes: &[u8],
+    ) -> Result<(), ControlSendError> {
+        self.send_waiting(tx);
+        if self.waiting.iter().any(|(at, _)| *at == address) {
+            return Err(ControlSendError::Blocked);
+        }
+        self.send_bytes(tx, address, bytes, false)
+    }
+
+    fn send_bytes<O: SocketOps>(
+        &mut self,
+        tx: &mut SocketsTx<O>,
+        address: SocketAddr,
+        encoded: &[u8],
+        transient: bool,
+    ) -> Result<(), ControlSendError> {
         // A reply that reuses a destination's own route (karyos#977
         // review): failing, it must not take that route with it.
         let protected = transient

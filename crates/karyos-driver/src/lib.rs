@@ -40,12 +40,14 @@ pub mod paths;
 mod positions;
 pub mod recording;
 mod remote_generations;
+pub mod remote_guard;
 pub mod repair;
 pub mod replay;
 pub mod rtt;
 pub mod schedule;
 pub mod sessions;
 pub(crate) mod shared_words;
+pub mod signed_control;
 #[cfg(target_os = "linux")]
 pub mod sizing;
 pub mod sm_schedule;

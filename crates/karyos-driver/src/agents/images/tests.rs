@@ -7529,3 +7529,234 @@ fn a_bare_announce_for_an_authenticated_subscription_is_refused() {
     );
     assert_eq!(rig.agents.receiver.role.session_counters(), sessions);
 }
+
+/// #648 acceptance, ADR-0086 domains 3 and 4 (design sections 5 and 6),
+/// end to end on two endpoints: a SESSION_ABORT signed by the
+/// publication's abort authority closes the receiver's authenticated
+/// image, whose SESSION_ABORT_ACK, sealed in domain 4, verifies at the
+/// publisher. The identical datagram again hits the digest cache: the ACK
+/// is resent and nothing transitions twice. A forged abort changes
+/// nothing.
+#[test]
+fn a_remote_session_abort_closes_the_image_and_is_acknowledged_in_domain_4() {
+    use crate::agents::roles::publish_auth::AbortAuthority;
+    use crate::authority::Ed25519Signer;
+    use crate::signed_control::Authority;
+
+    let (mut rig, b, _channel) = authenticated_rig();
+    let signer = Ed25519Signer::from_seed(&[9; 32]);
+    let verifier = signer.verifier();
+    let a = rig.publisher;
+    rig.agents
+        .sender
+        .role
+        .set_abort_authority(a, alias(), AbortAuthority::new(signer, 10, 10));
+    rig.agents
+        .receiver
+        .role
+        .trust_authorities(vec![Authority::of(10, verifier, 10, &[11], true)], rig.now);
+    let slot = established(&mut rig);
+    assert!(rig.agents.sender.role.request_abort(a, alias(), 2, 3));
+    for _ in 0..400 {
+        rig.round(true);
+        if rig.agents.sender.role.counters().abort_acks == 1 {
+            break;
+        }
+    }
+    let receiver = rig.agents.receiver.counters();
+    let sender = rig.agents.sender.role.counters();
+    assert_eq!(
+        (
+            receiver.images_closed_aborted,
+            receiver.abort_acks_sent,
+            receiver.signed_refused
+        ),
+        (1, 1, 0),
+        "{receiver:?}"
+    );
+    assert_eq!(
+        (sender.aborts_sent, sender.abort_acks),
+        (1, 1),
+        "{sender:?}"
+    );
+    let ack = rig.agents.sender.role.last_abort_ack().unwrap();
+    assert_eq!((ack.guard_epoch, ack.receiver.receiver_id), (3, 77));
+    assert_eq!(
+        (ack.identity, ack.alias, ack.lanes.count()),
+        (identity(), alias(), 2)
+    );
+    assert!(
+        rig.agents.receiver.role.auth_rejections(slot).is_none(),
+        "the image is gone"
+    );
+    // The identical SESSION_ABORT again: the cached ACK is resent.
+    let bytes = rig.agents.sender.role.last_abort_bytes().unwrap();
+    let source = rig.endpoints.local_address(a).unwrap();
+    rig.round(true);
+    let receiver = &mut rig.agents.receiver;
+    receiver
+        .role
+        .inject_datagram(&receiver.sessions, b, source, &bytes, rig.now);
+    for _ in 0..400 {
+        rig.round(true);
+        if rig.agents.sender.role.counters().abort_acks == 2 {
+            break;
+        }
+    }
+    let receiver = rig.agents.receiver.counters();
+    assert_eq!(
+        (receiver.images_closed_aborted, receiver.abort_acks_resent),
+        (1, 1),
+        "{receiver:?}"
+    );
+    assert_eq!(rig.agents.sender.role.counters().abort_acks, 2);
+    // A forged one: refused by its signature, nothing else.
+    let mut forged = bytes.clone();
+    let last = forged.len() - 1;
+    forged[last] ^= 1;
+    rig.round(true);
+    let before = rig.agents.receiver.counters();
+    let receiver = &mut rig.agents.receiver;
+    receiver
+        .role
+        .inject_datagram(&receiver.sessions, b, source, &forged, rig.now);
+    let after = rig.agents.receiver.counters();
+    assert_eq!(after.signed_refused, before.signed_refused + 1);
+    assert_eq!(after.images_closed_aborted, 1);
+}
+
+/// Marks in memory, for a followed guard.
+#[derive(Debug, Default)]
+struct MemoryMarks(std::collections::HashMap<u64, u64>);
+
+impl crate::remote_guard::MarkStore for MemoryMarks {
+    fn load(&self, guard_id: u64) -> Result<u64, crate::remote_guard::MarkError> {
+        Ok(self.0.get(&guard_id).copied().unwrap_or(0))
+    }
+
+    fn persist(&mut self, guard_id: u64, epoch: u64) -> Result<(), crate::remote_guard::MarkError> {
+        let held = self.0.entry(guard_id).or_insert(0);
+        *held = (*held).max(epoch);
+        Ok(())
+    }
+}
+
+/// ADR-0086 section 7 and design 4.4, through the receiver's intake: a
+/// followed guard starts closed and challenges; a signed `Open` STATE
+/// before recovery is discarded; the signed STATUS answering its own
+/// challenge recovers it open; a bare GUARD stays gated.
+#[test]
+fn a_followed_guard_recovers_only_through_its_own_challenge() {
+    use karyos_protocol::network::authenticated::{
+        AuthControl, GuardState, GuardStatus, GuardWord,
+    };
+    use karyos_protocol::protection::signed::{SignedBinding, SignedDomain, seal_signed};
+
+    use super::super::control::ControlItem;
+    use crate::authority::Ed25519Signer;
+    use crate::remote_guard::{Phase, RemoteGuard};
+    use crate::signed_control::Authority;
+
+    let (mut rig, b) = Rig::new(Setup::default());
+    rig.sender_stopped = true;
+    let signer = Ed25519Signer::from_seed(&[9; 32]);
+    let authority: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    rig.agents.receiver.role.trust_authorities(
+        vec![Authority::of(10, signer.verifier(), 10, &[11], false)],
+        0,
+    );
+    rig.agents.receiver.role.follow_guard(
+        RemoteGuard::new(10, 11, 0),
+        66,
+        b,
+        authority,
+        Box::new(MemoryMarks::default()),
+    );
+    let sign = |control: AuthControl, seq: u64| {
+        let mut bytes = vec![0u8; 256];
+        let body = control.encode(&mut bytes).unwrap();
+        let binding = SignedBinding {
+            domain: SignedDomain::Guard,
+            party_epoch: 0,
+            session_id: 0,
+            stream_id: 0,
+            key_id: 10,
+        };
+        let length = seal_signed(&mut bytes, body, &binding, seq, &signer).unwrap();
+        bytes.truncate(length);
+        bytes
+    };
+    rig.round(true);
+    // The challenge, bare, to the authority's address.
+    let mut challenge = None;
+    while let Some(item) = rig.agents.sender.role.take_control() {
+        if let ControlItem::Raw {
+            destination, bytes, ..
+        } = item
+            && destination == authority
+        {
+            let decoded =
+                karyos_protocol::network::authenticated::decode_bare_status_challenge(bytes.get())
+                    .unwrap();
+            challenge = Some(decoded);
+        }
+    }
+    let challenge = challenge.expect("a recovering guard challenges");
+    assert_eq!(challenge.receiver.receiver_id, 66);
+    let source: SocketAddr = "127.0.0.1:10".parse().unwrap();
+    let state = sign(
+        AuthControl::State(GuardState {
+            authority_id: 10,
+            guard_id: 11,
+            word: GuardWord::from_epoch(4).unwrap(),
+            lifetime_ms: 5_000,
+        }),
+        0,
+    );
+    let inject = |rig: &mut Rig, bytes: &[u8]| {
+        rig.round(true);
+        let receiver = &mut rig.agents.receiver;
+        receiver
+            .role
+            .inject_datagram(&receiver.sessions, b, source, bytes, rig.now);
+    };
+    inject(&mut rig, &state);
+    assert_eq!(rig.agents.receiver.counters().guard_refused, 1);
+    assert_eq!(
+        rig.agents.receiver.role.guard_phase(11, rig.now),
+        Some(Phase::Recovering)
+    );
+    // A bare one stays gated: never decoded.
+    let mut bare = vec![0u8; 256];
+    let length = AuthControl::State(GuardState {
+        authority_id: 10,
+        guard_id: 11,
+        word: GuardWord::from_epoch(4).unwrap(),
+        lifetime_ms: 5_000,
+    })
+    .encode(&mut bare)
+    .unwrap();
+    bare.truncate(length);
+    let decode_errors = rig.agents.receiver.counters().decode_errors;
+    inject(&mut rig, &bare);
+    assert_eq!(
+        rig.agents.receiver.counters().decode_errors,
+        decode_errors + 1
+    );
+    let status = sign(
+        AuthControl::Status(GuardStatus {
+            authority_id: 10,
+            guard_id: 11,
+            receiver: challenge.receiver,
+            nonce: challenge.nonce,
+            word: GuardWord::from_epoch(4).unwrap(),
+        }),
+        1,
+    );
+    inject(&mut rig, &status);
+    assert_eq!(rig.agents.receiver.counters().guard_changes, 1);
+    assert!(matches!(
+        rig.agents.receiver.role.guard_phase(11, rig.now),
+        Some(Phase::Open { epoch: 4, .. })
+    ));
+}
