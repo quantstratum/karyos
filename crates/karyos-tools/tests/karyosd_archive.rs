@@ -674,3 +674,159 @@ fn a_karyosd_retention_policy_refuses_an_early_purge() {
     let _ = std::fs::remove_dir_all(&archive);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// One record's 18 words, as `karyos-tools calibrate append` arguments.
+fn record_words(words: &[u64; karyos_trace::clocks::CALIBRATION_WORDS]) -> Vec<String> {
+    words.iter().map(u64::to_string).collect()
+}
+
+/// The calibration journal end to end (karyos#991, #1065, #1128): a
+/// `karyosd --archive-time-evidence --archive-calibration-journal` run
+/// while a producer appends a synthetic calibration and UTC reference
+/// record with `karyos-tools calibrate append`, then `karyos-catalog
+/// verify --time-requirement` on its archive. The daemon has no recording
+/// group, the only producer of time evidence entries (ADR-0098), so the
+/// store it makes holds none and the verdict is `no_evidence`, never
+/// `met`, and reported apart from the integrity outcome.
+#[test]
+fn karyosd_reports_no_time_evidence_without_a_group_from_its_calibration_journal() {
+    use karyos_archive::disk::StdDisk;
+    use karyos_archive::integrity::{calibration_journal, time_evidence};
+    use karyos_trace::clocks::utc::{Scale, Source, SyncState, UtcReference};
+    use karyos_trace::clocks::{Calibration, ClockKey};
+    use karyos_trace::journal::ObserverId;
+
+    let dir = dir("calibration");
+    let archive = dir.with_extension("archive");
+    let journal = dir.with_extension("calibration-journal");
+    let anchors = dir.with_extension("anchors");
+    for path in [&archive, &journal, &anchors] {
+        let _ = std::fs::remove_dir_all(path);
+    }
+    std::fs::create_dir_all(&archive).unwrap();
+    std::fs::create_dir_all(&anchors).unwrap();
+    let log_path = dir.with_extension("calibration.log");
+    let mut daemon = Daemon::start(
+        &dir,
+        &archive,
+        &[
+            "--record",
+            &format!("{STREAM}:{SESSION}"),
+            "--archive-time-evidence",
+            "--archive-calibration-journal",
+            journal.to_str().unwrap(),
+        ],
+        &log_path,
+    );
+    let client = connect(&dir);
+    // The daemon made the store before its agent started.
+    let entries_dir = time_evidence::entries_dir(&archive);
+    assert!(entries_dir.is_dir(), "{}", entries_dir.display());
+
+    // A synthetic calibration of a clock A to a UTC-traceable clock B, and
+    // a UTC reference record of B, appended while the daemon runs.
+    let clock = |domain| ClockKey {
+        observer: ObserverId {
+            driver: [1, 0],
+            journal: 2,
+        },
+        domain,
+        epoch: 1,
+    };
+    let calibration = Calibration {
+        from: clock(3),
+        to: clock(9),
+        reference: 0,
+        offset: 10,
+        offset_uncertainty: 2,
+        drift: 0,
+        drift_uncertainty: 0,
+        valid_from: 0,
+        valid_to: u64::MAX / 4,
+    }
+    .encode()
+    .unwrap();
+    let reference = UtcReference {
+        clock: clock(9),
+        source: Source::Gnss,
+        sync_state: SyncState::Synchronised,
+        bound: 100,
+        valid_from: 0,
+        valid_to: u64::MAX / 2,
+        tick_fs: 1_000_000,
+        scale: Scale::Tai,
+        origin: 0,
+        origin_scale_ns: 2_000_000_000_000_000_000,
+        leap_table: 69,
+        transform_uncertainty_ns: 0,
+    }
+    .encode()
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_karyos-tools"))
+        .args(["calibrate", "append", "--journal"])
+        .arg(&journal)
+        .args(record_words(&calibration))
+        .args(record_words(&reference))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    drop(client);
+    assert!(daemon.stop().success());
+    let text = log(&log_path);
+    for line in ["boot recording started", "archive stopped"] {
+        assert!(text.contains(line), "{line:?} not in the log:\n{text}");
+    }
+
+    // The journal the daemon was given holds both records, lossless.
+    let records = calibration_journal::read(StdDisk, &journal).unwrap();
+    assert_ne!(records.generation, 0);
+    assert!(records.lossless);
+    assert_eq!(records.records, [calibration, reference]);
+    // No group, so no entry: the store is there and empty.
+    assert_eq!(time_evidence::read_sealed(StdDisk, &archive).unwrap(), []);
+
+    // The verdict, apart from integrity: no evidence, never met. With no
+    // trust root the integrity evidence is untrusted (1), never an error.
+    let verify = |json: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_karyos-catalog"));
+        command.arg("verify");
+        if json {
+            command.arg("--json");
+        }
+        command
+            .args(["--time-requirement", "1000:1000", "--time-anchors"])
+            .arg(format!("{}={}", "ab".repeat(32), anchors.display()))
+            .arg(&archive)
+            .output()
+            .unwrap()
+    };
+    let output = verify(false);
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert!(shown.ends_with("time verdict: no_evidence\n"), "{shown}");
+    assert!(!shown.contains(" met\n"), "{shown}");
+    assert!(!shown.contains("corruption"), "{shown}");
+    let output = verify(true);
+    let shown = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert!(
+        shown.contains("\"time\":{\"verdict\":\"no_evidence\",\"entries\":[],"),
+        "{shown}"
+    );
+    assert!(shown.contains("\"untrusted_evidence\""), "{shown}");
+    assert!(!shown.contains("\"met\""), "{shown}");
+
+    let _ = std::fs::remove_file(&log_path);
+    for path in [&archive, &journal, &anchors, &dir] {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}

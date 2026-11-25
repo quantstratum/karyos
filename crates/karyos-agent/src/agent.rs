@@ -58,6 +58,15 @@ pub struct AgentConfig {
     /// The agent's own name (R-CORE-24), from its deployment's
     /// configuration; `None` by default.
     pub agent_id: Option<String>,
+    /// The operation classes marked for two people (R-CORE-20, karyos#739,
+    /// `--two-person`); none by default.
+    pub two_person: Vec<crate::two_person::TwoPersonClass>,
+    /// How long a marked operation waits for its approval
+    /// (`--approval-wait`).
+    pub approval_wait: Duration,
+    /// The operations journal's retention policy, copies and trust
+    /// (ADR-0113): no policy by default, so no purge.
+    pub journal_retention: crate::journal::JournalRetention,
 }
 
 impl AgentConfig {
@@ -74,7 +83,32 @@ impl AgentConfig {
             guard_timeout: DEFAULT_ATTACH_TIMEOUT,
             archives: Vec::new(),
             agent_id: None,
+            two_person: Vec::new(),
+            approval_wait: crate::two_person::DEFAULT_WAIT,
+            journal_retention: crate::journal::JournalRetention::default(),
         }
+    }
+
+    /// With the operations journal's retention `settings` (ADR-0113).
+    #[must_use]
+    pub fn with_journal_retention(mut self, settings: crate::journal::JournalRetention) -> Self {
+        self.journal_retention = settings;
+        self
+    }
+
+    /// With `classes` marked for two people (R-CORE-20, karyos#739).
+    #[must_use]
+    pub fn with_two_person(mut self, classes: Vec<crate::two_person::TwoPersonClass>) -> Self {
+        self.two_person = classes;
+        self
+    }
+
+    /// With `wait` as the wait for an approval, at most
+    /// [`crate::two_person::MAX_WAIT`] (karyos#739).
+    #[must_use]
+    pub fn with_approval_wait(mut self, wait: Duration) -> Self {
+        self.approval_wait = wait.min(crate::two_person::MAX_WAIT);
+        self
     }
 
     /// With `id` as the agent's own name (R-CORE-24): what its deployment
@@ -231,6 +265,9 @@ pub struct Agent {
     boot: Vec<u8>,
     /// The product Clusters attached for admin commands (karyos#772).
     clusters: crate::cluster_admin::Clusters,
+    /// The operations in the two-person flow, rebuilt from the journal at
+    /// start (karyos#739).
+    approvals: crate::approval::Approvals,
 }
 
 impl Agent {
@@ -270,7 +307,7 @@ impl Agent {
         let start = host_monotonic_ns();
         let (mut journal, journal_error) = match config.journal.as_deref() {
             None => (None, None),
-            Some(dir) => match Journal::open(dir, start) {
+            Some(dir) => match Journal::open_with(dir, start, config.journal_retention.clone()) {
                 Ok(journal) => (Some(journal), None),
                 Err(error) => (None, Some(error.to_string())),
             },
@@ -281,6 +318,15 @@ impl Agent {
             .unwrap_or_default();
         let boot = crate::preview::boot_id();
         let outcomes = crate::preview::Outcomes::rebuild(&operations, (start, &boot));
+        // A pending operation never survives a restart, nor a granted one
+        // without its dispatch record (karyos#739): their ends are
+        // journalled now.
+        let (approvals, ended) = crate::approval::Approvals::rebuild(&operations, (start, &boot));
+        if let Some(journal) = journal.as_mut() {
+            for record in &ended {
+                let _ = journal.append_durable(record, record.time);
+            }
+        }
         // Only callers' ids: the agent's own direct ids are not journalled
         // as submits, and its allocator starts past them (karyos#738).
         // And the ids of every admin command sent to a Cluster (karyos#772).
@@ -292,6 +338,7 @@ impl Agent {
                     .filter(|record| record.kind == crate::journal::Kind::ClusterRequest)
                     .map(|record| record.operation),
             )
+            .chain(approvals.ids())
             .collect();
         let unopened_gap = journal_error.as_ref().map(|_| Gap {
             position: UNOPENED_POSITION,
@@ -316,6 +363,7 @@ impl Agent {
             used_ids,
             boot,
             clusters: crate::cluster_admin::Clusters::default(),
+            approvals,
         }
     }
 
@@ -466,6 +514,11 @@ impl Agent {
         (requester, clearance): (Requester, crate::cluster_admin::Clearance),
         reason: &[u8],
     ) -> crate::cluster_admin::ClusterAnswer {
+        // A marked command enters the approval flow, never this path
+        // (karyos#739).
+        if self.command_marked(cluster, command) {
+            return crate::cluster_admin::ClusterAnswer::TwoPersonRequired;
+        }
         let command = crate::cluster_admin::Command {
             cluster,
             command,
@@ -530,6 +583,38 @@ impl Agent {
         )
     }
 
+    /// Makes a retention `operation` on the agent's own operations journal
+    /// for `requester` with `reason` (ADR-0113): the reserved recording
+    /// name `journal`. `authorised` is false for a purge the requester's
+    /// role does not allow, which is refused and journalled.
+    pub fn journal_retention(
+        &mut self,
+        operation: crate::retention::Operation,
+        requester: Requester,
+        reason: &[u8],
+        authorised: bool,
+    ) -> crate::retention::RetentionAnswer {
+        let id = self.allocate_operation();
+        let command = crate::retention::Command {
+            operation,
+            recording: crate::retention::JOURNAL_SUBJECT,
+            id,
+            operator: requester.operator,
+            relay: requester.relay,
+            reason,
+        };
+        // Every id used is retained: pending, within its outcome's
+        // retention, or a tombstone (karyos#738, karyos#739).
+        let used = &self.used_ids;
+        let retained = |operation: u64| used.contains(&operation);
+        crate::retention::journal_command(
+            self.journal.as_mut(),
+            &command,
+            (authorised, &retained),
+            host_monotonic_ns,
+        )
+    }
+
     /// Closes guard `guard` of the driver in `dir` for operator `uid`
     /// with `reason`, journalled (M10b; see `operations`).
     pub fn guard_close(&mut self, dir: &Path, guard: u64, uid: u32, reason: &[u8]) -> GuardAnswer {
@@ -572,6 +657,9 @@ impl Agent {
         requester: Requester,
         reason: &[u8],
     ) -> GuardAnswer {
+        if self.reopen_marked() {
+            return GuardAnswer::TwoPersonRequired;
+        }
         self.guard_command(
             dir,
             guard,
@@ -593,6 +681,9 @@ impl Agent {
         uid: u32,
         reason: &[u8],
     ) -> GuardAnswer {
+        if self.reopen_marked() {
+            return GuardAnswer::TwoPersonRequired;
+        }
         self.guard_command(
             dir,
             guard,
@@ -659,6 +750,11 @@ impl Agent {
         reason: &[u8],
     ) -> Result<GuardAnswer, crate::preview::SubmitRefusal> {
         use crate::preview::{Bound, PreviewKind, SubmitRefusal, Used};
+        // A marked reopen enters the approval flow ([`Agent::submit_for`]),
+        // never this path (karyos#739).
+        if kind == PreviewKind::Reopen && self.reopen_marked() {
+            return Ok(GuardAnswer::TwoPersonRequired);
+        }
         let instance = self
             .drivers
             .iter()
@@ -725,6 +821,496 @@ impl Agent {
             self.outcomes.record(operation, used, answer, now);
         }
         Ok(answer)
+    }
+
+    /// Whether this deployment marks guard reopens for two people
+    /// (karyos#739).
+    fn reopen_marked(&self) -> bool {
+        self.config
+            .two_person
+            .contains(&crate::two_person::TwoPersonClass::GuardReopen)
+    }
+
+    /// Whether this deployment marks `command` of Cluster `cluster` for two
+    /// people (karyos#739).
+    fn command_marked(&self, cluster: &str, command: &str) -> bool {
+        self.config.two_person.iter().any(|class| {
+            matches!(
+                class,
+                crate::two_person::TwoPersonClass::ClusterCommand {
+                    cluster: marked,
+                    command: name,
+                } if marked == cluster && name == command
+            )
+        })
+    }
+
+    /// Detaches the Cluster attached as `name`; `false` when none is. An
+    /// operation pending on it ends `target changed` at its approval, even
+    /// after a new attach under the name (karyos#739).
+    pub fn detach_cluster(&mut self, name: &str) -> bool {
+        self.clusters.detach(name)
+    }
+
+    /// Submits a previewed guard operation as [`Agent::guard_submit_for`]
+    /// does; a reopen this deployment marks for two people enters the
+    /// approval flow instead (R-CORE-20, karyos#739; see
+    /// [`crate::approval`]): it is answered pending once its request is
+    /// journalled durably, which consumes the token and reserves the id,
+    /// and nothing is sent.
+    pub fn submit_for(
+        &mut self,
+        (operation, token): (u64, Option<crate::preview::Token>),
+        kind: crate::preview::PreviewKind,
+        dir: &Path,
+        guard: u64,
+        requester: Requester,
+        reason: &[u8],
+    ) -> crate::approval::ApprovalAnswer {
+        use crate::approval::{ApprovalAnswer, Request, Target};
+        use crate::preview::{Bound, PreviewKind, SubmitRefusal};
+        if kind != PreviewKind::Reopen || !self.reopen_marked() {
+            return match self.guard_submit_for(
+                (operation, token),
+                kind,
+                dir,
+                guard,
+                requester,
+                reason,
+            ) {
+                Ok(answer) => ApprovalAnswer::Guard(answer),
+                Err(refusal) => ApprovalAnswer::Submit(refusal),
+            };
+        }
+        let now = host_monotonic_ns();
+        self.sweep_approvals(now);
+        let mut request = Request {
+            requester,
+            target: Target::Guard {
+                dir: dir.to_path_buf(),
+                instance: 0,
+                guard,
+                epoch: 0,
+            },
+            reason: operations::cut_reason(reason).to_vec(),
+        };
+        // The exact request again: pending, or its retained outcome, with
+        // no token needed (ADR-0112 point 9).
+        if let Some(answer) = self.approvals.retry(operation, &request, now) {
+            return answer;
+        }
+        let bound = Bound {
+            kind,
+            dir: dir.to_path_buf(),
+            guard,
+            requester,
+            reason: request.reason.clone(),
+        };
+        if let Some(answer) = self.outcomes.answer(operation, &bound, now) {
+            return match answer {
+                Ok(answer) => ApprovalAnswer::Guard(answer),
+                Err(refusal) => ApprovalAnswer::Submit(refusal),
+            };
+        }
+        if self.used_ids.contains(&operation) {
+            return ApprovalAnswer::Submit(SubmitRefusal::OperationConflict);
+        }
+        let Some(token) = token else {
+            return ApprovalAnswer::Submit(SubmitRefusal::TokenUnknown);
+        };
+        let current = self
+            .drivers
+            .iter()
+            .find(|driver| driver.dir == dir)
+            .and_then(|driver| driver.instance);
+        // Checked, not used up: the token goes with the durable record.
+        let epoch = match self
+            .previews
+            .peek(token, &bound, current, std::time::Instant::now())
+        {
+            Ok(epoch) => epoch,
+            Err(refusal) => return ApprovalAnswer::Submit(refusal),
+        };
+        let Some(current) = current else {
+            return ApprovalAnswer::Submit(SubmitRefusal::TargetChanged);
+        };
+        request.target = Target::Guard {
+            dir: dir.to_path_buf(),
+            instance: current,
+            guard,
+            epoch,
+        };
+        self.pend(operation, request, now, Some(token))
+    }
+
+    /// Makes admin command `command` as [`Agent::cluster_command_for`]
+    /// does; a command this deployment marks for two people enters the
+    /// approval flow instead (R-CORE-20, karyos#739), after the checks a
+    /// direct command has: answered pending once its request is journalled
+    /// durably, which reserves the id, and nothing is sent.
+    pub fn cluster_command_answer_for(
+        &mut self,
+        (cluster, command, parameters): (&str, &str, &[u8]),
+        operation: u64,
+        (requester, clearance): (Requester, crate::cluster_admin::Clearance),
+        reason: &[u8],
+    ) -> crate::approval::ApprovalAnswer {
+        use crate::approval::{ApprovalAnswer, Request, Target};
+        if !self.command_marked(cluster, command) {
+            return ApprovalAnswer::Cluster(self.cluster_command_for(
+                (cluster, command, parameters),
+                operation,
+                (requester, clearance),
+                reason,
+            ));
+        }
+        let now = host_monotonic_ns();
+        self.sweep_approvals(now);
+        let reason = operations::cut_reason(reason);
+        let mut request = Request {
+            requester,
+            target: Target::Cluster {
+                cluster: cluster.to_owned(),
+                instance: 0,
+                command: command.to_owned(),
+                parameters: parameters.to_vec(),
+            },
+            reason: reason.to_vec(),
+        };
+        if let Some(answer) = self.approvals.retry(operation, &request, now) {
+            return answer;
+        }
+        let checked = crate::cluster_admin::Command {
+            cluster,
+            command,
+            parameters,
+            operation,
+            operator: requester.operator,
+            relay: requester.relay,
+            clearance,
+            reason,
+        };
+        let used_ids = &self.used_ids;
+        let mut clock = host_monotonic_ns;
+        let instance = match crate::cluster_admin::check(
+            self.journal.as_mut(),
+            &self.clusters,
+            &checked,
+            &mut |id, _| used_ids.contains(&id),
+            &mut clock,
+        ) {
+            Ok(attached) => attached.instance(),
+            Err(answer) => return ApprovalAnswer::Cluster(answer),
+        };
+        if let Target::Cluster {
+            instance: bound, ..
+        } = &mut request.target
+        {
+            *bound = instance;
+        }
+        self.pend(operation, request, now, None)
+    }
+
+    /// Enters `request` as `operation` at `now`: pending once its
+    /// `ApprovalRequested` is durable, which uses up `token` and reserves
+    /// the id; refused `journal unavailable` otherwise, the token and the
+    /// id as they were (karyos#739).
+    fn pend(
+        &mut self,
+        operation: u64,
+        request: crate::approval::Request,
+        now: u64,
+        token: Option<crate::preview::Token>,
+    ) -> crate::approval::ApprovalAnswer {
+        use crate::approval::{ApprovalAnswer, Refusal, nanos, requested_record};
+        let wait = self.config.approval_wait;
+        let record = requested_record(operation, &request, wait, (now, &self.boot));
+        let durable = self
+            .journal
+            .as_mut()
+            .is_some_and(|journal| journal.append_durable(&record, now).is_ok());
+        if !durable {
+            return ApprovalAnswer::Refused(Refusal::JournalUnavailable);
+        }
+        if let Some(token) = token {
+            self.previews.remove(token);
+        }
+        let _ = self.used_ids.insert(operation);
+        self.approvals
+            .pend(operation, request, now.saturating_add(nanos(wait)));
+        ApprovalAnswer::Pending {
+            operation,
+            expires_in_ms: u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// Approves pending operation `operation` for `approver`, whose role
+    /// may reopen guards (`may_reopen`) and grants `clearance` (R-CORE-20,
+    /// karyos#739; see [`crate::approval`]): refused for the requester
+    /// itself, a role that may not make the operation, an expired or ended
+    /// operation; ended `target changed` for a target that changed;
+    /// otherwise journalled durably and dispatched as a direct request is.
+    pub fn approve_for(
+        &mut self,
+        operation: u64,
+        approver: Requester,
+        (may_reopen, clearance): (bool, crate::cluster_admin::Clearance),
+    ) -> crate::approval::ApprovalAnswer {
+        use crate::approval::{
+            ApprovalAnswer, Approvals, End, EndCode, Refusal, State, Target, principal_record,
+        };
+        let now = host_monotonic_ns();
+        // Expiry first (ADR-0112 point 5).
+        self.sweep_approvals(now);
+        let Some(entry) = self.approvals.get(operation) else {
+            return ApprovalAnswer::Refused(if self.used_ids.contains(&operation) {
+                Refusal::NotPending
+            } else {
+                Refusal::OperationIdUnknown
+            });
+        };
+        if !matches!(entry.state, State::Pending { .. }) {
+            // The role first: a completed operation's retained outcome is
+            // only for a role that may approve it, never for any caller
+            // that knows its id (karyos#739 review). A Cluster command
+            // whose authority is not known now is refused.
+            let allowed = match &entry.request.target {
+                Target::Guard { .. } => may_reopen,
+                Target::Cluster {
+                    cluster, command, ..
+                } => self
+                    .clusters
+                    .find(cluster)
+                    .and_then(|attached| attached.authority(command))
+                    .is_some_and(|authority| clearance.allows(authority)),
+            };
+            if !allowed {
+                return ApprovalAnswer::Refused(Refusal::Forbidden);
+            }
+            return Approvals::state_answer(operation, &entry.state, now, false);
+        }
+        let request = entry.request.clone();
+        if approver.operator == request.requester.operator {
+            return ApprovalAnswer::Refused(Refusal::SamePrincipal);
+        }
+        let current = match &request.target {
+            Target::Guard { dir, instance, .. } => {
+                if !may_reopen {
+                    return ApprovalAnswer::Refused(Refusal::Forbidden);
+                }
+                self.drivers
+                    .iter()
+                    .find(|driver| &driver.dir == dir)
+                    .and_then(|driver| driver.instance)
+                    == Some(*instance)
+            }
+            Target::Cluster {
+                cluster,
+                instance,
+                command,
+                ..
+            } => {
+                let attached = self.clusters.find(cluster);
+                if attached
+                    .and_then(|attached| attached.authority(command))
+                    .is_some_and(|authority| !clearance.allows(authority))
+                {
+                    return ApprovalAnswer::Refused(Refusal::Forbidden);
+                }
+                attached.map(crate::cluster_admin::Attached::instance) == Some(*instance)
+            }
+        };
+        if !current {
+            self.end_unsent(operation, EndCode::TargetChanged, now);
+            return ApprovalAnswer::Refused(Refusal::TargetChanged);
+        }
+        let record = principal_record(
+            crate::journal::Kind::ApprovalGranted,
+            operation,
+            approver,
+            (now, &self.boot),
+        );
+        let durable = self
+            .journal
+            .as_mut()
+            .is_some_and(|journal| journal.append_durable(&record, now).is_ok());
+        if !durable {
+            return ApprovalAnswer::Refused(Refusal::JournalUnavailable);
+        }
+        self.approvals.set(operation, State::Granted);
+        let requester = request.requester;
+        let (end, answer) = match request.target {
+            Target::Guard {
+                dir,
+                instance,
+                guard,
+                epoch,
+            } => {
+                let answer = self.guard_command(
+                    &dir,
+                    guard,
+                    operations::Transition::Reopen(epoch),
+                    requester,
+                    &request.reason,
+                    (Some(operation), Some(instance)),
+                );
+                let unsent = match answer {
+                    GuardAnswer::State { .. }
+                    | GuardAnswer::Refused { .. }
+                    | GuardAnswer::NoAnswer { .. } => None,
+                    GuardAnswer::InstanceChanged => Some(EndCode::TargetChanged),
+                    GuardAnswer::JournalUnavailable => Some(EndCode::JournalUnavailable),
+                    _ => Some(EndCode::DriverUnavailable),
+                };
+                if let Some(code) = unsent {
+                    (End::Unsent(code), ApprovalAnswer::Refused(code.refusal()))
+                } else {
+                    let used = crate::preview::Used {
+                        kind: crate::preview::PreviewKind::Reopen,
+                        dir: Some(dir),
+                        guard,
+                        requester,
+                        reason: request.reason,
+                    };
+                    let now = host_monotonic_ns();
+                    // Its dispatch is journalled as a submit's: what a
+                    // restart rebuilds (karyos#738).
+                    if let Some(journal) = self.journal.as_mut() {
+                        let record = crate::preview::submitted_record(
+                            operation,
+                            &used,
+                            (epoch, answer),
+                            (now, &self.boot),
+                        );
+                        let _ = journal.append(&record, now);
+                    }
+                    self.outcomes.record(operation, used, answer, now);
+                    (End::Guard(answer), ApprovalAnswer::Guard(answer))
+                }
+            }
+            Target::Cluster {
+                cluster,
+                command,
+                parameters,
+                ..
+            } => {
+                let checked = crate::cluster_admin::Command {
+                    cluster: &cluster,
+                    command: &command,
+                    parameters: &parameters,
+                    operation,
+                    operator: requester.operator,
+                    relay: requester.relay,
+                    clearance,
+                    reason: &request.reason,
+                };
+                // The id is reserved by the pending operation: free for
+                // its own dispatch.
+                let answer = crate::cluster_admin::cluster_command(
+                    self.journal.as_mut(),
+                    &self.clusters,
+                    &checked,
+                    (self.config.guard_timeout, |_, _| false),
+                    host_monotonic_ns,
+                );
+                match answer {
+                    crate::cluster_admin::ClusterAnswer::Busy => (
+                        End::Unsent(EndCode::Busy),
+                        ApprovalAnswer::Refused(Refusal::Busy),
+                    ),
+                    crate::cluster_admin::ClusterAnswer::JournalUnavailable => (
+                        End::Unsent(EndCode::JournalUnavailable),
+                        ApprovalAnswer::Refused(Refusal::JournalUnavailable),
+                    ),
+                    answer => (
+                        End::Cluster(answer.clone()),
+                        ApprovalAnswer::Cluster(answer),
+                    ),
+                }
+            }
+        };
+        let now = host_monotonic_ns();
+        match end {
+            End::Unsent(code) => self.end_unsent(operation, code, now),
+            end => self
+                .approvals
+                .set(operation, State::Ended { end, at: Some(now) }),
+        }
+        answer
+    }
+
+    /// Withdraws pending operation `operation` for `requester`: only its
+    /// requester's operator id may (R-CORE-20, karyos#739).
+    pub fn withdraw_for(
+        &mut self,
+        operation: u64,
+        requester: Requester,
+    ) -> crate::approval::ApprovalAnswer {
+        use crate::approval::{ApprovalAnswer, Approvals, End, Refusal, State, principal_record};
+        let now = host_monotonic_ns();
+        self.sweep_approvals(now);
+        let Some(entry) = self.approvals.get(operation) else {
+            return ApprovalAnswer::Refused(if self.used_ids.contains(&operation) {
+                Refusal::NotPending
+            } else {
+                Refusal::OperationIdUnknown
+            });
+        };
+        if !matches!(entry.state, State::Pending { .. }) {
+            return match Approvals::state_answer(operation, &entry.state, now, false) {
+                expired @ ApprovalAnswer::Refused(Refusal::OperationExpired) => expired,
+                _ => ApprovalAnswer::Refused(Refusal::NotPending),
+            };
+        }
+        if entry.request.requester.operator != requester.operator {
+            return ApprovalAnswer::Refused(Refusal::NotRequester);
+        }
+        let record = principal_record(
+            crate::journal::Kind::ApprovalWithdrawn,
+            operation,
+            requester,
+            (now, &self.boot),
+        );
+        let durable = self
+            .journal
+            .as_mut()
+            .is_some_and(|journal| journal.append_durable(&record, now).is_ok());
+        if !durable {
+            return ApprovalAnswer::Refused(Refusal::JournalUnavailable);
+        }
+        self.approvals.set(
+            operation,
+            State::Ended {
+                end: End::Withdrawn,
+                at: Some(now),
+            },
+        );
+        ApprovalAnswer::Withdrawn { operation }
+    }
+
+    /// Expires every pending operation whose deadline passed at `now`,
+    /// journalled (karyos#739).
+    fn sweep_approvals(&mut self, now: u64) {
+        for operation in self.approvals.due(now) {
+            self.end_unsent(operation, crate::approval::EndCode::Expired, now);
+        }
+    }
+
+    /// Ends `operation` unsent for `code` at `now`, journalled. Nothing was
+    /// sent, so it ends even when the record cannot be made durable.
+    fn end_unsent(&mut self, operation: u64, code: crate::approval::EndCode, now: u64) {
+        use crate::approval::{End, State, ended_record};
+        if let Some(journal) = self.journal.as_mut() {
+            let record = ended_record(operation, code, (now, &self.boot));
+            let _ = journal.append_durable(&record, now);
+        }
+        self.approvals.set(
+            operation,
+            State::Ended {
+                end: End::Unsent(code),
+                at: Some(now),
+            },
+        );
     }
 
     /// The next operation id of the agent's own, skipping any a caller
@@ -937,7 +1523,7 @@ impl Agent {
         let gap = journal.and_then(Journal::gap).or(self.unopened_gap);
         Some(JournalView {
             recording: journal.map(Journal::recording),
-            unsealed: true,
+            unsealed: journal.is_none_or(Journal::unsealed),
             unavailable: journal.is_none_or(Journal::unavailable),
             error: self.journal_error.clone(),
             failed_appends: journal.map_or(0, Journal::failed_appends),
@@ -964,6 +1550,19 @@ impl Agent {
                     since,
                 }))
                 .collect(),
+            integrity: journal
+                .and_then(Journal::integrity)
+                .map(|integrity| integrity.ranges.clone()),
+            integrity_truncated: journal
+                .and_then(Journal::integrity)
+                .is_some_and(|integrity| integrity.truncated),
+            hold: journal.map(Journal::hold),
+            policy: journal.and_then(Journal::policy),
+            purged: journal
+                .and_then(Journal::integrity)
+                .map(|integrity| integrity.purged.clone())
+                .unwrap_or_default(),
+            purge_pending: journal.is_some_and(Journal::purge_pending),
         })
     }
 
@@ -975,6 +1574,17 @@ impl Agent {
         for driver in &mut self.drivers {
             driver.refresh(timeout, trace, &self.config.alerts);
         }
+        // The journal's integrity, again once its last verification is
+        // old (karyos#702).
+        // A journal hold in memory only becomes durable once it can
+        // (ADR-0113, point 6).
+        if let Some(journal) = self.journal.as_mut() {
+            journal.retry_hold();
+            journal.verify_if_due(host_monotonic_ns());
+        }
+        // The periodic sweep of the approvals past their deadline
+        // (karyos#739).
+        self.sweep_approvals(host_monotonic_ns());
     }
 
     /// The join registry's generation (karyos#736).
@@ -1622,3 +2232,6 @@ fn gap_view(gap: Gap) -> GapView {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod approval_tests;

@@ -841,7 +841,11 @@ fn test_harness_the_test_service_ignores_the_event_time() {
             entry.index
         );
     }
-    assert_eq!(stamped, zeroed);
+    // Everything but the log time, the last 8 bytes of the encoding
+    // (ADR-0111), which follows the event times.
+    let (stamped, zeroed) = (stamped.encode().unwrap(), zeroed.encode().unwrap());
+    assert_eq!(stamped.len(), zeroed.len());
+    assert_eq!(stamped[..stamped.len() - 8], zeroed[..zeroed.len() - 8]);
 }
 
 /// karyos#976: a core's panic is a verdict of its own, reported after

@@ -42,6 +42,10 @@ karyos-driver.workspace = true
 proptest.workspace = true
 # A busy table entry and a malformed record in the export's tests.
 karyos-sys = { workspace = true, features = ["test-hooks"] }
+# The test signing key of the journal's `--journal-trust` tests (ADR-0113),
+# dev-dependencies only, as scripts/check-archive-test-hooks-absent.sh
+# requires.
+karyos-archive = { workspace = true, features = ["test-hooks"] }
 
 [lints]
 workspace = true
