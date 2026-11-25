@@ -9,8 +9,14 @@
 //! `karyos_trace::clocks::utc::UtcReference`) for the host's
 //! `CLOCK_REALTIME`:
 //!
-//! - the bound is chrony's own error bound, `|System time| + Root delay / 2
-//!   + Root dispersion`, rounded up to whole nanoseconds;
+//! - the bound is chrony's own error bound at the sample, `|System time| +
+//!   Root delay / 2 + Root dispersion`, plus its growth over the whole
+//!   validity window as chrony itself grows the root dispersion
+//!   (`REF_GetReferenceParams`: `(Skew + |Residual freq| +
+//!   maxclockerror) * elapsed`, rates in ppm; `maxclockerror` is not in the
+//!   `-c` output and is given by `--max-clock-error-ppm`, chrony's default
+//!   1), all rounded up to whole nanoseconds, so the bound covers every
+//!   instant of the record's validity;
 //! - it is valid from the sample time over a short window the caller gives.
 //!   The bound holds **only as sampled**: chrony's dispersion grows between
 //!   updates and the clock is slewed, so a record is evidence for the window
@@ -67,6 +73,7 @@ from chrony's tracking state.
 
 Usage: chronyc -c tracking | karyos-tools calibrate utc [--window-ms 10000]
            [--sampled-at-ns N] [--domain 4] [--epoch 1] [--leap-table 72]
+           [--max-clock-error-ppm 1]
        karyos-tools calibrate utc --tracking <file> ...
        karyos-tools calibrate realtime [--reads 4096] [--keep 25]
            [--interval-us 500] [--extension-ms 0] [--source-domain 0]
@@ -74,11 +81,16 @@ Usage: chronyc -c tracking | karyos-tools calibrate utc [--window-ms 10000]
 
 `utc` reads one line of `chronyc -c tracking` (it never runs chronyc)
 and prints a UTC reference record: bound |System time| + Root delay/2 +
-Root dispersion, rounded up to ns; source NTP; scale stepped UTC; valid
+Root dispersion + (Skew + |Residual freq| + maxclockerror) x window,
+chrony's own dispersion growth (maxclockerror is chrony's setting, 1 ppm
+by default), rounded up to ns, so it covers the whole window; source NTP; scale stepped UTC; valid
 from the sample time (--sampled-at-ns, CLOCK_REALTIME in ns; by default
 this tool's own reading of it, so sample chrony right before) over
 --window-ms, at most 600000. The bound holds only as sampled: keep the
-window short and sample again for a longer claim. An unsynchronised
+window short and sample again for a longer claim. To chain it with a
+`realtime` record, their validities must overlap: sample `utc` first, or
+run `realtime` with --extension-ms; `calibrate compose <calibration>...
+<utc record>` checks that and refuses otherwise. An unsynchronised
 state (leap status \"Not synchronised\", stratum 0 or 16 and above), a
 pending leap second or a missing field prints no record.
 
@@ -103,6 +115,10 @@ pub struct Tracking {
     pub root_delay_as: u128,
     /// Root dispersion, in attoseconds.
     pub root_dispersion_as: u128,
+    /// Skew, in ppm times 10^18.
+    pub skew_appm: u128,
+    /// `|Residual freq|`, in ppm times 10^18.
+    pub residual_appm: u128,
     /// The leap status, as chrony prints it.
     pub leap_status: String,
     /// The synchronisation state the leap status and stratum give.
@@ -110,18 +126,29 @@ pub struct Tracking {
 }
 
 impl Tracking {
-    /// chrony's bound, `|System time| + Root delay / 2 + Root dispersion`,
-    /// in nanoseconds rounded up; `None` when unsynchronised (no bound
-    /// exists) or on overflow.
+    /// chrony's bound over `window_ns` after the sample, in nanoseconds
+    /// rounded up: `|System time| + Root delay / 2 + Root dispersion +
+    /// (Skew + |Residual freq| + max_clock_error) * window`, the rates in
+    /// ppm (`max_clock_error_appm` in ppm times 10^18); `None` when
+    /// unsynchronised (no bound exists) or on overflow.
     #[must_use]
-    pub fn bound_ns(&self) -> Option<u64> {
+    pub fn bound_ns(&self, window_ns: u64, max_clock_error_appm: u128) -> Option<u64> {
         if self.sync_state != SyncState::Synchronised {
             return None;
         }
+        let rate = self
+            .skew_appm
+            .checked_add(self.residual_appm)?
+            .checked_add(max_clock_error_appm)?;
+        // window ns * rate (ppm * 10^18) / 10^15 is attoseconds.
+        let growth = u128::from(window_ns)
+            .checked_mul(rate)?
+            .div_ceil(1_000_000_000_000_000);
         let total = self
             .system_time_as
             .checked_add(self.root_delay_as.div_ceil(2))?
-            .checked_add(self.root_dispersion_as)?;
+            .checked_add(self.root_dispersion_as)?
+            .checked_add(growth)?;
         u64::try_from(total.div_ceil(1_000_000_000)).ok()
     }
 }
@@ -187,8 +214,8 @@ pub fn parse_tracking(text: &str) -> Result<Tracking, String> {
         _last_offset,
         _rms_offset,
         _frequency,
-        _residual,
-        _skew,
+        residual,
+        skew,
         root_delay,
         root_dispersion,
         _interval,
@@ -214,6 +241,8 @@ pub fn parse_tracking(text: &str) -> Result<Tracking, String> {
     let root_delay_as = seconds_as(root_delay).ok_or_else(|| missing("root delay"))?;
     let root_dispersion_as =
         seconds_as(root_dispersion).ok_or_else(|| missing("root dispersion"))?;
+    let residual_appm = seconds_as(residual).ok_or_else(|| missing("residual frequency"))?;
+    let skew_appm = seconds_as(skew).ok_or_else(|| missing("skew"))?;
     let sync_state = match *leap_status {
         "Not synchronised" => SyncState::Unsynchronised,
         "Normal" | "Insert second" | "Delete second" if (1..16).contains(&stratum) => {
@@ -228,6 +257,8 @@ pub fn parse_tracking(text: &str) -> Result<Tracking, String> {
         system_time_as,
         root_delay_as,
         root_dispersion_as,
+        skew_appm,
+        residual_appm,
         leap_status: (*leap_status).to_owned(),
         sync_state,
     })
@@ -246,7 +277,12 @@ pub struct UtcSettings {
     pub epoch: u64,
     /// The IERS Bulletin C number.
     pub leap_table: u64,
+    /// chrony's `maxclockerror`, in ppm times 10^18.
+    pub max_clock_error_appm: u128,
 }
+
+/// chrony's default `maxclockerror`, 1 ppm, in ppm times 10^18.
+pub const DEFAULT_MAX_CLOCK_ERROR_APPM: u128 = 1_000_000_000_000_000_000;
 
 /// The UTC reference record of `tracking` for `CLOCK_REALTIME`.
 ///
@@ -270,10 +306,13 @@ pub fn reference(tracking: &Tracking, settings: &UtcSettings) -> Result<UtcRefer
     if settings.window_ms == 0 || settings.window_ms > MAX_WINDOW_MS {
         return Err(format!("--window-ms takes 1 to {MAX_WINDOW_MS}"));
     }
-    let bound = tracking.bound_ns().ok_or("the bound overflows")?;
+    let window_ns = settings.window_ms.saturating_mul(1_000_000);
+    let bound = tracking
+        .bound_ns(window_ns, settings.max_clock_error_appm)
+        .ok_or("the bound overflows")?;
     let valid_to = settings
         .sampled_at
-        .checked_add(settings.window_ms.saturating_mul(1_000_000))
+        .checked_add(window_ns)
         .ok_or("the validity overflows")?;
     let origin_scale_ns = settings
         .sampled_at
@@ -333,6 +372,7 @@ pub fn run_utc(
         domain: REALTIME_DOMAIN,
         epoch: 1,
         leap_table: DEFAULT_LEAP_TABLE,
+        max_clock_error_appm: DEFAULT_MAX_CLOCK_ERROR_APPM,
     };
     while let Some(arg) = args.next() {
         let arg = arg.to_string_lossy().into_owned();
@@ -349,6 +389,10 @@ pub fn run_utc(
         let number = value.parse::<u64>();
         match (arg.as_str(), number) {
             ("--tracking", _) => tracking_path = Some(value),
+            ("--max-clock-error-ppm", _) => match seconds_as(&value) {
+                Some(appm) if !value.starts_with('-') => settings.max_clock_error_appm = appm,
+                _ => return fail(err, &format!("bad argument {arg} {value}")),
+            },
             ("--sampled-at-ns", Ok(number)) => sampled_at = Some(number),
             ("--window-ms", Ok(number)) => settings.window_ms = number,
             ("--domain", Ok(number)) => settings.domain = number,
@@ -384,7 +428,7 @@ pub fn run_utc(
     };
     let written = writeln!(
         out,
-        "utc reference for CLOCK_REALTIME (domain {}, epoch {}): chrony via {} at stratum {}, bound {} ns (|System time| + Root delay/2 + Root dispersion, as sampled), valid realtime {} to {}, scale UTC stepped, leap table {}",
+        "utc reference for CLOCK_REALTIME (domain {}, epoch {}): chrony via {} at stratum {}, bound {} ns (|System time| + Root delay/2 + Root dispersion + (Skew + |Residual freq| + maxclockerror) x window), valid realtime {} to {}, scale UTC stepped, leap table {}",
         record.clock.domain,
         record.clock.epoch,
         tracking.reference,
@@ -400,6 +444,120 @@ pub fn run_utc(
         return fail(err, "cannot write the result");
     }
     0
+}
+
+/// Why a calibration and a UTC reference record do not chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ChainError {
+    /// The calibration converts into another clock than the record's.
+    #[error(
+        "the calibration converts into domain {calibration} epoch {calibration_epoch}, the UTC record is for domain {reference} epoch {reference_epoch}"
+    )]
+    WrongClock {
+        /// The calibration's target domain.
+        calibration: u64,
+        /// Its epoch.
+        calibration_epoch: u64,
+        /// The record's domain.
+        reference: u64,
+        /// Its epoch.
+        reference_epoch: u64,
+    },
+    /// The calibration's validity ends before the record's starts.
+    #[error(
+        "the calibration ends before the UTC record starts: run `calibrate realtime` with `--extension-ms`, or sample `calibrate utc` first"
+    )]
+    EndsBefore,
+    /// The calibration's validity starts after the record's ends.
+    #[error(
+        "the calibration starts after the UTC record ends: sample `calibrate utc` again, then run `calibrate realtime` within its --window-ms (or with `--extension-ms` before it)"
+    )]
+    StartsAfter,
+    /// The time is outside the calibration's validity.
+    #[error("the time is outside the calibration's validity")]
+    NotCovered,
+    /// The converted time is outside the record's validity, though the two
+    /// overlap.
+    #[error("the converted time is outside the UTC record's validity")]
+    OutsideReference,
+    /// The arithmetic does not fit, or the record's scale cannot say (an
+    /// inserted second, a leap table this build does not know).
+    #[error("the time does not convert to UTC")]
+    NoUtc,
+}
+
+/// Checks that `calibration` converts into `reference`'s clock and that
+/// its validity, converted, overlaps the record's.
+///
+/// # Errors
+///
+/// [`ChainError::WrongClock`], [`ChainError::EndsBefore`],
+/// [`ChainError::StartsAfter`], or [`ChainError::NoUtc`] on overflow.
+pub fn check_chain(
+    calibration: &karyos_trace::clocks::Calibration,
+    reference: &UtcReference,
+) -> Result<(), ChainError> {
+    if calibration.to != reference.clock {
+        return Err(ChainError::WrongClock {
+            calibration: calibration.to.domain,
+            calibration_epoch: calibration.to.epoch,
+            reference: reference.clock.domain,
+            reference_epoch: reference.clock.epoch,
+        });
+    }
+    let (start, _) = calibration
+        .convert(
+            i128::from(calibration.valid_from),
+            i128::from(calibration.valid_from),
+        )
+        .ok_or(ChainError::NoUtc)?;
+    let (_, end) = calibration
+        .convert(
+            i128::from(calibration.valid_to),
+            i128::from(calibration.valid_to),
+        )
+        .ok_or(ChainError::NoUtc)?;
+    if end < i128::from(reference.valid_from) {
+        return Err(ChainError::EndsBefore);
+    }
+    if start > i128::from(reference.valid_to) {
+        return Err(ChainError::StartsAfter);
+    }
+    Ok(())
+}
+
+/// The UTC interval, as `U` nanoseconds, of time `t` of the calibration's
+/// source clock: `t` converted, both ends to UTC, widened by the record's
+/// bound.
+///
+/// # Errors
+///
+/// The [`check_chain`] refusals first, then why this `t` does not convert.
+pub fn utc_of(
+    t: u64,
+    calibration: &karyos_trace::clocks::Calibration,
+    reference: &UtcReference,
+) -> Result<(i128, i128), ChainError> {
+    check_chain(calibration, reference)?;
+    let time = i128::from(t);
+    if !calibration.covers(time, time) {
+        return Err(ChainError::NotCovered);
+    }
+    let (low, high) = calibration.convert(time, time).ok_or(ChainError::NoUtc)?;
+    if low < i128::from(reference.valid_from) || high > i128::from(reference.valid_to) {
+        return Err(ChainError::OutsideReference);
+    }
+    let utc = |value: i128| {
+        u64::try_from(value)
+            .ok()
+            .and_then(|value| reference.utc(value))
+            .ok_or(ChainError::NoUtc)
+    };
+    let widen = i128::from(reference.bound_ns().ok_or(ChainError::NoUtc)?);
+    let low = utc(low)?.checked_sub(widen).ok_or(ChainError::NoUtc)?;
+    let high = utc(high)?.checked_add(widen).ok_or(ChainError::NoUtc)?;
+    Ok((low, high))
 }
 
 /// Takes `reads` bracketed reads of `CLOCK_REALTIME`, `interval_us` apart.

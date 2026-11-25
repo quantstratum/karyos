@@ -6,8 +6,8 @@ use karyos_trace::clocks::utc::SyncState;
 use karyos_trace::journal::ObserverId;
 
 use super::{
-    DEFAULT_LEAP_TABLE, REALTIME_DOMAIN, UNIX_EPOCH_U_NS, UtcSettings, parse_tracking, reference,
-    run_utc,
+    ChainError, DEFAULT_LEAP_TABLE, DEFAULT_MAX_CLOCK_ERROR_APPM, REALTIME_DOMAIN, UNIX_EPOCH_U_NS,
+    UtcSettings, check_chain, parse_tracking, reference, run_utc, utc_of,
 };
 
 /// A line as chrony 4.8 prints it on swarmer01's shape of setup: stratum
@@ -24,8 +24,13 @@ fn settings() -> UtcSettings {
         domain: REALTIME_DOMAIN,
         epoch: 1,
         leap_table: DEFAULT_LEAP_TABLE,
+        max_clock_error_appm: DEFAULT_MAX_CLOCK_ERROR_APPM,
     }
 }
+
+/// TRACKING's bound over 10 s: 19.4 ms as sampled plus (0.050 + 0.001 +
+/// 1) ppm of 10 s, 10.51 us.
+const BOUND_10S: u64 = 19_410_510;
 
 fn key(domain: u64) -> ClockKey {
     ClockKey {
@@ -50,11 +55,11 @@ fn a_real_shaped_line_parses_and_bounds() {
     assert_eq!(tracking.reference, "ntp.ubuntu.com");
     assert_eq!(tracking.stratum, 3);
     assert_eq!(tracking.sync_state, SyncState::Synchronised);
-    // 1.4 ms + 33.5 ms / 2 + 1.25 ms.
-    assert_eq!(tracking.bound_ns(), Some(19_400_000));
+    // 1.4 ms + 33.5 ms / 2 + 1.25 ms, as sampled.
+    assert_eq!(tracking.bound_ns(0, 0), Some(19_400_000));
     let record = reference(&tracking, &settings()).unwrap();
-    assert_eq!(record.bound, 19_400_000);
-    assert_eq!(record.bound_ns(), Some(19_400_000));
+    assert_eq!(record.bound, BOUND_10S);
+    assert_eq!(record.bound_ns(), Some(BOUND_10S));
     assert_eq!(
         (record.valid_from, record.valid_to),
         (SAMPLED, SAMPLED + 10_000_000_000)
@@ -79,7 +84,7 @@ fn the_bound_rounds_up_to_whole_nanoseconds() {
     let bound = |system, delay, dispersion| {
         parse_tracking(&line(system, delay, dispersion, "2", "Normal"))
             .unwrap()
-            .bound_ns()
+            .bound_ns(0, 0)
     };
     assert_eq!(bound("0.0", "0.0", "0.0"), Some(0));
     // A sign is dropped: the magnitude counts.
@@ -90,6 +95,41 @@ fn the_bound_rounds_up_to_whole_nanoseconds() {
     // Digits past the attosecond still round up.
     assert_eq!(bound("0.0000000000000000001", "0", "0"), Some(1));
     assert_eq!(bound("1", "2", "0.5"), Some(2_500_000_000));
+}
+
+#[test]
+fn the_bound_grows_over_the_window_as_chrony_grows_dispersion() {
+    // Skew 0.01 ppm, residual -0.5 ppm (its magnitude counts).
+    let tracking =
+        parse_tracking("A,ntp1,2,1.0,0.000001,0.0,0.0,1.0,-0.5,0.01,0.000004,0.000002,64.0,Normal")
+            .unwrap();
+    // 1 us + 2 us + 2 us as sampled.
+    assert_eq!(tracking.bound_ns(0, 0), Some(5_000));
+    // Over 1 s with no clock error: 0.51 ppm of 1 s, 510 ns.
+    assert_eq!(tracking.bound_ns(1_000_000_000, 0), Some(5_510));
+    // chrony's default maxclockerror adds 1 ppm: 1.51 us.
+    assert_eq!(
+        tracking.bound_ns(1_000_000_000, DEFAULT_MAX_CLOCK_ERROR_APPM),
+        Some(6_510)
+    );
+    // A third of a nanosecond of growth rounds up.
+    assert_eq!(tracking.bound_ns(1, 0), Some(5_001));
+    // A longer window gives a larger record bound.
+    let tracking = parse_tracking(TRACKING).unwrap();
+    let bound = |window_ms| {
+        reference(
+            &tracking,
+            &UtcSettings {
+                window_ms,
+                ..settings()
+            },
+        )
+        .unwrap()
+        .bound
+    };
+    assert_eq!(bound(10_000), BOUND_10S);
+    assert_eq!(bound(600_000), 19_400_000 + 630_600);
+    assert!(bound(1_000) < bound(10_000) && bound(10_000) < bound(600_000));
 }
 
 #[test]
@@ -129,7 +169,7 @@ fn an_unsynchronised_state_gives_no_bound_and_no_record() {
     ] {
         let tracking = parse_tracking(&line("0", "0", "0", stratum, leap)).unwrap();
         assert_eq!(tracking.sync_state, SyncState::Unsynchronised);
-        assert_eq!(tracking.bound_ns(), None);
+        assert_eq!(tracking.bound_ns(0, 0), None);
         assert!(
             reference(&tracking, &settings())
                 .unwrap_err()
@@ -173,7 +213,8 @@ fn the_command_prints_a_record_append_reads() {
     );
     assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
     let printed = String::from_utf8(out).unwrap();
-    assert!(printed.contains("bound 19400000 ns"), "{printed}");
+    // 19.4 ms plus 1.051 ppm of 5 s.
+    assert!(printed.contains("bound 19405255 ns"), "{printed}");
     let records =
         super::super::journal::input_records(&mut std::io::Cursor::new(printed.as_bytes()))
             .unwrap();
@@ -286,11 +327,16 @@ fn a_raw_time_reaches_utc_with_a_bound_near_the_inputs() {
     let half = u64::try_from((high - low).div_euclid(2)).unwrap();
     let extra = calibration.offset_uncertainty;
     assert!(
-        (19_400_000..=19_400_000 + extra).contains(&half),
+        (BOUND_10S..=BOUND_10S + extra).contains(&half),
         "{half} {calibration:?}"
     );
     let realtime = i128::from(raw + OFFSET);
-    assert!(low <= realtime - 19_400_000 && realtime + 19_400_000 <= high);
+    let chrony_bound = i128::from(BOUND_10S);
+    assert!(low <= realtime - chrony_bound && realtime + chrony_bound <= high);
+    // The tool's own helper gives the same interval in U.
+    let (u_low, u_high) = utc_of(raw, &calibration, &chrony).unwrap();
+    let epoch = i128::from(UNIX_EPOCH_U_NS);
+    assert_eq!((u_low - epoch, u_high - epoch), (low, high));
     // The UTC coordinate of the realtime the fit gives.
     assert_eq!(
         chrony.utc(raw + OFFSET),
@@ -317,10 +363,112 @@ fn a_raw_time_reaches_utc_with_a_bound_near_the_inputs() {
     };
     assert_eq!(
         time::combined_bound(realtime_now, coordinate, &identity, &evidence),
-        Ok(19_400_000 + extra)
+        Ok(BOUND_10S + extra)
     );
     assert_eq!(
         time::utc_interval(5_000_000_000, coordinate, &calibration, &evidence),
         Err(Gap::CalibrationNotValid)
     );
+}
+
+/// A calibration and a UTC record that do not overlap are a typed error
+/// naming `--extension-ms`, never a silent gap.
+#[test]
+fn a_chain_that_does_not_overlap_is_a_typed_error() {
+    let calibration = fit(&reads(OFFSET, 0, 0), &config()).unwrap().calibration;
+    let tracking = parse_tracking(TRACKING).unwrap();
+    let at = |sampled_at| {
+        reference(
+            &tracking,
+            &UtcSettings {
+                sampled_at,
+                ..settings()
+            },
+        )
+        .unwrap()
+    };
+    // The fit's reads end about 1 s after SAMPLED; chrony sampled 5 s on.
+    let late = at(SAMPLED + 5_000_000_000);
+    assert_eq!(
+        check_chain(&calibration, &late),
+        Err(ChainError::EndsBefore)
+    );
+    assert_eq!(
+        utc_of(1_500_000_050, &calibration, &late),
+        Err(ChainError::EndsBefore)
+    );
+    assert!(
+        ChainError::EndsBefore
+            .to_string()
+            .contains("--extension-ms"),
+        "{}",
+        ChainError::EndsBefore
+    );
+    // An extension reaching the sample makes it chain.
+    let extended = FitConfig {
+        extension: 5_000_000_000,
+        ..config()
+    };
+    let longer = fit(&reads(OFFSET, 0, 0), &extended).unwrap().calibration;
+    assert_eq!(check_chain(&longer, &late), Ok(()));
+    // A record whose window ended before the fit's reads began.
+    let early = at(SAMPLED - 60_000_000_000);
+    assert_eq!(
+        check_chain(&calibration, &early),
+        Err(ChainError::StartsAfter)
+    );
+    assert!(
+        ChainError::StartsAfter
+            .to_string()
+            .contains("--extension-ms")
+    );
+    // Another clock's record.
+    let other = UtcSettings {
+        domain: 9,
+        ..settings()
+    };
+    assert!(matches!(
+        check_chain(&calibration, &reference(&tracking, &other).unwrap()),
+        Err(ChainError::WrongClock { .. })
+    ));
+    // Overlapping, but this time is outside the fit's validity.
+    let sampled = at(SAMPLED + 100_000_000);
+    assert_eq!(
+        utc_of(5_000_000_000, &calibration, &sampled),
+        Err(ChainError::NotCovered)
+    );
+    // Overlapping, but this time converts to before the record starts.
+    assert_eq!(
+        utc_of(1_000_000_000, &calibration, &sampled),
+        Err(ChainError::OutsideReference)
+    );
+
+    // `compose` with the UTC record last checks the same.
+    let text = |words: &[u64; 18]| super::super::format_record(words);
+    let run = |records: Vec<String>| {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = super::super::run_compose(
+            records.into_iter().map(std::ffi::OsString::from),
+            &mut out,
+            &mut err,
+        );
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    };
+    let (code, out, err) = run(vec![
+        format!("record {}", text(&calibration.encode().unwrap())),
+        format!("record {}", text(&late.encode().unwrap())),
+    ]);
+    assert_eq!(code, super::EXIT_ERROR, "{out}");
+    assert!(out.is_empty());
+    assert!(err.contains("--extension-ms"), "{err}");
+    let (code, out, err) = run(vec![
+        text(&calibration.encode().unwrap()),
+        text(&sampled.encode().unwrap()),
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("overlaps the UTC record"), "{out}");
 }

@@ -582,15 +582,40 @@ pub fn run_compose(
         .filter(|word| *word != "record")
         .collect();
     let width = karyos_trace::clocks::CALIBRATION_WORDS;
-    if words.len() < 2 * width || !words.len().is_multiple_of(width) {
+    // A last record of type 2 is a UTC reference record: the calibrations
+    // before it are composed and checked against it.
+    let utc = match words
+        .len()
+        .checked_sub(width)
+        .and_then(|at| words.get(at..))
+    {
+        Some(last) if words.len().is_multiple_of(width) && is_utc_record(last) => {
+            match journal_words(last).and_then(|record| {
+                karyos_trace::clocks::utc::UtcReference::decode(&record)
+                    .map_err(|error| error.to_string())
+            }) {
+                Ok(record) => Some(record),
+                Err(error) => {
+                    let _ = writeln!(err, "karyos-tools calibrate compose: {error}");
+                    return EXIT_ERROR;
+                }
+            }
+        }
+        _ => None,
+    };
+    let calibrations = words
+        .len()
+        .saturating_sub(if utc.is_some() { width } else { 0 });
+    let least = if utc.is_some() { width } else { 2 * width };
+    if calibrations < least || !words.len().is_multiple_of(width) {
         let _ = writeln!(
             err,
-            "karyos-tools calibrate compose: two or more records of {width} words each"
+            "karyos-tools calibrate compose: two or more records of {width} words each, or one or more calibrations and a UTC reference record last"
         );
         return EXIT_ERROR;
     }
     let mut composed: Option<karyos_trace::clocks::Calibration> = None;
-    for chunk in words.chunks(width) {
+    for chunk in words.get(..calibrations).unwrap_or_default().chunks(width) {
         let next = match parse_record(chunk) {
             Ok(next) => next,
             Err(error) => {
@@ -612,6 +637,32 @@ pub fn run_compose(
     let Some(calibration) = composed else {
         return EXIT_ERROR;
     };
+    if let Some(reference) = utc {
+        if let Err(error) = utc::check_chain(&calibration, &reference) {
+            let _ = writeln!(err, "karyos-tools calibrate compose: {error}");
+            return EXIT_ERROR;
+        }
+        let code = print_record(
+            &calibration,
+            &format!(
+                "composed: offset {} ns +/- {} ns, drift {} ppb +/- {} ppb at {}, valid {} to {}; it overlaps the UTC record (domain {}, bound {} ns, valid {} to {})",
+                calibration.offset,
+                calibration.offset_uncertainty,
+                calibration.drift,
+                calibration.drift_uncertainty,
+                calibration.reference,
+                calibration.valid_from,
+                calibration.valid_to,
+                reference.clock.domain,
+                reference.bound,
+                reference.valid_from,
+                reference.valid_to
+            ),
+            out,
+            err,
+        );
+        return code;
+    }
     print_record(
         &calibration,
         &format!(
@@ -627,6 +678,38 @@ pub fn run_compose(
         out,
         err,
     )
+}
+
+/// One record word: hexadecimal with `0x`, or decimal.
+fn record_word(word: &str) -> Option<u64> {
+    match word.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => word.parse().ok(),
+    }
+}
+
+/// Whether `words` starts a record of type 2 (word 0's low byte).
+fn is_utc_record(words: &[&str]) -> bool {
+    words
+        .first()
+        .and_then(|first| record_word(first))
+        .is_some_and(|word| word & 0xff == karyos_trace::clocks::utc::UTC_REFERENCE_TYPE)
+}
+
+/// The 18 words of a record, parsed.
+fn journal_words(words: &[&str]) -> Result<[u64; karyos_trace::clocks::CALIBRATION_WORDS], String> {
+    let mut parsed = [0_u64; karyos_trace::clocks::CALIBRATION_WORDS];
+    if words.len() != parsed.len() {
+        return Err(format!(
+            "a record has {} words, not {}",
+            parsed.len(),
+            words.len()
+        ));
+    }
+    for (slot, word) in parsed.iter_mut().zip(words) {
+        *slot = record_word(word).ok_or_else(|| format!("{word} is not a record word"))?;
+    }
+    Ok(parsed)
 }
 
 /// Prints `summary` and the record, or fails.
