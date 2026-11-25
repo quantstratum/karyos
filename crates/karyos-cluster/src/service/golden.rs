@@ -394,15 +394,34 @@ fn print_the_large_vectors() {
 const B1: &str = "05 00 01 00 01 00 14 00 20 00 00 00
     40 00 00 00 40 00 00 00 00 20 00 00 00 58 47 f8 0d 00 00 00";
 
+/// B-1 as this build writes it (karyos#750): version 2 of schema 5, the
+/// same block under the exact identity's rules.
+const B1_V2: &str = "05 00 01 00 02 00 14 00 20 00 00 00
+    40 00 00 00 40 00 00 00 00 20 00 00 00 58 47 f8 0d 00 00 00";
+
 /// The golden vectors of schema 5 version 1, the core's own entries
-/// (karyos#927): B-1 and B-2 are reproduced byte for byte, B-3 to B-12
-/// refused as stated. Schema 2's vectors above are unchanged.
+/// (karyos#927): B-1 and B-2 are reproduced byte for byte (as an earlier
+/// build's entries, `exact` false), B-3 to B-12 refused as stated. B-1 v2
+/// is this build's version 2 (karyos#750), and B-7 names version 3, the
+/// first one unknown. Schema 2's vectors above are unchanged.
 #[test]
 fn test_schema_5_golden_vectors_b1_to_b12() {
-    let b1 = SessionBounds::new(DedupConfig::default());
+    let earlier = |config| SessionBounds {
+        config,
+        exact: false,
+    };
+    let b1 = earlier(DedupConfig::default());
     assert_eq!(b1.to_vec().unwrap(), hex(B1), "B-1 encode");
     assert_eq!(SessionBounds::decode(&hex(B1)), Ok(b1), "B-1 decode");
-    let b2 = SessionBounds::new(
+    let b1_v2 = SessionBounds::new(DedupConfig::default());
+    assert!(b1_v2.exact);
+    assert_eq!(b1_v2.to_vec().unwrap(), hex(B1_V2), "B-1 v2 encode");
+    assert_eq!(
+        SessionBounds::decode(&hex(B1_V2)),
+        Ok(b1_v2),
+        "B-1 v2 decode"
+    );
+    let b2 = earlier(
         DedupConfig::default()
             .with_sessions(u32::MAX)
             .with_window(u32::MAX)
@@ -469,9 +488,9 @@ fn test_schema_5_golden_vectors_b1_to_b12() {
     for (label, text, expected) in [
         (
             "B-7",
-            "05 00 01 00 02 00 14 00 20 00 00 00
+            "05 00 01 00 03 00 14 00 20 00 00 00
              40 00 00 00 40 00 00 00 00 20 00 00 00 58 47 f8 0d 00 00 00",
-            unsupported(5, 1, 2),
+            unsupported(5, 1, 3),
         ),
         (
             "B-8",
