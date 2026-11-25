@@ -458,6 +458,18 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     removal: Option<Box<removal::Removal>>,
     /// A timed publication's schedule ([`Outbound::set_timed`]).
     timed: Option<Box<Timed>>,
+    /// The etf queue of a timed publication on the `etf` route
+    /// ([`Outbound::set_etf`], ADR-0109): its lane queues are opened with
+    /// it, and each timed head is committed with its send time.
+    etf: Option<karyos_io::backend::EtfQueue>,
+    /// On the `etf` route, `CLOCK_TAI` less the sender's clock at this
+    /// cycle, read once a cycle from the endpoint: a head's time plus it is
+    /// its send time. `None` while the clock cannot be read, and then a
+    /// timed lane stages nothing.
+    tai_offset: Option<i128>,
+    /// The host monotonic clock the TAI offset pairs with `CLOCK_TAI`,
+    /// read next to it (tests replace it).
+    monotonic: fn() -> u64,
     /// Its counters' CnC cells (M2b), when the region had room for them:
     /// the sender agent is their only writer.
     cells: Option<crate::agents::AgentCells>,
@@ -692,6 +704,9 @@ impl<T: StreamTerms> Outbound<T> {
             path_sent: None,
             removal: None,
             timed: None,
+            etf: None,
+            tai_offset: None,
+            monotonic: karyos_sys::host_clock::host_monotonic_ns,
             cells: None,
             admission: 0,
             admission_slot: None,
@@ -1333,7 +1348,7 @@ impl<T: StreamTerms> Outbound<T> {
                 authority: Authority::FIRST,
                 route,
                 max_pending: NonZeroU16::new(STAGED_PER_LANE).unwrap_or(NonZeroU16::MIN),
-                etf: None,
+                etf: self.etf,
             });
             let opened = match opened {
                 Ok(opened) => opened,
@@ -1568,6 +1583,30 @@ impl<T: StreamTerms> Outbound<T> {
         Ok(())
     }
 
+    /// Puts the timed publication on the `etf` route (ADR-0109): its lane
+    /// queues are opened as etf queues of `etf` from the next open, and
+    /// each timed head is committed with its time in `CLOCK_TAI`, so the
+    /// kernel's `etf` leaf releases it then. Its timed gate's policies
+    /// carry the declared advance ([`LatePolicy::advance`]) by which a
+    /// head is handed over early. Its repair queue stays immediate.
+    pub(crate) fn set_etf(&mut self, etf: karyos_io::backend::EtfQueue) {
+        self.etf = Some(etf);
+    }
+
+    /// Replaces the monotonic clock the TAI offset pairs with (tests).
+    #[cfg(test)]
+    pub(crate) fn set_monotonic(&mut self, monotonic: fn() -> u64) {
+        self.monotonic = monotonic;
+    }
+
+    /// The send time of a head requested at `time` on the sender's clock,
+    /// in `CLOCK_TAI` (this cycle's offset), saturated at the ends of
+    /// `u64`; `None` without an offset.
+    fn txtime(time: u64, tai_offset: Option<i128>) -> Option<u64> {
+        let tai = i128::from(time).checked_add(tai_offset?)?;
+        Some(u64::try_from(tai.max(0)).unwrap_or(u64::MAX))
+    }
+
     /// What its timed gate counted, if it is timed (tests).
     #[cfg(test)]
     #[must_use]
@@ -1624,6 +1663,15 @@ impl<T: StreamTerms> Outbound<T> {
             for consumer in timed.consumers.iter_mut().flatten() {
                 consumer.set_now(now);
             }
+        }
+        // On the etf route, the cycle's TAI offset (ADR-0109): `CLOCK_TAI`
+        // and the monotonic clock sampled together, not against the
+        // cycle's `now`, which an open or a pause may have made stale.
+        if self.etf.is_some() {
+            let tai = tx.tai_now_ns();
+            let monotonic = (self.monotonic)();
+            self.tai_offset =
+                tai.and_then(|tai| i128::from(tai).checked_sub(i128::from(monotonic)));
         }
         let mut work = 0u32;
         for lane in 0..self.readers.len() {
@@ -2024,6 +2072,7 @@ impl<T: StreamTerms> Outbound<T> {
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         let mut staged = 0u32;
+        let tai_offset = self.tai_offset;
         let (Some(queue), Some(reader)) =
             (self.queues.get(lane).copied(), self.readers.get_mut(lane))
         else {
@@ -2055,6 +2104,11 @@ impl<T: StreamTerms> Outbound<T> {
                 .and_then(Option::as_ref)
                 .is_some_and(ScheduleConsumer::violated)
             {
+                break;
+            }
+            // On the etf route a timed head needs its send time, so no
+            // read is made while `CLOCK_TAI` cannot be read (ADR-0109).
+            if self.etf.is_some() && self.tai_offset.is_none() {
                 break;
             }
             // The receivers' edge, before the read (it cannot be undone):
@@ -2197,10 +2251,18 @@ impl<T: StreamTerms> Outbound<T> {
             };
             let token = SenderToken::new(self.next_token);
             self.next_token = self.next_token.checked_add(1).ok_or(overflow.clone())?;
+            // On the etf route a timed head carries its send time; one sent
+            // again after a reset (no time) and padding go at once.
+            let options = match (self.etf, schedule) {
+                (Some(_), Some((Some(time), _))) => {
+                    Self::txtime(time, tai_offset).map_or(TxOptions::none(), TxOptions::txtime)
+                }
+                _ => TxOptions::none(),
+            };
             let Ok(ticket) = frame.commit(Commit {
                 len,
                 token,
-                options: TxOptions::none(),
+                options,
             }) else {
                 // The cursor moved past a read that was not staged: a gap
                 // the receiver closes by repair or by its gap policy. A

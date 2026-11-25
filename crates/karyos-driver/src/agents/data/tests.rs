@@ -1698,3 +1698,97 @@ fn an_authenticated_eos_is_the_bare_one_sealed() {
         bare_eos.as_slice()
     );
 }
+
+/// ADR-0109 (#625): on the `etf` route a timed head is eligible its lane's
+/// declared advance before its time, and goes on the etf socket with its
+/// time converted to `CLOCK_TAI` by the cycle's offset, `CLOCK_TAI` less
+/// the monotonic clock sampled with it, not less the cycle's (possibly
+/// stale) `now`; before that it waits. While `CLOCK_TAI` cannot be read
+/// nothing is read or staged.
+#[test]
+fn an_etf_head_goes_early_with_its_time_in_tai() {
+    use karyos_io::backend::EtfQueue;
+    use karyos_sys::log_buffer::ScheduledOutcome;
+
+    use super::testing::outbound_timed;
+    use crate::timed_gate::LatePolicy;
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // CLOCK_TAI runs this far ahead of the monotonic clock.
+    const OFFSET: u64 = 37_000_000_000;
+    static MONOTONIC: AtomicU64 = AtomicU64::new(0);
+    fn monotonic() -> u64 {
+        MONOTONIC.load(Ordering::Relaxed)
+    }
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&sent);
+    observer.set_etf_send_hook(Box::new(move |_, _, txtime| {
+        seen.lock().unwrap().push(txtime);
+    }));
+    let mut local = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+    local.etf_route = true;
+    let endpoint = SocketsEndpoint::open(&local, InstanceId::FIRST, socket).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    let alias = Alias {
+        session_id: 5,
+        stream_id: 6,
+    };
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 9,
+        mtu: 1408,
+    };
+    let destination = SocketAddr::from(([127, 0, 0, 1], 41_000));
+    let (mut path, mut log) = outbound_timed(EndpointId(1), alias, destination, term, 4);
+    let policy = LatePolicy {
+        advance: 50,
+        ..LatePolicy::default()
+    };
+    path.set_timed(&[policy], vec![None], 0).unwrap();
+    path.set_etf(EtfQueue {
+        interface: 1,
+        priority: 3,
+        delta_ns: 20,
+    });
+    path.set_monotonic(monotonic);
+    assert!(matches!(
+        log.publications[0]
+            .append_scheduled(&[1; 100], AppendOptions::default(), 100)
+            .unwrap(),
+        ScheduledOutcome::Append(karyos_sys::log_buffer::AppendOutcome::Appended { .. })
+    ));
+    let budget = Budget {
+        work: 64,
+        bytes: 1 << 20,
+    };
+    // No CLOCK_TAI: nothing is read.
+    let _ = path.serve(&mut tx, budget, None, 10).unwrap();
+    assert_eq!(path.counters().staged, 0, "no send time without CLOCK_TAI");
+    // Staged, but not eligible before its time less the advance (50). The
+    // cycle's `now` (20) is 5 behind the clocks read with CLOCK_TAI.
+    MONOTONIC.store(25, Ordering::Relaxed);
+    observer.set_tai_now_ns(Some(25 + OFFSET));
+    let _ = path.serve(&mut tx, budget, None, 20).unwrap();
+    assert_eq!(path.counters().staged, 1);
+    assert_eq!(observer.etf_send_calls(), 0, "held until 50");
+    observer.push_etf_send(SendResult::Sent {
+        sent: 1,
+        error: None,
+    });
+    MONOTONIC.store(50, Ordering::Relaxed);
+    observer.set_tai_now_ns(Some(50 + OFFSET));
+    let _ = path.serve(&mut tx, budget, None, 50).unwrap();
+    assert_eq!(*sent.lock().unwrap(), vec![100 + OFFSET], "its time in TAI");
+    assert_eq!(path.counters().submitted, 1);
+    let mut endpoint = SocketsEndpoint::join(tx, rx).ok().unwrap();
+    let mut report = karyos_io::backend::TxReport::new();
+    while !matches!(
+        endpoint.retire(&mut report),
+        karyos_io::sockets::endpoint::Retired::Complete { .. }
+    ) {
+        while report.pop_front().is_some() {}
+    }
+}

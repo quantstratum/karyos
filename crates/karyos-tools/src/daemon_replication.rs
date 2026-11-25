@@ -447,6 +447,7 @@ pub fn forward_channel(endpoint: SocketAddr) -> UdpConfig {
         reliable: true,
         flow_control: None,
         security: Security::Trusted,
+        etf: None,
     }
 }
 

@@ -77,11 +77,92 @@ fn resolve(table: &str, target: Ipv4Addr) -> Option<String> {
     best.map(|(_, name)| name.to_owned())
 }
 
+/// The index of the interface that owns `address` (an etf leaf's
+/// interface, ADR-0109 point 2), resolved without `libc` or netlink: an
+/// IPv4 address by [`path_interface`] and the interface's name, an IPv6
+/// one from `/proc/net/if_inet6`, which lists each address with its
+/// interface index. `None` when it cannot be resolved here (off Linux,
+/// an unassigned address, or the unspecified address).
+#[must_use]
+pub fn interface_index(address: std::net::IpAddr) -> Option<u32> {
+    if address.is_unspecified() {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match address {
+            std::net::IpAddr::V4(v4) => {
+                let name = path_interface(v4, v4)?;
+                let socket = rustix::net::socket(
+                    rustix::net::AddressFamily::INET,
+                    rustix::net::SocketType::DGRAM,
+                    None,
+                )
+                .ok()?;
+                rustix::net::netdevice::name_to_index(socket, &name).ok()
+            }
+            std::net::IpAddr::V6(v6) => {
+                let table = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
+                inet6_index(&table, v6)
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// The interface index of `address` in a `/proc/net/if_inet6` `table`:
+/// lines of the address in 32 hex digits, then the index in hex.
+#[cfg_attr(
+    not(any(target_os = "linux", test)),
+    expect(dead_code, reason = "Linux only")
+)]
+fn inet6_index(table: &str, address: std::net::Ipv6Addr) -> Option<u32> {
+    let wanted = u128::from(address);
+    table.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let listed = u128::from_str_radix(fields.next()?, 16).ok()?;
+        let index = u32::from_str_radix(fields.next()?, 16).ok()?;
+        (listed == wanted).then_some(index)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
 
-    use super::resolve;
+    use super::{inet6_index, resolve};
+
+    /// `/proc/net/if_inet6` lists an address with its interface index in
+    /// hex; another address, or a malformed line, resolves nothing.
+    #[test]
+    fn an_ipv6_address_resolves_to_its_listed_index() {
+        let table = "00000000000000000000000000000001 01 80 10 80       lo\n\
+                     fe80000000000000021122fffe334455 0a 40 20 80     eth0\n\
+                     garbage\n";
+        assert_eq!(inet6_index(table, std::net::Ipv6Addr::LOCALHOST), Some(1));
+        assert_eq!(
+            inet6_index(
+                table,
+                std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0x0211, 0x22ff, 0xfe33, 0x4455)
+            ),
+            Some(10)
+        );
+        assert_eq!(
+            inet6_index(table, std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+            None
+        );
+    }
+
+    /// The loopback address resolves to `lo`'s index on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn loopback_resolves_to_an_index() {
+        assert!(super::interface_index(Ipv4Addr::LOCALHOST.into()).is_some());
+        assert_eq!(super::interface_index(Ipv4Addr::UNSPECIFIED.into()), None);
+    }
 
     /// A `/proc/net/route` table as Linux prints it on a little-endian
     /// host: the default route and 172.17.0.0/16 on `eth0`, 10.1.0.0/24 on

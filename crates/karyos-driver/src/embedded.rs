@@ -3622,6 +3622,29 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Ok(())
     }
 
+    /// [`Self::schedule_stream_with_clock`] for a lane of a network
+    /// publication, which alone may take the `etf` route (its creation
+    /// checked the route).
+    pub(crate) fn schedule_network_stream_with_clock(
+        &mut self,
+        stream: StreamHandle,
+        options: karyos_client::schedule::ScheduleOptions,
+        clock: karyos_client::schedule::ScheduleClock,
+    ) -> Result<(), DriverError> {
+        self.schedule_lane(stream, options, true)?;
+        self.active_stream(stream)?.schedule_clock = Some(clock);
+        Ok(())
+    }
+
+    /// [`Self::schedule_stream`] for a lane of a network publication.
+    pub(crate) fn schedule_network_stream(
+        &mut self,
+        stream: StreamHandle,
+        options: karyos_client::schedule::ScheduleOptions,
+    ) -> Result<(), DriverError> {
+        self.schedule_lane(stream, options, true)
+    }
+
     /// Sets a timed lane's settings (`quantstratum-docs:
     /// karyos/design/timed-tx.md`, TT-2 and TT-3) on the control path,
     /// before any publication handle is issued: its clock domain, horizon,
@@ -3640,18 +3663,44 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// [`DriverError::NotTimed`] for a stream whose buffer has no schedule
     /// ring (`schedule_capacity` 0); [`DriverError::InvalidConfig`] once a
     /// handle of the incarnation was issued, also if it was dropped since;
-    /// [`DriverError::Client`] with `InvalidSchedule` for a zero horizon and
-    /// for the `Tai` domain off Linux; the stream lookup errors.
+    /// [`DriverError::Client`] with `InvalidSchedule` for a zero horizon,
+    /// the `etf` route (a network publication's alone, set at its creation)
+    /// and the `Tai` domain off Linux; the stream lookup errors.
     pub fn schedule_stream(
         &mut self,
         stream: StreamHandle,
         options: karyos_client::schedule::ScheduleOptions,
     ) -> Result<(), DriverError> {
+        self.schedule_lane(stream, options, false)
+    }
+
+    /// [`Self::schedule_stream`]; `network` for a lane of a network
+    /// publication, which may take the `etf` route.
+    fn schedule_lane(
+        &mut self,
+        stream: StreamHandle,
+        options: karyos_client::schedule::ScheduleOptions,
+        network: bool,
+    ) -> Result<(), DriverError> {
         let _ = options.domain.clock()?;
+        if !network && options.route != karyos_client::schedule::TimedRoute::Software {
+            return Err(DriverError::Client(
+                karyos_client::ClientError::InvalidSchedule {
+                    reason: "the etf route outside a network publication",
+                },
+            ));
+        }
         if options.max_horizon == 0 {
             return Err(DriverError::Client(
                 karyos_client::ClientError::InvalidSchedule {
                     reason: "a zero horizon",
+                },
+            ));
+        }
+        if options.route == (karyos_client::schedule::TimedRoute::Etf { advance: 0 }) {
+            return Err(DriverError::Client(
+                karyos_client::ClientError::InvalidSchedule {
+                    reason: "a zero etf advance",
                 },
             ));
         }
