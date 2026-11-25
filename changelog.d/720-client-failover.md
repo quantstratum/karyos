@@ -1,3 +1,9 @@
 ### Added
 
-- The Cluster client's failover state (`karyos_cluster::client::ClusterClient`, karyos#720). It reads the session bounds the cluster advertises at registration and holds to its window (`SubmitError::WindowFull`). It resends the same request (identity, epoch, sequence) only after a redirect, and reports a request outstanding across a leader change or a timeout as unknown, never resent unless its caller retries it. It refuses a reply or an announcement of a generation below the highest seen, and surfaces a session expiry as a typed event. After registration it allocates nothing.
+- The Cluster client's failover state (`karyos_cluster::client::ClusterClient`, karyos#720).
+  - **Bounds.** It reads the session bounds the cluster advertises at registration and holds to its window. Registrations are ordered by epoch.
+  - **Correlation.** Every send carries a key (epoch, sequence, attempt), so an answer or a timer of another session or an older attempt steers nothing, and only a correlated answer raises the generation.
+  - **Resends.** It resends the same request only after a redirect of its current attempt.
+  - **Unknown outcomes.** A request outstanding across a leader change, a timeout or a new session is reported unknown, keeps its place, and is never resent unless its caller retries it.
+  - **Refusals.** It refuses a lower generation. Expiry, an out-of-order refusal and a payload mismatch reach the caller typed.
+  - **Allocation.** After registration it allocates nothing.

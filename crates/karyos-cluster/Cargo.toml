@@ -18,6 +18,17 @@ karyos-archive.workspace = true
 karyos-codec.workspace = true
 thiserror.workspace = true
 
+[features]
+# Backups to remote storage and a rebuild from them (`backup`): control
+# path only. Off by default; karyos-tools enables it, and
+# scripts/check-cluster-backup-graph.sh keeps it out of every data-path
+# graph.
+backup = []
+
+[[test]]
+name = "backup"
+required-features = ["backup"]
+
 [dev-dependencies]
 # The counting allocator of the client's allocation test (karyos#720).
 karyos-sys = { workspace = true, features = ["alloc-count"] }
