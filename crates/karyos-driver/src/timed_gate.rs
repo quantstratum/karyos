@@ -11,8 +11,12 @@
 //!   a time at or before the gate's clock ([`TimedGate::set_now`]), and
 //!   the inner gate admits it. On the `etf` route ([`LatePolicy::advance`],
 //!   ADR-0109) a head is eligible up to its lane's declared advance before
-//!   its time: the kernel's `etf` qdisc, not the gate, holds it until its
-//!   time, so its not-before guarantee is the qdisc's. The inner gate is always asked, so a guard
+//!   its time, and the kernel's `etf` leaf holds it: without launch-time
+//!   offload (which stays refused, SPEC §16's hardware track) the leaf
+//!   dequeues it up to its `delta` before its time, so it may reach the
+//!   wire that early. The publication declared that it tolerates as much
+//!   (`delta <= advance`, checked at configuration): on this route
+//!   not-before holds within the declared tolerated advance, not exactly. The inner gate is always asked, so a guard
 //!   that closed while a head waits for its time is seen at once.
 //! - **Exposure.** Only the prefix of the candidates whose times are due
 //!   reaches the inner gate, so it charges nothing for a datagram not yet

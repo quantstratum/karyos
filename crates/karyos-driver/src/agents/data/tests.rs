@@ -1375,8 +1375,10 @@ fn reset_with_a_held_window(extra: u64) {
 
 /// ADR-0109 (#625): on the `etf` route a timed head is eligible its lane's
 /// declared advance before its time, and goes on the etf socket with its
-/// time converted to `CLOCK_TAI` by the cycle's offset; before that it
-/// waits. While `CLOCK_TAI` cannot be read nothing is read or staged.
+/// time converted to `CLOCK_TAI` by the cycle's offset, `CLOCK_TAI` less
+/// the monotonic clock sampled with it, not less the cycle's (possibly
+/// stale) `now`; before that it waits. While `CLOCK_TAI` cannot be read
+/// nothing is read or staged.
 #[test]
 fn an_etf_head_goes_early_with_its_time_in_tai() {
     use karyos_io::backend::EtfQueue;
@@ -1385,8 +1387,14 @@ fn an_etf_head_goes_early_with_its_time_in_tai() {
     use super::testing::outbound_timed;
     use crate::timed_gate::LatePolicy;
 
-    // CLOCK_TAI runs this far ahead of the sender's clock.
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // CLOCK_TAI runs this far ahead of the monotonic clock.
     const OFFSET: u64 = 37_000_000_000;
+    static MONOTONIC: AtomicU64 = AtomicU64::new(0);
+    fn monotonic() -> u64 {
+        MONOTONIC.load(Ordering::Relaxed)
+    }
     let socket = ScriptedSocket::new();
     let observer = socket.observer();
     let sent = Arc::new(Mutex::new(Vec::new()));
@@ -1415,10 +1423,11 @@ fn an_etf_head_goes_early_with_its_time_in_tai() {
     };
     path.set_timed(&[policy], vec![None], 0).unwrap();
     path.set_etf(EtfQueue {
-        interface: 0,
+        interface: 1,
         priority: 3,
         delta_ns: 20,
     });
+    path.set_monotonic(monotonic);
     assert!(matches!(
         log.publications[0]
             .append_scheduled(&[1; 100], AppendOptions::default(), 100)
@@ -1432,8 +1441,10 @@ fn an_etf_head_goes_early_with_its_time_in_tai() {
     // No CLOCK_TAI: nothing is read.
     let _ = path.serve(&mut tx, budget, None, 10).unwrap();
     assert_eq!(path.counters().staged, 0, "no send time without CLOCK_TAI");
-    // Staged, but not eligible before its time less the advance (50).
-    observer.set_tai_now_ns(Some(20 + OFFSET));
+    // Staged, but not eligible before its time less the advance (50). The
+    // cycle's `now` (20) is 5 behind the clocks read with CLOCK_TAI.
+    MONOTONIC.store(25, Ordering::Relaxed);
+    observer.set_tai_now_ns(Some(25 + OFFSET));
     let _ = path.serve(&mut tx, budget, None, 20).unwrap();
     assert_eq!(path.counters().staged, 1);
     assert_eq!(observer.etf_send_calls(), 0, "held until 50");
@@ -1441,6 +1452,7 @@ fn an_etf_head_goes_early_with_its_time_in_tai() {
         sent: 1,
         error: None,
     });
+    MONOTONIC.store(50, Ordering::Relaxed);
     observer.set_tai_now_ns(Some(50 + OFFSET));
     let _ = path.serve(&mut tx, budget, None, 50).unwrap();
     assert_eq!(*sent.lock().unwrap(), vec![100 + OFFSET], "its time in TAI");

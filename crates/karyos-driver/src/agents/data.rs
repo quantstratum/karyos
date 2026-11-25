@@ -458,6 +458,9 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     /// its send time. `None` while the clock cannot be read, and then a
     /// timed lane stages nothing.
     tai_offset: Option<i128>,
+    /// The host monotonic clock the TAI offset pairs with `CLOCK_TAI`,
+    /// read next to it (tests replace it).
+    monotonic: fn() -> u64,
     /// Its counters' CnC cells (M2b), when the region had room for them:
     /// the sender agent is their only writer.
     cells: Option<crate::agents::AgentCells>,
@@ -693,6 +696,7 @@ impl<T: StreamTerms> Outbound<T> {
             timed: None,
             etf: None,
             tai_offset: None,
+            monotonic: karyos_sys::host_clock::host_monotonic_ns,
             cells: None,
             admission: 0,
             admission_slot: None,
@@ -1570,6 +1574,12 @@ impl<T: StreamTerms> Outbound<T> {
         self.etf = Some(etf);
     }
 
+    /// Replaces the monotonic clock the TAI offset pairs with (tests).
+    #[cfg(test)]
+    pub(crate) fn set_monotonic(&mut self, monotonic: fn() -> u64) {
+        self.monotonic = monotonic;
+    }
+
     /// The send time of a head requested at `time` on the sender's clock,
     /// in `CLOCK_TAI` (this cycle's offset), saturated at the ends of
     /// `u64`; `None` without an offset.
@@ -1635,11 +1645,14 @@ impl<T: StreamTerms> Outbound<T> {
                 consumer.set_now(now);
             }
         }
-        // On the etf route, the cycle's TAI offset (ADR-0109).
+        // On the etf route, the cycle's TAI offset (ADR-0109): `CLOCK_TAI`
+        // and the monotonic clock sampled together, not against the
+        // cycle's `now`, which an open or a pause may have made stale.
         if self.etf.is_some() {
-            self.tai_offset = tx
-                .tai_now_ns()
-                .and_then(|tai| i128::from(tai).checked_sub(i128::from(now)));
+            let tai = tx.tai_now_ns();
+            let monotonic = (self.monotonic)();
+            self.tai_offset =
+                tai.and_then(|tai| i128::from(tai).checked_sub(i128::from(monotonic)));
         }
         let mut work = 0u32;
         for lane in 0..self.readers.len() {

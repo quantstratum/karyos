@@ -516,6 +516,8 @@ enum EndpointPurpose {
     /// so the publication's etf socket can join its port, and its etf
     /// leaf is the one `priority` maps to on its interface.
     Etf {
+        /// The index of the interface holding its etf leaf.
+        interface: u32,
         /// The `SO_PRIORITY` of its etf queue.
         priority: u32,
     },
@@ -1106,29 +1108,34 @@ impl<T: StreamTerms> Network<T> {
     }
 
     /// A new send endpoint bound to `bind` for a publication on the `etf`
-    /// route whose etf queue declares `priority` (ADR-0109 points 2 and 5):
-    /// never shared, opened with [`SocketsConfig::etf_route`].
+    /// route with the etf queue `etf` (ADR-0109 points 2 and 5): never
+    /// shared, opened with [`SocketsConfig::etf_route`].
     ///
     /// # Errors
     ///
     /// [`DriverError::TimedNetworkUnsupported`] with `EtfPriorityShared`
-    /// when another etf publication of this driver declares `priority` on
-    /// the same interface address; [`DriverError::NetworkEndpoint`] when it
-    /// cannot open.
+    /// when another etf publication of this driver declares its priority on
+    /// the same interface (by index, whatever address it binds there);
+    /// [`DriverError::NetworkEndpoint`] when it cannot open.
     pub(crate) fn hold_etf_endpoint(
         &mut self,
         bind: SocketAddr,
-        priority: u32,
+        etf: karyos_io::backend::EtfQueue,
     ) -> Result<EndpointId, DriverError> {
-        let shared = self.send_endpoints.iter().any(|entry| {
-            entry.purpose == EndpointPurpose::Etf { priority } && entry.bind.ip() == bind.ip()
-        });
-        if shared {
+        let purpose = EndpointPurpose::Etf {
+            interface: etf.interface,
+            priority: etf.priority,
+        };
+        if self
+            .send_endpoints
+            .iter()
+            .any(|entry| entry.purpose == purpose)
+        {
             return Err(DriverError::TimedNetworkUnsupported {
                 reason: crate::error::TimedNetworkUnsupported::EtfPriorityShared,
             });
         }
-        self.hold_for(bind, None, EndpointPurpose::Etf { priority }, false)
+        self.hold_for(bind, None, purpose, false)
     }
 
     /// The data endpoint bound to `bind`, joined to `multicast` if any,

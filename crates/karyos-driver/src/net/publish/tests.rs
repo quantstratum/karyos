@@ -2705,8 +2705,24 @@ fn the_etf_route_is_refused_without_its_declaration() {
         ),
         (multicast, etf, Unsupported::EtfUnavailable),
     ];
+    // A typed declaration a URI could not give is refused, not dropped.
+    let no_interface = UdpConfig {
+        interface: None,
+        ..declared(3, 100_000)
+    };
     if cfg!(target_os = "linux") {
         cases.push((declared(3, 500_001), etf, Unsupported::EtfDeltaAboveAdvance));
+        for invalid in [
+            declared(3, 0),
+            declared(3, u64::from(u32::MAX) + 1),
+            no_interface,
+        ] {
+            cases.push((
+                invalid,
+                ScheduleOptions::default().with_route(TimedRoute::Etf { advance: u64::MAX }),
+                Unsupported::EtfDeclarationInvalid,
+            ));
+        }
     } else {
         cases.push((declared(3, 100_000), etf, Unsupported::EtfUnavailable));
     }
@@ -2767,8 +2783,55 @@ fn the_etf_route_is_refused_without_its_declaration() {
         })
     );
     driver.free_retired_streams();
+    // Another address of the same interface shares its leaf: refused.
+    let mut config = aggregate(14, 1);
+    config.stream.buffer.schedule_capacity = 4;
+    let alias = UdpConfig {
+        interface: Some(Interface::Address(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)))),
+        ..declared(3, 100_000)
+    };
+    assert_eq!(
+        driver
+            .add_timed_network_publication(config, &alias, None, etf)
+            .map(drop),
+        Err(DriverError::TimedNetworkUnsupported {
+            reason: Unsupported::EtfPriorityShared
+        })
+    );
+    driver.free_retired_streams();
     let mut config = aggregate(13, 1);
     config.stream.buffer.schedule_capacity = 4;
     let other = driver.add_timed_network_publication(config, &declared(4, 100_000), None, etf);
     assert!(other.is_ok(), "{other:?}");
+}
+
+/// ADR-0109 (#625): the `etf` route is set only by a network
+/// publication's creation, which checks it: the public `schedule_stream`
+/// refuses it, typed, on any lane.
+#[test]
+fn schedule_stream_refuses_the_etf_route() {
+    use karyos_client::schedule::{ScheduleOptions, TimedRoute};
+
+    let socket = receiver();
+    let mut driver = driver();
+    let mut config = aggregate(20, 1);
+    config.stream.buffer.schedule_capacity = 4;
+    let handle = driver
+        .add_timed_network_publication(
+            config,
+            &channel(Destination::Unicast(socket.local_addr().unwrap())),
+            None,
+            ScheduleOptions::default(),
+        )
+        .unwrap();
+    let stream = handle.lane(Lane::ZERO).unwrap();
+    assert!(matches!(
+        driver.schedule_stream(
+            stream,
+            ScheduleOptions::default().with_route(TimedRoute::Etf { advance: 1_000 }),
+        ),
+        Err(DriverError::Client(
+            karyos_client::ClientError::InvalidSchedule { .. }
+        ))
+    ));
 }

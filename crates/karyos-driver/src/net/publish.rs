@@ -824,8 +824,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     ) -> Result<(), DriverError> {
         for stream in handle.streams() {
             match &clock {
-                Some(clock) => self.schedule_stream_with_clock(stream, options, clock.clone())?,
-                None => self.schedule_stream(stream, options)?,
+                Some(clock) => {
+                    self.schedule_network_stream_with_clock(stream, options, clock.clone())?;
+                }
+                None => self.schedule_network_stream(stream, options)?,
             }
             self.ensure_timed_counters(stream)?;
             self.stream(stream)?.fix_schedule()?;
@@ -1244,7 +1246,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let etf = etf.filter(|_| timed.is_some());
         for &(bind, to) in &binds {
             let opened = if let Some(etf) = etf {
-                net.hold_etf_endpoint(bind, etf.priority)
+                net.hold_etf_endpoint(bind, etf)
             } else if paired {
                 net.hold_path_endpoint(bind)
             } else {
@@ -1393,26 +1395,38 @@ fn etf_refused(
         {
             Some(Unsupported::EtfUnavailable)
         }
-        (advance, Some(etf)) => u64::try_from(etf.delta.as_nanos())
-            .ok()
-            .filter(|delta| *delta <= advance)
-            .is_none()
-            .then_some(Unsupported::EtfDeltaAboveAdvance),
+        (advance, Some(etf)) => {
+            let delta = u64::try_from(etf.delta.as_nanos()).unwrap_or(u64::MAX);
+            if etf_queue(channel).is_none() {
+                Some(Unsupported::EtfDeclarationInvalid)
+            } else if delta > advance {
+                Some(Unsupported::EtfDeltaAboveAdvance)
+            } else {
+                None
+            }
+        }
     }
 }
 
 /// The etf queue of a publication on the `etf` route (ADR-0109 point 2):
-/// the channel's declaration and the bind address of its interface, which
-/// [`etf_refused`] checked.
+/// the channel's declaration, with the index of the interface that owns
+/// the channel's `interface` address. `None` for a declaration a URI could
+/// not give (a zero `delta` or one of 2^32 ns or more, no interface
+/// address) or an address no interface of this host owns; [`etf_refused`]
+/// refuses those. The declaration is recorded; only the priority reaches
+/// the kernel.
 fn etf_queue(channel: &UdpConfig) -> Option<karyos_io::backend::EtfQueue> {
     let etf = channel.etf?;
+    let Some(Interface::Address(address)) = channel.interface else {
+        return None;
+    };
+    let delta_ns = u32::try_from(etf.delta.as_nanos())
+        .ok()
+        .filter(|delta| *delta > 0)?;
     Some(karyos_io::backend::EtfQueue {
-        // The leaf's interface is named by the channel's `interface`
-        // address, which the endpoint binds; the declaration is recorded,
-        // and only the priority reaches the kernel.
-        interface: 0,
+        interface: karyos_io::sockets::path_interface::interface_index(address)?,
         priority: etf.priority,
-        delta_ns: u32::try_from(etf.delta.as_nanos()).ok()?,
+        delta_ns,
     })
 }
 

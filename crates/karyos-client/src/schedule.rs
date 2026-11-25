@@ -117,8 +117,11 @@ pub enum TimedRoute {
     /// The Linux `etf` qdisc releases each datagram at its time
     /// (`SO_TXTIME`). The sender hands a head to the kernel up to `advance`
     /// nanoseconds before its time, the declared tolerated advance, which
-    /// the channel's `etf-delta` must not exceed. Network publications
-    /// only, on Linux; a zero advance is refused.
+    /// the channel's `etf-delta` must not exceed. Without launch-time
+    /// offload the leaf dequeues a datagram up to its `delta` early, so a
+    /// datagram may reach the wire up to the advance before its time: the
+    /// publication declares it tolerates that. Network publications only,
+    /// on Linux; a zero advance is refused.
     Etf {
         /// The declared tolerated advance, in nanoseconds.
         advance: u64,

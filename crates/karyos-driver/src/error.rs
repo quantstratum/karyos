@@ -66,6 +66,11 @@ pub enum TimedNetworkUnsupported {
     /// driver (ADR-0109 point 5).
     #[error("the etf route off Linux or off a unicast destination")]
     EtfUnavailable,
+    /// An `etf` declaration a URI could not give: a zero `delta` or one of
+    /// 2^32 ns or more, no `interface` address, or an interface address
+    /// this host cannot resolve to an interface (ADR-0109 point 2).
+    #[error("an etf declaration with no valid delta or resolvable interface")]
+    EtfDeclarationInvalid,
 }
 
 /// Errors returned by the embedded driver.
