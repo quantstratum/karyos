@@ -140,6 +140,25 @@ pub enum Party {
 }
 
 impl Party {
+    /// Whether `other` is a party of the same key scope: both senders, or
+    /// receivers of the same receiver id. Only such a party may take over
+    /// a key already checked against its file.
+    fn same_scope(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Sender { .. }, Self::Sender { .. }) => true,
+            (
+                Self::Receiver {
+                    receiver_id: mine, ..
+                },
+                Self::Receiver {
+                    receiver_id: theirs,
+                    ..
+                },
+            ) => mine == theirs,
+            _ => false,
+        }
+    }
+
     fn domain(&self) -> Domain {
         match self {
             Self::Sender { .. } => Domain::Data,
@@ -269,6 +288,31 @@ impl Sealer {
     /// [`KeyError`] when the file does not fit the party.
     pub fn new(file: &KeyFile, party: Party, alias: Alias) -> Result<Self, KeyError> {
         Self::starting(file, party, alias, 0, 0)
+    }
+
+    /// A sealer for `party` on `alias` under this sealer's key file, from
+    /// in-band epoch 0: a new establishment of the same publication or receiver
+    /// (a new boot id or nonce) without reading the key file again.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError::Scope`] for a party of another kind or receiver.
+    pub fn with_party(&self, party: Party, alias: Alias) -> Result<Self, KeyError> {
+        if !party.same_scope(&self.party) {
+            return Err(KeyError::Scope);
+        }
+        let key = party
+            .context(self.file_epoch, 0, self.key_id)
+            .derive(&self.secret);
+        Ok(Self {
+            secret: Zeroizing::new(*self.secret),
+            party,
+            alias,
+            key_id: self.key_id,
+            file_epoch: self.file_epoch,
+            party_epoch: 0,
+            profile: keyed(&key, binding(party.domain(), 0, alias, self.key_id), 0),
+        })
     }
 
     fn starting(
@@ -506,6 +550,48 @@ impl Verifier {
         Ok(())
     }
 
+    /// A verifier for `party` on `alias` under this verifier's key files,
+    /// with empty windows: the binding of a new boot id (ADR-0086 section 7, publisher
+    /// rule) without reading the key files again.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError::Scope`] for a party of another kind or receiver.
+    pub fn with_party(&self, party: Party, alias: Alias) -> Result<Self, KeyError> {
+        if !party.same_scope(&self.party) {
+            return Err(KeyError::Scope);
+        }
+        let mut verifier = Self {
+            party,
+            alias,
+            key_id: self.key_id,
+            epochs: [None, None],
+        };
+        let mut epochs: [Option<EpochKeys>; MAX_FILE_EPOCHS] = [None, None];
+        for (slot, keys) in epochs.iter_mut().zip(&self.epochs) {
+            let Some(keys) = keys else { continue };
+            let secret = Zeroizing::new(*keys.secret);
+            let current = verifier.slot_for(&secret, self.key_id, keys.file_epoch, 0);
+            let next = Some(verifier.slot_for(&secret, self.key_id, keys.file_epoch, 1));
+            *slot = Some(EpochKeys {
+                file_epoch: keys.file_epoch,
+                secret,
+                previous: None,
+                previous_until: i64::MIN,
+                current,
+                next,
+            });
+        }
+        verifier.epochs = epochs;
+        Ok(verifier)
+    }
+
+    /// The `key_id` this verifier checks.
+    #[must_use]
+    pub fn key_id(&self) -> u32 {
+        self.key_id
+    }
+
     fn slot_for(
         &self,
         secret: &[u8; KEY_LEN],
@@ -714,6 +800,10 @@ pub struct Proof {
     signing: Option<(u32, HmacSha256)>,
     /// One profile per verifying file epoch.
     verifying: [Option<(u32, HmacSha256)>; MAX_FILE_EPOCHS],
+    /// The derived keys of `signing` and `verifying`, for the same proof
+    /// on another alias ([`Proof::for_alias`]).
+    signing_key: Option<Zeroizing<[u8; KEY_LEN]>>,
+    verifying_keys: [Option<Zeroizing<[u8; KEY_LEN]>>; MAX_FILE_EPOCHS],
 }
 
 impl core::fmt::Debug for Proof {
@@ -778,7 +868,11 @@ impl ProofKind {
         }
     }
 
-    fn profile(self, file: &KeyFile, alias: Alias) -> Result<HmacSha256, KeyError> {
+    fn profile(
+        self,
+        file: &KeyFile,
+        alias: Alias,
+    ) -> Result<(Zeroizing<[u8; KEY_LEN]>, HmacSha256), KeyError> {
         self.check(file)?;
         let context = match self {
             Self::Setup => Context::Setup {
@@ -794,11 +888,8 @@ impl ProofKind {
             },
         };
         let key = context.derive(secret(file)?);
-        Ok(keyed(
-            &key,
-            binding(self.domain(), 0, alias, file.key_id),
-            0,
-        ))
+        let profile = keyed(&key, binding(self.domain(), 0, alias, file.key_id), 0);
+        Ok((key, profile))
     }
 }
 
@@ -825,11 +916,17 @@ impl Proof {
             current,
             signing: None,
             verifying: [None, None],
+            signing_key: None,
+            verifying_keys: [None, None],
         };
         let mut count = 0_usize;
         for file in verifying {
             let slot = proof.verifying.get_mut(count).ok_or(KeyError::NoKey)?;
-            *slot = Some((file.file_epoch, kind.profile(file, alias)?));
+            let (key, profile) = kind.profile(file, alias)?;
+            *slot = Some((file.file_epoch, profile));
+            if let Some(held) = proof.verifying_keys.get_mut(count) {
+                *held = Some(key);
+            }
             if count == 0 {
                 proof.key_id = file.key_id;
             } else if file.key_id != proof.key_id {
@@ -842,12 +939,57 @@ impl Proof {
                 return Err(KeyError::Mixed);
             }
             proof.key_id = file.key_id;
-            proof.signing = Some((file.file_epoch, kind.profile(file, alias)?));
+            let (key, profile) = kind.profile(file, alias)?;
+            proof.signing = Some((file.file_epoch, profile));
+            proof.signing_key = Some(key);
         }
         if count == 0 && proof.signing.is_none() {
             return Err(KeyError::NoKey);
         }
         Ok(proof)
+    }
+
+    /// The same proof on `alias`: a subscription's SETUP proof checks, and
+    /// its RSP_SETUP proof seals, for each session of its stream, whose
+    /// alias it learns only from the datagram. Its sequence starts at 0:
+    /// these domains keep no window (ADR-0086 section 7).
+    #[must_use]
+    pub fn for_alias(&self, alias: Alias) -> Self {
+        let domain = self.kind.domain();
+        let rebound =
+            |key: &Zeroizing<[u8; KEY_LEN]>| keyed(key, binding(domain, 0, alias, self.key_id), 0);
+        let mut verifying: [Option<(u32, HmacSha256)>; MAX_FILE_EPOCHS] = [None, None];
+        let mut verifying_keys: [Option<Zeroizing<[u8; KEY_LEN]>>; MAX_FILE_EPOCHS] = [None, None];
+        for ((slot, held), (old, key)) in verifying
+            .iter_mut()
+            .zip(verifying_keys.iter_mut())
+            .zip(self.verifying.iter().zip(self.verifying_keys.iter()))
+        {
+            if let (Some((epoch, _)), Some(key)) = (old, key) {
+                *slot = Some((*epoch, rebound(key)));
+                *held = Some(Zeroizing::new(**key));
+            }
+        }
+        let signing = self
+            .signing
+            .as_ref()
+            .zip(self.signing_key.as_ref())
+            .map(|((epoch, _), key)| (*epoch, rebound(key)));
+        Self {
+            kind: self.kind,
+            key_id: self.key_id,
+            current: self.current,
+            signing,
+            verifying,
+            signing_key: self.signing_key.as_ref().map(|key| Zeroizing::new(**key)),
+            verifying_keys,
+        }
+    }
+
+    /// The `key_id` this proof checks.
+    #[must_use]
+    pub fn key_id(&self) -> u32 {
+        self.key_id
     }
 
     /// The domain this proof tags in: 5 for SETUP, 6 for RSP_SETUP.

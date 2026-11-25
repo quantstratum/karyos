@@ -102,6 +102,9 @@ struct Setup {
     /// Whether the subscription has a unicast control endpoint S, from
     /// which its SOLICITs and multicast CHALLENGEs leave (ADR-0096).
     solicit: bool,
+    /// Whether the publication is authenticated (ADR-0086): its
+    /// `Outbound` requires a sealer before anything leaves.
+    auth: bool,
 }
 
 impl Setup {
@@ -136,6 +139,7 @@ impl Default for Setup {
             concurrent: None,
             path_skew: None,
             solicit: false,
+            auth: false,
         }
     }
 }
@@ -302,6 +306,9 @@ impl Rig {
         rig.log = Some(log);
         let mut outbound = outbound;
         outbound.set_path_skew(setup.path_skew);
+        if setup.auth {
+            outbound.require_auth().unwrap();
+        }
         rig.links
             .sender
             .post(|reply| AgentCommand::AddPublication {
@@ -7393,4 +7400,132 @@ fn an_authenticated_images_rttm_request_leaves_the_duty_cycle_sealed() {
         panic!("not a control");
     };
     assert_eq!(decoded, expected);
+}
+
+/// A rig whose publication on A and subscription on B (as receiver 77)
+/// are authenticated, on the channel and pairwise keys returned, before
+/// any traffic.
+fn authenticated_rig() -> (Rig, EndpointId, crate::wire_keys::KeyFile) {
+    use crate::agents::roles::publish_auth::PublicationAuth;
+    use crate::agents::roles::receive_auth::SubscriptionAuth;
+
+    let (mut rig, b) = Rig::new(Setup {
+        auth: true,
+        reliable: true,
+        identity: Some(identity_77(0)),
+        ..Setup::default()
+    });
+    let (channel, pairwise) = auth_keys(77);
+    let a = rig.publisher;
+    rig.agents.receiver.role.authenticate_published(a, alias());
+    rig.agents.receiver.role.authenticate_subscription(
+        SubscriptionAuth::new(b, alias(), &channel, &pairwise, 77).unwrap(),
+    );
+    rig.agents.sender.role.authenticate_publication(
+        PublicationAuth::new(a, alias(), identity(), 2, &channel, &[&[&pairwise]]).unwrap(),
+    );
+    (rig, b, channel)
+}
+
+/// ADR-0086 sections 2, 4, 7 and 7a, end to end on unicast: the SETUP
+/// ANNOUNCE and ANSWER verify under the channel's SETUP proof, the
+/// CHALLENGE under the pair's RSP_SETUP proof and the publisher rule, the
+/// publication's session sealer is installed for the receiver's boot id
+/// and nonce, its SMs and RTTM probes verify in domain 4, and every DATA
+/// datagram is delivered sealed: nothing is refused on either side, and
+/// RTTM REPLYs (domain 1) are matched.
+#[test]
+fn an_authenticated_publisher_and_receiver_establish_and_deliver() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let (mut rig, _b, _channel) = authenticated_rig();
+    let slot = established(&mut rig);
+    let boot = rig.agents.receiver.role.receiver_of(slot).receiver_boot_id;
+    let party = rig.agents.sender.role.outbound(0).unwrap().sealer_party();
+    let Some(crate::wire_auth::Party::Sender {
+        identity: sealed_for,
+        lane_count,
+        receiver_boot_id,
+        ..
+    }) = party
+    else {
+        panic!("the session sealer is installed: {party:?}");
+    };
+    assert_eq!(
+        (sealed_for, lane_count, receiver_boot_id),
+        (identity(), 2, boot)
+    );
+    assert!(
+        rig.agents.receiver.role.auth_rejections(slot).is_some(),
+        "the image is authenticated"
+    );
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let messages: Vec<Vec<u8>> = (0..10u8)
+        .map(|i| vec![i; 100 + usize::from(i) * 90])
+        .collect();
+    for message in &messages {
+        let _ = rig.log.as_mut().unwrap().publications[0]
+            .append(message, AppendOptions::default())
+            .unwrap();
+    }
+    let mut delivered = Vec::new();
+    for _ in 0..3000 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            delivered.push(message);
+        }
+        if delivered.len() == messages.len() && rig.agents.receiver.counters().rttm_samples > 0 {
+            break;
+        }
+    }
+    assert_eq!(delivered, messages);
+    let receiver = rig.agents.receiver.counters();
+    let sender = rig.agents.sender.role.counters();
+    assert!(receiver.data_committed >= 10, "{receiver:?}");
+    assert!(receiver.rttm_samples > 0, "a domain 1 RTTM REPLY matched");
+    assert_eq!(
+        (
+            receiver.auth_rejected,
+            receiver.auth_bare,
+            receiver.auth_unbound,
+            receiver.auth_inner_invalid,
+            receiver.auth_install_refused,
+        ),
+        (0, 0, 0, 0, 0),
+        "{receiver:?}"
+    );
+    assert_eq!(
+        (sender.auth_rejected, sender.auth_bare, sender.auth_unbound),
+        (0, 0, 0),
+        "{sender:?}"
+    );
+    assert_eq!(sender.auth_sealers_installed, 1);
+}
+
+/// ADR-0086 section 2: a bare SETUP ANNOUNCE for an authenticated
+/// subscription creates no challenge; the trusted rig, with nothing
+/// authenticated, establishes as before.
+#[test]
+fn a_bare_announce_for_an_authenticated_subscription_is_refused() {
+    use karyos_protocol::network::Control;
+
+    let (mut rig, b, _channel) = authenticated_rig();
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let sessions = rig.agents.receiver.role.session_counters();
+    let before = rig.agents.receiver.counters();
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_control(
+        &receiver.sessions,
+        b,
+        source,
+        Control::SetupAnnounce(announce(65_536)),
+        rig.now,
+    );
+    only_changed(
+        before,
+        rig.agents.receiver.counters(),
+        |c| &mut c.auth_bare,
+        1,
+    );
+    assert_eq!(rig.agents.receiver.role.session_counters(), sessions);
 }

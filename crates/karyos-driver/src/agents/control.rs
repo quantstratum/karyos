@@ -232,6 +232,20 @@ pub enum ControlItem {
         /// `None` on a trusted channel, whose controls go bare.
         seal: Option<SharedSealer>,
     },
+    /// An envelope that arrived on `endpoint` from `source` for a local
+    /// authenticated publication: carried undecoded, so that the sender
+    /// agent verifies it before anything reads its inner frames (ADR-0086
+    /// section 2).
+    Sealed {
+        /// The endpoint it arrived on.
+        endpoint: EndpointId,
+        /// Its backend source.
+        source: SocketAddr,
+        /// The datagram.
+        bytes: SealedBytes,
+        /// When the receiver took it from the backend.
+        seen: u64,
+    },
     /// `control` arrived on `endpoint` from `source`, for a local
     /// publication.
     Incoming {
@@ -244,6 +258,41 @@ pub enum ControlItem {
         /// When the receiver took it from the backend.
         seen: u64,
     },
+}
+
+/// The bytes of one sealed control, in a fixed array: a control is at
+/// most [`MAX_CONTROL_LENGTH`] bytes and its envelope [`ENVELOPE_LEN`].
+#[derive(Clone, Copy)]
+pub struct SealedBytes {
+    len: usize,
+    bytes: [u8; MAX_CONTROL_LENGTH + ENVELOPE_LEN],
+}
+
+impl core::fmt::Debug for SealedBytes {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SealedBytes")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SealedBytes {
+    /// A copy of `datagram`; `None` when longer than any sealed control.
+    #[must_use]
+    pub fn copy(datagram: &[u8]) -> Option<Self> {
+        let mut bytes = [0u8; MAX_CONTROL_LENGTH + ENVELOPE_LEN];
+        bytes.get_mut(..datagram.len())?.copy_from_slice(datagram);
+        Some(Self {
+            len: datagram.len(),
+            bytes,
+        })
+    }
+
+    /// The datagram.
+    #[must_use]
+    pub fn get(&self) -> &[u8] {
+        self.bytes.get(..self.len).unwrap_or(&[])
+    }
 }
 
 /// The gate of control traffic: every candidate is permitted.
@@ -414,7 +463,7 @@ impl ControlSeal for Sealer {
 /// the control is not sent (fail closed).
 #[derive(Clone)]
 pub struct SharedSealer {
-    sealer: Arc<Mutex<Sealer>>,
+    sealer: Arc<Mutex<dyn ControlSeal + Send>>,
     domain: Domain,
 }
 
@@ -436,6 +485,17 @@ impl SharedSealer {
             domain,
         }
     }
+
+    /// Shares the RSP_SETUP or SETUP `proof` of a subscription: its
+    /// CHALLENGEs and SOLICITs are sealed by the sender agent.
+    #[must_use]
+    pub fn proof(proof: Proof) -> Self {
+        let domain = proof.domain();
+        Self {
+            sealer: Arc::new(Mutex::new(proof)),
+            domain,
+        }
+    }
 }
 
 impl ControlSeal for SharedSealer {
@@ -444,7 +504,7 @@ impl ControlSeal for SharedSealer {
     }
 
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
-        self.sealer.lock().ok()?.seal(buffer, frames).ok()
+        self.sealer.lock().ok()?.seal_control(buffer, frames)
     }
 }
 

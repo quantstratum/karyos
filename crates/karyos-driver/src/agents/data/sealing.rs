@@ -154,6 +154,37 @@ impl<T: StreamTerms> Outbound<T> {
         Ok(())
     }
 
+    /// Lends the installed sealer, to seal one of the publication's
+    /// sender controls (PATH_HB, ERR, RTTM REPLY) in domain 1 under the
+    /// same envelope sequence as its DATA; [`Outbound::return_sealer`]
+    /// gives it back. `None` while no sealer is installed. Moves a box:
+    /// allocates nothing.
+    pub(crate) fn lend_sealer(&mut self) -> Option<Box<Sealer>> {
+        match core::mem::replace(&mut self.auth, SenderAuth::Pending) {
+            SenderAuth::Sealing(sealer) => Some(sealer),
+            other => {
+                self.auth = other;
+                None
+            }
+        }
+    }
+
+    /// Gives back the sealer [`Outbound::lend_sealer`] lent.
+    pub(crate) fn return_sealer(&mut self, sealer: Box<Sealer>) {
+        if matches!(self.auth, SenderAuth::Pending) {
+            self.auth = SenderAuth::Sealing(sealer);
+        }
+    }
+
+    /// The installed sealer's party (tests).
+    #[cfg(test)]
+    pub(crate) fn sealer_party(&self) -> Option<crate::wire_auth::Party> {
+        match &self.auth {
+            SenderAuth::Sealing(sealer) => Some(sealer.party()),
+            SenderAuth::Off | SenderAuth::Pending => None,
+        }
+    }
+
     /// Whether the publication is authenticated.
     #[must_use]
     pub fn authenticated(&self) -> bool {

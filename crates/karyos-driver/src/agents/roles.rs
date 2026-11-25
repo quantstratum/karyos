@@ -87,7 +87,7 @@ use karyos_sys::sizing::TermLength;
 use super::chain::{ImageChain, SessionCommand, SessionEnd, SessionEvent};
 use super::control::{
     ControlItem, ControlRoutes, ControlSeal, ControlSendError, ItemGuard, ReportGuard, ReportSlot,
-    RouteSlot, SendReport, SharedSealer, SmGuard, SmSlot,
+    RouteSlot, SealedBytes, SendReport, SharedSealer, SmGuard, SmSlot,
 };
 use super::data::Outbound;
 
@@ -275,6 +275,12 @@ pub struct ReceiverCounters {
     /// Envelopes for no authenticated binding: dropped before any key or
     /// state is touched, with no SOLICIT.
     pub auth_unbound: u64,
+    /// Images of an authenticated subscription whose keys could not be
+    /// made: not installed (fail closed).
+    pub auth_install_refused: u64,
+    /// Sealed controls of a receiver for an authenticated publication on
+    /// this driver that a full control ring dropped.
+    pub ring_full_sealed: u64,
     /// Bare DATA, heartbeats, PATH_HB, ERR, RTTM REPLY, SETUP ANNOUNCE or
     /// SETUP ANSWER for an authenticated image (ADR-0086 section 2):
     /// dropped.
@@ -440,6 +446,16 @@ pub struct SenderCounters {
     /// Controls of an authenticated image that could not be sealed: never
     /// sent bare (ADR-0086 section 2).
     pub seal_failures: u64,
+    /// Sealed controls of an authenticated publication its keys refused
+    /// (by reason on the publication; ADR-0086 sections 2 and 7).
+    pub auth_rejected: u64,
+    /// Bare controls of a receiver for an authenticated publication:
+    /// dropped.
+    pub auth_bare: u64,
+    /// Sealed controls for no authenticated publication: dropped.
+    pub auth_unbound: u64,
+    /// Session sealers installed at a binding.
+    pub auth_sealers_installed: u64,
     /// Idle heartbeats submitted: header-only DATA frames of established
     /// lanes that sent nothing for `sender_heartbeat_interval` (SPEC §6),
     /// one per route of a redundant-path lane, each counted.
@@ -930,6 +946,15 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// Refused envelopes no authenticated binding owns (unbound, or too
     /// short to name one), by reason (ADR-0086 section 2).
     auth_unattributed: AuthRejections,
+    /// The local authenticated publications, by endpoint and alias: their
+    /// receivers' envelopes go to the sender agent undecoded, their bare
+    /// controls are dropped.
+    published_auth: Vec<(EndpointId, Alias)>,
+    /// The authenticated subscriptions.
+    subscription_auth: Vec<SubscriptionAuth>,
+    /// A SETUP ANNOUNCE or ANSWER being handled verified under its
+    /// subscription's SETUP proof.
+    verified_setup: bool,
     /// Each image's RTT probes' settings.
     rtt: RttConfig,
     /// A multicast image's NAK timing.
@@ -1846,6 +1871,10 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     budget: u32,
     /// The announcements due this cycle (allocated at creation).
     due: Vec<(EndpointId, SetupAnnounce)>,
+    /// The authenticated publications' keys (ADR-0086).
+    publication_auth: Vec<PublicationAuth>,
+    /// The verified RSP_SETUP being answered.
+    establishing: Option<Establishing>,
     /// `path_heartbeat_interval` in ns (RP-3).
     path_heartbeat_interval: u64,
     /// `sender_heartbeat_interval` in ns (SPEC §6).
@@ -2035,6 +2064,8 @@ pub(super) fn roles<T: StreamTerms>(
             routes,
             budget: u32::try_from(config.control_capacity).unwrap_or(u32::MAX),
             due: Vec::with_capacity(config.publications),
+            publication_auth: Vec::new(),
+            establishing: None,
             path_heartbeat_interval: config.path_heartbeat_interval,
             sender_heartbeat_interval: config.sender_heartbeat_interval,
             setup_interval: config.setup_interval,
@@ -2155,6 +2186,9 @@ pub(super) fn roles<T: StreamTerms>(
             path_config: receiver_path_config(config),
             path_intake: None,
             auth_unattributed: AuthRejections::default(),
+            published_auth: Vec::new(),
+            subscription_auth: Vec::new(),
+            verified_setup: false,
             rtt: config.rtt,
             multicast: config.multicast,
             unicast_retry_slack: config.unicast_retry_slack,
@@ -2785,6 +2819,20 @@ impl<T: StreamTerms> ReceiverRole<T> {
             work: 0,
         };
         intake.bytes_in(source, bytes);
+    }
+
+    /// Marks the local publication `alias` on `endpoint` authenticated
+    /// (tests): its receivers' envelopes go to the sender undecoded and
+    /// their bare controls are dropped.
+    #[cfg(test)]
+    pub(super) fn authenticate_published(&mut self, endpoint: EndpointId, alias: Alias) {
+        self.published_auth.push((endpoint, alias));
+    }
+
+    /// Makes a subscription authenticated with `auth` (tests).
+    #[cfg(test)]
+    pub(super) fn authenticate_subscription(&mut self, auth: SubscriptionAuth) {
+        self.subscription_auth.push(auth);
     }
 
     /// Hands `item` to the sender agent's ring (tests).
@@ -3428,6 +3476,36 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 self.barrier_ack_timeout,
             ))
         });
+        // An authenticated subscription's image derives its keys for this
+        // establishment, or is not installed (fail closed).
+        let auth = match self
+            .subscription_auth
+            .iter()
+            .find(|auth| auth.endpoint == key.endpoint && auth.stream_id == key.alias.stream_id)
+        {
+            None => None,
+            Some(subscription) => {
+                let boot = self.sessions.boot_id();
+                let sender = crate::wire_auth::Party::Sender {
+                    identity,
+                    lane_count: chain.lane_count,
+                    receiver_boot_id: boot,
+                    nonce: chain.nonce,
+                };
+                let receiver = crate::wire_auth::Party::Receiver {
+                    identity,
+                    receiver_boot_id: boot,
+                    receiver_id: named,
+                };
+                match subscription.image(key.alias, sender, receiver) {
+                    Ok(auth) => Some(Box::new(auth)),
+                    Err(_) => {
+                        self.count(|c| &mut c.auth_install_refused);
+                        return Err(Some(chain.retire));
+                    }
+                }
+            }
+        };
         self.images.push(Installed {
             slot: installed,
             owner,
@@ -3476,7 +3554,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             receiver_id: named,
             group_tag,
             nonce: chain.nonce,
-            auth: None,
+            auth,
         });
         Ok(link)
     }
@@ -4664,6 +4742,7 @@ impl<T: StreamTerms> Intake<'_, T> {
     fn forward(&mut self, item: ControlItem) -> bool {
         let full: fn(&mut ReceiverCounters) -> &mut u64 = match item {
             ControlItem::Outgoing { .. } => |c| &mut c.ring_full_rsp_setup,
+            ControlItem::Sealed { .. } => |c| &mut c.ring_full_sealed,
             ControlItem::Incoming {
                 control: Control::Solicit(_),
                 ..
@@ -5186,12 +5265,29 @@ impl<T: StreamTerms> Intake<'_, T> {
                 _ => "other",
             }
         ));
+        // An authenticated subscription's CHALLENGE or SOLICIT goes sealed
+        // under its pairwise key's RSP_SETUP proof (domain 6), never bare.
+        let alias = match control {
+            Control::Challenge(challenge) => Some(challenge.alias),
+            Control::Solicit(solicit) => Some(solicit.alias),
+            _ => None,
+        };
+        let seal = alias.and_then(|alias| {
+            self.role
+                .subscription_auth
+                .iter()
+                .find(|auth| {
+                    auth.stream_id == alias.stream_id
+                        && (auth.endpoint == self.endpoint || auth.endpoint == endpoint)
+                })
+                .map(|auth| auth.rsp_sealer(alias))
+        });
         self.forward(ControlItem::Outgoing {
             endpoint,
             destination: source,
             control,
             guard: None,
-            seal: None,
+            seal,
         })
     }
 
@@ -5384,13 +5480,17 @@ impl<T: StreamTerms> Intake<'_, T> {
         let now = self.now;
         match control {
             Control::SetupAnnounce(announce) => {
-                // A bare SETUP for an authenticated image is refused before
-                // any challenge is created or consumed: an unverified
-                // ANNOUNCE or ANSWER could otherwise bind a later path.
-                // Every further path of an authenticated image is refused
-                // until the SETUP proof (domain 5) is verified (slice 3b of
-                // karyos#648; ADR-0086 section 7a).
-                if self.names_authenticated(announce.alias, announce.identity) {
+                // A bare SETUP for an authenticated subscription or image is
+                // refused before any challenge is created or consumed: an
+                // unverified ANNOUNCE or ANSWER could otherwise bind a path.
+                // One verified under the channel's SETUP proof (domain 5,
+                // ADR-0086 section 7a) proceeds, a later path of an
+                // authenticated image included: only a holder of the
+                // channel key can make one.
+                if !self.role.verified_setup
+                    && (self.names_authenticated(announce.alias, announce.identity)
+                        || self.subscription_authenticated(announce.alias.stream_id))
+                {
                     self.role.count(|c| &mut c.auth_bare);
                     return;
                 }
@@ -5446,13 +5546,17 @@ impl<T: StreamTerms> Intake<'_, T> {
                 }
             }
             Control::SetupAnswer(answer) => {
-                // A bare SETUP for an authenticated image is refused before
-                // any challenge is created or consumed: an unverified
-                // ANNOUNCE or ANSWER could otherwise bind a later path.
-                // Every further path of an authenticated image is refused
-                // until the SETUP proof (domain 5) is verified (slice 3b of
-                // karyos#648; ADR-0086 section 7a).
-                if self.names_authenticated(answer.alias, answer.identity) {
+                // A bare SETUP for an authenticated subscription or image is
+                // refused before any challenge is created or consumed: an
+                // unverified ANNOUNCE or ANSWER could otherwise bind a path.
+                // One verified under the channel's SETUP proof (domain 5,
+                // ADR-0086 section 7a) proceeds, a later path of an
+                // authenticated image included: only a holder of the
+                // channel key can make one.
+                if !self.role.verified_setup
+                    && (self.names_authenticated(answer.alias, answer.identity)
+                        || self.subscription_authenticated(answer.alias.stream_id))
+                {
                     self.role.count(|c| &mut c.auth_bare);
                     return;
                 }
@@ -5700,13 +5804,26 @@ impl<T: StreamTerms> Intake<'_, T> {
     /// counter: no SOLICIT, no path queue, no state.
     fn bytes_in(&mut self, source: SocketAddr, bytes: &[u8]) {
         if receive_auth::is_envelope(bytes) {
-            self.sealed(source, bytes);
+            let alias = receive_auth::envelope_alias(bytes);
+            let domain = bytes.get(10).copied();
+            if alias.is_some_and(|alias| self.published_authenticated(alias)) {
+                self.sealed_for_publication(source, bytes);
+            } else if domain
+                == Some(karyos_protocol::protection::hmac_sha256::Domain::SetupProof as u8)
+            {
+                self.sealed_setup(source, bytes);
+            } else {
+                self.sealed(source, bytes);
+            }
             return;
         }
         match classify(bytes) {
             Ok(Datagram::Control(control)) => {
-                if sender_frame_alias(&control)
-                    .is_some_and(|alias| self.authenticated(source, alias))
+                let bare_for_publication = receiver_control_alias(&control)
+                    .is_some_and(|alias| self.published_authenticated(alias));
+                if bare_for_publication
+                    || sender_frame_alias(&control)
+                        .is_some_and(|alias| self.authenticated(source, alias))
                 {
                     self.role.count(|c| &mut c.auth_bare);
                     return;
@@ -5847,6 +5964,107 @@ impl<T: StreamTerms> Intake<'_, T> {
         }
     }
 
+    /// Whether `alias` is a local authenticated publication on this
+    /// endpoint.
+    fn published_authenticated(&self, alias: Alias) -> bool {
+        self.role.published_auth.contains(&(self.endpoint, alias))
+    }
+
+    /// Whether the subscription to `stream_id` on this endpoint is
+    /// authenticated.
+    fn subscription_authenticated(&self, stream_id: i32) -> bool {
+        self.role
+            .subscription_auth
+            .iter()
+            .any(|auth| auth.endpoint == self.endpoint && auth.stream_id == stream_id)
+    }
+
+    /// An envelope for a local authenticated publication: handed to the
+    /// sender agent undecoded, which verifies it under that publication's
+    /// keys before anything reads it (ADR-0086 section 2).
+    fn sealed_for_publication(&mut self, source: SocketAddr, bytes: &[u8]) {
+        let Some(sealed) = SealedBytes::copy(bytes) else {
+            self.role.auth_unattributed.bump(AuthReason::Length);
+            self.role.count(|c| &mut c.auth_rejected);
+            return;
+        };
+        let _ = self.forward(ControlItem::Sealed {
+            endpoint: self.endpoint,
+            source,
+            bytes: sealed,
+            seen: self.now,
+        });
+    }
+
+    /// A SETUP ANNOUNCE or ANSWER envelope (domain 5): verified under the
+    /// SETUP proof of its stream's authenticated subscription on this
+    /// endpoint before its inner control is read, and handled only if
+    /// that control is a SETUP of the envelope's own alias.
+    fn sealed_setup(&mut self, source: SocketAddr, bytes: &[u8]) {
+        let Some(alias) = receive_auth::envelope_alias(bytes) else {
+            self.role.auth_unattributed.bump(AuthReason::Short);
+            self.role.count(|c| &mut c.auth_unbound);
+            return;
+        };
+        let endpoint = self.endpoint;
+        let Some(index) = self
+            .role
+            .subscription_auth
+            .iter()
+            .position(|auth| auth.endpoint == endpoint && auth.stream_id == alias.stream_id)
+        else {
+            self.role.auth_unattributed.bump(AuthReason::Unbound);
+            self.role.count(|c| &mut c.auth_unbound);
+            return;
+        };
+        let verified = self
+            .role
+            .subscription_auth
+            .get(index)
+            .map(|auth| auth.verify_setup(alias, bytes));
+        let reject = |intake: &mut Self, reason: AuthReason| {
+            if let Some(auth) = intake.role.subscription_auth.get_mut(index) {
+                auth.rejections.bump(reason);
+            }
+            intake.role.count(|c| &mut c.auth_rejected);
+        };
+        let proved = match verified {
+            Some(Ok(proved)) => proved,
+            Some(Err(rejection)) => {
+                reject(
+                    self,
+                    AuthReason::of(crate::wire_auth::Refusal::Envelope(rejection)),
+                );
+                return;
+            }
+            None => return,
+        };
+        let inner = bytes
+            .get(proved.opened.start..)
+            .and_then(|rest| rest.get(..proved.opened.frames));
+        let control = match inner.map(classify) {
+            Some(Ok(Datagram::Control(control @ Control::SetupAnnounce(announce))))
+                if announce.alias == alias =>
+            {
+                control
+            }
+            Some(Ok(Datagram::Control(control @ Control::SetupAnswer(answer))))
+                if answer.alias == alias =>
+            {
+                control
+            }
+            _ => {
+                reject(self, AuthReason::Inner);
+                self.role.count(|c| &mut c.auth_inner_invalid);
+                return;
+            }
+        };
+        self.drain_own_queue();
+        self.role.verified_setup = true;
+        self.control(source, control);
+        self.role.verified_setup = false;
+    }
+
     /// Whether a bare SETUP ANNOUNCE or ANSWER names an authenticated
     /// image: its identity, or its alias on this endpoint.
     fn names_authenticated(&self, alias: Alias, identity: Identity) -> bool {
@@ -5886,6 +6104,28 @@ impl<T: StreamTerms> SenderRole<T> {
     #[must_use]
     pub fn counters(&self) -> SenderCounters {
         self.counters
+    }
+
+    /// Makes the publication `auth` names authenticated (tests); its
+    /// `Outbound` must have been made authenticated too. Nothing else
+    /// does yet.
+    #[cfg(test)]
+    pub(super) fn authenticate_publication(&mut self, auth: PublicationAuth) {
+        self.publication_auth.push(auth);
+    }
+
+    /// Sends `control` as the publication's sender control would be sent
+    /// (tests).
+    #[cfg(test)]
+    pub(super) fn send_sender_control_for<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        endpoint: EndpointId,
+        destination: SocketAddr,
+        control: &Control,
+    ) -> bool {
+        self.send_sender_control(halves, endpoint, destination, control)
+            .submitted()
     }
 
     /// Takes the next control the receiver handed over, unsent (tests).
@@ -6723,7 +6963,7 @@ impl<T: StreamTerms> SenderRole<T> {
             }
             for (endpoint, destination) in due.into_iter().flatten() {
                 if matches!(
-                    self.send(halves, endpoint, destination, &control),
+                    self.send_sender_control(halves, endpoint, destination, &control),
                     Sent::Submitted
                 ) {
                     if let Some(outbound) = self.publications.get_mut(index) {
@@ -6747,6 +6987,151 @@ impl<T: StreamTerms> SenderRole<T> {
         control: &Control,
     ) -> Sent {
         self.send_with(halves, endpoint, destination, control, Mode::Now, None)
+    }
+
+    /// The index of the authenticated publication `alias` on `endpoint`.
+    fn publication_auth_index(&self, endpoint: EndpointId, alias: Alias) -> Option<usize> {
+        self.publication_auth
+            .iter()
+            .position(|auth| auth.endpoint == endpoint && auth.alias == alias)
+    }
+
+    /// Verifies an envelope for a local authenticated publication under
+    /// its keys and returns its control; `None` when refused (counted by
+    /// reason), with nothing else changed.
+    fn open_sealed(&mut self, endpoint: EndpointId, bytes: &[u8]) -> Option<Control> {
+        let alias = receive_auth::envelope_alias(bytes);
+        let index = alias.and_then(|alias| self.publication_auth_index(endpoint, alias));
+        let (Some(alias), Some(index)) = (alias, index) else {
+            self.count(|c| &mut c.auth_unbound);
+            return None;
+        };
+        let identity = self.sessions.identity(endpoint, alias);
+        let lane_count = self
+            .publications
+            .iter()
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+            .and_then(|outbound| u8::try_from(outbound.readers().len()).ok());
+        let (Some(identity), Some(lane_count)) = (identity, lane_count) else {
+            self.count(|c| &mut c.auth_unbound);
+            return None;
+        };
+        let opened = self
+            .publication_auth
+            .get_mut(index)
+            .map(|auth| auth.open(bytes, identity, lane_count));
+        match opened {
+            Some(Ok(publish_auth::Opened::RspSetup(control, establishing))) => {
+                self.establishing = Some(establishing);
+                Some(control)
+            }
+            Some(Ok(publish_auth::Opened::Receiver(control))) => Some(control),
+            Some(Err(_)) | None => {
+                self.count(|c| &mut c.auth_rejected);
+                None
+            }
+        }
+    }
+
+    /// Installs the session sealer of a verified establishment on the
+    /// publication `answer` names: a new binding's, or the bound one's if
+    /// none is installed yet. The bound establishment's own sealer is
+    /// never replaced, so its envelope sequence is kept.
+    fn establish(&mut self, endpoint: EndpointId, answer: &Control, establishing: Establishing) {
+        let Control::SetupAnswer(answer) = answer else {
+            return;
+        };
+        let Some(index) = self.publication_auth_index(endpoint, answer.alias) else {
+            return;
+        };
+        let sealer = self
+            .publication_auth
+            .get(index)
+            .and_then(|auth| auth.sealer(establishing.party).ok());
+        let Some(sealer) = sealer else {
+            return;
+        };
+        let installed = self
+            .publications
+            .iter_mut()
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == answer.alias)
+            .is_some_and(|outbound| outbound.install_sealer(sealer).is_ok());
+        if installed {
+            self.count(|c| &mut c.auth_sealers_installed);
+        }
+    }
+
+    /// Sends a SETUP ANNOUNCE or ANSWER of the authenticated publication at
+    /// `index`, sealed under its SETUP proof (domain 5), now or not at all.
+    fn send_setup<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        endpoint: EndpointId,
+        destination: SocketAddr,
+        control: &Control,
+        index: usize,
+    ) -> Sent {
+        // Moved out and back: allocates nothing.
+        let mut auths = std::mem::take(&mut self.publication_auth);
+        let sent = match auths.get_mut(index) {
+            Some(auth) => self.send_with(
+                halves,
+                endpoint,
+                destination,
+                control,
+                Mode::Now,
+                Some(&mut auth.setup),
+            ),
+            None => Sent::NotSubmitted,
+        };
+        self.publication_auth = auths;
+        sent
+    }
+
+    /// Sends a sender control of a publication (PATH_HB, ERR, RTTM REPLY):
+    /// for an authenticated one sealed in domain 1 by its session sealer,
+    /// or not at all while it has none; bare otherwise.
+    fn send_sender_control<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        endpoint: EndpointId,
+        destination: SocketAddr,
+        control: &Control,
+    ) -> Sent {
+        let alias = match control {
+            Control::PathHeartbeat(heartbeat) => Some(heartbeat.alias),
+            Control::NakReply(reply) => Some(reply.alias),
+            Control::Rttm(rttm) => Some(rttm.alias),
+            _ => None,
+        };
+        let Some(alias) =
+            alias.filter(|alias| self.publication_auth_index(endpoint, *alias).is_some())
+        else {
+            return self.send(halves, endpoint, destination, control);
+        };
+        let index = self
+            .publications
+            .iter()
+            .position(|outbound| outbound.serves(endpoint) && outbound.alias() == alias);
+        let sealer = index
+            .and_then(|index| self.publications.get_mut(index))
+            .and_then(|outbound| outbound.lend_sealer());
+        let (Some(index), Some(mut sealer)) = (index, sealer) else {
+            self.count(|c| &mut c.seal_failures);
+            return Sent::NotSubmitted;
+        };
+        let sent = self.send_with(
+            halves,
+            endpoint,
+            destination,
+            control,
+            Mode::Now,
+            Some(&mut *sealer),
+        );
+        if let Some(outbound) = self.publications.get_mut(index) {
+            outbound.return_sealer(sealer);
+        }
+        sent
     }
 
     /// [`SenderRole::send`] of a receiver's control: sealed under `seal`
@@ -6940,6 +7325,37 @@ impl<T: StreamTerms> SenderRole<T> {
                 break;
             };
             work = work.checked_add(1).ok_or(overflow.clone())?;
+            // An authenticated publication's receiver controls are verified
+            // under its keys before anything decodes them; a bare one is
+            // dropped (ADR-0086 section 2).
+            let item = match item {
+                ControlItem::Sealed {
+                    endpoint,
+                    source,
+                    bytes,
+                    seen,
+                } => match self.open_sealed(endpoint, bytes.get()) {
+                    Some(control) => ControlItem::Incoming {
+                        endpoint,
+                        source,
+                        control,
+                        seen,
+                    },
+                    None => continue,
+                },
+                ControlItem::Incoming {
+                    endpoint,
+                    ref control,
+                    ..
+                } if receiver_control_alias(control).is_some_and(|alias| {
+                    self.publication_auth_index(endpoint, alias).is_some()
+                }) =>
+                {
+                    self.count(|c| &mut c.auth_bare);
+                    continue;
+                }
+                other => other,
+            };
             match item {
                 // §7.3: an RSP_SETUP to the trigger's validated source,
                 // checked by the receiver.
@@ -7028,7 +7444,7 @@ impl<T: StreamTerms> SenderRole<T> {
                 } => {
                     if let Some(reply) = self.rttm_request(endpoint, source, &request, seen, now)
                         && self
-                            .send(halves, endpoint, source, &Control::Rttm(reply))
+                            .send_sender_control(halves, endpoint, source, &Control::Rttm(reply))
                             .submitted()
                     {
                         self.count(|c| &mut c.rttm_replied);
@@ -7040,12 +7456,32 @@ impl<T: StreamTerms> SenderRole<T> {
                     control,
                     ..
                 } => {
+                    let establishing = self.establishing.take();
+                    let authenticated = receiver_control_alias(&control)
+                        .and_then(|alias| self.publication_auth_index(endpoint, alias));
+                    // An authenticated publication answers only a verified
+                    // RSP_SETUP (fail closed).
+                    if authenticated.is_some() && establishing.is_none() {
+                        self.count(|c| &mut c.auth_bare);
+                        continue;
+                    }
                     if let Some((destination, answer)) =
                         self.answer_for(endpoint, source, now, control)
                     {
-                        let _ = self.send(halves, endpoint, destination, &answer);
+                        match (authenticated, establishing) {
+                            (Some(index), Some(establishing)) => {
+                                self.establish(endpoint, &answer, establishing);
+                                let _ =
+                                    self.send_setup(halves, endpoint, destination, &answer, index);
+                            }
+                            _ => {
+                                let _ = self.send(halves, endpoint, destination, &answer);
+                            }
+                        }
                     }
                 }
+                // Turned into `Incoming` or dropped above.
+                ControlItem::Sealed { .. } => {}
             }
         }
         // A publication with no live receiver (no live member and no
@@ -7125,12 +7561,28 @@ impl<T: StreamTerms> SenderRole<T> {
                     }
                     None => {
                         work = work.checked_add(1).ok_or(overflow.clone())?;
-                        let _ = self.send_or_wait(
-                            halves,
-                            endpoint,
-                            destination,
-                            &Control::SetupAnnounce(announce),
-                        );
+                        // An authenticated publication's ANNOUNCE goes
+                        // sealed now (domain 5) or not at all: the waiting
+                        // room would send it bare. It is announced again.
+                        match self.publication_auth_index(endpoint, announce.alias) {
+                            Some(index) => {
+                                let _ = self.send_setup(
+                                    halves,
+                                    endpoint,
+                                    destination,
+                                    &Control::SetupAnnounce(announce),
+                                    index,
+                                );
+                            }
+                            None => {
+                                let _ = self.send_or_wait(
+                                    halves,
+                                    endpoint,
+                                    destination,
+                                    &Control::SetupAnnounce(announce),
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -7997,7 +8449,7 @@ impl<T: StreamTerms> SenderRole<T> {
         let intake = outbound.nak_at(normal, nak, requester, (route, validated), now);
         if let NakIntake::Reply(reply) = intake
             && self
-                .send(halves, endpoint, source, &Control::NakReply(reply))
+                .send_sender_control(halves, endpoint, source, &Control::NakReply(reply))
                 .submitted()
         {
             self.count(|c| &mut c.nak_replies);
@@ -8115,7 +8567,7 @@ impl<T: StreamTerms> SenderRole<T> {
         match destination {
             Some(destination) => {
                 if self
-                    .send(halves, endpoint, destination, &Control::NakReply(*reply))
+                    .send_sender_control(halves, endpoint, destination, &Control::NakReply(*reply))
                     .submitted()
                 {
                     self.count(|c| &mut c.nak_replies);
@@ -9020,9 +9472,11 @@ fn established<T: StreamTerms>(sessions: &SendSessions, outbound: &Outbound<T>) 
 }
 
 mod path_intake;
+pub(crate) mod publish_auth;
 pub(crate) mod receive_auth;
 
-use receive_auth::{AuthReason, AuthRejections, ImageAuth};
+use publish_auth::{Establishing, PublicationAuth, receiver_control_alias};
+use receive_auth::{AuthReason, AuthRejections, ImageAuth, SubscriptionAuth};
 
 /// The receiver's redundant path settings under `config`.
 pub(crate) fn receiver_path_config(config: &AgentConfig) -> PathConfig {

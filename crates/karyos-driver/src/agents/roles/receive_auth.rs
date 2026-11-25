@@ -58,9 +58,18 @@ pub enum AuthReason {
     Duplicate,
     /// A sequence older than the window.
     TooOld,
-    /// It opened, but its inner frames are not a domain 1 datagram of its
-    /// own binding: its sequence is not consumed.
+    /// It opened, but its inner frames are not a datagram of its own
+    /// binding and domain: its sequence is not consumed.
     Inner,
+    /// An RSP_SETUP of a boot id already bound under another nonce: it
+    /// would move the session key (ADR-0086 section 7, publisher rule).
+    Rebind,
+    /// An RSP_SETUP of a retired boot id.
+    Retired,
+    /// An RSP_SETUP that verified only under the previous file epoch.
+    PreviousEpoch,
+    /// An RSP_SETUP of a new boot id with no room left to retire the old.
+    Full,
     /// An envelope for no authenticated binding.
     Unbound,
 }
@@ -132,6 +141,137 @@ pub(crate) struct ImageAuth {
     pub(crate) rejections: AuthRejections,
     /// The wall clock in seconds, for the in-band epoch overlap.
     wall: fn() -> i64,
+}
+
+/// An authenticated subscription's keys (ADR-0086 sections 4 and 7a):
+/// the channel's SETUP proof verifies its publishers' SETUP ANNOUNCE and
+/// ANSWER (domain 5), its pairwise key's RSP_SETUP proof seals its
+/// CHALLENGEs and SOLICITs (domain 6), and each image it installs derives
+/// its domain 1 verifier and domain 4 sealer from the prototypes here.
+#[derive(Debug)]
+pub(crate) struct SubscriptionAuth {
+    pub(crate) endpoint: crate::agents::EndpointId,
+    pub(crate) stream_id: i32,
+    /// Verify only, rebound to each SETUP's alias.
+    setup: crate::wire_auth::Proof,
+    /// Signing, rebound to each RSP_SETUP's alias.
+    rsp: crate::wire_auth::Proof,
+    /// The channel key's domain 1 verifier for no establishment yet.
+    sender: Verifier,
+    /// The pairwise key's domain 4 sealer for no boot id yet.
+    receiver: Sealer,
+    /// Its refusals by reason: the SETUPs of its stream.
+    pub(crate) rejections: AuthRejections,
+}
+
+impl SubscriptionAuth {
+    /// The keys of the subscription to `stream_id` on `endpoint` as
+    /// `receiver_id`: `channel` the channel key files (verify), `pairwise`
+    /// the pairwise signing key. `alias` is any alias of the stream: the
+    /// SETUP and RSP_SETUP proofs take only its stream, and an image
+    /// derives its own keys for its session.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError`] when a file does not fit its purpose.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no authenticated channel opens yet")
+    )]
+    pub(crate) fn new(
+        endpoint: crate::agents::EndpointId,
+        alias: Alias,
+        channel: &KeyFile,
+        pairwise: &KeyFile,
+        receiver_id: u64,
+    ) -> Result<Self, KeyError> {
+        use crate::wire_auth::{Proof, ProofKind};
+
+        let none = [0u64; 2];
+        let identity = karyos_protocol::network::Identity {
+            driver_id: none,
+            registration_id: 0,
+            incarnation: 0,
+        };
+        let setup = Proof::new(ProofKind::Setup, alias, None, [channel], channel.file_epoch)?;
+        let rsp = Proof::new(
+            ProofKind::RspSetup { receiver_id },
+            alias,
+            Some(pairwise),
+            [pairwise],
+            pairwise.file_epoch,
+        )?;
+        let sender = Verifier::new(
+            [channel],
+            Party::Sender {
+                identity,
+                lane_count: 1,
+                receiver_boot_id: none,
+                nonce: none,
+            },
+            alias,
+        )?;
+        let receiver = Sealer::new(
+            pairwise,
+            Party::Receiver {
+                identity,
+                receiver_boot_id: none,
+                receiver_id,
+            },
+            alias,
+        )?;
+        Ok(Self {
+            endpoint,
+            stream_id: alias.stream_id,
+            setup,
+            rsp,
+            sender,
+            receiver,
+            rejections: AuthRejections::default(),
+        })
+    }
+
+    /// Checks a SETUP ANNOUNCE or ANSWER envelope on `alias` under the
+    /// channel's SETUP proof (domain 5); changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// The [`Rejection`].
+    pub(crate) fn verify_setup(
+        &self,
+        alias: Alias,
+        datagram: &[u8],
+    ) -> Result<crate::wire_auth::Proved, Rejection> {
+        self.setup.for_alias(alias).verify(datagram)
+    }
+
+    /// The sealer of a CHALLENGE or SOLICIT on `alias` (domain 6).
+    pub(crate) fn rsp_sealer(&self, alias: Alias) -> SharedSealer {
+        SharedSealer::proof(self.rsp.for_alias(alias))
+    }
+
+    /// The keys of an image of this subscription on `alias`, for its
+    /// domain 1 `sender` and domain 4 `receiver` parties.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError::Scope`] for a receiver id other than the pairwise
+    /// key's: the image is then not installed (fail closed).
+    pub(crate) fn image(
+        &self,
+        alias: Alias,
+        sender: Party,
+        receiver: Party,
+    ) -> Result<ImageAuth, KeyError> {
+        let verifier = self.sender.with_party(sender, alias)?;
+        let sealer = self.receiver.with_party(receiver, alias)?;
+        Ok(ImageAuth {
+            verifier,
+            sealer: SharedSealer::new(sealer),
+            rejections: AuthRejections::default(),
+            wall: wall_seconds,
+        })
+    }
 }
 
 impl ImageAuth {
@@ -232,10 +372,6 @@ pub(crate) fn envelope_alias(bytes: &[u8]) -> Option<Alias> {
 /// The wall clock in whole seconds since the Unix epoch. A clock before
 /// the epoch reads as the far future, which ends every in-band overlap
 /// early (fail closed) and never extends one.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no authenticated channel opens yet")
-)]
 pub(crate) fn wall_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
