@@ -6,36 +6,47 @@
 //! cluster can be rebuilt from them into an isolated environment for audit
 //! or testing"; karyos#717).
 //!
-//! - **Export** ([`export`]): the node's latest snapshot and its committed
-//!   log after the snapshot's base go to remote storage through the
-//!   Archive's [`ObjectStore`] (the S3 client implements it; nothing here
-//!   depends on it), each retained until the caller's deadline. Every
-//!   object is read back and checked against the CRC-32C taken before the
-//!   put before it counts: an export whose copy does not read back whole
-//!   is refused, and nothing counts it. The manifest goes last, so an
-//!   export a failure cut short has no manifest and is never rebuilt
-//!   from. It reads the snapshot store and the log only, on the control
-//!   path: nothing on the data path calls it.
-//! - **Rebuild** ([`rebuild`]): from an export's manifest, the snapshot is
-//!   streamed into a fresh snapshot store piece by piece and published,
-//!   and the log restarts after its base with the exported entries,
-//!   committed up to the export's top. Every object is checked against
-//!   the manifest's CRC-32C before anything is written: a damaged one is
-//!   refused, naming its range ([`BackupError::Damaged`]). A target that
-//!   already holds a log is installed over only under the Archive's hold
-//!   ([`HoldSource`]): through a hold it is refused, typed, and nothing
-//!   changes (owner decisions 2026-10-21, item 35).
+//! - **Export** ([`export`]) of a *stopped* node: its latest snapshot and
+//!   its committed log after the snapshot's base go to remote storage
+//!   through the Archive's [`ObjectStore`] (the S3 client implements it;
+//!   nothing here depends on it), each retained until the caller's
+//!   deadline. The snapshot's term is checked against the log's term at
+//!   its base, and the commit must reach the base. Every object is read
+//!   back and checked against the CRC-32C taken before the put before it
+//!   counts, and the manifest goes last. An export refuses a remote that
+//!   already holds an export of the cluster ([`BackupError::Exists`]): an
+//!   export never overwrites another. It reads the stores only, on the
+//!   control path: nothing on the data path calls it.
+//! - **Check** ([`verify`]): the manifest's structure (exactly one snapshot
+//!   first, then log ranges covering the base's next index to the top in
+//!   order, with no gap or overlap), then every object, one at a time: its
+//!   CRC-32C and length, and its contents (every entry at the index its
+//!   range says, terms never going down, the last the top).
+//! - **Rebuild** ([`rebuild`]) into *empty* directories only: the export is
+//!   checked whole first, as [`verify`] does, before anything is written;
+//!   then each object is fetched again, rechecked and written, the
+//!   snapshot streamed into the fresh store and published, the log
+//!   restarted after its base and committed up to the top. A non-empty
+//!   target is refused ([`BackupError::NotEmpty`]): a rebuild never
+//!   installs over a node's state, so it never purges anything, and in
+//!   particular nothing an Archive hold keeps (owner decisions 2026-10-21,
+//!   item 35). A failure after the checks (a disk error) can leave the
+//!   target partly written: it is discarded, and the rebuild run again into
+//!   empty directories.
 //! - **Report**: an export and a rebuild each report the index and term
 //!   their state reaches and what they do not include ([`NOT_INCLUDED`]).
 //!
 //! The CRC-32C detects corruption; it claims no tamper evidence (item 15).
+//! At most one object is held in memory at a time; an object is at most
+//! [`ENTRIES_PER_OBJECT`] entries and [`MAX_OBJECT_BYTES`] bytes, but the
+//! snapshot's object is as large as the snapshot.
 //!
 //! **Layout.** Objects are keyed by the cluster's 32-byte identity, as the
 //! Archive keys an archive's: recording [`SNAPSHOT_OBJECT`] holds the
 //! snapshot (one object, its sections framed as kind, version, length,
-//! bytes), recording [`LOG_OBJECTS`] the log in ranges of at most
-//! [`ENTRIES_PER_OBJECT`] entries (`start` and `end` are log indices, end
-//! exclusive), and recording [`MANIFEST_OBJECT`] the manifest.
+//! bytes), recording [`LOG_OBJECTS`] the log in ranges (`start` and `end`
+//! are log indices, end exclusive), and recording [`MANIFEST_OBJECT`] the
+//! manifest.
 
 use std::io;
 use std::path::Path;
@@ -46,7 +57,7 @@ use karyos_archive::integrity::Digest;
 use karyos_archive::integrity::tiering::{ObjectKey, ObjectKind, ObjectStore};
 use karyos_archive::segment::Geometry;
 
-use crate::log::{HoldSource, LogError, RaftLog};
+use crate::log::{LogError, RaftLog};
 use crate::snapshot::{SectionKind, SnapshotConfig, SnapshotError, SnapshotStore, WRITE_CHUNK};
 use crate::{Entry, HardState};
 
@@ -58,7 +69,9 @@ pub const LOG_OBJECTS: u64 = 1;
 pub const MANIFEST_OBJECT: u64 = 2;
 /// The most entries one log object holds.
 pub const ENTRIES_PER_OBJECT: u64 = 1024;
-/// The log bytes an export or a rebuild reads at once.
+/// The most bytes one log object holds, but for a single larger entry.
+pub const MAX_OBJECT_BYTES: usize = 8 << 20;
+/// The log bytes an export reads at once.
 const READ_BYTES: u64 = 1 << 20;
 
 /// What an export and a rebuild do not include, stated in every report.
@@ -67,11 +80,14 @@ pub const NOT_INCLUDED: &[&str] = &[
     "the node's term and vote (the rebuilt log takes the top entry's term, no vote)",
     "snapshots older than the latest",
     "the Archive's own recordings, holds and journals",
-    "the live cluster's membership and identity: a rebuild is its own cluster",
+    "a separate identity or membership: the rebuild is restored storage, to be started only under isolation its operator enforces",
 ];
 
 const MANIFEST_MAGIC: [u8; 4] = *b"KYBK";
 const MANIFEST_VERSION: u32 = 1;
+/// A log entry's fixed framing in an object: index, term, event time,
+/// length.
+const ENTRY_HEADER: usize = 32;
 
 /// One object of an export, as its manifest lists it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,7 +125,7 @@ pub struct Report {
     pub top: (u64, u64),
     /// The log entries after the base.
     pub entries: u64,
-    /// The objects, each read back and checked.
+    /// The objects, the manifest included, each read back and checked.
     pub objects: u64,
     /// What it does not include.
     pub not_included: &'static [&'static str],
@@ -122,15 +138,39 @@ pub enum BackupError {
     /// The node has no snapshot to export.
     #[error("the node has no snapshot to export")]
     NoSnapshot,
+    /// The snapshot's term is not the log's at its base, or the log cannot
+    /// tell: the snapshot is not this log's.
+    #[error("the snapshot at {index} has term {snapshot}, the log {log:?}")]
+    SnapshotTerm {
+        /// The snapshot's base index.
+        index: u64,
+        /// Its term.
+        snapshot: u64,
+        /// The log's term there, if it holds one.
+        log: Option<u64>,
+    },
+    /// The log's commit is below the snapshot's base, or unknown.
+    #[error("the commit {commit:?} is below the snapshot's base {base}")]
+    CommitBelowBase {
+        /// The snapshot's base.
+        base: u64,
+        /// The stored commit.
+        commit: Option<u64>,
+    },
     /// The log does not hold every committed entry after the snapshot's
-    /// base, or not its base's term.
+    /// base.
     #[error("the log does not hold the committed entries after {base}")]
     LogShort {
         /// The snapshot's base.
         base: u64,
     },
-    /// An object's bytes do not match its manifest entry, or did not read
-    /// back whole after an export's put: its recording and range.
+    /// The remote already holds an export of the cluster: an export never
+    /// overwrites another.
+    #[error("the remote already holds an export of this cluster")]
+    Exists,
+    /// An object's bytes do not match its manifest entry or its range, or
+    /// did not read back whole after an export's put: its recording and
+    /// range.
     #[error("object {recording} {start}..{end} is damaged")]
     Damaged {
         /// Its recording.
@@ -140,14 +180,17 @@ pub enum BackupError {
         /// Its end, exclusive.
         end: u64,
     },
-    /// The manifest is missing or does not decode whole.
-    #[error("the export's manifest is missing or damaged")]
-    Manifest,
+    /// The manifest is missing, damaged, or does not describe a whole
+    /// export: why.
+    #[error("the export's manifest is missing or invalid: {0}")]
+    Manifest(&'static str),
+    /// A rebuild's target directories are not empty, or cannot be listed.
+    #[error("the rebuild's target {0} is not empty")]
+    NotEmpty(String),
     /// The snapshot store's error.
     #[error(transparent)]
     Snapshot(#[from] SnapshotError),
-    /// The log's error: [`LogError::ArchiveHeld`] for a rebuild through a
-    /// hold.
+    /// The log's error.
     #[error(transparent)]
     Log(#[from] LogError),
     /// Remote storage's error.
@@ -169,6 +212,14 @@ fn key(cluster: Digest, recording: u64, start: u64, end: u64) -> ObjectKey {
     }
 }
 
+fn damaged(listed: &Listed) -> BackupError {
+    BackupError::Damaged {
+        recording: listed.recording,
+        start: listed.start,
+        end: listed.end,
+    }
+}
+
 /// Puts `bytes` under `listed`'s key, reads them back and checks them.
 fn put_checked(
     store: &mut impl ObjectStore,
@@ -181,24 +232,23 @@ fn put_checked(
     let _ = store.put(&key, bytes, retain_until_ns)?;
     let back = store.get(&key)?;
     if back.len() as u64 != listed.length || crc32c(&back) != listed.crc {
-        return Err(BackupError::Damaged {
-            recording: listed.recording,
-            start: listed.start,
-            end: listed.end,
-        });
+        return Err(damaged(listed));
     }
     Ok(())
 }
 
-/// Exports the node's latest snapshot and its committed log after it to
-/// `store` under `cluster`, retained until `retain_until_ns`; every object
-/// is read back and checked, the manifest last.
+/// Exports a stopped node's latest snapshot and its committed log after it
+/// to `store` under `cluster`, retained until `retain_until_ns`.
 ///
 /// # Errors
 ///
-/// [`BackupError::NoSnapshot`], [`BackupError::LogShort`],
-/// [`BackupError::Damaged`] for a copy that does not read back whole, and
-/// the stores' errors. An export that fails has no manifest.
+/// [`BackupError::Exists`] for a remote that holds an export of `cluster`;
+/// [`BackupError::NoSnapshot`], [`BackupError::SnapshotTerm`],
+/// [`BackupError::CommitBelowBase`] and [`BackupError::LogShort`], before
+/// anything is put; [`BackupError::Damaged`] for a copy that does not read
+/// back whole; the stores' errors. An export that fails before its
+/// manifest's put has no manifest; one whose manifest's read-back fails may
+/// have one, which [`verify`] then judges.
 pub fn export<D: Disk + Clone, E: Disk + Clone>(
     snapshots: &SnapshotStore<E>,
     log: &mut RaftLog<D>,
@@ -206,7 +256,30 @@ pub fn export<D: Disk + Clone, E: Disk + Clone>(
     cluster: Digest,
     retain_until_ns: u64,
 ) -> Result<Report, BackupError> {
+    if store.get(&key(cluster, MANIFEST_OBJECT, 0, 0)).is_ok() {
+        return Err(BackupError::Exists);
+    }
     let info = snapshots.latest().ok_or(BackupError::NoSnapshot)?;
+    let base = info.index;
+    // The snapshot must be this log's: its term is the log's at its base,
+    // as the log holds it or as an install recorded it.
+    let log_term = log.term(base).or_else(|| {
+        log.base()
+            .filter(|(index, _)| *index == base)
+            .map(|(_, term)| term)
+    });
+    if base > 0 && log_term != Some(info.term) {
+        return Err(BackupError::SnapshotTerm {
+            index: base,
+            snapshot: info.term,
+            log: log_term,
+        });
+    }
+    let commit = log.hard_state().and_then(|state| state.commit);
+    let commit = match commit {
+        Some(commit) if commit >= base => commit,
+        commit => return Err(BackupError::CommitBelowBase { base, commit }),
+    };
     // The snapshot, framed section by section.
     let mut reader = snapshots.reader(&info)?;
     let mut bytes = Vec::new();
@@ -231,23 +304,20 @@ pub fn export<D: Disk + Clone, E: Disk + Clone>(
         crc: crc32c(&bytes),
     };
     put_checked(store, cluster, &snapshot, &bytes, retain_until_ns)?;
+    drop(bytes);
     let mut objects = vec![snapshot];
-    // The committed log after the base, in ranges.
-    let base = info.index;
-    let commit = log
-        .hard_state()
-        .and_then(|state| state.commit)
-        .unwrap_or(base)
-        .max(base);
+    // The committed log after the base, in ranges bounded in entries and
+    // bytes.
     let mut top = (info.index, info.term);
     let mut next = base + 1;
     let mut entries = 0u64;
     while next <= commit {
-        let end = (next + ENTRIES_PER_OBJECT).min(commit + 1);
+        let limit = (next + ENTRIES_PER_OBJECT).min(commit + 1);
         let mut chunk = Vec::new();
         let mut at = next;
-        while at < end {
-            let read = log.entries(at..end, READ_BYTES)?;
+        while at < limit && (chunk.is_empty() || chunk.len() < MAX_OBJECT_BYTES) {
+            let budget = (MAX_OBJECT_BYTES - chunk.len()) as u64;
+            let read = log.entries(at..limit, budget.min(READ_BYTES))?;
             if read.is_empty() {
                 return Err(BackupError::LogShort { base });
             }
@@ -265,19 +335,20 @@ pub fn export<D: Disk + Clone, E: Disk + Clone>(
         let listed = Listed {
             recording: LOG_OBJECTS,
             start: next,
-            end,
+            end: at,
             length: chunk.len() as u64,
             crc: crc32c(&chunk),
         };
         put_checked(store, cluster, &listed, &chunk, retain_until_ns)?;
         objects.push(listed);
-        next = end;
+        next = at;
     }
     let manifest = Manifest {
         base: (info.index, info.term),
         top,
         objects,
     };
+    manifest.validate()?;
     let encoded = manifest.encode();
     let listed = Listed {
         recording: MANIFEST_OBJECT,
@@ -325,97 +396,195 @@ impl Manifest {
     ///
     /// [`BackupError::Manifest`] for anything else.
     pub fn decode(bytes: &[u8]) -> Result<Self, BackupError> {
+        let bad = BackupError::Manifest("its bytes do not decode whole");
         let (body, crc) = bytes
             .split_at_checked(bytes.len().saturating_sub(4))
-            .ok_or(BackupError::Manifest)?;
-        if u32::from_le_bytes(crc.try_into().map_err(|_| BackupError::Manifest)?) != crc32c(body) {
-            return Err(BackupError::Manifest);
+            .ok_or(BackupError::Manifest("too short"))?;
+        let stored = <[u8; 4]>::try_from(crc).map(u32::from_le_bytes).ok();
+        if stored != Some(crc32c(body)) {
+            return Err(BackupError::Manifest("its CRC-32C does not match"));
         }
         let mut cursor = Cursor(body);
-        if cursor.take(4)? != MANIFEST_MAGIC || cursor.u32()? != MANIFEST_VERSION {
-            return Err(BackupError::Manifest);
+        let header = (|| Some((cursor.take(4)?.to_vec(), cursor.u32()?)))();
+        if header != Some((MANIFEST_MAGIC.to_vec(), MANIFEST_VERSION)) {
+            return Err(bad);
         }
-        let base = (cursor.u64()?, cursor.u64()?);
-        let top = (cursor.u64()?, cursor.u64()?);
-        let count = cursor.u64()?;
-        let mut objects = Vec::new();
-        for _ in 0..count {
-            objects.push(Listed {
-                recording: cursor.u64()?,
-                start: cursor.u64()?,
-                end: cursor.u64()?,
-                length: cursor.u64()?,
-                crc: cursor.u32()?,
-            });
-        }
+        let numbers = (|| {
+            let base = (cursor.u64()?, cursor.u64()?);
+            let top = (cursor.u64()?, cursor.u64()?);
+            let count = cursor.u64()?;
+            let mut objects = Vec::new();
+            for _ in 0..count {
+                objects.push(Listed {
+                    recording: cursor.u64()?,
+                    start: cursor.u64()?,
+                    end: cursor.u64()?,
+                    length: cursor.u64()?,
+                    crc: cursor.u32()?,
+                });
+            }
+            Some((base, top, objects))
+        })();
+        let Some((base, top, objects)) = numbers else {
+            return Err(bad);
+        };
         if !cursor.0.is_empty() {
-            return Err(BackupError::Manifest);
+            return Err(bad);
         }
         Ok(Self { base, top, objects })
+    }
+
+    /// Checks that the manifest describes a whole export: exactly one
+    /// snapshot, first; then log ranges in order covering the base's next
+    /// index to the top, each non-empty and at most
+    /// [`ENTRIES_PER_OBJECT`] entries, with no gap or overlap; a top at the
+    /// base exactly when there is none.
+    ///
+    /// # Errors
+    ///
+    /// [`BackupError::Manifest`], with what is wrong.
+    pub fn validate(&self) -> Result<(), BackupError> {
+        let Some((snapshot, ranges)) = self.objects.split_first() else {
+            return Err(BackupError::Manifest("no object"));
+        };
+        if snapshot.recording != SNAPSHOT_OBJECT
+            || snapshot.start != 0
+            || snapshot.end != snapshot.length
+        {
+            return Err(BackupError::Manifest(
+                "the first object is not the snapshot",
+            ));
+        }
+        if self.top.0 < self.base.0 || self.top.1 < self.base.1 {
+            return Err(BackupError::Manifest("the top is below the base"));
+        }
+        let mut next = self
+            .base
+            .0
+            .checked_add(1)
+            .ok_or(BackupError::Manifest("the base overflows"))?;
+        for range in ranges {
+            if range.recording != LOG_OBJECTS {
+                return Err(BackupError::Manifest(
+                    "an object after the first is not a log range",
+                ));
+            }
+            if range.start != next
+                || range.end <= range.start
+                || range.end - range.start > ENTRIES_PER_OBJECT
+            {
+                return Err(BackupError::Manifest(
+                    "the log ranges leave a gap, overlap or are empty",
+                ));
+            }
+            next = range.end;
+        }
+        let covered = next - 1;
+        if covered != self.top.0 {
+            return Err(BackupError::Manifest(
+                "the log ranges do not end at the top",
+            ));
+        }
+        Ok(())
     }
 }
 
 /// A reader over manifest or object bytes.
 struct Cursor<'a>(&'a [u8]);
 
-impl Cursor<'_> {
-    fn take(&mut self, n: usize) -> Result<&[u8], BackupError> {
-        let (head, rest) = self.0.split_at_checked(n).ok_or(BackupError::Manifest)?;
+impl<'a> Cursor<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let (head, rest) = self.0.split_at_checked(n)?;
         self.0 = rest;
-        Ok(head)
+        Some(head)
     }
 
-    fn u32(&mut self) -> Result<u32, BackupError> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?
-                .try_into()
-                .map_err(|_| BackupError::Manifest)?,
-        ))
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
 
-    fn u64(&mut self) -> Result<u64, BackupError> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?
-                .try_into()
-                .map_err(|_| BackupError::Manifest)?,
-        ))
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
 }
 
-/// Fetches `listed` from `store` and checks it against the manifest.
+/// A snapshot object's sections, as (kind, version, bytes).
+fn snapshot_sections(bytes: &[u8]) -> Option<Vec<(SectionKind, u64, &[u8])>> {
+    let mut cursor = Cursor(bytes);
+    let mut sections = Vec::new();
+    while !cursor.0.is_empty() {
+        let kind = SectionKind::from_code(cursor.u32()?)?;
+        let version = cursor.u64()?;
+        let length = usize::try_from(cursor.u64()?).ok()?;
+        sections.push((kind, version, cursor.take(length)?));
+    }
+    (!sections.is_empty()).then_some(sections)
+}
+
+/// A log object's entries, each at the index its range says, terms never
+/// below `floor` nor going down.
+fn log_entries(bytes: &[u8], listed: &Listed, floor: u64) -> Option<Vec<Entry>> {
+    let mut cursor = Cursor(bytes);
+    let mut entries = Vec::new();
+    let mut expected = listed.start;
+    let mut term_floor = floor;
+    while !cursor.0.is_empty() {
+        if cursor.0.len() < ENTRY_HEADER {
+            return None;
+        }
+        let index = cursor.u64()?;
+        let term = cursor.u64()?;
+        let event_time = cursor.u64()?;
+        let length = usize::try_from(cursor.u64()?).ok()?;
+        let payload = cursor.take(length)?.to_vec();
+        if index != expected || term < term_floor {
+            return None;
+        }
+        expected += 1;
+        term_floor = term;
+        entries.push(Entry {
+            index,
+            term,
+            event_time,
+            payload,
+        });
+    }
+    (expected == listed.end).then_some(entries)
+}
+
+/// Fetches `listed` and checks its length and CRC-32C.
 fn fetch(
     store: &mut impl ObjectStore,
     cluster: Digest,
     listed: &Listed,
 ) -> Result<Vec<u8>, BackupError> {
-    let damaged = || BackupError::Damaged {
-        recording: listed.recording,
-        start: listed.start,
-        end: listed.end,
-    };
     let bytes = store
         .get(&key(cluster, listed.recording, listed.start, listed.end))
-        .map_err(|_| damaged())?;
+        .map_err(|_| damaged(listed))?;
     if bytes.len() as u64 != listed.length || crc32c(&bytes) != listed.crc {
-        return Err(damaged());
+        return Err(damaged(listed));
     }
     Ok(bytes)
 }
 
-/// The export's manifest under `cluster`.
+/// The export's manifest under `cluster`, decoded and validated.
 ///
 /// # Errors
 ///
-/// [`BackupError::Manifest`] when it is missing or damaged.
+/// [`BackupError::Manifest`] when it is missing, damaged or invalid.
 pub fn manifest(store: &mut impl ObjectStore, cluster: Digest) -> Result<Manifest, BackupError> {
     let bytes = store
         .get(&key(cluster, MANIFEST_OBJECT, 0, 0))
-        .map_err(|_| BackupError::Manifest)?;
-    Manifest::decode(&bytes)
+        .map_err(|_| BackupError::Manifest("missing"))?;
+    let manifest = Manifest::decode(&bytes)?;
+    manifest.validate()?;
+    Ok(manifest)
 }
 
-/// Checks every object of the export under `cluster` against its manifest,
-/// changing nothing: what an auditor runs before trusting a rebuild.
+/// Checks every object of the export under `cluster`, one at a time,
+/// changing nothing: its bytes against the manifest, and its contents
+/// against its range; the last entry is the top. What an auditor runs
+/// before trusting a copy, and what [`rebuild`] runs before writing.
 ///
 /// # Errors
 ///
@@ -423,14 +592,28 @@ pub fn manifest(store: &mut impl ObjectStore, cluster: Digest) -> Result<Manifes
 /// first damaged object.
 pub fn verify(store: &mut impl ObjectStore, cluster: Digest) -> Result<Manifest, BackupError> {
     let manifest = manifest(store, cluster)?;
+    let mut floor = manifest.base.1;
+    let mut last = manifest.base;
     for listed in &manifest.objects {
-        let _ = fetch(store, cluster, listed)?;
+        let bytes = fetch(store, cluster, listed)?;
+        if listed.recording == SNAPSHOT_OBJECT {
+            snapshot_sections(&bytes).ok_or_else(|| damaged(listed))?;
+        } else {
+            let entries = log_entries(&bytes, listed, floor).ok_or_else(|| damaged(listed))?;
+            if let Some(entry) = entries.last() {
+                floor = entry.term;
+                last = (entry.index, entry.term);
+            }
+        }
+    }
+    if last != manifest.top {
+        return Err(BackupError::Manifest("the last entry is not the top"));
     }
     Ok(manifest)
 }
 
 /// Where a rebuild writes: a node's log and snapshot directories on `disk`,
-/// which exist; an empty log directory makes a fresh node.
+/// both existing and empty.
 #[derive(Debug, Clone, Copy)]
 pub struct Target<'a, D> {
     /// The disk.
@@ -443,47 +626,34 @@ pub struct Target<'a, D> {
     pub geometry: Geometry,
 }
 
-/// Rebuilds a node from the export under `cluster` into `target`: the
-/// export is checked whole first, then the snapshot is streamed into the
-/// target's snapshot store and published, and the log restarts after its
-/// base with the exported entries, committed up to the top. A target that
-/// already holds a log is installed over only when `hold` holds nothing.
+/// Rebuilds a node from the export under `cluster` into `target`, whose
+/// directories are empty: the export is checked whole first ([`verify`]),
+/// then each object is fetched again, rechecked and written, the snapshot
+/// streamed into a fresh store and published and the log restarted after
+/// its base, committed up to the top.
 ///
 /// # Errors
 ///
-/// [`BackupError::Manifest`] and [`BackupError::Damaged`], before anything
-/// is written; [`BackupError::Log`] with [`LogError::ArchiveHeld`] through
-/// a hold, changing nothing; the stores' errors.
+/// [`BackupError::NotEmpty`], [`BackupError::Manifest`] and
+/// [`BackupError::Damaged`], before anything is written; the stores'
+/// errors after, which may leave the target partly written.
 pub fn rebuild<D: Disk + Clone>(
     store: &mut impl ObjectStore,
     cluster: Digest,
     target: &Target<'_, D>,
-    hold: &impl HoldSource,
 ) -> Result<Report, BackupError> {
-    // Everything checked before anything is written.
-    let manifest = manifest(store, cluster)?;
-    let mut fetched = Vec::with_capacity(manifest.objects.len());
-    for listed in &manifest.objects {
-        fetched.push((*listed, fetch(store, cluster, listed)?));
-    }
-    let (base, base_term) = manifest.base;
-    // A target that holds a log is opened, and refused through a hold
-    // before anything changes.
-    let existing = target
-        .disk
-        .clone()
-        .list(target.log)
-        .map(|names| !names.is_empty())
-        .unwrap_or(false);
-    // Over a node's log, the hold is read before anything is opened: an
-    // open may rewrite the log's watermark, and nothing may change through
-    // a hold.
-    if existing {
-        match hold.hold_state() {
-            karyos_archive::control::HoldState::None => {}
-            state => return Err(BackupError::Log(LogError::ArchiveHeld { state })),
+    for dir in [target.log, target.snapshots] {
+        let names = target
+            .disk
+            .clone()
+            .list(dir)
+            .map_err(|_| BackupError::NotEmpty(dir.display().to_string()))?;
+        if !names.is_empty() {
+            return Err(BackupError::NotEmpty(dir.display().to_string()));
         }
     }
+    let manifest = verify(store, cluster)?;
+    let (base, base_term) = manifest.base;
     let mut snapshots = SnapshotStore::open(
         target.disk.clone(),
         target.snapshots,
@@ -491,96 +661,41 @@ pub fn rebuild<D: Disk + Clone>(
         SnapshotConfig::default(),
     )?
     .store;
-    let mut log = if existing {
-        RaftLog::open_with_under(
-            target.disk.clone(),
-            target.log,
-            target.geometry,
-            Some(&snapshots),
-            hold,
-        )?
-        .log
-    } else {
-        RaftLog::create(target.disk.clone(), target.log, target.geometry, 1)?
-    };
-    // The snapshot, streamed into the target's store.
+    let mut log = RaftLog::create(target.disk.clone(), target.log, target.geometry, 1)?;
     let mut entries = 0u64;
-    for (listed, bytes) in &fetched {
-        if listed.recording != SNAPSHOT_OBJECT {
-            continue;
-        }
-        let mut pending = snapshots.begin(base, base_term)?;
-        let mut cursor = Cursor(bytes);
-        while !cursor.0.is_empty() {
-            let damaged = |_| BackupError::Damaged {
-                recording: listed.recording,
-                start: listed.start,
-                end: listed.end,
-            };
-            let code = cursor.u32().map_err(damaged)?;
-            let version = cursor.u64().map_err(damaged)?;
-            let length = cursor.u64().map_err(damaged)?;
-            let kind = SectionKind::from_code(code).ok_or(BackupError::Damaged {
-                recording: listed.recording,
-                start: listed.start,
-                end: listed.end,
-            })?;
-            pending.section(kind, version, length)?;
-            let body = cursor
-                .take(usize::try_from(length).unwrap_or(usize::MAX))
-                .map_err(damaged)?;
-            for piece in body.chunks(WRITE_CHUNK) {
-                pending.write(piece)?;
+    let mut floor = base_term;
+    for listed in &manifest.objects {
+        // Fetched again and rechecked: what is written is what was checked.
+        let bytes = fetch(store, cluster, listed)?;
+        if listed.recording == SNAPSHOT_OBJECT {
+            let sections = snapshot_sections(&bytes).ok_or_else(|| damaged(listed))?;
+            let mut pending = snapshots.begin(base, base_term)?;
+            for (kind, version, body) in sections {
+                pending.section(kind, version, body.len() as u64)?;
+                for piece in body.chunks(WRITE_CHUNK) {
+                    pending.write(piece)?;
+                }
             }
-        }
-        let _ = snapshots.publish(pending)?;
-    }
-    log.install_under(base, base_term, &snapshots, hold)?;
-    // The log after the base, in order.
-    let mut top = manifest.base;
-    for (listed, bytes) in &fetched {
-        if listed.recording != LOG_OBJECTS {
+            let _ = snapshots.publish(pending)?;
+            log.install(base, base_term, &snapshots)?;
             continue;
         }
-        let damaged = |_| BackupError::Damaged {
-            recording: listed.recording,
-            start: listed.start,
-            end: listed.end,
-        };
-        let mut cursor = Cursor(bytes);
-        let mut batch = Vec::new();
-        while !cursor.0.is_empty() {
-            let index = cursor.u64().map_err(damaged)?;
-            let term = cursor.u64().map_err(damaged)?;
-            let event_time = cursor.u64().map_err(damaged)?;
-            let length = cursor.u64().map_err(damaged)?;
-            let payload = cursor
-                .take(usize::try_from(length).unwrap_or(usize::MAX))
-                .map_err(damaged)?
-                .to_vec();
-            top = (index, term);
-            batch.push(Entry {
-                index,
-                term,
-                event_time,
-                payload,
-            });
+        let batch = log_entries(&bytes, listed, floor).ok_or_else(|| damaged(listed))?;
+        if let Some(entry) = batch.last() {
+            floor = entry.term;
         }
         entries += batch.len() as u64;
         let _ = log.append(&batch)?;
     }
     let _ = log.sync()?;
-    if top != manifest.top {
-        return Err(BackupError::Manifest);
-    }
     log.save_hard_state(HardState {
-        current_term: top.1,
+        current_term: manifest.top.1,
         voted_for: None,
-        commit: Some(top.0),
+        commit: Some(manifest.top.0),
     })?;
     Ok(Report {
         base: manifest.base,
-        top,
+        top: manifest.top,
         entries,
         objects: manifest.objects.len() as u64 + 1,
         not_included: NOT_INCLUDED,

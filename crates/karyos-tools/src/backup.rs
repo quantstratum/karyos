@@ -7,16 +7,16 @@
 //! Remote storage here is a directory ([`DirStore`]): one file per object,
 //! named by its key, written whole then renamed into place. It is what the
 //! documented procedure runs against and what an operator copies to or
-//! from object storage with their own tooling; the S3 client
-//! (`karyos-tiering`) implements the same `ObjectStore` for an Archive's
-//! tiering. Every command runs on the control path, against a stopped
-//! node's directories or a copy of them.
+//! from object storage with their own tooling, setting the retention and
+//! object lock SPEC §8.4 asks for there (this store keeps neither); the S3
+//! client (`karyos-tiering`) implements the same `ObjectStore` for an
+//! Archive's tiering. Every command runs on the control path, against a
+//! stopped node's directories or a copy taken while it was stopped.
 
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use karyos_archive::control::HoldState;
 use karyos_archive::disk::StdDisk;
 use karyos_archive::integrity::Digest;
 use karyos_archive::integrity::copies::Enforcement;
@@ -39,9 +39,9 @@ export   copies the node's latest snapshot and its committed log after it,
          every object read back and checked, the manifest last
 verify   checks every object of an export against its manifest, changing
          nothing
-rebuild  rebuilds a node from an export into the given directories (they
-         exist; an empty log directory makes a fresh node), every object
-         checked before anything is written
+rebuild  rebuilds a node from an export into the given directories, which
+         exist and are empty, every object checked before anything is
+         written
 
 --geometry is the node's log geometry: its term length and segment length,
 in bytes. --cluster names the cluster in the objects' keys: 64 hex digits.
@@ -187,7 +187,6 @@ pub fn run(args: &[String]) -> Result<String, String> {
                         snapshots: &snapshots,
                         geometry,
                     },
-                    &HoldState::None,
                 )
                 .map_err(|error| error.to_string())?;
                 return Ok(report("rebuild", &done));

@@ -178,6 +178,17 @@ fn a_node_is_exported_verified_and_rebuilt_end_to_end() {
         rebuilt.entries(1_001..2_401, u64::MAX).unwrap(),
         (1_001..=2_400).map(entry).collect::<Vec<_>>()
     );
+    assert_eq!(
+        rebuilt.hard_state().and_then(|state| state.commit),
+        Some(2_400)
+    );
+    let source = SnapshotStore::open(StdDisk, &snapshots, geometry(), SnapshotConfig::default())
+        .unwrap()
+        .store;
+    assert_eq!(
+        store.read(&latest).unwrap(),
+        source.read(&source.latest().unwrap()).unwrap()
+    );
     // One byte of the second log range damaged: both commands refuse,
     // naming its range.
     let damaged = std::fs::read_dir(&remote)
@@ -211,9 +222,11 @@ fn a_node_is_exported_verified_and_rebuilt_end_to_end() {
     ]);
     assert!(!ok);
     assert!(out.contains("object 1 2025..2401 is damaged"), "{out}");
-    assert_eq!(
-        std::fs::read_dir(&fresh_log).unwrap().count(),
-        0,
-        "a refused rebuild wrote"
-    );
+    for refused in [&fresh_log, &fresh_snaps] {
+        assert_eq!(
+            std::fs::read_dir(refused).unwrap().count(),
+            0,
+            "a refused rebuild wrote"
+        );
+    }
 }

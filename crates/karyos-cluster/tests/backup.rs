@@ -17,7 +17,6 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use karyos_archive::control::HoldState;
 use karyos_archive::disk::StdDisk;
 use karyos_archive::integrity::copies::Enforcement;
 use karyos_archive::integrity::tiering::{ObjectKey, ObjectStore};
@@ -26,7 +25,7 @@ use karyos_cluster::backup::{
     self, BackupError, LOG_OBJECTS, MANIFEST_OBJECT, NOT_INCLUDED, Target,
 };
 use karyos_cluster::snapshot::{Section, SectionKind, SnapshotConfig, SnapshotStore};
-use karyos_cluster::{Entry, HardState, LogError, RaftLog};
+use karyos_cluster::{Entry, HardState, RaftLog};
 
 struct TempDir(PathBuf);
 
@@ -182,7 +181,6 @@ fn a_rebuild_matches_its_source_up_to_the_reported_top() {
             snapshots: &snap_dir,
             geometry: geometry(),
         },
-        &HoldState::None,
     )
     .unwrap();
     assert_eq!(
@@ -245,7 +243,6 @@ fn a_damaged_object_is_refused_naming_its_range_before_anything_is_written() {
                 snapshots: &snap_dir,
                 geometry: geometry(),
             },
-            &HoldState::None,
         )
         .map(|_| ());
         assert!(files(&dir.0).is_empty(), "a refused rebuild wrote");
@@ -266,7 +263,7 @@ fn a_damaged_object_is_refused_naming_its_range_before_anything_is_written() {
         .retain(|name, _| !name.contains(&format!("/{MANIFEST_OBJECT:016x}/")));
     assert!(matches!(
         backup::verify(&mut bucket, CLUSTER),
-        Err(BackupError::Manifest)
+        Err(BackupError::Manifest(_))
     ));
 }
 
@@ -284,23 +281,76 @@ fn an_export_whose_copy_does_not_read_back_counts_nothing() {
     ));
     assert!(matches!(
         backup::manifest(&mut bucket, CLUSTER),
-        Err(BackupError::Manifest)
+        Err(BackupError::Manifest(_))
     ));
 }
 
+/// A rebuild writes only into empty directories: over a node's state it
+/// is refused, changing nothing, so it never installs over a log, and never
+/// purges what an Archive hold keeps.
 #[test]
-fn a_rebuild_through_a_hold_is_refused_and_changes_nothing() {
-    let source_dir = TempDir::new("held-source");
+fn a_rebuild_into_a_node_s_directories_is_refused_and_changes_nothing() {
+    let source_dir = TempDir::new("occupied-source");
     let (mut log, snapshots) = source(&source_dir.0);
     let mut bucket = Bucket::default();
     let _ = backup::export(&snapshots, &mut log, &mut bucket, CLUSTER, u64::MAX).unwrap();
-    // A target that already holds a node's log, under a hold.
-    let held_dir = TempDir::new("held-target");
-    drop(source(&held_dir.0));
-    let before = files(&held_dir.0);
-    let (log_dir, snap_dir) = target(&held_dir.0);
-    for state in [HoldState::Held, HoldState::Pending, HoldState::Unknown] {
-        let refused = backup::rebuild(
+    let occupied = TempDir::new("occupied-target");
+    drop(source(&occupied.0));
+    let before = files(&occupied.0);
+    let (log_dir, snap_dir) = target(&occupied.0);
+    let refused = backup::rebuild(
+        &mut bucket,
+        CLUSTER,
+        &Target {
+            disk: &StdDisk,
+            log: &log_dir,
+            snapshots: &snap_dir,
+            geometry: geometry(),
+        },
+    );
+    assert!(
+        matches!(refused, Err(BackupError::NotEmpty(_))),
+        "{refused:?}"
+    );
+    assert_eq!(files(&occupied.0), before);
+}
+
+/// A manifest that is whole and checksummed but leaves a gap in the log,
+/// or does not reach its top, is refused by `verify` and `rebuild`.
+#[test]
+fn a_manifest_that_does_not_cover_the_log_is_refused() {
+    let source_dir = TempDir::new("gap-source");
+    let (mut log, snapshots) = source(&source_dir.0);
+    let mut bucket = Bucket::default();
+    let _ = backup::export(&snapshots, &mut log, &mut bucket, CLUSTER, u64::MAX).unwrap();
+    let manifest = backup::manifest(&mut bucket, CLUSTER).unwrap();
+    let key = ObjectKey {
+        archive: CLUSTER,
+        recording: MANIFEST_OBJECT,
+        start: 0,
+        end: 0,
+        kind: karyos_archive::integrity::tiering::ObjectKind::Index,
+    };
+    // Its top raised past the last entry: the ranges no longer end there.
+    let mut raised = manifest.clone();
+    raised.top.0 += 1;
+    bucket.objects.insert(key.name(), raised.encode());
+    assert!(matches!(
+        backup::verify(&mut bucket, CLUSTER),
+        Err(BackupError::Manifest(_))
+    ));
+    // Its log range dropped: a gap.
+    let mut gap = manifest.clone();
+    let _ = gap.objects.pop();
+    bucket.objects.insert(key.name(), gap.encode());
+    assert!(matches!(
+        backup::verify(&mut bucket, CLUSTER),
+        Err(BackupError::Manifest(_))
+    ));
+    let dir = TempDir::new("gap-target");
+    let (log_dir, snap_dir) = target(&dir.0);
+    assert!(matches!(
+        backup::rebuild(
             &mut bucket,
             CLUSTER,
             &Target {
@@ -309,16 +359,61 @@ fn a_rebuild_through_a_hold_is_refused_and_changes_nothing() {
                 snapshots: &snap_dir,
                 geometry: geometry(),
             },
-            &state,
-        );
-        assert!(
-            matches!(refused, Err(BackupError::Log(LogError::ArchiveHeld { state: got })) if got == state),
-            "{state:?}: {refused:?}"
-        );
-        assert_eq!(
-            files(&held_dir.0),
-            before,
-            "{state:?}: a refused rebuild changed a file"
-        );
-    }
+        ),
+        Err(BackupError::Manifest(_))
+    ));
+    assert!(files(&dir.0).is_empty());
+}
+
+/// An export checks its snapshot is the log's and its commit reaches the
+/// snapshot, and never overwrites another export.
+#[test]
+fn an_export_refuses_a_foreign_snapshot_a_low_commit_and_a_used_remote() {
+    let source_dir = TempDir::new("checks-source");
+    let (mut log, mut snapshots) = source(&source_dir.0);
+    let mut bucket = Bucket::default();
+    let _ = backup::export(&snapshots, &mut log, &mut bucket, CLUSTER, u64::MAX).unwrap();
+    assert!(matches!(
+        backup::export(&snapshots, &mut log, &mut bucket, CLUSTER, u64::MAX),
+        Err(BackupError::Exists)
+    ));
+    // A snapshot at 200 with another term than the log's there.
+    let _ = snapshots
+        .write(
+            200,
+            entry(200).term + 5,
+            &[Section::new(SectionKind::Service, 2, b"x")],
+        )
+        .unwrap();
+    assert!(matches!(
+        backup::export(
+            &snapshots,
+            &mut log,
+            &mut Bucket::default(),
+            CLUSTER,
+            u64::MAX
+        ),
+        Err(BackupError::SnapshotTerm { index: 200, .. })
+    ));
+    // A snapshot past the commit.
+    let _ = snapshots
+        .write(
+            295,
+            entry(295).term,
+            &[Section::new(SectionKind::Service, 2, b"y")],
+        )
+        .unwrap();
+    assert!(matches!(
+        backup::export(
+            &snapshots,
+            &mut log,
+            &mut Bucket::default(),
+            CLUSTER,
+            u64::MAX
+        ),
+        Err(BackupError::CommitBelowBase {
+            base: 295,
+            commit: Some(290)
+        })
+    ));
 }
