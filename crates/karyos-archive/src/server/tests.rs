@@ -1705,7 +1705,11 @@ impl crate::client::ControlRequests for Asking {
 /// streams. The agent pages the retention state of 1000 recordings to its
 /// own stream while the replay client starts a replay on the shared one:
 /// no version 2 frame reaches the shared stream, the replay's start is
-/// answered within the replay client's deadline, and the replay finishes.
+/// answered no later than the server duty that completes the page (the
+/// paging never holds the version 1 answer back), and the replay
+/// finishes. Counted in the server's duties, not in wall time: the test
+/// thread runs the server, and a loaded host that starves it for a second
+/// says nothing about the Archive (karyos#1067).
 #[test]
 fn a_version_1_replay_and_a_version_2_page_share_one_archive() {
     use crate::client::replay::{ReplaySpec, Replayer, ReplayerConfig, ReplayerEvent};
@@ -1761,32 +1765,42 @@ fn a_version_1_replay_and_a_version_2_page_share_one_archive() {
     let mut page = None;
     let mut started = None;
     let begun = std::time::Instant::now();
+    let (mut duties, mut page_duty, mut started_duty) = (0u32, None, None);
     while (page.is_none() || started.is_none()) && begun.elapsed() < Duration::from_secs(120) {
         rig.server.duty();
+        duties += 1;
         if page.is_none() {
             match ask(&mut agent) {
                 RetentionStatePoll::Pending => {}
                 RetentionStatePoll::Answered {
                     descriptors,
                     summary,
-                } => page = Some((descriptors.len(), summary.count)),
+                } => {
+                    page = Some((descriptors.len(), summary.count));
+                    page_duty = Some(duties);
+                }
                 other => panic!("{other:?}"),
             }
         }
+        // The replayer's own clock is held at the request's instant: its
+        // 1 s deadline, which a starved test thread can pass, never fires
+        // here; how soon the answer came is counted in duties below.
         if started.is_none()
-            && let Some(event) = replayer.poll(std::time::Instant::now())
+            && let Some(event) = replayer.poll(asked)
         {
-            started = Some((event, asked.elapsed()));
+            started = Some(event);
+            started_duty = Some(duties);
         }
         std::thread::sleep(Duration::from_micros(200));
     }
     assert_eq!(page, Some((RECORDINGS, RECORDINGS as u64)), "the full page");
-    let (event, took) = started.unwrap();
+    let event = started.unwrap();
+    assert!(matches!(event, ReplayerEvent::Started { .. }), "{event:?}");
+    let (started_duty, page_duty) = (started_duty.unwrap(), page_duty.unwrap());
     assert!(
-        matches!(event, ReplayerEvent::Started { .. }),
-        "{event:?} after {took:?}"
+        started_duty <= page_duty,
+        "the replay was answered at duty {started_duty}, after the page at {page_duty}"
     );
-    assert!(took < ReplayerConfig::new(0x5250).deadline, "{took:?}");
     // The replay finishes into its target.
     let replayed = Arc::clone(&rig.server.host().replays[0].1);
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
