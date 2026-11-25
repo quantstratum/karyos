@@ -14,6 +14,10 @@ use super::super::{GapReason, JournalRetention};
 use super::*;
 use karyos_sys::frame::FRAME_ALIGNMENT;
 
+/// The time the server lets one connection take to write its reply
+/// (`server::WRITE_DEADLINE`, on Linux only).
+const WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// A fresh journal directory for test `name`.
 fn dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -231,7 +235,7 @@ fn a_full_page_is_bounded_work() {
         assert_eq!(page.records.len(), HISTORY_MAX);
     }
     assert!(
-        slowest < crate::server::WRITE_DEADLINE,
+        slowest < WRITE_DEADLINE,
         "a full page took {slowest:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
