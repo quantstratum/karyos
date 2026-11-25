@@ -26,6 +26,8 @@ use karyos_trace::calibrate::{PairedRead, fit};
 use karyos_trace::clocks::ClockKey;
 use karyos_trace::journal::ObserverId;
 
+pub mod journal;
+
 /// The most reads one run takes: 16 MiB of reads, a few minutes at the
 /// default interval.
 pub const MAX_READS: usize = 1 << 20;
@@ -49,6 +51,7 @@ Usage: karyos-tools calibrate phc [--device /dev/ptp0] [--reads 4096]
            [--client-domain N] [--epoch N] [--max-gap-ms 2000]
            [--max-bound-ns 10000]
        karyos-tools calibrate compose <record> <record> [<record>...]
+       karyos-tools calibrate append --journal <dir> [<word>...]
 
 `phc --reverse` reads the PHC, the raw clock and the PHC again, so the
 record converts PHC times into the raw clock (the receiving host of a link).
@@ -238,6 +241,9 @@ pub fn run(
     let mut args = args;
     match args.next().as_ref().and_then(|arg| arg.to_str()) {
         Some("phc") => {}
+        Some("append") => {
+            return journal::run(args, &mut std::io::stdin().lock(), out, err);
+        }
         Some("link") => return run_link(args, out, err),
         Some("compose") => return run_compose(args, out, err),
         None | Some("-h" | "--help") => {

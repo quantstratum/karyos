@@ -185,6 +185,9 @@ Archive:
                                     purge (the three together, with --archive-copy-location)
   --archive-time-evidence           keep time evidence entries: makes <archive>/time-evidence
                                     (with a signer, the trust file needs a time-journal line)
+  --archive-calibration-journal <dir>
+                                    the calibration journal `karyos-tools calibrate append`
+                                    writes: groups' time evidence takes its snapshots from it
 
 Shutdown:
   --shutdown-linger <duration>      time clients have to leave after SIGTERM or SIGINT [5s]
@@ -391,6 +394,11 @@ pub struct ArchiveOptions {
     /// makes `<archive>/time-evidence/` before the agent starts. With a
     /// signer, the trust file needs its `time-journal` line.
     pub time_evidence: bool,
+    /// The calibration journal the agent reads its calibration snapshots
+    /// from (`--archive-calibration-journal`, ADR-0098 item 5;
+    /// karyos#1137): the directory `karyos-tools calibrate append`
+    /// writes, read again at each snapshot.
+    pub calibration_journal: Option<PathBuf>,
     /// The replications this source pushes (`--replicate`; ADR-0102).
     pub replications: Vec<ReplicateOption>,
     /// The replications this Archive accepts as a replica (`--replica`;
@@ -703,6 +711,10 @@ where
             "--archive-signer-key" => crate::catalog_verify::hex32(&value)
                 .ok()
                 .map(|key| archive.signer_key = Some(key)),
+            "--archive-calibration-journal" => {
+                archive.calibration_journal = Some(PathBuf::from(&value));
+                Some(())
+            }
             "--archive-trust" => {
                 archive.trust = Some(PathBuf::from(&value));
                 Some(())
@@ -897,6 +909,7 @@ const OPTIONS: &[&str] = &[
     "--archive-signer-key",
     "--archive-trust",
     "--archive-copy-location",
+    "--archive-calibration-journal",
     "--archive-retain-for",
     "--archive-purge",
     "--archive-min-copies",
@@ -1315,6 +1328,7 @@ struct Archive {
     purge: Option<karyos_archive::integrity::retention::PurgeMode>,
     min_copies: Option<std::num::NonZeroU32>,
     time_evidence: bool,
+    calibration_journal: Option<PathBuf>,
     replications: Vec<ReplicateOption>,
     replicas: Vec<ReplicaOption>,
     trusted_network: bool,
@@ -1344,6 +1358,10 @@ impl Archive {
                 (self.purge.is_some(), "--archive-purge"),
                 (self.min_copies.is_some(), "--archive-min-copies"),
                 (self.time_evidence, "--archive-time-evidence"),
+                (
+                    self.calibration_journal.is_some(),
+                    "--archive-calibration-journal",
+                ),
                 (!self.replications.is_empty(), "--replicate"),
                 (!self.replicas.is_empty(), "--replica"),
                 (self.trusted_network, "--replication-trusted-network"),
@@ -1449,6 +1467,7 @@ impl Archive {
             copy_location: self.copy_location,
             retention,
             time_evidence: self.time_evidence,
+            calibration_journal: self.calibration_journal,
             replications: self.replications,
             replicas: self.replicas,
             trusted_network: self.trusted_network,
@@ -2117,6 +2136,7 @@ mod tests {
                 copy_location: None,
                 retention: None,
                 time_evidence: false,
+                calibration_journal: None,
                 replications: Vec::new(),
                 replicas: Vec::new(),
                 trusted_network: false,
@@ -2258,6 +2278,19 @@ mod tests {
             .archive
             .unwrap();
         assert!(kept.time_evidence);
+        assert_eq!(kept.calibration_journal, None);
+        // karyos#1137: the calibration journal, a path, with --archive only.
+        let journal = options(&[&base[..], &["--archive-calibration-journal", "cal"]].concat())
+            .archive
+            .unwrap();
+        assert_eq!(journal.calibration_journal, Some(PathBuf::from("cal")));
+        assert_eq!(
+            run(&["--dir", "d", "--archive-calibration-journal", "cal"]),
+            Err(ArgsError::Needs {
+                option: "--archive-calibration-journal",
+                needs: "--archive",
+            })
+        );
         assert_eq!(
             parsed.retention,
             Some(RetentionPolicy {
