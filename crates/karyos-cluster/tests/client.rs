@@ -4,9 +4,10 @@
 //! replicated deduplication (`SessionTable`, one table standing for every
 //! replica's): a leader change with no duplicate application, a lower
 //! generation refused once a higher one is seen (S5), an unknown outcome
-//! reported and never resent on its own, the advertised window held to,
-//! an expiry reaching the caller typed, and nothing allocated after
-//! registration.
+//! reported and never resent on its own, answers and timers of older
+//! attempts ignored, registrations ordered by epoch, the advertised window
+//! held to, an expiry reaching the caller typed, and nothing allocated
+//! after registration.
 
 #![allow(
     clippy::unwrap_used,
@@ -15,8 +16,10 @@
     reason = "test helpers, as ADR-0007 allows in tests"
 )]
 
-use karyos_cluster::client::{Answer, ClusterClient, Event, Reply, SubmitError};
-use karyos_cluster::dedup::{DedupConfig, Outcome, Request, SessionTable};
+use karyos_cluster::client::{
+    Answer, ClusterClient, Event, Key, RegisterError, Reply, Send, SubmitError,
+};
+use karyos_cluster::dedup::{DedupConfig, Outcome, Registered, Request, SessionTable};
 use karyos_sys::alloc_count::{CountingAllocator, count_allocations};
 
 #[global_allocator]
@@ -33,19 +36,20 @@ fn config(window: u32) -> DedupConfig {
         .with_ttl(1_000_000_000)
 }
 
-/// A table and a client registered on it, sending to the old leader.
-fn registered(window: u32) -> (SessionTable, ClusterClient) {
-    let mut table = SessionTable::new(config(window)).unwrap();
-    let session = table.register(9, 1, 0).unwrap();
-    let mut client = ClusterClient::new(9, Some(OLD));
-    client.registered(session, 1);
-    (table, client)
-}
-
 fn events(call: impl FnOnce(&mut dyn FnMut(Event))) -> Vec<Event> {
     let mut out = Vec::new();
     call(&mut |event| out.push(event));
     out
+}
+
+/// A table, its session for client 9, and a client registered on it,
+/// sending to the old leader.
+fn registered(window: u32) -> (SessionTable, Registered, ClusterClient) {
+    let mut table = SessionTable::new(config(window)).unwrap();
+    let session = table.register(9, 1, 0).unwrap();
+    let mut client = ClusterClient::new(9, Some(OLD));
+    assert!(events(|sink| client.registered(session, 1, sink).unwrap()).is_empty());
+    (table, session, client)
 }
 
 /// The answer, as the client reads it, to `request` applied on `table`;
@@ -62,18 +66,22 @@ fn apply(table: &mut SessionTable, request: Request, at: u64, applied: &mut u32)
         Outcome::ReplyTooLarge => Answer::ReplyTooLarge,
         Outcome::SessionExpired => Answer::SessionExpired,
         Outcome::WindowFull => Answer::WindowFull,
+        Outcome::OutOfOrder { expected } => Answer::OutOfOrder { expected },
         other => panic!("{other:?}"),
     }
 }
 
 #[test]
 fn a_leader_change_reports_unknown_and_a_retry_is_not_applied_twice() {
-    let (mut table, mut client) = registered(4);
+    let (mut table, _, mut client) = registered(4);
     let mut applied = 0;
-    let (to, request) = client.submit().unwrap();
-    assert_eq!((to, request.sequence), (OLD, 0));
+    let first = client.submit().unwrap();
+    assert_eq!(
+        (first.to, first.request.sequence, first.key.attempt),
+        (OLD, 0, 0)
+    );
     // The old leader applies it; its reply is lost; the leader changes.
-    let _ = apply(&mut table, request, 10, &mut applied);
+    let _ = apply(&mut table, first.request, 10, &mut applied);
     let seen = events(|sink| client.leader_changed(Some(NEW), 2, sink));
     assert_eq!(
         seen,
@@ -83,13 +91,16 @@ fn a_leader_change_reports_unknown_and_a_retry_is_not_applied_twice() {
         }]
     );
     // Nothing was resent on its own; the caller retries: the same request,
-    // to the new leader, answered from the kept reply.
-    let (to, again) = client.retry(0).unwrap();
-    assert_eq!((to, again.sequence, again.epoch), (NEW, 0, request.epoch));
-    let answer = apply(&mut table, again, 20, &mut applied);
+    // a new attempt, to the new leader, answered from the kept reply.
+    let again = client.retry(0).unwrap();
+    assert_eq!(
+        (again.to, again.request, again.key.attempt),
+        (NEW, first.request, 1)
+    );
+    let answer = apply(&mut table, again.request, 20, &mut applied);
     assert_eq!(answer, Answer::Retained);
     assert_eq!(applied, 1, "applied twice");
-    let seen = events(|sink| client.replied(0, 2, Reply::Outcome(answer), sink));
+    let seen = events(|sink| client.replied(again.key, 2, Reply::Outcome(answer), sink));
     assert_eq!(
         seen,
         vec![Event::Completed {
@@ -101,11 +112,66 @@ fn a_leader_change_reports_unknown_and_a_retry_is_not_applied_twice() {
 
 #[test]
 fn a_redirect_resends_the_same_request_to_the_leader_it_names() {
-    let (_, mut client) = registered(4);
-    let (_, request) = client.submit().unwrap();
-    let seen = events(|sink| client.replied(0, 1, Reply::Redirect { leader: Some(NEW) }, sink));
-    assert_eq!(seen, vec![Event::Resend { to: NEW, request }]);
+    let (_, _, mut client) = registered(4);
+    let sent = client.submit().unwrap();
+    let seen =
+        events(|sink| client.replied(sent.key, 1, Reply::Redirect { leader: Some(NEW) }, sink));
+    let resent = Send {
+        to: NEW,
+        request: sent.request,
+        key: Key {
+            attempt: 1,
+            ..sent.key
+        },
+    };
+    assert_eq!(seen, vec![Event::Resend(resent)]);
     assert_eq!(client.leader(), Some(NEW));
+    // A redirect naming no leader: not taken, waiting for one, nothing sent.
+    let seen = events(|sink| client.replied(resent.key, 1, Reply::Redirect { leader: None }, sink));
+    assert_eq!(seen, vec![Event::NoLeader { sequence: 0 }]);
+    assert_eq!(client.retry(0), Err(SubmitError::NoLeader));
+}
+
+/// A redirect, a busy or out-of-order refusal, or a timer, of an attempt a
+/// newer one overtook, or of a request already unknown, steers nothing.
+#[test]
+fn an_older_attempt_or_an_unknown_request_is_not_steered() {
+    let (_, _, mut client) = registered(4);
+    let first = client.submit().unwrap();
+    let second = client.retry(0).unwrap();
+    for reply in [
+        Reply::Redirect { leader: Some(NEW) },
+        Reply::Outcome(Answer::WindowFull),
+        Reply::Outcome(Answer::OutOfOrder { expected: 0 }),
+    ] {
+        assert!(
+            events(|sink| client.replied(first.key, 1, reply, sink)).is_empty(),
+            "{reply:?}"
+        );
+    }
+    assert!(events(|sink| client.timed_out(first.key, sink)).is_empty());
+    assert_eq!(client.leader(), Some(OLD));
+    // The current attempt times out: unknown, and a redirect after that is
+    // not followed by a resend.
+    let seen = events(|sink| client.timed_out(second.key, sink));
+    assert_eq!(
+        seen,
+        vec![Event::Unknown {
+            client: 9,
+            sequence: 0
+        }]
+    );
+    let redirect = Reply::Redirect { leader: Some(NEW) };
+    assert!(events(|sink| client.replied(second.key, 1, redirect, sink)).is_empty());
+    // An outcome of any attempt still settles it.
+    let seen = events(|sink| client.replied(first.key, 1, Reply::Outcome(Answer::Applied), sink));
+    assert_eq!(
+        seen,
+        vec![Event::Completed {
+            sequence: 0,
+            answer: Answer::Applied
+        }]
+    );
 }
 
 /// S5 (phase-5 cluster scenarios): a client that has seen generation 2
@@ -113,10 +179,10 @@ fn a_redirect_resends_the_same_request_to_the_leader_it_names() {
 /// leader's announcement.
 #[test]
 fn a_client_that_saw_generation_2_refuses_every_generation_1_reply() {
-    let (_, mut client) = registered(4);
-    let _ = client.submit().unwrap();
-    let _ = client.submit().unwrap();
-    let seen = events(|sink| client.replied(0, 2, Reply::Outcome(Answer::Applied), sink));
+    let (_, _, mut client) = registered(4);
+    let first = client.submit().unwrap();
+    let second = client.submit().unwrap();
+    let seen = events(|sink| client.replied(first.key, 2, Reply::Outcome(Answer::Applied), sink));
     assert_eq!(
         seen,
         vec![Event::Completed {
@@ -130,7 +196,7 @@ fn a_client_that_saw_generation_2_refuses_every_generation_1_reply() {
         Reply::Outcome(Answer::SessionExpired),
         Reply::Redirect { leader: Some(OLD) },
     ] {
-        let seen = events(|sink| client.replied(1, 1, reply, sink));
+        let seen = events(|sink| client.replied(second.key, 1, reply, sink));
         assert_eq!(
             seen,
             vec![Event::StaleGeneration {
@@ -153,11 +219,34 @@ fn a_client_that_saw_generation_2_refuses_every_generation_1_reply() {
     assert_eq!(client.leader(), Some(OLD));
 }
 
+/// An answer that names no outstanding request, or another session,
+/// raises no generation: only a correlated answer does.
+#[test]
+fn an_uncorrelated_answer_raises_no_generation() {
+    let (_, _, mut client) = registered(4);
+    let sent = client.submit().unwrap();
+    let stray = Key {
+        sequence: 7,
+        ..sent.key
+    };
+    let other = Key {
+        epoch: sent.key.epoch + 1,
+        ..sent.key
+    };
+    for key in [stray, other] {
+        assert!(
+            events(|sink| client.replied(key, 9, Reply::Outcome(Answer::Applied), sink)).is_empty()
+        );
+    }
+    assert_eq!(client.generation(), 1);
+    assert_eq!(client.lowest_unanswered(), 0);
+}
+
 #[test]
 fn a_timed_out_request_is_unknown_and_never_resent_on_its_own() {
-    let (_, mut client) = registered(4);
-    let _ = client.submit().unwrap();
-    let seen = events(|sink| client.timed_out(0, sink));
+    let (_, _, mut client) = registered(4);
+    let sent = client.submit().unwrap();
+    let seen = events(|sink| client.timed_out(sent.key, sink));
     assert_eq!(
         seen,
         vec![Event::Unknown {
@@ -166,40 +255,143 @@ fn a_timed_out_request_is_unknown_and_never_resent_on_its_own() {
         }]
     );
     // Once: a second timeout, or a leader change, reports it no more.
-    assert!(events(|sink| client.timed_out(0, sink)).is_empty());
+    assert!(events(|sink| client.timed_out(sent.key, sink)).is_empty());
     assert!(events(|sink| client.leader_changed(Some(NEW), 1, sink)).is_empty());
-    // It holds its place in the window until retried or abandoned.
+    // It holds its place in the window until it has an outcome.
     assert_eq!(client.lowest_unanswered(), 0);
-    client.abandon(0);
+    let again = client.retry(0).unwrap();
+    let seen = events(|sink| client.replied(again.key, 1, Reply::Outcome(Answer::Duplicate), sink));
+    assert_eq!(
+        seen,
+        vec![Event::Completed {
+            sequence: 0,
+            answer: Answer::Duplicate
+        }]
+    );
     assert_eq!(client.lowest_unanswered(), 1);
 }
 
 #[test]
+fn registrations_are_ordered_by_epoch() {
+    let (mut table, session, mut client) = registered(4);
+    let _ = client.submit().unwrap();
+    // The same session again: nothing changes.
+    assert!(events(|sink| client.registered(session, 1, sink).unwrap()).is_empty());
+    assert_eq!(client.lowest_unanswered(), 0);
+    let newer = table.register(9, 2, 1).unwrap();
+    assert!(newer.epoch > session.epoch);
+    // A newer one replaces it: the outstanding request is unknown.
+    let seen = events(|sink| client.registered(newer, 1, sink).unwrap());
+    assert_eq!(
+        seen,
+        vec![Event::Unknown {
+            client: 9,
+            sequence: 0
+        }]
+    );
+    let sent = client.submit().unwrap();
+    assert_eq!((sent.key.epoch, sent.request.sequence), (newer.epoch, 0));
+    // The older one, arriving late, is refused.
+    assert_eq!(
+        events(|sink| {
+            assert_eq!(
+                client.registered(session, 1, sink),
+                Err(RegisterError::Stale {
+                    epoch: session.epoch,
+                    held: newer.epoch
+                })
+            );
+        }),
+        vec![]
+    );
+}
+
+#[test]
 fn the_advertised_window_is_read_and_held_to() {
-    let (mut table, mut client) = registered(2);
+    let (mut table, _, mut client) = registered(2);
     assert_eq!(client.bounds().map(|bounds| bounds.window), Some(2));
     let mut applied = 0;
-    let (_, first) = client.submit().unwrap();
-    let (_, second) = client.submit().unwrap();
+    let first = client.submit().unwrap();
+    let second = client.submit().unwrap();
     assert_eq!(client.submit(), Err(SubmitError::WindowFull { window: 2 }));
-    // The cluster's own window, full of unacknowledged replies, refuses a
-    // third request typed: the client reports it busy, not applied.
-    let _ = apply(&mut table, first, 1, &mut applied);
-    let _ = apply(&mut table, second, 2, &mut applied);
-    let third = Request::new(9, first.epoch, 2, 0);
-    let answer = apply(&mut table, third, 3, &mut applied);
+    // Both applied; the client settles the first but its next request
+    // still advertises 0 as the lowest unanswered (a stale advert): the
+    // cluster's window, full of replies it must keep, refuses it typed and
+    // the client reports it busy, not applied.
+    let _ = apply(&mut table, first.request, 1, &mut applied);
+    let _ = apply(&mut table, second.request, 2, &mut applied);
+    let seen = events(|sink| client.replied(first.key, 1, Reply::Outcome(Answer::Applied), sink));
+    assert_eq!(
+        seen,
+        vec![Event::Completed {
+            sequence: 0,
+            answer: Answer::Applied
+        }]
+    );
+    let third = client.submit().unwrap();
+    let stale = Request::new(9, third.key.epoch, third.request.sequence, 0);
+    let answer = apply(&mut table, stale, 3, &mut applied);
     assert_eq!(answer, Answer::WindowFull);
-    let seen = events(|sink| client.replied(1, 1, Reply::Outcome(answer), sink));
-    assert_eq!(seen, vec![Event::Busy { sequence: 1 }]);
+    let seen = events(|sink| client.replied(third.key, 1, Reply::Outcome(answer), sink));
+    assert_eq!(seen, vec![Event::Busy { sequence: 2 }]);
     assert_eq!(applied, 2);
+    // Sent as the client builds it, with its real lowest unanswered, the
+    // retry is taken.
+    let again = client.retry(2).unwrap();
+    assert_eq!(
+        apply(&mut table, again.request, 4, &mut applied),
+        Answer::Applied
+    );
+}
+
+/// Sequences 0 and 1 delivered in reverse: the cluster refuses 1 typed,
+/// the client keeps it outstanding, and once 0 is applied a retry of 1 is.
+#[test]
+fn an_out_of_order_refusal_reaches_the_caller_typed_and_is_retried() {
+    let (mut table, _, mut client) = registered(4);
+    let mut applied = 0;
+    let first = client.submit().unwrap();
+    let second = client.submit().unwrap();
+    let answer = apply(&mut table, second.request, 1, &mut applied);
+    assert_eq!(answer, Answer::OutOfOrder { expected: 0 });
+    let seen = events(|sink| client.replied(second.key, 1, Reply::Outcome(answer), sink));
+    assert_eq!(
+        seen,
+        vec![Event::OutOfOrder {
+            sequence: 1,
+            expected: 0
+        }]
+    );
+    let answer = apply(&mut table, first.request, 2, &mut applied);
+    let seen = events(|sink| client.replied(first.key, 1, Reply::Outcome(answer), sink));
+    assert_eq!(
+        seen,
+        vec![Event::Completed {
+            sequence: 0,
+            answer: Answer::Applied
+        }]
+    );
+    let again = client.retry(1).unwrap();
+    let answer = apply(&mut table, again.request, 3, &mut applied);
+    let seen = events(|sink| client.replied(again.key, 1, Reply::Outcome(answer), sink));
+    assert_eq!(
+        seen,
+        vec![Event::Completed {
+            sequence: 1,
+            answer: Answer::Applied
+        }]
+    );
+    assert_eq!(applied, 2);
+    assert_eq!(client.lowest_unanswered(), 2);
 }
 
 #[test]
 fn an_expired_session_reaches_the_caller_typed() {
-    let (_, mut client) = registered(4);
+    let (_, _, mut client) = registered(4);
     let _ = client.submit().unwrap();
-    let (_, request) = client.submit().unwrap();
-    let seen = events(|sink| client.replied(1, 1, Reply::Outcome(Answer::SessionExpired), sink));
+    let second = client.submit().unwrap();
+    let reply = Reply::Outcome(Answer::SessionExpired);
+    let seen = events(|sink| client.replied(second.key, 1, reply, sink));
     assert_eq!(
         seen,
         vec![
@@ -213,7 +405,7 @@ fn an_expired_session_reaches_the_caller_typed() {
             },
             Event::Expired {
                 client: 9,
-                epoch: request.epoch
+                epoch: second.key.epoch
             },
         ]
     );
@@ -224,29 +416,54 @@ fn an_expired_session_reaches_the_caller_typed() {
 /// redirects, leader changes, timeouts, retries and outcomes.
 #[test]
 fn the_failover_path_allocates_nothing_after_registration() {
-    let (_, mut client) = registered(8);
+    let (_, _, mut client) = registered(8);
     let mut seen = 0u64;
     let ((), allocations) = count_allocations(|| {
         for round in 0..100u64 {
             let mut sink = |_: Event| seen += 1;
-            let (_, request) = client.submit().unwrap();
+            let sent = client.submit().unwrap();
             client.replied(
-                request.sequence,
+                sent.key,
                 1,
                 Reply::Redirect { leader: Some(NEW) },
                 &mut sink,
             );
             client.leader_changed(Some(OLD), 1, &mut sink);
-            client.timed_out(request.sequence, &mut sink);
-            let _ = client.retry(request.sequence).unwrap();
+            let again = client.retry(sent.request.sequence).unwrap();
+            client.timed_out(again.key, &mut sink);
+            let again = client.retry(sent.request.sequence).unwrap();
             let answer = if round % 2 == 0 {
                 Answer::Applied
             } else {
                 Answer::Retained
             };
-            client.replied(request.sequence, 1, Reply::Outcome(answer), &mut sink);
+            client.replied(again.key, 1, Reply::Outcome(answer), &mut sink);
         }
     });
     assert_eq!(allocations, 0);
-    assert!(seen >= 300);
+    assert!(seen >= 400);
+}
+
+/// A newer session with a larger window: the buffer is reserved to the
+/// whole new window, so filling it allocates nothing.
+#[test]
+fn a_larger_window_on_a_new_session_is_reserved_whole() {
+    let (_, _, mut client) = registered(8);
+    for _ in 0..8 {
+        let _ = client.submit().unwrap();
+    }
+    let mut wider = SessionTable::new(config(16)).unwrap();
+    let session = wider.register(9, 2, 0).unwrap();
+    let mut unknown = 0;
+    client
+        .registered(session, 1, &mut |_| unknown += 1)
+        .unwrap();
+    assert_eq!(unknown, 8);
+    let ((), allocations) = count_allocations(|| {
+        for _ in 0..16 {
+            let _ = client.submit().unwrap();
+        }
+    });
+    assert_eq!(allocations, 0);
+    assert_eq!(client.submit(), Err(SubmitError::WindowFull { window: 16 }));
 }
