@@ -434,6 +434,7 @@ fn cancel() -> LatePolicy {
         tolerance: TOLERANCE,
         cancel_on_deadline: true,
         max_horizon: u64::MAX,
+        advance: 0,
     }
 }
 
@@ -492,6 +493,7 @@ fn without_cancel_late_heads_are_sent_and_counted() {
         tolerance: TOLERANCE,
         cancel_on_deadline: false,
         max_horizon: u64::MAX,
+        advance: 0,
     };
     let mut f = Fixture::with_policy(1, None, policy);
     f.stage(0, Some(NOW));
@@ -770,4 +772,26 @@ fn the_lane_cells_count_lateness_and_aborts() {
     assert!(!f.gate.admits(0));
     assert!(!f.gate.admits(0));
     assert_eq!(read("aborts"), 1);
+}
+
+/// ADR-0109 (#625): on the `etf` route a head is eligible its lane's
+/// advance before its time (the qdisc holds it until then), and the gate
+/// wakes for that, not for its time; the software route keeps its time.
+#[test]
+fn an_etf_head_is_eligible_its_advance_early() {
+    const ADVANCE: u64 = 30;
+    let policy = LatePolicy {
+        advance: ADVANCE,
+        ..LatePolicy::default()
+    };
+    let mut f = Fixture::with_policy(1, None, policy);
+    let token = f.stage(0, Some(FUTURE));
+    assert_eq!(f.gate.earliest(), Some(FUTURE - ADVANCE));
+    f.gate.set_now(FUTURE - ADVANCE - 1);
+    assert_eq!(check(&mut f.gate, 0, &[token]), GateDecision::Deny);
+    f.gate.set_now(FUTURE - ADVANCE);
+    assert_eq!(check(&mut f.gate, 0, &[token]), permit(1));
+    // A time below the advance is eligible at once.
+    assert_eq!(eligible_at(ADVANCE - 1, ADVANCE), 0);
+    assert_eq!(eligible_at(FUTURE, 0), FUTURE);
 }

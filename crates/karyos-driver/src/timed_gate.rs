@@ -9,7 +9,10 @@
 //!
 //! - **Eligibility.** A lane is eligible when its head carries no time or
 //!   a time at or before the gate's clock ([`TimedGate::set_now`]), and
-//!   the inner gate admits it. The inner gate is always asked, so a guard
+//!   the inner gate admits it. On the `etf` route ([`LatePolicy::advance`],
+//!   ADR-0109) a head is eligible up to its lane's declared advance before
+//!   its time: the kernel's `etf` qdisc, not the gate, holds it until its
+//!   time, so its not-before guarantee is the qdisc's. The inner gate is always asked, so a guard
 //!   that closed while a head waits for its time is seen at once.
 //! - **Exposure.** Only the prefix of the candidates whose times are due
 //!   reaches the inner gate, so it charges nothing for a datagram not yet
@@ -86,6 +89,10 @@ pub struct LatePolicy {
     /// clock plus it breaches the schedule ring's protocol (timed-tx.md
     /// section 11, TT-6).
     pub max_horizon: u64,
+    /// How far before its time a head is eligible: 0 on the software
+    /// route; on the `etf` route, the lane's declared tolerated advance
+    /// (ADR-0109), the qdisc releasing the datagram at its time.
+    pub advance: u64,
 }
 
 impl Default for LatePolicy {
@@ -96,6 +103,7 @@ impl Default for LatePolicy {
             tolerance: 1_000_000,
             cancel_on_deadline: false,
             max_horizon: 1_000_000_000,
+            advance: 0,
         }
     }
 }
@@ -235,6 +243,14 @@ fn bump(count: &mut u64, overflows: &mut u64) {
             }
         }
     }
+}
+
+/// When a head requested at `time` becomes eligible on a route that hands
+/// heads to the kernel `advance` before their time (0 on the software
+/// route); a time below the advance is eligible at once.
+#[must_use]
+pub const fn eligible_at(time: u64, advance: u64) -> u64 {
+    time.saturating_sub(advance)
 }
 
 /// `now - time`, signed; `None` when it does not fit an `i64`.
@@ -468,7 +484,12 @@ impl TimedState {
             .lanes
             .iter()
             .filter(|lane| !lane.missed)
-            .filter_map(|lane| lane.heads.front().and_then(|head| head.time))
+            .filter_map(|lane| {
+                lane.heads
+                    .front()
+                    .and_then(|head| head.time)
+                    .map(|time| eligible_at(time, lane.policy.advance))
+            })
             .filter(|time| *time > now);
         let deadlines = self
             .lanes
@@ -487,8 +508,9 @@ impl TimedState {
         heads.chain(deadlines).min()
     }
 
-    fn due(&self, head: &Head) -> bool {
-        head.time.is_none_or(|time| time <= self.now)
+    fn due(&self, head: &Head, advance: u64) -> bool {
+        head.time
+            .is_none_or(|time| eligible_at(time, advance) <= self.now)
     }
 
     /// Records a datagram committed to `lane`'s queue with `token` and
@@ -693,10 +715,15 @@ impl<G: LaneGate> SenderGate for TimedView<'_, G> {
             );
             return GateDecision::Deny;
         }
+        let advance = self
+            .state
+            .lanes
+            .get(lane)
+            .map_or(0, |state| state.policy.advance);
         let due = heads
             .iter()
             .take(candidate.tokens.len())
-            .take_while(|head| self.state.due(head))
+            .take_while(|head| self.state.due(head, advance))
             .count();
         if due < candidate.tokens.len() {
             bump(
@@ -748,11 +775,12 @@ impl<G: LaneGate> LaneGate for TimedView<'_, G> {
         if !self.live(lane) {
             return false;
         }
-        let due = self
-            .state
-            .lanes
-            .get(lane)
-            .is_some_and(|state| state.heads.front().is_none_or(|head| self.state.due(head)));
+        let due = self.state.lanes.get(lane).is_some_and(|state| {
+            state
+                .heads
+                .front()
+                .is_none_or(|head| self.state.due(head, state.policy.advance))
+        });
         if inner && !due {
             bump(
                 &mut self.state.counts.held,

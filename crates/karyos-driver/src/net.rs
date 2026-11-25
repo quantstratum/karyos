@@ -447,6 +447,9 @@ pub(crate) struct SenderChannel {
     /// A `control-mode=dynamic` publication's registration policy
     /// (karyos#644); `None` otherwise.
     pub(crate) registration: Option<crate::sessions::register::RegistrationPolicy>,
+    /// The etf queue of a timed publication on the `etf` route (ADR-0109);
+    /// `None` otherwise.
+    pub(crate) etf: Option<karyos_io::backend::EtfQueue>,
 }
 
 /// A network publication between incarnations (guards-and-abort.md, On
@@ -508,6 +511,14 @@ enum EndpointPurpose {
     Data,
     /// The driver's unicast control endpoint for SOLICITs (plan 169).
     Solicit,
+    /// One publication's endpoint on the `etf` route of timed sends
+    /// (ADR-0109 point 5), never shared: its socket sets `SO_REUSEPORT`
+    /// so the publication's etf socket can join its port, and its etf
+    /// leaf is the one `priority` maps to on its interface.
+    Etf {
+        /// The `SO_PRIORITY` of its etf queue.
+        priority: u32,
+    },
 }
 
 /// What every handle of one subscription key shares, as
@@ -1094,6 +1105,32 @@ impl<T: StreamTerms> Network<T> {
             })
     }
 
+    /// A new send endpoint bound to `bind` for a publication on the `etf`
+    /// route whose etf queue declares `priority` (ADR-0109 points 2 and 5):
+    /// never shared, opened with [`SocketsConfig::etf_route`].
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::TimedNetworkUnsupported`] with `EtfPriorityShared`
+    /// when another etf publication of this driver declares `priority` on
+    /// the same interface address; [`DriverError::NetworkEndpoint`] when it
+    /// cannot open.
+    pub(crate) fn hold_etf_endpoint(
+        &mut self,
+        bind: SocketAddr,
+        priority: u32,
+    ) -> Result<EndpointId, DriverError> {
+        let shared = self.send_endpoints.iter().any(|entry| {
+            entry.purpose == EndpointPurpose::Etf { priority } && entry.bind.ip() == bind.ip()
+        });
+        if shared {
+            return Err(DriverError::TimedNetworkUnsupported {
+                reason: crate::error::TimedNetworkUnsupported::EtfPriorityShared,
+            });
+        }
+        self.hold_for(bind, None, EndpointPurpose::Etf { priority }, false)
+    }
+
     /// The data endpoint bound to `bind`, joined to `multicast` if any,
     /// opened on first use; one more user holds it.
     fn hold_endpoint(
@@ -1144,6 +1181,7 @@ impl<T: StreamTerms> Network<T> {
         }
         let mut config = SocketsConfig::new(bind);
         config.multicast = multicast;
+        config.etf_route = matches!(purpose, EndpointPurpose::Etf { .. });
         config.tx_slots = self.endpoint_tables.tx_slots;
         config.max_queues = self.endpoint_tables.max_queues;
         config.max_routes = self.endpoint_tables.max_routes;

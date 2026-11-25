@@ -106,6 +106,7 @@ fn channel(address: SocketAddr, reliable: bool) -> UdpConfig {
         reliable,
         flow_control: None,
         security: Security::Trusted,
+        etf: None,
     }
 }
 
@@ -1080,6 +1081,7 @@ fn a_multicast_publication_reaches_every_subscriber() {
         reliable: true,
         flow_control: None,
         security: Security::Trusted,
+        etf: None,
     };
     let (mut a, mut b, mut c) = (
         driver(ThreadingMode::Shared),
@@ -1178,6 +1180,7 @@ fn two_drivers_on_one_host(offer: bool, socket: ControlSocket, name: &str) {
         reliable: true,
         flow_control: None,
         security: Security::Trusted,
+        etf: None,
     };
     let ids: Vec<i32> = (0..STREAMS)
         .map(|index| 300 + i32::try_from(index).unwrap())
@@ -1351,6 +1354,7 @@ fn colliding_aliases_on_one_multicast_group_keep_two_images_apart() {
         reliable: true,
         flow_control: None,
         security: Security::Trusted,
+        etf: None,
     };
     let (mut a1, mut a2, mut b) = (
         driver(ThreadingMode::Shared),
@@ -1835,6 +1839,7 @@ fn nak_copies_reach_the_control_group(name: &str, by_uri: bool) {
         reliable: true,
         flow_control: None,
         security: Security::Trusted,
+        etf: None,
     };
     let (mut a, mut b, mut c) = (frozen(), frozen(), frozen());
     for subscriber in [&mut b, &mut c] {
@@ -3126,6 +3131,7 @@ fn optional_receiver_closes(
         // `max`, as the roles below: the channel's `fc` is the strategy.
         flow_control: Some(karyos_protocol::channel::FlowControl::Max),
         security: Security::Trusted,
+        etf: None,
     };
     let (mut a, mut b, mut c) = (
         driver(ThreadingMode::Shared),
@@ -3631,6 +3637,7 @@ fn a_slow_optional_receiver_under_min_is_bounded_and_repaired() {
         reliable: true,
         flow_control: None,
         security: Security::Trusted,
+        etf: None,
     };
     let (mut a, mut b, mut c) = (
         driver(ThreadingMode::Shared),
@@ -3919,6 +3926,7 @@ fn two_paths(
         reliable,
         flow_control: None,
         security: Security::Trusted,
+        etf: None,
     };
     let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
     for side in [&mut a, &mut b] {
@@ -4315,6 +4323,7 @@ fn a_two_path_publication_reaches_a_two_path_subscription() {
         reliable: true,
         flow_control: None,
         security: Security::Trusted,
+        etf: None,
     };
     let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
     for side in [&mut a, &mut b] {

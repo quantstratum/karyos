@@ -1027,6 +1027,7 @@ fn loopback(port: u16) -> karyos_protocol::channel::UdpConfig {
         reliable: true,
         flow_control: None,
         security: Security::Trusted,
+        etf: None,
     }
 }
 

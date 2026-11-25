@@ -369,6 +369,7 @@ fn a_network_subscription_reads_two_images_of_one_alias() {
         reliable: true,
         flow_control: None,
         security: Security::Trusted,
+        etf: None,
     };
     // One alias, (8, 1), from two sources.
     let mut publishers = [network_driver(), network_driver()];

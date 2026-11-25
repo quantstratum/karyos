@@ -3617,8 +3617,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// [`DriverError::NotTimed`] for a stream whose buffer has no schedule
     /// ring (`schedule_capacity` 0); [`DriverError::InvalidConfig`] once a
     /// handle of the incarnation was issued, also if it was dropped since;
-    /// [`DriverError::Client`] with `InvalidSchedule` for a zero horizon and
-    /// for the `Tai` domain off Linux; the stream lookup errors.
+    /// [`DriverError::Client`] with `InvalidSchedule` for a zero horizon, a
+    /// zero `etf` advance and the `Tai` domain off Linux; the stream lookup
+    /// errors.
     pub fn schedule_stream(
         &mut self,
         stream: StreamHandle,
@@ -3629,6 +3630,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             return Err(DriverError::Client(
                 karyos_client::ClientError::InvalidSchedule {
                     reason: "a zero horizon",
+                },
+            ));
+        }
+        if options.route == (karyos_client::schedule::TimedRoute::Etf { advance: 0 }) {
+            return Err(DriverError::Client(
+                karyos_client::ClientError::InvalidSchedule {
+                    reason: "a zero etf advance",
                 },
             ));
         }

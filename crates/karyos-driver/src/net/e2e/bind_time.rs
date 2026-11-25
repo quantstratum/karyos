@@ -246,6 +246,7 @@ fn measure(label: &str, reliable: bool, count: usize) {
         // The anchor bounds the sender: a joiner that leaves never holds it.
         flow_control: Some(FlowControl::Max),
         security: Security::Trusted,
+        etf: None,
     };
     let (mut a, mut anchor) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
     let _ = anchor.add_network_subscription(10, &channel).unwrap();
@@ -548,6 +549,7 @@ fn measure_drivers(label: &str, reliable: bool, count: usize, streams: usize, dr
         reliable,
         flow_control: Some(FlowControl::Max),
         security: Security::Trusted,
+        etf: None,
     };
     let ids: Vec<i32> = (0..streams)
         .map(|index| 100 + i32::try_from(index).unwrap())

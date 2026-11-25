@@ -59,6 +59,7 @@ fn channel(address: SocketAddr) -> UdpConfig {
         reliable: false,
         flow_control: None,
         security: Security::Trusted,
+        etf: None,
     }
 }
 

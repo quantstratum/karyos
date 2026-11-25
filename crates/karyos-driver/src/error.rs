@@ -43,6 +43,29 @@ pub enum TimedNetworkUnsupported {
     /// assumed to use this driver's `image_liveness_timeout`.
     #[error("a horizon that, with a heartbeat interval, reaches the image liveness timeout")]
     HorizonPastLiveness,
+    /// The `etf` route (ADR-0109) on a channel without an `etf`
+    /// declaration (`etf-priority` and `etf-delta`).
+    #[error("the etf route without the channel's etf declaration")]
+    EtfUndeclared,
+    /// An `etf` declaration on a channel whose publication is not timed on
+    /// the `etf` route: nothing would use the leaf it names.
+    #[error("an etf declaration without the etf route")]
+    EtfWithoutRoute,
+    /// The declared leaf's `delta` exceeds the publication's declared
+    /// tolerated advance (ADR-0109 point 2): a datagram handed to the
+    /// kernel at the advance could reach the leaf too late and be dropped.
+    #[error("the etf leaf's delta exceeds the declared advance")]
+    EtfDeltaAboveAdvance,
+    /// Another `etf` publication of this driver declares the same priority
+    /// on the same interface (ADR-0109 point 2, isolation): one could
+    /// advance the shared leaf's clock and get the other's datagrams
+    /// dropped.
+    #[error("another etf publication declares this priority on this interface")]
+    EtfPriorityShared,
+    /// The `etf` route anywhere but on a unicast destination of a Linux
+    /// driver (ADR-0109 point 5).
+    #[error("the etf route off Linux or off a unicast destination")]
+    EtfUnavailable,
 }
 
 /// Errors returned by the embedded driver.

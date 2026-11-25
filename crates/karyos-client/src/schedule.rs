@@ -104,6 +104,49 @@ pub fn now(domain: ClockDomain) -> Result<u64, ClientError> {
     domain.clock().map(|clock| clock())
 }
 
+/// The route a timed lane's datagrams take to the wire
+/// (`quantstratum-docs: karyos/design/timed-tx.md`, section 5, and
+/// ADR-0109).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum TimedRoute {
+    /// The sender holds each head until its time and submits it then: the
+    /// default, on every platform.
+    #[default]
+    Software,
+    /// The Linux `etf` qdisc releases each datagram at its time
+    /// (`SO_TXTIME`). The sender hands a head to the kernel up to `advance`
+    /// nanoseconds before its time, the declared tolerated advance, which
+    /// the channel's `etf-delta` must not exceed. Network publications
+    /// only, on Linux; a zero advance is refused.
+    Etf {
+        /// The declared tolerated advance, in nanoseconds.
+        advance: u64,
+    },
+}
+
+impl TimedRoute {
+    /// The route's word in a schedule ring's binding (ADR-0109): 0 for the
+    /// software route, the advance for the `etf` route.
+    #[must_use]
+    pub const fn etf_advance(self) -> u64 {
+        match self {
+            Self::Software => 0,
+            Self::Etf { advance } => advance,
+        }
+    }
+
+    /// The route a binding's word names.
+    #[must_use]
+    pub const fn from_etf_advance(advance: u64) -> Self {
+        if advance == 0 {
+            Self::Software
+        } else {
+            Self::Etf { advance }
+        }
+    }
+}
+
 /// A timed publication's settings (TT-2, TT-3); the defaults are
 /// provisional and configurable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +162,8 @@ pub struct ScheduleOptions {
     /// Whether a head past its time plus the tolerance aborts the
     /// incarnation (G7) instead of being sent late.
     pub cancel_on_deadline: bool,
+    /// The route to the wire (default [`TimedRoute::Software`]).
+    pub route: TimedRoute,
 }
 
 impl Default for ScheduleOptions {
@@ -128,6 +173,7 @@ impl Default for ScheduleOptions {
             max_horizon: 1_000_000_000,
             lateness_tolerance: 1_000_000,
             cancel_on_deadline: false,
+            route: TimedRoute::Software,
         }
     }
 }
@@ -161,6 +207,13 @@ impl ScheduleOptions {
         self.cancel_on_deadline = cancel_on_deadline;
         self
     }
+
+    /// These options on `route`.
+    #[must_use]
+    pub const fn with_route(mut self, route: TimedRoute) -> Self {
+        self.route = route;
+        self
+    }
 }
 
 impl ScheduleOptions {
@@ -173,6 +226,7 @@ impl ScheduleOptions {
             max_horizon: self.max_horizon,
             lateness_tolerance: self.lateness_tolerance,
             cancel_on_deadline: self.cancel_on_deadline,
+            etf_advance: self.route.etf_advance(),
         }
     }
 
@@ -191,6 +245,7 @@ impl ScheduleOptions {
             max_horizon: binding.max_horizon,
             lateness_tolerance: binding.lateness_tolerance,
             cancel_on_deadline: binding.cancel_on_deadline,
+            route: TimedRoute::from_etf_advance(binding.etf_advance),
         })
     }
 }
@@ -499,6 +554,13 @@ mod tests {
             ScheduleOptions::from_binding(options.binding()),
             Some(options)
         );
+        // The route travels in word 7: 0 is the software route.
+        assert_eq!(options.binding().etf_advance, 0);
+        let etf = options.with_route(TimedRoute::Etf { advance: 250_000 });
+        assert_eq!(etf.binding().etf_advance, 250_000);
+        write_binding(&ring, etf.binding()).unwrap();
+        assert_eq!(ring_binding(&ring).unwrap().options(), etf);
+        assert_eq!(ring[7].load(Ordering::Acquire), 250_000);
         for domain in [ClockDomain::Monotonic, ClockDomain::Tai] {
             assert_eq!(ClockDomain::from_code(domain.code()), Some(domain));
         }

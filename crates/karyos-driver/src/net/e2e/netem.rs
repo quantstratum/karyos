@@ -627,6 +627,7 @@ fn multicast_group(label: &str, late: bool) {
         reliable: true,
         flow_control: None,
         security: Security::Trusted,
+        etf: None,
     };
     let (mut a, mut b, mut c) = (
         driver(ThreadingMode::Shared),
