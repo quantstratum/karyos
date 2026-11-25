@@ -29,16 +29,28 @@
 //!   durability, for a command that goes ahead when the journal cannot
 //!   record it (a safety-reducing one); its answer says it is not durable
 //!   yet.
-//! - **Import after an outage.** A journal that could not record (it
-//!   refused an append, or could not be opened) records an unknown
-//!   interval at the agent's next start, which the view shows as the
-//!   journal's gap with its alert until an administrator acknowledges it
-//!   (`gap-ack`). The product then imports the records it kept, by
-//!   operation id: `journal-import INTERVAL TIME request|outcome OPID
-//!   SERVICE COMMAND VALUE CORRELATION [REASON]`, `INTERVAL` the unknown
-//!   interval's position (an unknown interval the journal holds, refused
-//!   otherwise) and `TIME` the product's own time of the original record,
-//!   kept as given. An import is durable, and is its own record kind, so
+//! - **Import after an outage.** Every refusal of a product's append is
+//!   followed by an unknown interval in the journal, which the view shows
+//!   as the journal's gap with its alert until an administrator
+//!   acknowledges it (`gap-ack`):
+//!   - a journal that failed (an append it could not write) records one
+//!     at the agent's next start, as the run did not end cleanly;
+//!   - a journal that refused appends but stayed open (a segment close it
+//!     could not make) records one at its next write, from the first
+//!     refusal ([`GapReason::AppendRefused`]);
+//!   - a journal that could not be opened at the agent's start leaves a
+//!     marker beside its directory, and the next start that opens it
+//!     records one from it
+//!     ([`GapReason::JournalUnavailableAtStart`]); only when even the
+//!     marker cannot be written does the outage stay in that run's memory.
+//!
+//!   The product then imports the records it kept, by operation id:
+//!   `journal-import RECORDING INTERVAL TIME request|outcome OPID SERVICE
+//!   COMMAND VALUE CORRELATION [REASON]`, `RECORDING` and `INTERVAL` the
+//!   unknown interval's recording and position (one the current journal
+//!   holds, refused otherwise, so an interval of a replaced journal is
+//!   never taken for one at the same position of the new one) and `TIME`
+//!   the product's own time of the original record, kept as given. An import is durable, and is its own record kind, so
 //!   an imported record never reads as one made at the time. Importing
 //!   does not close the gap: the interval stays visible until an
 //!   administrator acknowledges it, having seen the imports.
@@ -51,6 +63,8 @@
 //!   `expected` (the interval) and `word` (the product's time).
 
 use crate::agent::Requester;
+#[cfg(doc)]
+use crate::journal::GapReason;
 use crate::journal::{JournalRecord, Kind};
 
 /// The longest service or command name, in bytes.
@@ -72,6 +86,8 @@ pub enum Phase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Import {
+    /// The journal recording the interval is in.
+    pub recording: u64,
     /// The unknown interval's position.
     pub interval: u64,
     /// The product's own time of the original record, as given.
@@ -165,6 +181,8 @@ pub enum ProductAnswer {
     /// An import names a position that is no unknown interval the
     /// journal holds.
     NotAnInterval {
+        /// The recording named.
+        recording: u64,
         /// The position named.
         position: u64,
     },
@@ -188,9 +206,14 @@ pub fn parse(arguments: &str, import: bool) -> Option<ProductAppend<'_>> {
             .flatten()
     };
     let import = if import {
+        let recording = number(word()?)?;
         let interval = number(word()?)?;
         let time = number(word()?)?;
-        Some(Import { interval, time })
+        Some(Import {
+            recording,
+            interval,
+            time,
+        })
     } else {
         None
     };

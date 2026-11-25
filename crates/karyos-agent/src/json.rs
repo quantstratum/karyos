@@ -369,7 +369,8 @@ fn history_record(out: &mut Out<'_>, record: &crate::journal::HistoryRecord) {
 /// `{"journalled":{"recording":R,"position":P,"durable":B}}`; `{"error":
 /// "journal unavailable","journalled":false}` when nothing was recorded,
 /// so a fail-closed command is not sent; `{"error":"not an unknown
-/// interval","position":P}` for an import that names none.
+/// interval","recording":R,"position":P}` for an import that names none
+/// the current journal holds.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn product_answer(answer: &crate::product::ProductAnswer) -> String {
@@ -388,8 +389,12 @@ pub fn product_answer(answer: &crate::product::ProductAnswer) -> String {
                 fields.key("durable").bool(durable);
             });
         }
-        ProductAnswer::NotAnInterval { position } => {
+        ProductAnswer::NotAnInterval {
+            recording,
+            position,
+        } => {
             fields.string("error", "not an unknown interval");
+            fields.number("recording", recording);
             fields.number("position", position);
         }
         _ => {

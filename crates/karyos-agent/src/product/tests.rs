@@ -41,7 +41,7 @@ fn appends_and_imports_take_the_contracts_form() {
     );
     assert_eq!(
         parse(
-            "4096 1700000000 request 9 market-ops resume 0123456789abcdef l:1",
+            "3 4096 1700000000 request 9 market-ops resume 0123456789abcdef l:1",
             true
         ),
         Some(ProductAppend {
@@ -54,6 +54,7 @@ fn appends_and_imports_take_the_contracts_form() {
             correlation: "l:1",
             reason: "",
             import: Some(Import {
+                recording: 3,
                 interval: 4096,
                 time: 1_700_000_000
             }),
@@ -81,8 +82,12 @@ fn appends_and_imports_take_the_contracts_form() {
         ("question durable 7 svc cmd 0 l", false),
         ("request durable 7 svc  cmd 00000000deadbeef l", false),
         // An import takes no durability word, and needs its two numbers.
-        ("4096 1 request durable 9 svc cmd 0123456789abcdef l", true),
-        ("4096 request 9 svc cmd 0123456789abcdef l", true),
+        (
+            "3 4096 1 request durable 9 svc cmd 0123456789abcdef l",
+            true,
+        ),
+        ("3 4096 request 9 svc cmd 0123456789abcdef l", true),
+        ("4096 1 request 9 svc cmd 0123456789abcdef l", true),
     ] {
         assert_eq!(parse(arguments, import), None, "{arguments}");
     }
@@ -133,7 +138,7 @@ fn an_append_is_recorded_with_its_fields() {
     assert!(!outcome.waits());
 
     let import = parse(
-        "4096 1700 outcome 7 market-ops halt-venue 12 log:4712",
+        "3 4096 1700 outcome 7 market-ops halt-venue 12 log:4712",
         true,
     )
     .unwrap();

@@ -308,8 +308,28 @@ impl Agent {
         let (mut journal, journal_error) = match config.journal.as_deref() {
             None => (None, None),
             Some(dir) => match Journal::open_with(dir, start, config.journal_retention.clone()) {
-                Ok(journal) => (Some(journal), None),
-                Err(error) => (None, Some(error.to_string())),
+                Ok(mut journal) => {
+                    // An earlier start that could not open the journal is
+                    // an unknown interval, from its marker (karyos#773
+                    // review); the marker goes once it is recorded.
+                    let marker = crate::journal::outage_marker(dir);
+                    if let Ok(text) = std::fs::read_to_string(&marker) {
+                        let from = text.trim().parse().unwrap_or(0);
+                        if journal.record_outage(from, start).is_ok() {
+                            let _ = std::fs::remove_file(&marker);
+                        }
+                    }
+                    (Some(journal), None)
+                }
+                Err(error) => {
+                    // Best effort: a marker that cannot be written leaves
+                    // the outage in memory only, for this run.
+                    let marker = crate::journal::outage_marker(dir);
+                    if !marker.exists() {
+                        let _ = std::fs::write(&marker, start.to_string());
+                    }
+                    (None, Some(error.to_string()))
+                }
             },
         };
         let operations = journal
@@ -1583,13 +1603,15 @@ impl Agent {
             return ProductAnswer::JournalUnavailable;
         };
         if let Some(import) = append.import
-            && !journal.holds_unknown_interval(import.interval)
+            && (import.recording != journal.recording()
+                || !journal.holds_unknown_interval(import.interval))
         {
             // An unavailable journal holds nothing to name.
             if journal.unavailable() {
                 return ProductAnswer::JournalUnavailable;
             }
             return ProductAnswer::NotAnInterval {
+                recording: import.recording,
                 position: import.interval,
             };
         }

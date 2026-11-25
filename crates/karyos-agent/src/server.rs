@@ -120,7 +120,7 @@
 //!   unavailable"}`.
 //! - **A product service's records (R-CORE-42, karyos#773).**
 //!   `journal-append request|outcome durable|ordinary OPID SERVICE COMMAND
-//!   VALUE CORRELATION [REASON]` and `journal-import INTERVAL TIME
+//!   VALUE CORRELATION [REASON]` and `journal-import RECORDING INTERVAL TIME
 //!   request|outcome OPID SERVICE COMMAND VALUE CORRELATION [REASON]`,
 //!   for the role `service` and an administrator, answer
 //!   [`json::product_answer`]; [`crate::product`] states the contract.

@@ -179,23 +179,33 @@ fn records_made_during_an_outage_are_imported_by_operation_id() {
     drop(agent);
     let mut agent = self::agent(&dir);
     let gap = agent.view().journal.unwrap().gap.unwrap();
-    // A position that is no unknown interval.
+    let recording = agent.journal.as_ref().unwrap().recording();
+    // A position that is no unknown interval, and the interval's position
+    // in another recording.
     let wrong = gap.position + 32;
-    assert_eq!(
-        agent.journal_append(
-            &import(&format!(
-                "{wrong} 1700 request 9 market-ops halt 00000000000000bb log:2"
-            )),
-            Requester::local(1001)
-        ),
-        ProductAnswer::NotAnInterval { position: wrong }
-    );
+    for (other, position) in [(recording, wrong), (recording + 1, gap.position)] {
+        assert_eq!(
+            agent.journal_append(
+                &import(&format!(
+                    "{other} {position} 1700 request 9 market-ops halt 00000000000000bb log:2"
+                )),
+                Requester::local(1001)
+            ),
+            ProductAnswer::NotAnInterval {
+                recording: other,
+                position
+            }
+        );
+    }
     for line in [
         format!(
-            "{} 1700 request 9 market-ops halt 00000000000000bb log:2",
+            "{recording} {} 1700 request 9 market-ops halt 00000000000000bb log:2",
             gap.position
         ),
-        format!("{} 1701 outcome 9 market-ops halt 0 log:3", gap.position),
+        format!(
+            "{recording} {} 1701 outcome 9 market-ops halt 0 log:3",
+            gap.position
+        ),
     ] {
         assert!(matches!(
             agent.journal_append(&import(&line), Requester::local(1001)),
@@ -219,5 +229,53 @@ fn records_made_during_an_outage_are_imported_by_operation_id() {
         .acknowledge_gap_for(gap.position, Requester::local(0))
         .unwrap();
     assert_eq!(agent.view().journal.unwrap().gap, None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Codex on #1276: a journal that cannot be opened at a start, after a
+/// clean stop, leaves a marker; the next start that opens it records the
+/// outage as an unknown interval, which the product imports against.
+#[test]
+fn an_outage_at_start_is_recorded_at_the_next_start_and_imported() {
+    use crate::journal::outage_marker;
+
+    let dir = dir("unopened");
+    let journal = dir.join("journal");
+    {
+        let mut agent = agent(&dir);
+        agent.journal.as_mut().unwrap().stop(1).unwrap();
+    }
+    // A file stands where the journal's directory was.
+    let aside = dir.join("aside");
+    std::fs::rename(&journal, &aside).unwrap();
+    std::fs::write(&journal, b"not a directory").unwrap();
+    let mut unopened = agent(&dir);
+    assert!(unopened.journal.is_none());
+    assert_eq!(
+        append(
+            &mut unopened,
+            "request ordinary 9 market-ops halt 00000000000000bb log:2"
+        ),
+        ProductAnswer::JournalUnavailable
+    );
+    assert!(outage_marker(&journal).exists());
+    drop(unopened);
+    std::fs::remove_file(&journal).unwrap();
+    std::fs::rename(&aside, &journal).unwrap();
+    let mut agent = agent(&dir);
+    let gap = agent.view().journal.unwrap().gap.unwrap();
+    assert_eq!(gap.reason, "journal_unavailable_at_start");
+    assert!(!outage_marker(&journal).exists());
+    let recording = agent.journal.as_ref().unwrap().recording();
+    assert!(matches!(
+        agent.journal_append(
+            &import(&format!(
+                "{recording} {} 1700 request 9 market-ops halt 00000000000000bb log:2",
+                gap.position
+            )),
+            Requester::local(1001)
+        ),
+        ProductAnswer::Journalled { durable: true, .. }
+    ));
     let _ = std::fs::remove_dir_all(&dir);
 }
