@@ -244,6 +244,36 @@ impl Wire for Custom {
     fn decode(bytes: &[u8]) -> Option<Message> {
         decode(bytes)
     }
+
+    fn appended(message: &Message) -> Option<(u64, Vec<(u64, u64)>)> {
+        let CoreMessage::Append { term, .. } = message.core else {
+            return None;
+        };
+        Some((
+            term,
+            message
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.index,
+                        u64::try_from(entry.payload.len()).unwrap_or(u64::MAX),
+                    )
+                })
+                .collect(),
+        ))
+    }
+
+    fn acknowledged(message: &Message) -> Option<(u64, u64)> {
+        match message.core {
+            CoreMessage::AppendReply {
+                term,
+                outcome: AppendOutcome::Accepted { index },
+                ..
+            } => Some((term, index)),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

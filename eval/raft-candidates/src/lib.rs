@@ -23,6 +23,7 @@
 //!   harness test service to client processes.
 //! - [`record`]: what those processes report, stamped from the host
 //!   monotonic clock, and its merge for the harness checks.
+//! - [`v2`]: C5 version 2's frozen W2 in-flight byte case.
 //! - [`variant`]: which build of a candidate ran, baseline or patched,
 //!   with its patch record.
 
@@ -33,4 +34,5 @@ pub mod openraft_wire;
 pub mod process;
 pub mod raft_rs;
 pub mod record;
+pub mod v2;
 pub mod variant;

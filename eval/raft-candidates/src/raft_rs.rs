@@ -774,6 +774,14 @@ impl<const PRE_VOTE: bool, const BATCH: u64> crate::process::Wire for RaftCore<P
     fn decode(bytes: &[u8]) -> Option<eraftpb::Message> {
         protobuf::Message::parse_from_bytes(bytes).ok()
     }
+
+    fn appended(message: &eraftpb::Message) -> Option<(u64, Vec<(u64, u64)>)> {
+        append_entries(message)
+    }
+
+    fn acknowledged(message: &eraftpb::Message) -> Option<(u64, u64)> {
+        append_ack(message)
+    }
 }
 
 #[cfg(test)]

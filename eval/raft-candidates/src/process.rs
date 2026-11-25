@@ -52,14 +52,15 @@ use std::time::{Duration, Instant};
 use karyos_archive::disk::StdDisk;
 use karyos_cluster::{LogError, RaftLog};
 use karyos_sim::harness::core::{
-    ConsensusCore, DriveError, LogView, NotLeader, ReadyBuf, Refused, drive_into,
+    ConsensusCore, DriveError, Limits, LogView, NotLeader, ReadBudget, ReadyBuf, Refused,
+    drive_into,
 };
 use karyos_sim::harness::node::{
     Breach, Command, Observation, Positions, SEAL_TICKS, TestService, Wire as Harness,
 };
 use karyos_sim::harness::probe::{self, Probed};
 use karyos_sim::harness::standby::FIRST_GENERATION;
-use karyos_sim::harness::workloads::{self, Case};
+use karyos_sim::harness::workloads::{self, Action, Case};
 use karyos_sim::net::NodeId;
 
 use crate::record::{self, Item};
@@ -71,6 +72,15 @@ pub trait Wire: ConsensusCore {
 
     /// The message in `bytes`; `None` when they are not one.
     fn decode(bytes: &[u8]) -> Option<Self::Message>;
+
+    /// An append's leader term and its entries as (index, payload bytes),
+    /// read from the message itself, never from the adapter's counters
+    /// (the W2 byte case's oracle, C5 v2); `None` for any other message.
+    fn appended(message: &Self::Message) -> Option<(u64, Vec<(u64, u64)>)>;
+
+    /// The term and index an accepted append reply acknowledges; `None`
+    /// for any other message.
+    fn acknowledged(message: &Self::Message) -> Option<(u64, u64)>;
 }
 
 /// A probed core's messages are its inner core's. [`run_server`] counts
@@ -82,6 +92,14 @@ impl<C: Wire> Wire for Probed<C> {
 
     fn decode(bytes: &[u8]) -> Option<Self::Message> {
         C::decode(bytes)
+    }
+
+    fn appended(message: &Self::Message) -> Option<(u64, Vec<(u64, u64)>)> {
+        C::appended(message)
+    }
+
+    fn acknowledged(message: &Self::Message) -> Option<(u64, u64)> {
+        C::acknowledged(message)
     }
 }
 
@@ -124,12 +142,81 @@ pub const TICK_MS: u64 = 10;
 /// ticks.
 pub const MAX_READS_PER_LOOP: usize = 256;
 
-/// The W1 cases a real-process run takes, by index: the harness's frozen
-/// W1 (`W1::skeleton().cases()`, every process count, payload and client
+/// The W1 cases a real-process run takes: the harness's frozen W1
+/// (`W1::skeleton().cases()`, every process count, payload and client
 /// count of ADR-0043), so every value of a run is its [`Case`]'s.
 #[must_use]
 pub fn w1_cases() -> Vec<Case> {
     workloads::W1::skeleton().cases()
+}
+
+/// The W2 cases a real-process run takes: the manifest's frozen W2
+/// (`W2::manifest().cases()`: the nominal load, the bursts at 4x the
+/// queue and the in-flight entries, the paused follower and the log-read
+/// burst), then C5 v2's in-flight byte case ([`crate::v2::byte_case`]).
+#[must_use]
+pub fn w2_cases() -> Vec<Case> {
+    let mut cases = workloads::W2::manifest().cases().unwrap_or_default();
+    cases.push(crate::v2::byte_case());
+    cases
+}
+
+/// Every case a node or client process takes, by index: [`w1_cases`],
+/// then [`w2_cases`].
+#[must_use]
+pub fn cases() -> Vec<Case> {
+    let mut cases = w1_cases();
+    cases.extend(w2_cases());
+    cases
+}
+
+/// When a server is cut from every other server (`Action::Isolate`) and
+/// healed again (`Action::Heal`), from `case`'s schedule: `(server, from,
+/// until)` in ticks of each server's own clock, `until` `None` when no
+/// heal follows. These are the only actions a process run takes (W2's).
+///
+/// # Errors
+///
+/// The name of the first other action: a process run refuses it rather
+/// than run the case without it.
+pub fn isolations(case: &Case) -> Result<Vec<(NodeId, u64, Option<u64>)>, String> {
+    let mut schedule = case.schedule.clone();
+    schedule.sort_by_key(|(step, _)| *step);
+    let mut cuts: Vec<(NodeId, u64, Option<u64>)> = Vec::new();
+    for (step, action) in schedule {
+        match action {
+            Action::Isolate(server) => cuts.push((server, step, None)),
+            Action::Heal => {
+                for cut in &mut cuts {
+                    if cut.2.is_none() {
+                        cut.2 = Some(step);
+                    }
+                }
+            }
+            other => return Err(format!("{other:?}")),
+        }
+    }
+    Ok(cuts)
+}
+
+/// The steps at which `case` heals, in order.
+fn heals(case: &Case) -> Vec<u64> {
+    let mut heals: Vec<u64> = case
+        .schedule
+        .iter()
+        .filter(|(_, action)| *action == Action::Heal)
+        .map(|(step, _)| *step)
+        .collect();
+    heals.sort_unstable();
+    heals
+}
+
+/// Whether the link between servers `a` and `b` is cut at tick `now`.
+fn cut(cuts: &[(NodeId, u64, Option<u64>)], now: u64, a: NodeId, b: NodeId) -> bool {
+    a != b
+        && cuts.iter().any(|(server, from, until)| {
+            (*server == a || *server == b) && now >= *from && until.is_none_or(|until| now < until)
+        })
 }
 
 /// The id of client session `session` of `case`: after the servers, the
@@ -196,6 +283,8 @@ pub enum ProcessError {
     Geometry,
     /// The deadline passed without the test's stop.
     Deadline,
+    /// The case schedules an action a process run does not take.
+    Schedule(String),
     /// The configuration does not name this node.
     NotAPeer,
     /// A peer's address is not on the loopback: the runner speaks
@@ -211,6 +300,7 @@ impl fmt::Display for ProcessError {
             Self::Log(error) => write!(f, "log: {error:?}"),
             Self::Geometry => f.write_str("the log geometry is refused"),
             Self::Deadline => f.write_str("the deadline passed without a stop"),
+            Self::Schedule(action) => write!(f, "a process run does not take {action}"),
             Self::NotAPeer => f.write_str("the node is not among its peers"),
             Self::NotLoopback(address) => {
                 write!(f, "{address} is not a loopback address")
@@ -242,11 +332,14 @@ pub fn ticks_since(start: Instant) -> u64 {
         .unwrap_or(0)
 }
 
-/// `message`'s client frame: its length, a kind, then its fields, little
-/// endian; `None` for a message no client or server sends the other.
+/// `message`'s client frame, for or from client session `client`: its
+/// length, the session's id, a kind, then its fields, little endian; `None`
+/// for a message no client or server sends the other. The id routes a
+/// server's answer to its session: one client process runs every session
+/// of its window over one connection.
 #[must_use]
-pub fn frame<M>(message: &Harness<M>) -> Option<Vec<u8>> {
-    let mut body = Vec::new();
+pub fn frame<M>(client: NodeId, message: &Harness<M>) -> Option<Vec<u8>> {
+    let mut body = client.to_le_bytes().to_vec();
     match message {
         Harness::Request(command) => {
             body.push(1);
@@ -283,7 +376,11 @@ pub fn frame<M>(message: &Harness<M>) -> Option<Vec<u8>> {
     Some(framed)
 }
 
-/// The next whole frame's message in `buffer`, which loses its bytes:
+/// A client frame's session and message.
+pub type Framed<M> = (NodeId, Harness<M>);
+
+/// The next whole frame's session and message in `buffer`, which loses its
+/// bytes:
 /// `Some(None)` for a frame that is no message, `None` while no whole
 /// frame is there. A length past [`MAX_FRAME`] is an error: the stream
 /// is not this protocol.
@@ -291,7 +388,7 @@ pub fn frame<M>(message: &Harness<M>) -> Option<Vec<u8>> {
 /// # Errors
 ///
 /// [`io::ErrorKind::InvalidData`].
-pub fn unframe<M>(buffer: &mut Vec<u8>) -> io::Result<Option<Option<Harness<M>>>> {
+pub fn unframe<M>(buffer: &mut Vec<u8>) -> io::Result<Option<Option<Framed<M>>>> {
     let Some(length) = buffer.first_chunk::<4>().copied() else {
         return Ok(None);
     };
@@ -302,7 +399,10 @@ pub fn unframe<M>(buffer: &mut Vec<u8>) -> io::Result<Option<Option<Harness<M>>>
     let Some(end) = length.checked_add(4).filter(|end| *end <= buffer.len()) else {
         return Ok(None);
     };
-    let message = buffer.get(4..end).and_then(message_of);
+    let message = buffer.get(4..end).and_then(|body| {
+        let (client, body) = body.split_first_chunk::<4>()?;
+        Some((NodeId::from_le_bytes(*client), message_of(body)?))
+    });
     let _ = buffer.drain(..end);
     Ok(Some(message))
 }
@@ -390,7 +490,7 @@ impl Connection {
 
     /// Writes what it can of the queue and reads what arrived; then every
     /// whole message that arrived, in order.
-    pub fn poll<M>(&mut self, scratch: &mut [u8]) -> Vec<Harness<M>> {
+    pub fn poll<M>(&mut self, scratch: &mut [u8]) -> Vec<Framed<M>> {
         self.flush();
         while !self.closed {
             match self.stream.read(scratch) {
@@ -439,6 +539,14 @@ struct Serving<M> {
     now: u64,
     /// A drive error stopped it.
     stopped: bool,
+    /// The limits its core was declared (W2), if any.
+    limits: Option<Limits>,
+    /// Its duty's log-read budget, refilled at each tick and delivery, as
+    /// `ServerNode`'s.
+    budget: ReadBudget,
+    /// Whether it records the appends it sends and the acknowledgements
+    /// it steps (W2: the byte oracle's trace).
+    traces: bool,
 }
 
 fn observe(items: &mut Vec<(u64, Item)>, observation: Observation) {
@@ -448,6 +556,20 @@ fn observe(items: &mut Vec<(u64, Item)>, observation: Observation) {
 impl<M> Serving<M> {
     fn observe(&mut self, observation: Observation) {
         observe(&mut self.items, observation);
+    }
+
+    /// A new duty: its read budget refilled, when it has limits, as
+    /// `ServerNode::refill`. A loop of [`run_server`] is one duty: its
+    /// deliveries, its tick and its drive share one budget.
+    fn refill(&self) {
+        if let Some(limits) = self.limits {
+            self.budget.refill(limits.log_read_bytes);
+        }
+    }
+
+    /// The duty's budget, when it has limits.
+    fn metered(&self) -> Option<ReadBudget> {
+        self.limits.map(|_| self.budget.clone())
     }
 
     /// `ServerNode`'s handling of a client's request.
@@ -464,7 +586,8 @@ impl<M> Serving<M> {
             return;
         }
         command.encode_into(&mut self.command);
-        match core.propose_slice(&self.command, &mut LogView::new(log)) {
+        let budget = self.metered();
+        match core.propose_slice(&self.command, &mut LogView::metered(log, budget.as_ref())) {
             Ok(()) => {
                 let _ = self.pending.insert((command.client, sequence));
             }
@@ -498,7 +621,7 @@ impl<M> Serving<M> {
 
     /// `ServerNode`'s duty: drive the core, apply what committed and
     /// answer it, and record its configuration, commit and positions.
-    fn duty<C: ConsensusCore<Message = M>>(
+    fn duty<C: Wire<Message = M>>(
         &mut self,
         core: &mut C,
         log: &mut RaftLog<StdDisk>,
@@ -509,20 +632,35 @@ impl<M> Serving<M> {
         }
         let node = self.id;
         let now = self.now;
+        let traces = self.traces;
         let items = RefCell::new(std::mem::take(&mut self.items));
         let Self {
             service,
             pending,
             replies,
             ready,
+            limits,
+            budget,
             ..
         } = self;
+        let budget = limits.is_some().then_some(&*budget);
         let driven = drive_into(
             core,
             log,
             ready,
-            (None, None),
+            (budget, None),
             &mut |to, message, release| {
+                if traces && let Some((term, entries)) = C::appended(&message) {
+                    items.borrow_mut().push((
+                        record::now(),
+                        Item::Sent {
+                            leader: node,
+                            to,
+                            term,
+                            entries,
+                        },
+                    ));
+                }
                 if let Some(release) = release {
                     observe(
                         &mut items.borrow_mut(),
@@ -781,7 +919,33 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
     // crash; recovery is the simulator's to check).
     let mut log = RaftLog::create(StdDisk, &config.dir, geometry, 1).map_err(ProcessError::Log)?;
     log.set_seal_interval(SEAL_TICKS);
-    let mut core = C::recover(config.id, &ids, &mut LogView::new(&mut log));
+    let cuts = isolations(&config.case).map_err(ProcessError::Schedule)?;
+    let mut heals = heals(&config.case).into_iter().peekable();
+    // A core under declared limits (W2) takes them at its start, as the
+    // simulator's servers do; one that refuses them reports it, and the
+    // case is not demonstrated for it, never skipped.
+    let core = match config.case.limits {
+        None => Ok(C::recover(config.id, &ids, &mut LogView::new(&mut log))),
+        Some(limits) => C::recover_with(config.id, &ids, &limits, &mut LogView::new(&mut log)),
+    };
+    let Ok(mut core) = core else {
+        return Ok(Served {
+            items: vec![(
+                record::now(),
+                Item::Observation(Observation::Unsupported {
+                    node: config.id,
+                    what: "limits",
+                }),
+            )],
+            state: ServerState {
+                applied: None,
+                digest: TestService::default().digest(),
+                deduplicated: 0,
+                leads: false,
+                up: false,
+            },
+        });
+    };
     let mut serving: Serving<C::Message> = Serving {
         id: config.id,
         service: TestService::default(),
@@ -795,6 +959,9 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
         command: Vec::new(),
         now: 0,
         stopped: false,
+        limits: config.case.limits,
+        budget: ReadBudget::new(),
+        traces: config.case.limits.is_some(),
     };
     serving.record_state(&core, &log);
     let start = Instant::now();
@@ -816,6 +983,15 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
         if start.elapsed() >= config.deadline {
             return Err(ProcessError::Deadline);
         }
+        // The first server marks each heal in the order of observations,
+        // as the simulator's run does ([`Observation::Healed`]).
+        while heals.next_if(|at| now >= *at).is_some() {
+            if config.id == 0 {
+                serving.observe(Observation::Healed);
+            }
+        }
+        serving.refill();
+        let budget = serving.metered();
         // New clients.
         loop {
             match listener.accept() {
@@ -837,7 +1013,28 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
                         continue;
                     }
                     if let Some((from, message)) = arrived::<C>(datagram, &mut partial) {
-                        core.step(from, message, &mut LogView::new(&mut log));
+                        // An isolated server's link is cut both ways.
+                        if cut(&cuts, now, config.id, from) {
+                            continue;
+                        }
+                        if serving.traces
+                            && let Some((term, index)) = C::acknowledged(&message)
+                        {
+                            serving.items.push((
+                                record::now(),
+                                Item::Acked {
+                                    leader: config.id,
+                                    from,
+                                    term,
+                                    index,
+                                },
+                            ));
+                        }
+                        core.step(
+                            from,
+                            message,
+                            &mut LogView::metered(&mut log, budget.as_ref()),
+                        );
                     }
                 }
                 Err(error) if idle(&error) => break,
@@ -846,7 +1043,7 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
         }
         // Clients' requests, each on the connection that sent it.
         for (at, connection) in connections.iter_mut().enumerate() {
-            for message in connection.poll::<C::Message>(&mut scratch) {
+            for (_, message) in connection.poll::<C::Message>(&mut scratch) {
                 if let Harness::Request(command) = message {
                     let _ = clients.insert(command.client, at);
                     serving.request(&mut core, &mut log, &command);
@@ -855,7 +1052,7 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
         }
         if ticked != Some(now) && !serving.stopped {
             ticked = Some(now);
-            core.tick(now, &mut LogView::new(&mut log));
+            core.tick(now, &mut LogView::metered(&mut log, budget.as_ref()));
             // The log's seal duty on the harness clock, as the simulator's
             // servers run it (karyos#1050): a failed seal poisons the log,
             // and the next drive stops the server.
@@ -863,6 +1060,9 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
         }
         serving.duty(&mut core, &mut log, &mut outbox);
         for (to, message) in outbox.drain(..) {
+            if cut(&cuts, now, config.id, to) {
+                continue;
+            }
             let Some(address) = config
                 .peers
                 .iter()
@@ -877,7 +1077,7 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
         for (client, message) in serving.replies.drain(..) {
             if let (Some(connection), Some(framed)) = (
                 clients.get(&client).and_then(|at| connections.get_mut(*at)),
-                frame(&message),
+                frame(client, &message),
             ) {
                 connection.queue(&framed);
             }
@@ -922,14 +1122,14 @@ mod tests {
             Harness::Busy { sequence: 2 },
             Harness::Redirect { server: 1 },
         ] {
-            let mut buffer = frame(&message).unwrap_or_default();
+            let mut buffer = frame(7, &message).unwrap_or_default();
             // Split across two reads: nothing until the frame is whole.
             let tail = buffer.split_off(3);
             assert!(matches!(unframe::<()>(&mut buffer), Ok(None)));
             buffer.extend_from_slice(&tail);
             assert!(matches!(
                 unframe::<()>(&mut buffer),
-                Ok(Some(Some(ref got))) if *got == message
+                Ok(Some(Some((7, ref got)))) if *got == message
             ));
             assert!(buffer.is_empty());
         }

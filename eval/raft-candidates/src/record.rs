@@ -55,6 +55,30 @@ pub enum Item {
         /// The return.
         ret: Ret,
     },
+    /// A server sent an append (W2: the byte oracle's trace, read from
+    /// the message itself).
+    Sent {
+        /// The sender.
+        leader: NodeId,
+        /// The receiver.
+        to: NodeId,
+        /// The append's leader term.
+        term: u64,
+        /// Its entries: index and payload bytes.
+        entries: Vec<(u64, u64)>,
+    },
+    /// A server stepped an accepted append reply (W2: the byte oracle's
+    /// trace).
+    Acked {
+        /// The server that stepped it.
+        leader: NodeId,
+        /// The follower that sent it.
+        from: NodeId,
+        /// Its term.
+        term: u64,
+        /// The index it acknowledges.
+        index: u64,
+    },
 }
 
 /// The stamp of now: nanoseconds of the host's monotonic clock ([`CLOCK`]).
@@ -173,6 +197,26 @@ pub fn encode(stamp: u64, item: &Item) -> Option<String> {
             .number(u64::from(*client))
             .bytes(&ret.canonical()),
         Item::Observation(observation) => observation_line(stamp, observation)?,
+        Item::Sent {
+            leader,
+            to,
+            term,
+            entries,
+        } => Line::new(stamp, "sent")
+            .number(u64::from(*leader))
+            .number(u64::from(*to))
+            .number(*term)
+            .pairs(entries),
+        Item::Acked {
+            leader,
+            from,
+            term,
+            index,
+        } => Line::new(stamp, "acked")
+            .number(u64::from(*leader))
+            .number(u64::from(*from))
+            .number(*term)
+            .number(*index),
     };
     Some(line.0)
 }
@@ -330,6 +374,7 @@ fn observation_line(stamp: u64, observation: &Observation) -> Option<Line> {
         Observation::Expired { client, sequence } => Line::new(stamp, "expired")
             .number(id(client))
             .number(*sequence),
+        Observation::Healed => Line::new(stamp, "healed"),
         Observation::Unsupported { node, what } => Line::new(stamp, "unsupported")
             .number(id(node))
             .bytes(what.as_bytes()),
@@ -458,6 +503,18 @@ pub fn decode(line: &str) -> Option<(u64, Item)> {
             client: fields.node()?,
             ret: Ret::decode(&fields.bytes()?)?,
         },
+        "sent" => Item::Sent {
+            leader: fields.node()?,
+            to: fields.node()?,
+            term: fields.number()?,
+            entries: fields.pairs()?,
+        },
+        "acked" => Item::Acked {
+            leader: fields.node()?,
+            from: fields.node()?,
+            term: fields.number()?,
+            index: fields.number()?,
+        },
         _ => Item::Observation(observation(tag, &mut fields)?),
     };
     fields.end()?;
@@ -466,6 +523,7 @@ pub fn decode(line: &str) -> Option<(u64, Item)> {
 
 fn observation(tag: &str, fields: &mut Fields<'_>) -> Option<Observation> {
     Some(match tag {
+        "healed" => Observation::Healed,
         "panicked" => Observation::CorePanicked {
             node: fields.node()?,
         },
@@ -640,6 +698,8 @@ pub fn merge(processes: Vec<Vec<(u64, Item)>>) -> Recorder {
             Item::Return { client, ret } => {
                 let _ = recorder.history.ret(client, ret);
             }
+            // The byte oracle's trace: not the harness's to record.
+            Item::Sent { .. } | Item::Acked { .. } => {}
         }
     }
     recorder
@@ -676,6 +736,24 @@ mod tests {
         round_trip(Item::Return {
             client: 4,
             ret: Ret::Appended(9),
+        });
+        round_trip(Item::Sent {
+            leader: 0,
+            to: 2,
+            term: 3,
+            entries: vec![(7, 8209), (8, 0)],
+        });
+        round_trip(Item::Sent {
+            leader: 0,
+            to: 2,
+            term: 3,
+            entries: Vec::new(),
+        });
+        round_trip(Item::Acked {
+            leader: 0,
+            from: 2,
+            term: 3,
+            index: 8,
         });
         for observation in [
             Observation::Drive {
@@ -806,6 +884,7 @@ mod tests {
                 generation: 1,
             },
             Observation::CorePanicked { node: 1 },
+            Observation::Healed,
         ] {
             round_trip(Item::Observation(observation));
         }

@@ -1337,6 +1337,14 @@ impl<const PRE_VOTE: bool, const BATCH: u64> crate::process::Wire
     fn decode(bytes: &[u8]) -> Option<Message> {
         crate::openraft_wire::decode(bytes)
     }
+
+    fn appended(message: &Message) -> Option<(u64, Vec<(u64, u64)>)> {
+        append_entries(message)
+    }
+
+    fn acknowledged(message: &Message) -> Option<(u64, u64)> {
+        append_ack(message)
+    }
 }
 
 #[cfg(test)]

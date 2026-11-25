@@ -91,14 +91,68 @@
 //! cargo test --release --locked --test real_processes -- --ignored --nocapture w1_full_matrix
 //! ```
 
+//!
+//! **W2** (version 1, Environments: "W2 functionally"; C5 v2, "W2: an
+//! in-flight byte case that reaches its bound"). Every case of the
+//! manifest's frozen W2 (`W2::manifest().cases()`) and v2's byte case
+//! (`karyos_raft_eval::v2::byte_case`), on its 3 servers, for every
+//! variant (`process::w2_cases()`):
+//! - each server's core takes the case's declared `limits` at its start
+//!   (`ConsensusCore::recover_with`); a core that refuses them reports it,
+//!   and the case is not demonstrated for it, as the simulator reports it;
+//!   each server meters its log reads per duty (one loop of the server)
+//!   with the harness's `ReadBudget`, as `ServerNode` does;
+//! - the bursts are the clients' windows (`Case::window`): one process
+//!   per client runs its window of sessions, each one request open;
+//! - the paused follower is the case's own schedule, `Isolate` then
+//!   `Heal` at its steps: each server drops every core datagram to and
+//!   from the isolated server in that window of its own ticks, as the
+//!   simulator cuts its links (the server keeps running, as it does in
+//!   the simulator), and server 0 marks the heal (`Observation::Healed`);
+//!   a process run refuses any other scheduled action;
+//! - every run lasts its case's `steps`, whenever the clients finish, so
+//!   the heal and the catch-up after it happen as in the simulator;
+//! - the byte case's oracle reads the appends each server sent and the
+//!   acknowledgements it stepped (`record::Item::Sent`, `Item::Acked`),
+//!   from the messages themselves (`process::Wire::appended`,
+//!   `acknowledged`), with `tests/w2_bytes.rs`'s own oracle
+//!   (`tests/v2/oracle.rs`).
+//!
+//! By default `cargo test --release` runs W2's nominal case for every
+//! variant; every W2 case is `#[ignore]`d for its length:
+//!
+//! ```text
+//! cd eval/raft-candidates
+//! cargo test --release --locked --test real_processes -- --ignored --nocapture w2_full
+//! ```
+
 // Test helpers outside #[test] functions are not covered by clippy.toml's
 // test exemptions (ADR-0007 exempts tests from these lints).
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+/// One process-spawning test at a time in this test binary (as
+/// karyos#1272): libtest runs tests in parallel, and a run's servers and
+/// clients, up to 37 processes, each `fsync`ing its log, must not share
+/// the host's disk with another run's, or every flush waits on all of
+/// them. Poison-tolerant, as the allocation tests' `SERIAL`: a failed
+/// run does not fail the next.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// Takes [`SERIAL`] for the test's lifetime.
+pub fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 #[cfg(target_os = "linux")]
 use w1::*;
+
+// The W2 byte case's oracle, shared with `tests/w2_bytes.rs`.
+#[cfg(target_os = "linux")]
+#[path = "v2/oracle.rs"]
+mod oracle;
 
 #[cfg(target_os = "linux")]
 mod w1 {
@@ -107,25 +161,20 @@ mod w1 {
     use std::io::Read as _;
     use std::net::{TcpListener, UdpSocket};
     use std::process::{Child, Command, Stdio};
-    use std::sync::{Mutex, MutexGuard, PoisonError};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
-    use karyos_raft_eval::process::{STOP, TICK_MS, w1_cases};
+    use karyos_raft_eval::process::{STOP, TICK_MS, cases, w1_cases};
     use karyos_raft_eval::record::{self, Item};
+    use karyos_sim::harness::core::Limit;
+    use karyos_sim::harness::node::Observation;
     use karyos_sim::harness::probe::WARMUP;
-    use karyos_sim::harness::workloads::{self, Case, Liveness};
+    use karyos_sim::harness::workloads::{self, Case, Failed, Liveness, Outcome, RunError};
     use karyos_sim::net::NodeId;
 
     use super::json_escaped;
 
-    /// One run at a time: a run's 37 processes at most share the host
-    /// with no other run's.
-    static SERIAL: Mutex<()> = Mutex::new(());
-
-    pub fn serial() -> MutexGuard<'static, ()> {
-        SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
-    }
+    pub use super::serial;
 
     /// Distinct free loopback addresses, one per server, each free for UDP
     /// (between servers) and TCP (from clients) on the same port: every
@@ -346,18 +395,111 @@ mod w1 {
     /// Runs W1 case `index` of variant `core` on processes and passes it
     /// through the simulator's pass conditions.
     pub fn w1_case_passes(core: &str, index: usize) {
-        let _serial = serial();
         let case = w1_cases().into_iter().nth(index).unwrap();
+        let ran = run_case(core, index, &case);
+        let outcome = ran.outcome.as_ref().unwrap();
+        assert_eq!(
+            workloads::pass(&case, outcome),
+            Ok(None),
+            "{core} {}: {} observations, {} history events; waiting clients: {:?}",
+            case.name,
+            outcome.observations.len(),
+            outcome.history.events().len(),
+            ran.stuck
+        );
+        // A case with more entries than the warm-up measures past it.
+        let operations = case.sessions().unwrap() * case.operations;
+        if u64::try_from(operations).unwrap() > 2 * WARMUP {
+            assert!(
+                ran.probes.iter().any(|probe| probe.entries > 0),
+                "the probe measured no entry: {:?}",
+                ran.probes
+            );
+        }
+    }
+
+    /// What a run of a case gave.
+    pub struct Ran {
+        /// The outcome, or why the harness could not judge it (a core
+        /// that refused the case's limits: not demonstrated).
+        pub outcome: Result<Outcome, RunError>,
+        /// Every server's probe line.
+        pub probes: Vec<Probe>,
+        /// The appends the servers sent and the acknowledgements they
+        /// stepped, merged by stamp (W2's byte oracle).
+        pub trace: Vec<Item>,
+        /// The last lines of each client process with a session that did
+        /// not finish.
+        pub stuck: Vec<String>,
+    }
+
+    /// Runs case `index` of `cases()` for variant `core` on processes, one
+    /// run at a time, and writes its run-record line.
+    pub fn run_case(core: &str, index: usize, case: &Case) -> Ran {
+        let _serial = serial();
         for attempt in 1..=ATTEMPTS {
-            match run_once(core, index, &case) {
-                Ok(probes) => {
-                    record_line(core, &case, &probes);
-                    return;
+            match run_once(core, index, case) {
+                Ok(ran) => {
+                    record_line(core, case, &ran.probes);
+                    return ran;
                 }
                 Err(stderr) if attempt < ATTEMPTS && stderr.contains("in use") => {}
                 Err(stderr) => panic!("{core} {}: {stderr}", case.name),
             }
         }
+        unreachable!("the last attempt returns or panics")
+    }
+
+    /// W2 case `index` of `w2_cases()` for `core` on processes: what
+    /// `workloads::pass` says of it, the typed refusals it saw, and its
+    /// trace; `Err` with the harness's reason when it is not demonstrated.
+    pub fn w2_case(core: &str, index: usize) -> (Case, Result<W2Result, RunError>) {
+        let offset = w1_cases().len();
+        let case = cases().into_iter().nth(offset + index).unwrap();
+        let ran = run_case(core, offset + index, &case);
+        let result = ran.outcome.map(|outcome| {
+            let refused = outcome
+                .observations
+                .iter()
+                .filter_map(|observation| match observation {
+                    Observation::Backpressure { limit, .. } => Some(*limit),
+                    _ => None,
+                })
+                .collect();
+            W2Result {
+                safety: outcome.safety.is_ok(),
+                pass: workloads::pass(&case, &outcome),
+                refused,
+                trace: ran.trace,
+                stuck: ran.stuck,
+            }
+        });
+        (case, result)
+    }
+
+    /// A W2 run's result.
+    #[derive(Debug)]
+    pub struct W2Result {
+        pub safety: bool,
+        pub pass: Result<Option<Liveness>, Failed>,
+        pub refused: Vec<Limit>,
+        pub trace: Vec<Item>,
+        pub stuck: Vec<String>,
+    }
+
+    /// Every child's stderr, once each is killed and reaped: what a run
+    /// that timed out says of itself (as karyos#1272).
+    fn stderr_of(children: Vec<Child>, outputs: Vec<Output>) -> String {
+        let mut said = Vec::new();
+        for (mut child, output) in children.into_iter().zip(outputs) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stderr = output.stderr.join().unwrap_or_default();
+            if !stderr.trim().is_empty() {
+                said.push(stderr.trim().to_owned());
+            }
+        }
+        said.join(" | ")
     }
 
     /// Waits for every child of `children`; `false` past `deadline`.
@@ -377,7 +519,7 @@ mod w1 {
     }
 
     /// One run; `Err` with a failed child's stderr.
-    fn run_once(core: &str, index: usize, case: &Case) -> Result<Vec<Probe>, String> {
+    fn run_once(core: &str, index: usize, case: &Case) -> Result<Ran, String> {
         let addresses = free_addresses(case.servers);
         let peers: Vec<String> = addresses
             .iter()
@@ -392,6 +534,7 @@ mod w1 {
         // Each child joins the guard as it starts, so a later spawn failing
         // still stops the earlier ones.
         let mut outputs = Vec::new();
+        let started = Instant::now();
         for id in 0..case.servers {
             let mut child = Command::new(env!("CARGO_BIN_EXE_raft-eval-node"))
                 .arg(core)
@@ -406,11 +549,11 @@ mod w1 {
             outputs.push(drain(&mut child));
             run.children.push(child);
         }
-        let sessions = case.sessions().unwrap();
-        for session in 0..sessions {
+        // One process per client, running its window of sessions.
+        for client in 0..case.clients {
             let mut child = Command::new(env!("CARGO_BIN_EXE_raft-eval-client"))
                 .arg(index.to_string())
-                .arg(session.to_string())
+                .arg(client.to_string())
                 .args(&peers)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -426,7 +569,19 @@ mod w1 {
         };
         // A server that failed (a port taken) leaves the clients waiting:
         // its error is reported below either way.
-        assert!(clients_done, "the clients did not finish");
+        if !clients_done {
+            panic!(
+                "the clients did not finish: {}",
+                stderr_of(std::mem::take(&mut run.children), outputs)
+            );
+        }
+        // The run lasts its case's steps whatever the clients did, as the
+        // simulator's does: a schedule's actions past the clients' end (a
+        // heal, and the catch-up after it) still happen.
+        let steps = Duration::from_millis(case.steps * TICK_MS);
+        if let Some(left) = steps.checked_sub(started.elapsed()) {
+            std::thread::sleep(left);
+        }
         let stop = UdpSocket::bind("127.0.0.1:0").unwrap();
         for address in &addresses {
             stop.send_to(&[STOP], address).unwrap();
@@ -435,7 +590,12 @@ mod w1 {
             &mut run.children[..case.servers],
             Instant::now() + Duration::from_millis(case.quiet * TICK_MS) + SLACK,
         );
-        assert!(servers_done, "the servers did not stop");
+        if !servers_done {
+            panic!(
+                "the servers did not stop: {}",
+                stderr_of(std::mem::take(&mut run.children), outputs)
+            );
+        }
         let mut failed = None;
         let mut texts = Vec::new();
         for (child, output) in std::mem::take(&mut run.children).into_iter().zip(outputs) {
@@ -457,6 +617,7 @@ mod w1 {
         let mut states = Vec::new();
         let mut waiting = 0usize;
         let mut stuck: Vec<String> = Vec::new();
+        let mut traces = Vec::new();
         for text in &texts {
             let mut items: Vec<(u64, Item)> = Vec::new();
             for line in text.lines() {
@@ -475,7 +636,13 @@ mod w1 {
                 } else {
                     let decoded = record::decode(line);
                     assert!(decoded.is_some(), "a line that is no record: {line}");
-                    items.extend(decoded);
+                    if let Some((stamp, item)) = decoded {
+                        if matches!(item, Item::Sent { .. } | Item::Acked { .. }) {
+                            traces.push((stamp, item));
+                        } else {
+                            items.push((stamp, item));
+                        }
+                    }
                 }
             }
             processes.push(items);
@@ -497,25 +664,15 @@ mod w1 {
             .iter()
             .map(|state| (state.id, state.applied, state.digest))
             .collect();
-        let outcome =
-            workloads::outcome(case, &recorded, liveness, up_states, deduplicated).unwrap();
-        assert_eq!(
-            workloads::pass(case, &outcome),
-            Ok(None),
-            "{core} {}: {} observations, {} history events; waiting clients: {stuck:?}",
-            case.name,
-            outcome.observations.len(),
-            outcome.history.events().len()
-        );
-        // A case with more entries than the warm-up measures past it.
-        let operations = sessions * case.operations;
-        if u64::try_from(operations).unwrap() > 2 * WARMUP {
-            assert!(
-                probes.iter().any(|probe| probe.entries > 0),
-                "the probe measured no entry: {probes:?}"
-            );
-        }
-        Ok(probes)
+        let outcome = workloads::outcome(case, &recorded, liveness, up_states, deduplicated);
+        // The stamp order of the trace, as the oracle reads it.
+        traces.sort_by_key(|(stamp, _)| *stamp);
+        Ok(Ran {
+            outcome,
+            probes,
+            trace: traces.into_iter().map(|(_, item)| item).collect(),
+            stuck,
+        })
     }
 
     /// The index of the W1 case of `servers`, `payload` and `clients`.
@@ -563,6 +720,7 @@ fn the_run_record_escapes_its_strings() {
 /// and on Unix an argument that is not UTF-8 (karyos#956 review).
 #[test]
 fn a_malformed_argument_is_a_usage_error() {
+    let _serial = serial();
     for args in [
         &["raft", "0", "/tmp/unused", "many"][..],
         &["raft", "0", "/tmp/unused", "999"][..],
@@ -649,6 +807,7 @@ fn w1_full_matrix() {
 /// other, as a node restarted twice, never draw the same one.
 #[test]
 fn every_process_draws_its_own_incarnation() {
+    let _serial = serial();
     let draw = || {
         let output = Command::new(env!("CARGO_BIN_EXE_raft-eval-node"))
             .arg("incarnation")
@@ -669,6 +828,7 @@ fn every_process_draws_its_own_incarnation() {
 /// socket is bound, a usage the runner does not support.
 #[test]
 fn a_peer_off_the_loopback_is_refused() {
+    let _serial = serial();
     let output = Command::new(env!("CARGO_BIN_EXE_raft-eval-node"))
         .args(["raft", "0", "/tmp/unused", "1", "0=192.0.2.1:7000"])
         .output()
@@ -678,4 +838,152 @@ fn a_peer_off_the_loopback_is_refused() {
         String::from_utf8_lossy(&output.stderr).contains("not a loopback address"),
         "{output:?}"
     );
+}
+
+/// The byte oracle's reading of a run's trace (C5 v2, W2's byte case):
+/// the most payload bytes ever unacknowledged to one follower, and the
+/// largest entry payload seen in an append.
+#[cfg(target_os = "linux")]
+fn bytes_in_flight(trace: &[karyos_raft_eval::record::Item]) -> (u64, u64) {
+    use karyos_raft_eval::record::Item;
+    let mut oracle = oracle::Trace::default();
+    for item in trace {
+        match item {
+            Item::Sent {
+                leader,
+                to,
+                term,
+                entries,
+            } => oracle.sent(*leader, *to, *term, entries),
+            Item::Acked {
+                leader,
+                from,
+                term,
+                index,
+            } => oracle.acked(*leader, *from, *term, *index),
+            _ => {}
+        }
+    }
+    (oracle.most, oracle.largest)
+}
+
+/// Each limit refused, once, in the order first refused.
+#[cfg(target_os = "linux")]
+fn distinct(refused: &[karyos_sim::harness::core::Limit]) -> Vec<karyos_sim::harness::core::Limit> {
+    let mut seen = Vec::new();
+    for limit in refused {
+        if !seen.contains(limit) {
+            seen.push(*limit);
+        }
+    }
+    seen
+}
+
+/// W2 case `index` of `w2_cases()` for `core` on 3 processes, judged as
+/// the simulator's W2 tests judge it (`tests/workloads.rs`, `w2`;
+/// `tests/w2_bytes.rs`), with its result as one line (`"w2"`) beside its
+/// run record:
+/// - safety holds in every case;
+/// - only the queue burst is refused, each refusal a typed
+///   `Backpressure(Queue)`; the byte case's candidates refuse every
+///   command over their share, a typed `Backpressure(InFlightBytes)`, as
+///   their result to report;
+/// - every case passes `workloads::pass`, but a slow follower's or a
+///   log-read burst's leader may commit fewer entries than the case
+///   requires while the follower is cut off: the typed
+///   `Failed::NotBehind` the simulator expects of OpenRaft, here of any
+///   core whose real throughput falls short, reported, never a pass;
+/// - the custom core's byte case keeps every follower's unacknowledged
+///   payload bytes at or under 262,144 and reaches 229,376 at least once
+///   (the v2 oracle, from the appends the servers sent and the
+///   acknowledgements they stepped).
+///
+/// A core that refuses the case's limits is not demonstrated: the line
+/// says so and nothing else is asserted.
+#[cfg(target_os = "linux")]
+fn w2_case_is_judged(core: &str, index: usize) {
+    use karyos_sim::harness::core::Limit;
+    use karyos_sim::harness::workloads::Failed;
+    use std::io::Write as _;
+    let (case, result) = w2_case(core, index);
+    let summary = match &result {
+        Err(error) => format!("not demonstrated: {error:?}"),
+        Ok(ran) => {
+            let (most, largest) = bytes_in_flight(&ran.trace);
+            format!(
+                "{:?}; refused {:?}; most unacked {most} B, largest entry {largest} B; sessions unfinished in {} clients",
+                ran.pass,
+                distinct(&ran.refused),
+                ran.stuck.len()
+            )
+        }
+    };
+    let _ = writeln!(
+        std::io::stdout(),
+        "{{\"w2\":\"{}\",\"variant\":\"{core}\",\"result\":\"{}\"}}",
+        json_escaped(&case.name),
+        json_escaped(&summary)
+    );
+    let Ok(ran) = result else {
+        return;
+    };
+    assert!(ran.safety, "{core} {}: {summary}", case.name);
+    let bytes = case.name.starts_with("W2 v2");
+    if bytes && core != "custom" {
+        assert!(
+            !ran.refused.is_empty()
+                && ran
+                    .refused
+                    .iter()
+                    .all(|limit| *limit == Limit::InFlightBytes),
+            "{core} {}: {summary}",
+            case.name
+        );
+        return;
+    }
+    if case.name.contains("burst 4x queue") {
+        assert!(
+            !ran.refused.is_empty() && ran.refused.iter().all(|limit| *limit == Limit::Queue),
+            "{core} {}: {summary}",
+            case.name
+        );
+    } else {
+        assert!(ran.refused.is_empty(), "{core} {}: {summary}", case.name);
+    }
+    let short = case.name.contains("slow follower") || case.name.contains("log-read burst");
+    match &ran.pass {
+        Ok(None) => {}
+        Err(Failed::NotBehind { .. }) if short => {}
+        other => panic!("{core} {}: {other:?}; {summary}", case.name),
+    }
+    if bytes {
+        let (most, _) = bytes_in_flight(&ran.trace);
+        assert!(
+            (28 * 8192..=256 * 1024).contains(&most),
+            "{core} {}: {summary}",
+            case.name
+        );
+    }
+}
+
+/// W2's nominal case on 3 processes for every variant.
+#[cfg(target_os = "linux")]
+#[test]
+fn every_variant_passes_w2_nominal_on_three_processes() {
+    for core in ["raft", "openraft", "custom"] {
+        w2_case_is_judged(core, 0);
+    }
+}
+
+/// Every W2 case, the manifest's and v2's byte case, on 3 processes for
+/// every variant: see the module for the command.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "W2 on processes takes many minutes; run it with --ignored"]
+fn w2_full() {
+    for core in ["raft", "openraft", "custom"] {
+        for index in 0..karyos_raft_eval::process::w2_cases().len() {
+            w2_case_is_judged(core, index);
+        }
+    }
 }

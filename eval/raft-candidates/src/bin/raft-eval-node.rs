@@ -3,7 +3,7 @@
 //! One server of a real-process run of a candidate's adapter (karyos#678,
 //! karyos#690, karyos#691):
 //! `raft-eval-node <raft|openraft|custom> <id> <dir> <case> <id>=<address>...`,
-//! `<case>` the index of a W1 case in `process::w1_cases()`. It serves
+//! `<case>` the index of a case in `process::cases()` (W1, then W2). It serves
 //! the harness's test service to that case's clients
 //! ([`run_server`]) until the test's stop datagram and the case's quiet
 //! period after it; then it prints every observation it recorded, one
@@ -34,7 +34,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use karyos_raft_eval::openraft_core::OpenRaftBatch16;
-use karyos_raft_eval::process::{NodeConfig, ProcessError, Served, Wire, run_server, w1_cases};
+use karyos_raft_eval::process::{NodeConfig, ProcessError, Served, Wire, cases, run_server};
 use karyos_raft_eval::raft_rs::RaftRsBatch16;
 use karyos_raft_eval::record;
 use karyos_sim::harness::custom::Custom;
@@ -58,7 +58,7 @@ fn config() -> Option<(String, NodeConfig)> {
     let id = args.next()?.into_string().ok()?.parse().ok()?;
     let dir = PathBuf::from(args.next()?);
     let index: usize = args.next()?.into_string().ok()?.parse().ok()?;
-    let case = w1_cases().into_iter().nth(index)?;
+    let case = cases().into_iter().nth(index)?;
     let peers = args
         .map(|peer| {
             let peer = peer.into_string().ok()?;
