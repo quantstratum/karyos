@@ -283,6 +283,18 @@ struct Timed {
     reported: Vec<bool>,
 }
 
+/// The etf route's drop handling of one publication (ADR-0109 points 6
+/// to 8), allocated at [`Outbound::set_etf`].
+#[derive(Debug)]
+struct EtfDrops {
+    ledger: etf::EtfLedger,
+    /// One drain's reports.
+    reports: Vec<karyos_io::sockets::errqueue::ErrEntry>,
+    /// Per lane, the catch-up job repairing a dropped range, and the range
+    /// it was given.
+    jobs: [Option<(crate::repair::jobs::JobRef, (u64, u64))>; MAX_LANES],
+}
+
 /// The counters of one outbound publication; checked, sticky on overflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct OutboundCounters {
@@ -470,6 +482,12 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     /// The host monotonic clock the TAI offset pairs with `CLOCK_TAI`,
     /// read next to it (tests replace it).
     monotonic: fn() -> u64,
+    /// `CLOCK_TAI` at this cycle's sample, on the etf route.
+    tai_now: Option<u64>,
+    /// On the etf route, its drop ledger ([`etf::EtfLedger`], ADR-0109
+    /// points 6 to 8), its error queue reports' storage, and per lane the
+    /// catch-up job repairing its first dropped range.
+    etf_drops: Option<Box<EtfDrops>>,
     /// Its counters' CnC cells (M2b), when the region had room for them:
     /// the sender agent is their only writer.
     cells: Option<crate::agents::AgentCells>,
@@ -707,6 +725,8 @@ impl<T: StreamTerms> Outbound<T> {
             etf: None,
             tai_offset: None,
             monotonic: karyos_sys::host_clock::host_monotonic_ns,
+            tai_now: None,
+            etf_drops: None,
             cells: None,
             admission: 0,
             admission_slot: None,
@@ -1372,8 +1392,15 @@ impl<T: StreamTerms> Outbound<T> {
                 *queue = opened;
             }
         }
-        // A reliable lane reads again what the reset returned (below).
+        // A reliable lane reads again what the reset returned (below), so
+        // the etf ledger forgets what the old queues held.
         let rewound = self.opened.is_some() && self.reliable;
+        if let Some(drops) = self.etf_drops.as_deref_mut() {
+            for lane in 0..self.queues.len() {
+                drops.ledger.forget(lane);
+            }
+            drops.jobs = [None; MAX_LANES];
+        }
         for (lane, queue) in self.queues.iter().enumerate() {
             // A guarded lane reopens through its gate, which refunds what
             // the old queue held.
@@ -1589,8 +1616,116 @@ impl<T: StreamTerms> Outbound<T> {
     /// kernel's `etf` leaf releases it then. Its timed gate's policies
     /// carry the declared advance ([`LatePolicy::advance`]) by which a
     /// head is handed over early. Its repair queue stays immediate.
-    pub(crate) fn set_etf(&mut self, etf: karyos_io::backend::EtfQueue) {
+    pub(crate) fn set_etf(&mut self, etf: karyos_io::backend::EtfQueue, advance: u64) {
         self.etf = Some(etf);
+        let bound = self
+            .readers
+            .first()
+            .map(|reader| reader.subscription().buffer().config().schedule_capacity)
+            .and_then(|capacity| usize::try_from(capacity).ok())
+            .unwrap_or(0);
+        self.etf_drops = Some(Box::new(EtfDrops {
+            ledger: etf::EtfLedger::new(self.readers.len(), bound, self.reliable, advance),
+            reports: vec![karyos_io::sockets::errqueue::ErrEntry::Truncated; etf::DRAIN_BATCH],
+            jobs: [None; MAX_LANES],
+        }));
+    }
+
+    /// What its etf drop ledger counted, on the etf route (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn etf_counts(&self) -> Option<etf::EtfCounts> {
+        self.etf_drops.as_deref().map(|drops| drops.ledger.counts())
+    }
+
+    /// Hands its late drop reports, oldest first, to `post` (which says
+    /// whether it took one) for the driver's diagnostic ring, each with the
+    /// count it stands for, then those the ledger could only count, as one
+    /// count with no report (`None`); one `post` refused is offered again
+    /// at the next call.
+    pub(crate) fn post_etf_late(
+        &mut self,
+        mut post: impl FnMut(Option<etf::LateReport>, u64) -> bool,
+    ) {
+        let Some(drops) = self.etf_drops.as_deref_mut() else {
+            return;
+        };
+        while let Some(report) = drops.ledger.peek_late() {
+            if !post(Some(report), report.unrecorded.saturating_add(1)) {
+                return;
+            }
+            drops.ledger.pop_late();
+        }
+        let unrecorded = drops.ledger.take_unrecorded();
+        if unrecorded > 0 && !post(None, unrecorded) {
+            drops.ledger.restore_unrecorded(unrecorded);
+        }
+    }
+
+    /// The etf route's step of a sender duty (ADR-0109 points 6 to 8),
+    /// after the cycle's `CLOCK_TAI` sample: drains every lane's error
+    /// queue, then retires the expired entries as sent, then queues the
+    /// catch-up of each reliable lane's first dropped range on its repair
+    /// path, one job at a time per lane, in position order.
+    fn etf_duty<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) {
+        use karyos_io::sockets::errqueue::ErrEntry;
+
+        let Some(drops) = self.etf_drops.as_deref_mut() else {
+            return;
+        };
+        for (lane, queue) in self.queues.iter().enumerate() {
+            while let Ok(drained) = tx.drain_etf(*queue, &mut drops.reports) {
+                for entry in drops.reports.iter().take(drained) {
+                    match *entry {
+                        ErrEntry::Txtime { txtime_ns, .. } => {
+                            let _ = drops.ledger.drained(lane, txtime_ns);
+                        }
+                        _ => drops.ledger.other_report(),
+                    }
+                }
+                if drained < drops.reports.len() {
+                    break;
+                }
+            }
+        }
+        if let Some(tai) = self.tai_now {
+            let _ = drops.ledger.expire(tai);
+        }
+        let Some(repair) = self.repair.as_deref_mut() else {
+            return;
+        };
+        for (lane, reader) in self.readers.iter().enumerate() {
+            let (Ok(lane8), Some(job)) = (u8::try_from(lane), drops.jobs.get_mut(lane)) else {
+                continue;
+            };
+            // The job's own progress: the lane's watermark restarted at its
+            // start, and only it runs on the lane. What it did not send goes
+            // back to the ranges, in position order with any newer drops.
+            if let Some((current, (from, to))) = *job {
+                if repair.catch_up_pending(current) {
+                    continue;
+                }
+                *job = None;
+                let through = repair.catch_up_through(lane8).max(from);
+                drops.ledger.give_back(lane, (through, to));
+            }
+            let Some((from, to)) = drops.ledger.take_catch_up(lane) else {
+                continue;
+            };
+            repair.restart_catch_up(lane8, from);
+            match repair.catch_up(lane8, (from, to), reader.floor()) {
+                super::repair::CatchUp::Queued {
+                    job: queued,
+                    from: start,
+                    ..
+                } => *job = Some((queued, (start, to))),
+                // A full share tries again next duty.
+                super::repair::CatchUp::Full { .. } => drops.ledger.give_back(lane, (from, to)),
+                // Below the retention floor, counted lost by the repair
+                // path: nothing more to send.
+                super::repair::CatchUp::Done => {}
+            }
+        }
     }
 
     /// Replaces the monotonic clock the TAI offset pairs with (tests).
@@ -1670,8 +1805,11 @@ impl<T: StreamTerms> Outbound<T> {
         if self.etf.is_some() {
             let tai = tx.tai_now_ns();
             let monotonic = (self.monotonic)();
+            self.tai_now = tai;
             self.tai_offset =
                 tai.and_then(|tai| i128::from(tai).checked_sub(i128::from(monotonic)));
+            // Drops are drained before the duty expires or stages anything.
+            self.etf_duty(tx);
         }
         let mut work = 0u32;
         for lane in 0..self.readers.len() {
@@ -2107,8 +2245,14 @@ impl<T: StreamTerms> Outbound<T> {
                 break;
             }
             // On the etf route a timed head needs its send time, so no
-            // read is made while `CLOCK_TAI` cannot be read (ADR-0109).
+            // read is made while `CLOCK_TAI` cannot be read, nor while the
+            // lane's in-flight list is full (ADR-0109 point 6).
             if self.etf.is_some() && self.tai_offset.is_none() {
+                break;
+            }
+            if let Some(drops) = self.etf_drops.as_deref_mut()
+                && !drops.ledger.has_room(lane)
+            {
                 break;
             }
             // The receivers' edge, before the read (it cannot be undone):
@@ -2259,6 +2403,7 @@ impl<T: StreamTerms> Outbound<T> {
                 }
                 _ => TxOptions::none(),
             };
+            let txtime = options.txtime_ns();
             let Ok(ticket) = frame.commit(Commit {
                 len,
                 token,
@@ -2328,6 +2473,12 @@ impl<T: StreamTerms> Outbound<T> {
                 }
                 self.counters.bump(|c| &mut c.staged_refused, 1);
                 break;
+            }
+            // On the etf route a timed head handed to the etf queue holds an
+            // entry until it is dropped or expires (ADR-0109 point 6); the
+            // room was checked before the read.
+            if let (Some(txtime), Some(drops)) = (txtime, self.etf_drops.as_deref_mut()) {
+                let _ = drops.ledger.reserve(lane, txtime, (from, next));
             }
             if let Some(track) = self.tracks.get_mut(lane) {
                 track.staged.push_back((ticket, next));
@@ -2773,6 +2924,7 @@ pub(crate) struct Opened {
 
 pub(super) mod fanout;
 pub(crate) use fanout::destination_share;
+pub(crate) mod etf;
 mod heartbeat;
 mod removal;
 mod routed;

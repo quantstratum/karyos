@@ -4974,6 +4974,9 @@ fn a_publication_crosses_the_term_id_wrap() {
 
 mod destinations;
 
+#[cfg(target_os = "linux")]
+mod etf;
+
 mod registration;
 
 /// karyos#859: the driver's accounting of what publications hold of a

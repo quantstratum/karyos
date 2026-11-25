@@ -369,6 +369,9 @@ struct NetPublication {
     traced: karyos_protocol::trace_hook::PublicationIdentity,
     /// Its lane count.
     lanes: u8,
+    /// On the `etf` route, the drop reports its sender received after
+    /// their entries were retired as sent (ADR-0109 point 7).
+    etf_late_drop_reports: u64,
     /// What it takes of each endpoint it sends on (karyos#859), held until
     /// its entry goes, when its removal has ended.
     demand: Vec<(EndpointId, TxDemand)>,
@@ -721,6 +724,27 @@ pub(crate) struct ScheduleViolation {
 struct ScheduleViolations {
     pending: Vec<ScheduleViolation>,
     dropped: u64,
+    /// Late etf drop reports (ADR-0109 point 7) for the conductor's error
+    /// log, bounded like `pending`; one past the bound is counted in the
+    /// publication's counter only.
+    etf_late: Vec<EtfLateReport>,
+    /// Late reports counted in their publication but not logged yet:
+    /// carried by the next record.
+    etf_unlogged: u64,
+}
+
+/// A late etf drop report of a live publication, for the conductor's
+/// error log (ADR-0109 point 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EtfLateReport {
+    /// The aggregate's registration.
+    pub(crate) registration: u64,
+    /// The lane.
+    pub(crate) lane: u8,
+    /// The report's time, in `CLOCK_TAI` nanoseconds.
+    pub(crate) txtime: u64,
+    /// Late reports before it that were counted but not logged.
+    pub(crate) unlogged: u64,
 }
 
 impl ScheduleViolations {
@@ -1042,6 +1066,14 @@ impl<T: StreamTerms> Network<T> {
                         .unwrap_or(config.agents.publications),
                 ),
                 dropped: 0,
+                etf_late: Vec::with_capacity(
+                    config
+                        .agents
+                        .publications
+                        .checked_mul(karyos_protocol::network::MAX_LANES)
+                        .unwrap_or(config.agents.publications),
+                ),
+                etf_unlogged: 0,
             },
             guard_deregister_failures: 0,
             control_groups: config.nak_control_groups,
@@ -2577,6 +2609,7 @@ impl<T: StreamTerms> Network<T> {
             demand,
             per_destination,
             adds_pending: Vec::with_capacity(self.max_destinations),
+            etf_late_drop_reports: 0,
             max_destinations: self.max_destinations,
             limited: None,
             trace_closes: Vec::new(),
@@ -2635,6 +2668,21 @@ impl<T: StreamTerms> Network<T> {
     /// apply (timed-tx.md section 11, TT-6).
     pub(crate) fn pop_schedule_violation(&mut self) -> Option<ScheduleViolation> {
         self.schedule_violations.pending.pop()
+    }
+
+    /// The next late etf drop report a sender posted, for the conductor's
+    /// error log (ADR-0109 point 7).
+    pub(crate) fn pop_etf_late_report(&mut self) -> Option<EtfLateReport> {
+        self.schedule_violations.etf_late.pop()
+    }
+
+    /// The late etf drop reports of the publication `registration`
+    /// (ADR-0109 point 7); `None` for no such network publication.
+    pub(crate) fn etf_late_drop_reports(&self, registration: u64) -> Option<u64> {
+        self.publications
+            .iter()
+            .find(|entry| entry.registration == registration)
+            .map(|entry| entry.etf_late_drop_reports)
     }
 
     /// Schedule violation reports dropped since the last call, for the
@@ -3900,6 +3948,45 @@ fn publication_answer<T: StreamTerms>(
                 && entry.state == NetworkPublicationState::Removing
             {
                 entry.drained = true;
+            }
+        }
+        // A late etf drop report: counted for the publication it names,
+        // and kept for the error log while there is room.
+        AgentEvent::EtfLateDropReport {
+            endpoint,
+            alias,
+            registration,
+            report,
+            count,
+        } => {
+            if let Some(entry) = find(publications, endpoint, alias, registration)
+                .and_then(|index| publications.get_mut(index))
+            {
+                entry.etf_late_drop_reports = entry.etf_late_drop_reports.saturating_add(count);
+                // Every report is counted; one the error log has no room
+                // for, or that came as a count only, is logged as a count
+                // with the next record.
+                let unlogged = count.saturating_sub(u64::from(report.is_some()));
+                match report {
+                    Some((lane, txtime))
+                        if violations.etf_late.len() < violations.etf_late.capacity() =>
+                    {
+                        let unlogged =
+                            unlogged.saturating_add(std::mem::take(&mut violations.etf_unlogged));
+                        violations.etf_late.push(EtfLateReport {
+                            registration,
+                            lane,
+                            txtime,
+                            unlogged,
+                        });
+                    }
+                    _ => {
+                        violations.etf_unlogged = violations
+                            .etf_unlogged
+                            .saturating_add(unlogged)
+                            .saturating_add(u64::from(report.is_some()));
+                    }
+                }
             }
         }
         // A timed lane's publisher breached its ring: applied by the

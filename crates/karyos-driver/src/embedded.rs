@@ -5332,6 +5332,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // gates are gone, so their senders leave the close acknowledgement.
         self.deregister_released_guards();
         self.apply_schedule_violations();
+        self.record_etf_late_reports();
         served
     }
 
@@ -5958,6 +5959,41 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // The agents stopped with their hooks: no network journal stays open.
         self.close_network_tracing();
         Some(shutdown)
+    }
+
+    /// Records each late etf drop report the senders posted (ADR-0109
+    /// point 7) in the error log, one event per report, keyed by the
+    /// aggregate registration and the report's time; the publication's
+    /// `etf_late_drop_reports` already counted it.
+    fn record_etf_late_reports(&mut self) {
+        while let Some(report) = self
+            .net
+            .as_mut()
+            .and_then(crate::net::Network::pop_etf_late_report)
+        {
+            let message = format!(
+                "a late etf drop report on lane {} at TAI {}: retired as sent, nothing resubmitted \
+                 ({} earlier late reports counted, not logged)",
+                report.lane, report.txtime, report.unlogged
+            );
+            self.diagnostics.error(
+                &mut self.counters,
+                crate::diagnostics::ErrorCode::EtfLateDropReport,
+                [report.registration, report.txtime],
+                &message,
+            );
+        }
+    }
+
+    /// The late etf drop reports of the network publication `aggregate`
+    /// (ADR-0109 point 7): drop reports its sender received after their
+    /// entries were retired as sent; `None` when it is not a network
+    /// publication.
+    #[must_use]
+    pub fn etf_late_drop_reports(&self, aggregate: &AggregateHandle) -> Option<u64> {
+        self.net
+            .as_ref()?
+            .etf_late_drop_reports(aggregate.registration())
     }
 
     /// Applies the schedule violations the senders reported
