@@ -225,7 +225,7 @@ fn write_durable<D: Disk>(disk: &mut D, dir: &Path, durable: Durable) -> std::io
 pub const GENERATIONS_DIR: &str = ".karyos-calibration-generations";
 
 /// The most candidates tried before a generation claim gives up.
-const GENERATION_TRIES: usize = 64;
+pub const GENERATION_TRIES: usize = 64;
 
 /// Claims a generation for a journal in `parent`: the first of
 /// `candidates` (each non-zero) whose subdirectory of [`GENERATIONS_DIR`]
