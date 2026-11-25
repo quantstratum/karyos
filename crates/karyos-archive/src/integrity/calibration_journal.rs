@@ -231,8 +231,10 @@ const GENERATION_TRIES: usize = 64;
 /// `candidates` (each non-zero) whose subdirectory of [`GENERATIONS_DIR`]
 /// an exclusive `mkdir` creates. A candidate already claimed fails that
 /// `mkdir` and the next is tried, so no two journals of one parent ever
-/// share a generation, whatever their clocks or pids. The claim is synced
-/// (the new subdirectory's parent) before it is used.
+/// share a generation, whatever their clocks or pids. Before it is used,
+/// every claim syncs the journal's parent (so the claims directory's
+/// entry is durable, whoever made it) and the claims directory (so the
+/// claim's entry is).
 ///
 /// # Errors
 ///
@@ -244,10 +246,14 @@ pub fn claim_generation(
 ) -> Result<u64, JournalError> {
     let registry = parent.join(GENERATIONS_DIR);
     match std::fs::create_dir(&registry) {
-        Ok(()) => sync_directory(parent)?,
+        Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(JournalError::Io(error)),
     }
+    // Every claim syncs the parent, whether it made the claims directory
+    // or found it: a writer that finds it made by another, not yet synced,
+    // must not use a claim the parent may still lose.
+    sync_directory(parent)?;
     for _ in 0..GENERATION_TRIES {
         let candidate = candidates().max(1);
         match std::fs::create_dir(registry.join(format!("{candidate:016x}"))) {
