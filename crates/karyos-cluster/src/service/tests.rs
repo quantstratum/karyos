@@ -1162,3 +1162,170 @@ fn test_container_renewals_follow_leadership_and_the_interval() {
         .collect();
     assert_eq!(issued, vec![1_000, 1_000 + every, 1_000 + every + 2]);
 }
+
+/// R-CORE-6, "retained outcomes even when admission would now reject"
+/// (karyos#750): the service refuses every new command once its limit is
+/// reached, yet a retry of an accepted request gets its retained reply,
+/// and the service is not asked again: admission is evaluated once.
+#[test]
+fn test_container_a_retry_gets_its_outcome_even_when_it_would_now_be_refused() {
+    let mut container = registered();
+    // The Register service replies past any buffer to `[3]`: a stand-in
+    // for a refusal. Accept one order, then the "limit" refuses the rest.
+    let accepted = append(5);
+    let Applied::Answered { outcome, .. } = container
+        .apply(&entry(2, 10, request(1, &accepted)))
+        .unwrap()
+    else {
+        panic!("not answered");
+    };
+    assert_eq!(outcome, Outcome::Applied(&1u64.to_le_bytes()));
+    let refused = [3u8];
+    // Its sequence 1 leaves sequence 0 unacknowledged, so 0 stays retained.
+    let second = Envelope::Request {
+        request: Request::new(7, 1, 1, 0),
+        command: &refused,
+    };
+    let Applied::Answered { outcome, .. } = container.apply(&entry(3, 11, second)).unwrap() else {
+        panic!("not answered");
+    };
+    assert_eq!(outcome, Outcome::ReplyTooLarge);
+    let seen = container.service().seen.len();
+    // The retry of the accepted one: its reply, the service untouched.
+    let Applied::Answered { outcome, .. } = container
+        .apply(&entry(4, 12, request(1, &accepted)))
+        .unwrap()
+    else {
+        panic!("not answered");
+    };
+    assert_eq!(outcome, Outcome::Retained(&1u64.to_le_bytes()));
+    assert_eq!(container.service().seen.len(), seen, "not asked again");
+    // The same identity with another payload is refused, typed.
+    let other = append(6);
+    let Applied::Answered { outcome, .. } =
+        container.apply(&entry(5, 13, request(1, &other))).unwrap()
+    else {
+        panic!("not answered");
+    };
+    assert_eq!(outcome, Outcome::PayloadMismatch);
+}
+
+/// R-CORE-6, "advertised retention" (karyos#750; item 37): S, K, R and TTL
+/// are returned at registration and travel in the sessions section of a
+/// snapshot, so a restored replica holds a client to the same bounds.
+#[test]
+fn test_container_the_bounds_are_advertised_at_registration_and_in_a_snapshot() {
+    let mut container = container();
+    let Applied::Registered(Ok(registered)) = container
+        .apply(&entry(1, 0, Envelope::Register { client: 7 }))
+        .unwrap()
+    else {
+        panic!("not registered");
+    };
+    let bounds = config().dedup;
+    assert_eq!(registered.config, bounds);
+    let section = container.sessions().encode();
+    let decoded = SessionTable::decode(&section).unwrap();
+    assert_eq!(decoded.config(), bounds);
+    assert_eq!(
+        (
+            decoded.config().sessions,
+            decoded.config().window,
+            decoded.config().response_bytes,
+            decoded.config().ttl
+        ),
+        (4, 4, 16, 1000)
+    );
+}
+
+/// R-CORE-6, "durable sessions" (karyos#750): a replica restarted from its
+/// log, with no snapshot, rebuilds the same sessions and answers a retry
+/// with the retained reply; the table is driven only by applied entries.
+#[test]
+fn test_container_a_restarted_replica_answers_a_retry_alike() {
+    let log: Vec<Entry> = vec![
+        entry(1, 0, Envelope::Register { client: 7 }),
+        entry(2, 10, request(1, &append(1))),
+        entry(3, 11, request(3, &append(3))),
+        entry(4, 12, request(2, &append(2))),
+    ];
+    let mut first = container();
+    for item in &log {
+        first.apply(item).unwrap();
+    }
+    let mut restarted = container();
+    for item in &log {
+        restarted.apply(item).unwrap();
+    }
+    assert_eq!(restarted.sessions().encode(), first.sessions().encode());
+    let retry = entry(5, 13, request(3, &append(3)));
+    let answer = |container: &mut ServiceContainer<Register>| match container.apply(&retry).unwrap()
+    {
+        Applied::Answered { outcome, .. } => format!("{outcome:?}"),
+        other => format!("{other:?}"),
+    };
+    let expected = answer(&mut first);
+    assert_eq!(answer(&mut restarted), expected);
+    assert!(expected.starts_with("Retained"), "{expected}");
+}
+
+/// Codex review of #1270 (P1, #750): a log written by an earlier build,
+/// whose session bounds are a version 1 entry, replays its contiguous
+/// rules: a request past the next sequence is refused and the service is
+/// not called. This build's version 2 bounds apply the exact identity.
+#[test]
+fn test_container_a_version_1_bounds_log_replays_the_earlier_rules() {
+    for (exact, expect_run) in [(false, false), (true, true)] {
+        let mut container = container();
+        let bounds = SessionBounds {
+            config: container.sessions().config(),
+            exact,
+        };
+        let payload = bounds.to_vec().unwrap();
+        assert_eq!(SessionBounds::decode(&payload).unwrap().exact, exact);
+        container
+            .apply(&Entry {
+                index: 1,
+                term: 1,
+                event_time: 0,
+                payload,
+            })
+            .unwrap();
+        assert_eq!(container.sessions().exact(), exact);
+        container
+            .apply(&entry(2, 0, Envelope::Register { client: 7 }))
+            .unwrap();
+        let first = append(1);
+        container
+            .apply(&entry(
+                3,
+                1,
+                Envelope::Request {
+                    request: Request::new(7, 2, 0, 0),
+                    command: &first,
+                },
+            ))
+            .unwrap();
+        let skipping = append(3);
+        let Applied::Answered { outcome, .. } = container
+            .apply(&entry(
+                4,
+                2,
+                Envelope::Request {
+                    request: Request::new(7, 2, 2, 0),
+                    command: &skipping,
+                },
+            ))
+            .unwrap()
+        else {
+            panic!("not answered");
+        };
+        if expect_run {
+            assert!(matches!(outcome, Outcome::Applied(_)), "{outcome:?}");
+            assert_eq!(container.service().values, [1, 3]);
+        } else {
+            assert_eq!(outcome, Outcome::OutOfOrder { expected: 1 });
+            assert_eq!(container.service().values, [1]);
+        }
+    }
+}

@@ -149,3 +149,49 @@ fn the_byte_trigger_rises_with_the_large_session_profile() {
     let below = SnapshotConfig::default().with_every_bytes(sessions - 1);
     assert!(below.check_sessions(&large).is_err());
 }
+
+/// R-CORE-9 (karyos#746): a section of a kind this build does not know is
+/// a typed refusal naming the kind, told apart from damage; the snapshot
+/// is not used.
+#[test]
+fn a_section_of_an_unknown_kind_is_told_apart_from_damage() {
+    use karyos_archive::disk::StdDisk;
+
+    let dir = std::env::temp_dir().join(format!(
+        "karyos-snapshot-unknown-kind-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let geometry = Geometry::new(4096, 4096).unwrap();
+    let mut store = SnapshotStore::open(StdDisk, &dir, geometry, SnapshotConfig::default())
+        .unwrap()
+        .store;
+    let mut pending = store.begin(10, 1).unwrap();
+    pending.section(SectionKind::Sessions, 1, 2).unwrap();
+    pending.write(b"ok").unwrap();
+    pending.section_of_code(99, 1, 3).unwrap();
+    pending.write(b"new").unwrap();
+    let info = store.publish(pending).unwrap();
+    let read = store.read(&info);
+    assert!(
+        matches!(read, Err(SnapshotError::UnknownSection { code: 99, .. })),
+        "{read:?}"
+    );
+    // Codex review of #1270 (P2): the kind is classified only once the
+    // whole snapshot's digest holds; a digest that fails is damage.
+    let wrong = SnapshotInfo {
+        digest: info.digest ^ 1,
+        ..info
+    };
+    assert!(matches!(
+        store.read(&wrong),
+        Err(SnapshotError::Damaged { .. })
+    ));
+    // A reopened store reports it apart from damage, and does not use it.
+    let opened = SnapshotStore::open(StdDisk, &dir, geometry, SnapshotConfig::default()).unwrap();
+    assert_eq!(opened.unknown, vec![info]);
+    assert!(opened.damaged.is_empty());
+    assert!(opened.store.snapshots().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
