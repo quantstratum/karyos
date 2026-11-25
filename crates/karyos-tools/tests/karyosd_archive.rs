@@ -1276,17 +1276,17 @@ fn karyosd_records_its_trace_journal_with_time_evidence() {
     // C1 and a UTC reference valid over the whole run, then traffic
     // within C1.
     reference_now(&journal, &tracking, 60_000);
-    let c1 = calibrate_monotonic(&journal, 1_500);
+    let c1 = calibrate_monotonic(&journal, 5_000);
     traced.publish(20);
     assert!(karyos_sys::host_clock::host_monotonic_ns() < c1, "C1 ended");
     // The boundary: C2 starts after C1 ends; traffic within C2.
     monotonic_past(c1);
-    let c2 = calibrate_monotonic(&journal, 1_500);
+    let c2 = calibrate_monotonic(&journal, 5_000);
     traced.publish(20);
     assert!(karyos_sys::host_clock::host_monotonic_ns() < c2, "C2 ended");
     // The later records: C3 and a UTC reference past every observation.
     monotonic_past(c2);
-    let _ = calibrate_monotonic(&journal, 1_500);
+    let _ = calibrate_monotonic(&journal, 5_000);
     reference_now(&journal, &tracking, 10_000);
     std::thread::sleep(Duration::from_millis(1_500));
     drop(traced);
@@ -1388,6 +1388,107 @@ fn karyosd_records_its_trace_journal_with_time_evidence() {
     );
     assert!(shown.ends_with("time verdict: not_met\n"), "{shown}");
 
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ADR-0117 point 5, end to end: a real ring overwrite. karyosd's trace
+/// mirror holds two records while the driver drains a traced client's
+/// burst into it, so the ring overwrites records before the publisher
+/// reads them; the publisher reports them as losses of the client's own
+/// journal, and `karyos-catalog verify --time-requirement` reports each
+/// affected sealed range `no_evidence` with the lost journal and
+/// sequences, and the recording's verdict `no_evidence` for capture,
+/// never `met`.
+#[test]
+fn a_ring_overwrite_reaches_verify_as_no_evidence() {
+    use karyos_archive::disk::StdDisk;
+    use karyos_archive::integrity::anchor::LedgerAnchorStore;
+
+    if karyos_sys::host_clock::time_identity().is_err() {
+        return;
+    }
+    let dir = dir("ring-overwrite");
+    let root = dir.with_extension("root");
+    let _ = std::fs::remove_dir_all(&root);
+    let archive = root.join("archive");
+    let journal = root.join("calibrations");
+    let time_anchors = root.join("time-anchors");
+    for path in [&archive, &time_anchors] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    // The entries' anchor store must be there for verify to read it.
+    drop(LedgerAnchorStore::open(StdDisk, &time_anchors, OPERATOR).unwrap());
+    let record = format!("{STREAM}:{SESSION}");
+    let log_path = root.join("daemon.log");
+    let mut daemon = Daemon::start(
+        &dir,
+        &archive,
+        &[
+            "--record",
+            &record,
+            "--archive-time-evidence",
+            "--archive-calibration-journal",
+            journal.to_str().unwrap(),
+            "--archive-trace-record",
+            "50:1",
+            "--archive-trace-clock",
+            "5:boot:1000",
+            "--archive-calibration-wait",
+            "0s",
+            "--archive-seal-interval",
+            "200ms",
+            "--trace-mirror-records",
+            "2",
+        ],
+        &log_path,
+    );
+    let mut traced = Traced::new(&dir);
+    traced.connected();
+    // Bursts the driver drains many records of at once into two slots.
+    for _ in 0..20 {
+        traced.publish(50);
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    drop(traced);
+    assert!(daemon.stop().success(), "{}", log(&log_path));
+    let text = log(&log_path);
+    let losses: u64 = text
+        .lines()
+        .find(|line| line.contains("trace mirror published"))
+        .and_then(|line| line.split("losses=").nth(1))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(losses > 0, "no overwrite: {text}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_karyos-catalog"))
+        .arg("verify")
+        .arg(&archive)
+        .args(["--time-requirement", "1000000000:1000", "--time-anchors"])
+        .arg(format!("{}={}", hex(&OPERATOR), time_anchors.display()))
+        .output()
+        .unwrap();
+    let shown = String::from_utf8_lossy(&output.stdout).into_owned();
+    let lines: Vec<&str> = shown
+        .lines()
+        .filter(|line| line.contains(" loss journal "))
+        .collect();
+    assert!(
+        !lines.is_empty(),
+        "{shown}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for line in &lines {
+        assert!(line.ends_with(" no_evidence"), "{line}");
+        // Each overwrite's journal is known: the client's, never 0.
+        assert!(!line.contains(" loss journal 0 "), "{line}");
+    }
+    assert!(
+        shown.contains("time verdict: no_evidence (capture incomplete: "),
+        "{shown}"
+    );
+    assert!(!shown.contains(" met\n"), "{shown}");
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&dir);
 }
