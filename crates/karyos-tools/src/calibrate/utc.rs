@@ -87,9 +87,9 @@ Usage: chronyc -c tracking | karyos-tools calibrate utc [--window-ms 10000]
            [--sampled-at-ns N] [--domain 4] [--epoch 1] [--leap-table 72]
            [--max-clock-error-ppm 1]
        karyos-tools calibrate utc --tracking <file> --sampled-at-ns N ...
-       karyos-tools calibrate realtime [--reads 4096] [--keep 25]
-           [--interval-us 500] [--extension-ms 0] [--source-domain 0]
-           [--domain 4] [--epoch 1]
+       karyos-tools calibrate realtime [--from raw|monotonic] [--reads 4096]
+           [--keep 25] [--interval-us 500] [--extension-ms 0]
+           [--source-domain 0] [--domain 4] [--epoch 1|boot]
 
 `utc` reads one line of `chronyc -c tracking` (it never runs chronyc)
 and prints a UTC reference record: bound |System time| + Root delay/2 +
@@ -116,8 +116,13 @@ prints no record.
 `realtime` (Linux) reads CLOCK_MONOTONIC_RAW, CLOCK_REALTIME and
 CLOCK_MONOTONIC_RAW again, --reads times, and fits them like `phc`: the
 record converts raw times into CLOCK_REALTIME, the clock `utc` speaks
-for. NTP slews CLOCK_REALTIME, so keep the run short; a run no line
-explains is refused.
+for. With --from monotonic it reads CLOCK_MONOTONIC instead, the clock
+of host trace clocks: with --source-domain and --epoch boot naming
+karyosd's --archive-trace-clock, the record is the calibration its
+trace recording's time evidence cites (ADR-0117). NTP slews
+CLOCK_REALTIME, so keep the run short; a run no line explains is
+refused. --epoch boot (on `utc` too) derives this boot and time
+namespace's epoch.
 ";
 
 /// chrony's tracking state, as far as a UTC reference needs it.
@@ -461,7 +466,10 @@ pub fn run_utc(
             ("--sampled-at-ns", Ok(number)) => sampled_at = Some(number),
             ("--window-ms", Ok(number)) => settings.window_ms = number,
             ("--domain", Ok(number)) => settings.domain = number,
-            ("--epoch", Ok(number)) => settings.epoch = number,
+            ("--epoch", _) => match super::epoch(&value) {
+                Ok(number) => settings.epoch = number,
+                Err(error) => return fail(err, &error),
+            },
             ("--leap-table", Ok(number)) => settings.leap_table = number,
             _ => return fail(err, &format!("bad argument {arg} {value}")),
         }
@@ -633,6 +641,40 @@ pub fn utc_of(
     Ok((low, high))
 }
 
+/// The clock `calibrate realtime` fits to `CLOCK_REALTIME` (`--from`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FromClock {
+    /// `CLOCK_MONOTONIC_RAW` (`raw`, the default).
+    Raw,
+    /// `CLOCK_MONOTONIC` (`monotonic`), the clock of host trace clocks
+    /// (ADR-0117, point 4).
+    Monotonic,
+}
+
+impl FromClock {
+    /// The clock `--from` names.
+    ///
+    /// # Errors
+    ///
+    /// A message for another name.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "raw" => Ok(Self::Raw),
+            "monotonic" => Ok(Self::Monotonic),
+            other => Err(format!("--from takes raw or monotonic, not {other}")),
+        }
+    }
+
+    /// Its name in the record's description.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Raw => "CLOCK_MONOTONIC_RAW",
+            Self::Monotonic => "CLOCK_MONOTONIC",
+        }
+    }
+}
+
 /// Takes `reads` bracketed reads of `CLOCK_REALTIME`, `interval_us` apart.
 ///
 /// # Errors
@@ -643,11 +685,28 @@ pub fn collect_realtime(
     reads: usize,
     interval_us: u64,
 ) -> Result<Vec<karyos_trace::calibrate::PairedRead>, String> {
+    collect_realtime_from(FromClock::Raw, reads, interval_us)
+}
+
+/// [`collect_realtime`] bracketed by `from`.
+///
+/// # Errors
+///
+/// A message when the kernel refuses a read.
+#[cfg(target_os = "linux")]
+pub fn collect_realtime_from(
+    from: FromClock,
+    reads: usize,
+    interval_us: u64,
+) -> Result<Vec<karyos_trace::calibrate::PairedRead>, String> {
     let mut collected = Vec::with_capacity(reads);
     let pause = std::time::Duration::from_micros(interval_us);
     for _ in 0..reads {
-        let (before, target, after) = karyos_sys::host_clock::realtime_paired_read()
-            .ok_or("the kernel refused a clock read")?;
+        let read = match from {
+            FromClock::Raw => karyos_sys::host_clock::realtime_paired_read(),
+            FromClock::Monotonic => karyos_sys::host_clock::monotonic_realtime_paired_read(),
+        };
+        let (before, target, after) = read.ok_or("the kernel refused a clock read")?;
         collected.push(karyos_trace::calibrate::PairedRead {
             before,
             target,
@@ -667,17 +726,31 @@ pub fn run_realtime(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    // The same options as `phc`, with `--domain` naming CLOCK_REALTIME.
-    let rewritten = args.map(|arg| {
-        if arg == "--domain" {
-            "--target-domain".into()
-        } else {
-            arg
-        }
-    });
+    // The same options as `phc`, with `--domain` naming CLOCK_REALTIME,
+    // and `--from` the clock read around it.
+    let mut from = FromClock::Raw;
     let mut list: Vec<std::ffi::OsString> =
         vec!["--target-domain".into(), REALTIME_DOMAIN.to_string().into()];
-    list.extend(rewritten);
+    let mut args = args;
+    while let Some(arg) = args.next() {
+        if arg == "--from" {
+            let parsed = args
+                .next()
+                .ok_or_else(|| "--from needs a value".to_owned())
+                .and_then(|value| FromClock::parse(&value.to_string_lossy()));
+            match parsed {
+                Ok(parsed) => from = parsed,
+                Err(error) => {
+                    let _ = writeln!(err, "karyos-tools calibrate realtime: {error}");
+                    return EXIT_ERROR;
+                }
+            }
+        } else if arg == "--domain" {
+            list.push("--target-domain".into());
+        } else {
+            list.push(arg);
+        }
+    }
     if list
         .iter()
         .any(|arg| arg == "--device" || arg == "--reverse")
@@ -699,10 +772,11 @@ pub fn run_realtime(
             return EXIT_ERROR;
         }
     };
-    let fitted = collect_realtime(settings.reads, settings.interval_us).and_then(|reads| {
-        karyos_trace::calibrate::fit(&reads, &super::fit_config(&settings))
-            .map_err(|error| error.to_string())
-    });
+    let fitted =
+        collect_realtime_from(from, settings.reads, settings.interval_us).and_then(|reads| {
+            karyos_trace::calibrate::fit(&reads, &super::fit_config(&settings))
+                .map_err(|error| error.to_string())
+        });
     let fitted = match fitted {
         Ok(fitted) => fitted,
         Err(error) => {
@@ -714,8 +788,10 @@ pub fn run_realtime(
     super::print_record(
         &calibration,
         &format!(
-            "realtime: CLOCK_MONOTONIC_RAW (domain {}) to CLOCK_REALTIME (domain {}), reads {} kept {}, narrowest window {} ns, widest kept {} ns, span {} ns; offset {} ns +/- {} ns at raw {} (largest residual {} ns); drift {} ppb +/- {} ppb (halves {} and {} ppb); valid raw {} to {}",
+            "realtime: {} (domain {}, epoch {}) to CLOCK_REALTIME (domain {}), reads {} kept {}, narrowest window {} ns, widest kept {} ns, span {} ns; offset {} ns +/- {} ns at {} (largest residual {} ns); drift {} ppb +/- {} ppb (halves {} and {} ppb); valid {} to {}",
+            from.name(),
             calibration.from.domain,
+            calibration.from.epoch,
             calibration.to.domain,
             fitted.reads,
             fitted.kept,

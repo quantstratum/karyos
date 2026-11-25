@@ -360,6 +360,106 @@ fn test_utc_printed_rates_round_up_by_half_their_last_digit() {
     assert_eq!(zero.bound_ns(10_000_000_000, 0), Some(10));
 }
 
+/// ADR-0117 points 3 and 4: `--epoch boot` is karyosd's derivation, the
+/// same in this process as in any other of this boot and namespace;
+/// `--from` names the clock read around CLOCK_REALTIME.
+#[test]
+fn the_boot_epoch_and_the_from_clock_parse() {
+    assert_eq!(super::super::epoch("42"), Ok(42));
+    assert!(super::super::epoch("x").unwrap_err().contains("boot"));
+    match karyos_sys::host_clock::time_identity() {
+        Ok((boot, namespace)) => assert_eq!(
+            super::super::epoch("boot"),
+            Ok(karyos_archive::integrity::time_producer::boot_epoch(
+                &boot, namespace
+            ))
+        ),
+        Err(_) => assert!(
+            super::super::epoch("boot")
+                .unwrap_err()
+                .contains("unreadable")
+        ),
+    }
+    assert_eq!(super::FromClock::parse("raw"), Ok(super::FromClock::Raw));
+    assert_eq!(
+        super::FromClock::parse("monotonic"),
+        Ok(super::FromClock::Monotonic)
+    );
+    assert!(super::FromClock::parse("tai").is_err());
+    // `utc --epoch boot` names the same epoch in its record.
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let tracking =
+        "A29FC87B,ntp.example,2,1700000000.0,0.000001,0,0,0,0.001,0.002,0.0001,0.0002,64,Normal\n";
+    let code = super::run_utc(
+        ["--epoch", "boot", "--sampled-at-ns", "1700000000000000000"]
+            .into_iter()
+            .map(std::ffi::OsString::from),
+        &mut tracking.as_bytes(),
+        &mut out,
+        &mut err,
+    );
+    if let Ok(epoch) = super::super::epoch("boot") {
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        assert!(out.contains(&format!("epoch {epoch})")), "{out}");
+    } else {
+        assert_eq!(code, super::EXIT_ERROR);
+    }
+}
+
+/// `realtime --from monotonic --epoch boot` fits CLOCK_MONOTONIC: its
+/// record's source is the trace clock's domain and boot epoch.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_realtime_fit_from_the_monotonic_clock_names_the_boot_epoch() {
+    let Ok(epoch) = super::super::epoch("boot") else {
+        return;
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = super::run_realtime(
+        [
+            "--from",
+            "monotonic",
+            "--reads",
+            "64",
+            "--interval-us",
+            "0",
+            "--source-domain",
+            "5",
+            "--epoch",
+            "boot",
+        ]
+        .into_iter()
+        .map(std::ffi::OsString::from),
+        &mut out,
+        &mut err,
+    );
+    let out = String::from_utf8(out).unwrap();
+    let err = String::from_utf8(err).unwrap();
+    // A slew within the run is refused, never fitted.
+    if code == 0 {
+        assert!(
+            out.contains(&format!(
+                "realtime: CLOCK_MONOTONIC (domain 5, epoch {epoch})"
+            )),
+            "{out}"
+        );
+    } else {
+        assert!(err.contains("realtime"), "{err}");
+    }
+    let mut err = Vec::new();
+    assert_eq!(
+        super::run_realtime(
+            ["--from", "tai"].into_iter().map(std::ffi::OsString::from),
+            &mut Vec::new(),
+            &mut err,
+        ),
+        super::EXIT_ERROR
+    );
+}
+
 /// Reads of a realtime clock `offset` ns ahead of the raw clock and
 /// `ppb` faster, 1 ms apart, each bracketed by a 100 ns window; `step`
 /// ns added to every read from the middle on.

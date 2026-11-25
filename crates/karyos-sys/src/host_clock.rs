@@ -138,6 +138,28 @@ pub fn realtime_paired_read() -> Option<(u64, u64, u64)> {
     Some((ns(before)?, ns(realtime)?, ns(after)?))
 }
 
+/// A bracketed read of `CLOCK_REALTIME` against `CLOCK_MONOTONIC`, the
+/// clock of host trace clocks (ADR-0117, point 4): `CLOCK_MONOTONIC`,
+/// `CLOCK_REALTIME` and `CLOCK_MONOTONIC` again, in ns (the middle one
+/// since the Unix epoch), like [`realtime_paired_read`]. `None` when a
+/// reading is negative or overflows. A control-path call, through safe
+/// `rustix` only.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn monotonic_realtime_paired_read() -> Option<(u64, u64, u64)> {
+    fn ns(time: rustix::time::Timespec) -> Option<u64> {
+        let seconds = u64::try_from(time.tv_sec).ok()?;
+        let nanos = u64::try_from(time.tv_nsec).ok()?;
+        seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|ns| ns.checked_add(nanos))
+    }
+    let before = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    let realtime = rustix::time::clock_gettime(rustix::time::ClockId::Realtime);
+    let after = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    Some((ns(before)?, ns(realtime)?, ns(after)?))
+}
+
 /// Nanoseconds of this process's monotonic clock: on a host without
 /// cross-process IPC, one process is the whole scale. The scale starts at
 /// 1 ns, not 0: the first reading of a process is taken at its origin, and
