@@ -241,7 +241,12 @@ fn the_c5_version_2_corpus_over_every_core() {
             out.display()
         );
         for (workload, case, seed) in &summary.failed {
-            println!("  failed: {workload} {case} seed {seed}");
+            println!("  failed: {workload} {case} seed {seed} (its line carries the minimised run)");
+        }
+        for ((workload, fault), [before, during, after]) in &summary.coverage {
+            println!(
+                "  coverage: {workload} {fault}: before first commit {before}, during replication {during}, after last commit {after}"
+            );
         }
     }
 }
@@ -295,6 +300,15 @@ fn every_core_writes_one_marked_line_per_run() {
             if name == "custom" {
                 assert_ne!(verdict, "\"error\"", "{line}");
             }
+            assert!(line.contains("\"coverage\":["), "{line}");
+            // Seed 1 is named: a run that ran carries its trace; one not
+            // demonstrated, or not set up, has none to carry.
+            let ran = verdict != "\"not_demonstrated\"" && verdict != "\"error\"";
+            assert_eq!(
+                field(line, "trace").starts_with("null"),
+                !ran,
+                "seed 1 is named: {line}"
+            );
         }
     }
     assert_eq!(

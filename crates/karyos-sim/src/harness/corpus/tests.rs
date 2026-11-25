@@ -96,3 +96,216 @@ fn the_determinism_mode_repeats_each_seed() {
     let text = String::from_utf8(out).unwrap();
     assert!(text.lines().all(|line| line.contains("\"repetitions\":3,")));
 }
+
+/// A field of a line, as its raw JSON text up to the next field.
+fn field<'a>(line: &'a str, name: &str) -> &'a str {
+    let key = format!("\"{name}\":");
+    let (_, rest) = line.split_once(key.as_str()).unwrap();
+    let end = match rest.strip_prefix(['[', '{']) {
+        Some(_) => {
+            // Up to the matching close.
+            let (open, close) = if rest.starts_with('[') {
+                ('[', ']')
+            } else {
+                ('{', '}')
+            };
+            let mut depth = 0;
+            let mut quoted = false;
+            let mut escaped = false;
+            let mut end = 0;
+            for (at, c) in rest.char_indices() {
+                if quoted {
+                    match c {
+                        _ if escaped => escaped = false,
+                        '\\' => escaped = true,
+                        '"' => quoted = false,
+                        _ => {}
+                    }
+                    continue;
+                }
+                match c {
+                    '"' => quoted = true,
+                    c if c == open => depth += 1,
+                    c if c == close => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = at + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            end
+        }
+        None => rest.find([',', '}']).unwrap(),
+    };
+    &rest[..end]
+}
+
+/// Each fault a run applies is in its line with its step and phase, and
+/// the summary counts it by kind and phase: a crash at step 1 falls
+/// before the first commit, one late in the run after the last.
+#[test]
+fn every_fault_is_covered_by_its_phase() {
+    use crate::harness::workloads::Action;
+    let mut case = W1::skeleton().cases()[0].clone();
+    case.schedule = vec![(1, Action::Crash(2)), (2, Action::Restart(2))];
+    let mut late = case.clone();
+    late.name.push_str(" late");
+    late.schedule = vec![(late.steps - 1, Action::Crash(2))];
+    let cases = vec![case, late];
+    let both = |_seed: u64| cases.clone();
+    let mut out = Vec::new();
+    let summary = run_corpus::<Reference>(
+        "reference",
+        Evidence::HarnessValidation,
+        &[("W1", &both)],
+        (1..=1, 1),
+        &mut out,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        field(lines[0], "coverage"),
+        "[{\"step\":1,\"fault\":\"Crash(2)\",\"phase\":\"before_first_commit\"},{\"step\":2,\"fault\":\"Restart(2)\",\"phase\":\"before_first_commit\"}]"
+    );
+    assert!(
+        field(lines[1], "coverage").contains("\"phase\":\"after_last_commit\""),
+        "{}",
+        lines[1]
+    );
+    let crash = summary.coverage[&("W1".to_owned(), "Crash".to_owned())];
+    assert_eq!(crash, [1, 0, 1]);
+    assert_eq!(
+        summary.coverage[&("W1".to_owned(), "Restart".to_owned())],
+        [1, 0, 0]
+    );
+}
+
+/// A named seed carries its run's full trace; another seed does not.
+#[test]
+fn a_named_seed_carries_its_trace() {
+    let cases = W1::skeleton().cases();
+    let one = |_seed: u64| cases[..1].to_vec();
+    for (seed, named) in [(10, true), (11, false)] {
+        let mut out = Vec::new();
+        let _ = run_corpus::<Reference>(
+            "reference",
+            Evidence::HarnessValidation,
+            &[("W1", &one)],
+            (seed..=seed, 1),
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let trace = field(text.trim_end(), "trace");
+        if named {
+            let outcome = run::<Reference>(&cases[0], seed).unwrap();
+            assert!(!outcome.trace.is_empty());
+            assert_eq!(trace, super::trace(&outcome.trace));
+        } else {
+            assert_eq!(trace, "null");
+        }
+        assert_eq!(
+            field(text.trim_end(), "minimised"),
+            "null",
+            "a pass is not minimised"
+        );
+    }
+}
+
+/// A failing run is shrunk to the faults it needs: of a crash, a restart
+/// and two isolations, only what takes two of the three servers away
+/// stays, each fault left needed, and the shrunk case still fails the
+/// same check; its line carries it.
+#[test]
+fn a_failing_run_is_minimised_to_the_faults_it_needs() {
+    use crate::harness::workloads::Action;
+    let mut case = W1::skeleton().cases()[0].clone();
+    case.name = "W1 stalled".to_owned();
+    case.schedule = vec![
+        (3, Action::Crash(2)),
+        (4, Action::Restart(2)),
+        (5, Action::Isolate(0)),
+        (5, Action::Isolate(1)),
+    ];
+    let (kind, _) = failing::<Reference>(&case, 1).expect("the case fails");
+    let shrunk = minimise::<Reference>(&case, 1, kind).unwrap();
+    assert!(
+        shrunk.case.schedule.len() < case.schedule.len(),
+        "{:?}",
+        shrunk.case.schedule
+    );
+    // Every fault left is needed: without any one of them, the run no
+    // longer fails the same check.
+    for at in 0..shrunk.case.schedule.len() {
+        let mut fewer = shrunk.case.clone();
+        let _ = fewer.schedule.remove(at);
+        assert_ne!(
+            failing::<Reference>(&fewer, 1).map(|(got, _)| got),
+            Some(kind),
+            "fault {at} of {:?} is not needed",
+            shrunk.case.schedule
+        );
+    }
+    assert!(
+        shrunk.minimal,
+        "the fixed point is reached within the budget"
+    );
+    assert!(shrunk.case.steps <= case.steps);
+    assert_eq!(
+        failing::<Reference>(&shrunk.case, 1).map(|(got, _)| got),
+        Some(kind)
+    );
+    // The runner writes it in the failing line.
+    let cases = vec![case];
+    let one = |_seed: u64| cases.clone();
+    let mut out = Vec::new();
+    let summary = run_corpus::<Reference>(
+        "reference",
+        Evidence::HarnessValidation,
+        &[("W1", &one)],
+        (1..=1, 1),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(summary.failed.len(), 1);
+    let text = String::from_utf8(out).unwrap();
+    let minimised = field(text.trim_end(), "minimised");
+    assert!(
+        minimised.starts_with(&format!(
+            "{{\"minimal\":true,\"steps\":{},\"schedule\":[",
+            shrunk.case.steps
+        )),
+        "{minimised}"
+    );
+    assert!(minimised.ends_with(&format!("\"trace\":{}}}", super::trace(&shrunk.trace))));
+}
+
+/// A budget that runs out before the fixed point leaves the case shrunk
+/// as far as it got, still failing the same check, and marked not
+/// minimal; the full budget on the same case reaches it.
+#[test]
+fn a_minimisation_cut_by_its_budget_is_marked_not_minimal() {
+    use crate::harness::workloads::Action;
+    let mut case = W1::skeleton().cases()[0].clone();
+    case.name = "W1 stalled".to_owned();
+    case.schedule = vec![
+        (3, Action::Crash(2)),
+        (4, Action::Restart(2)),
+        (5, Action::Isolate(0)),
+        (5, Action::Isolate(1)),
+    ];
+    let (kind, _) = failing::<Reference>(&case, 1).expect("the case fails");
+    let cut = super::minimise_within::<Reference>(&case, 1, kind, 2).unwrap();
+    assert!(!cut.minimal, "{:?}", cut.case.schedule);
+    assert_eq!(
+        failing::<Reference>(&cut.case, 1).map(|(got, _)| got),
+        Some(kind)
+    );
+    let full = minimise::<Reference>(&case, 1, kind).unwrap();
+    assert!(full.minimal);
+    assert!(full.case.schedule.len() <= cut.case.schedule.len());
+}
