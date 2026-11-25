@@ -937,7 +937,7 @@ impl Agent {
         let gap = journal.and_then(Journal::gap).or(self.unopened_gap);
         Some(JournalView {
             recording: journal.map(Journal::recording),
-            unsealed: true,
+            unsealed: journal.is_none_or(Journal::unsealed),
             unavailable: journal.is_none_or(Journal::unavailable),
             error: self.journal_error.clone(),
             failed_appends: journal.map_or(0, Journal::failed_appends),
@@ -964,6 +964,12 @@ impl Agent {
                     since,
                 }))
                 .collect(),
+            integrity: journal
+                .and_then(Journal::integrity)
+                .map(|integrity| integrity.ranges.clone()),
+            integrity_truncated: journal
+                .and_then(Journal::integrity)
+                .is_some_and(|integrity| integrity.truncated),
         })
     }
 
@@ -974,6 +980,11 @@ impl Agent {
         let (timeout, trace) = (self.config.attach_timeout, self.config.trace);
         for driver in &mut self.drivers {
             driver.refresh(timeout, trace, &self.config.alerts);
+        }
+        // The journal's integrity, again once its last verification is
+        // old (karyos#702).
+        if let Some(journal) = self.journal.as_mut() {
+            journal.verify_if_due(host_monotonic_ns());
         }
     }
 

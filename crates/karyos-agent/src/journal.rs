@@ -4,8 +4,8 @@
 //! karyos/design/management-agent-gap-analysis.md, M10 and its new owner
 //! item 7, decided as item 51(7) of the 2026-10-21 owner decisions,
 //! interim; not item 7 of those decisions): an Archive recording in the agent's journal directory, written
-//! through the Archive's [`Recorder`] from a [`QueueSource`], and shown as
-//! unsealed until A10 seals it.
+//! through the Archive's [`Recorder`] from a [`QueueSource`], and sealed by
+//! the Archive's integrity journal (**Sealing**, below).
 //!
 //! - **One recording.** The directory's catalog holds the journal as one
 //!   `required` recording on channel [`CHANNEL`]. The agent resumes the open
@@ -34,21 +34,38 @@
 //!   the directory reports its ranges. A seal that fails stops the sealing
 //!   until the agent restarts, and counts in [`Journal::failed_seals`]; the
 //!   journal itself goes on, its later ranges shown unsealed.
+//! - **Verification** (karyos#702). [`Journal::verify`] runs the Archive's
+//!   verifier over the directory's integrity journal and the recording, as
+//!   `karyos-catalog verify` does without a trust file, and keeps each
+//!   range's outcome and reasons under the verifier's own names, adjacent
+//!   ranges with the same outcome and reasons merged into one. The agent
+//!   holds no trust root for the journal: an intact sealed range is
+//!   `inconsistent` with `untrusted_evidence` and `missing_evidence`, never
+//!   `verified`, and a damaged one is `inconsistent` with `corruption` (or
+//!   `shortened_index`), the range named. [`Journal::unsealed`] is true
+//!   while a part of the recording has no seal.
+//! - **Encoding.** Sealing changed nothing in a record's layout
+//!   ([`JournalRecord::encode`]): a journal written before it decodes as it
+//!   did, and is sealed from its start at its next durable append.
 
 #[cfg(test)]
 mod tests;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use karyos_archive::catalog::{
     Catalog, CatalogError, NewRecording, SourceIncarnation, StreamFormat,
 };
 use karyos_archive::disk::StdDisk;
-use karyos_archive::integrity::journal::IntegrityJournal;
+use karyos_archive::integrity::anchor::{Anchor, AnchorEvidence, Externality};
+use karyos_archive::integrity::journal::{IntegrityJournal, read_records};
+use karyos_archive::integrity::verify::{Evidence, RangeBytes, RangeReport, verify};
 use karyos_archive::queue::{QueueConfig, QueueError, QueueSource};
 use karyos_archive::recorder::{Mode, Recorder, RecorderError};
 use karyos_archive::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
 use karyos_sys::frame::{FRAME_ALIGNMENT, FrameType, HEADER_LENGTH, Lane, Word0};
+
+use crate::retention::RangeOutcome;
 
 /// The journal recording's channel.
 pub const CHANNEL: &[u8] = b"karyos:operations-journal";
@@ -62,6 +79,12 @@ const VERSION: u64 = 1;
 const WORDS: usize = 11;
 /// The most bytes one seal reads (karyos#1071).
 const SEAL_CHUNK: u64 = 1 << 20;
+/// How long a verification of the journal stands before the agent runs
+/// the next (karyos#702): a minute.
+pub const VERIFY_PERIOD_NS: u64 = 60_000_000_000;
+/// The most ranges a verification keeps, adjacent ones with the same
+/// outcome and reasons merged first.
+pub const MAX_INTEGRITY_RANGES: usize = 16;
 /// Bytes queued at most before the recorder takes them.
 const MAX_QUEUED: u64 = 1 << 20;
 /// The journal's largest frame: a term.
@@ -542,6 +565,10 @@ pub struct Journal {
     seal_buf: Vec<u8>,
     /// The most bytes one seal reads.
     seal_chunk: u64,
+    /// The journal's directory, which a verification reads.
+    dir: PathBuf,
+    /// The last verification that could run.
+    verification: Option<Integrity>,
     /// The records the open read, for tests.
     #[cfg(test)]
     pub(crate) scanned: Vec<JournalRecord>,
@@ -623,6 +650,8 @@ impl Journal {
             integrity,
             seal_buf: Vec::new(),
             seal_chunk,
+            dir: dir.to_path_buf(),
+            verification: None,
             #[cfg(test)]
             scanned: scan.all.clone(),
             operations: scan.operations,
@@ -655,6 +684,7 @@ impl Journal {
         // This run's first record: from here on, a run that does not end
         // with a clean stop is seen as one.
         let _ = journal.append_durable(&JournalRecord::new(Kind::AgentStarted, now), now)?;
+        journal.verify(now);
         Ok(journal)
     }
 
@@ -682,6 +712,94 @@ impl Journal {
     #[must_use]
     pub const fn failed_seals(&self) -> u64 {
         self.failed_seals
+    }
+
+    /// Whether a part of the recording has no seal (karyos#702): a seal
+    /// failed, or the integrity journal could not be opened; records were
+    /// written past the sealed end, until the next durable append seals
+    /// them; or an append failed, and that end is no longer known.
+    #[must_use]
+    pub fn unsealed(&self) -> bool {
+        let (Some(recorder), Some(integrity)) = (self.recorder.as_ref(), self.integrity.as_ref())
+        else {
+            return true;
+        };
+        let store = recorder.store();
+        self.failed_seals > 0
+            || integrity
+                .sealed_end(self.recording)
+                .unwrap_or(store.start())
+                < store.written()
+    }
+
+    /// The last verification that could run (see the module).
+    #[must_use]
+    pub const fn integrity(&self) -> Option<&Integrity> {
+        self.verification.as_ref()
+    }
+
+    /// Verifies the journal at host time `now` when the last verification
+    /// is [`VERIFY_PERIOD_NS`] old, or none ran.
+    pub fn verify_if_due(&mut self, now: u64) {
+        let due = self
+            .verification
+            .as_ref()
+            .is_none_or(|last| now.saturating_sub(last.at) >= VERIFY_PERIOD_NS);
+        if due {
+            self.verify(now);
+        }
+    }
+
+    /// Verifies the journal's recording at host time `now` with the
+    /// Archive's verifier (see the module); [`Journal::integrity`] then
+    /// reports it. Nothing is kept when the journal is unavailable or its
+    /// integrity journal cannot be read.
+    pub fn verify(&mut self, now: u64) {
+        self.verification = self.verified(now);
+    }
+
+    fn verified(&mut self, now: u64) -> Option<Integrity> {
+        let recorder = self.recorder.as_mut()?;
+        let (records, journal_fault) = read_records(&mut StdDisk, &self.dir).ok()?;
+        let id = self.recording;
+        let written = recorder.store().written();
+        let externality = Externality::default();
+        let evidence = Evidence {
+            records: &records,
+            journal_fault,
+            journal_id: 0,
+            trust: None,
+            registry: &[],
+            heads: &[],
+            anchors: &[],
+            anchor_faults: 0,
+            stores: &NoAnchors,
+            externality: &externality,
+            written: &[(id, written)],
+        };
+        let verification = verify(&evidence, |recording, start, end| {
+            // The journal's own ranges only, within what it wrote: a seal
+            // is corrupt input, checked before anything is allocated.
+            let Some(length) = end
+                .checked_sub(start)
+                .filter(|_| recording == id && end <= written)
+                .and_then(|length| usize::try_from(length).ok())
+            else {
+                return RangeBytes::Missing;
+            };
+            let mut bytes = vec![0; length];
+            match recorder.read(start, &mut bytes) {
+                Ok(()) => RangeBytes::Bytes(bytes),
+                Err(_) => RangeBytes::Missing,
+            }
+        });
+        Some(Integrity::of(
+            now,
+            verification
+                .ranges
+                .iter()
+                .filter(|report| report.recording == id),
+        ))
     }
 
     /// Whether an append failed: the journal then refuses every append.
@@ -855,12 +973,95 @@ impl Journal {
         self.recorder = None;
     }
 
+    /// Tests: flips the byte at `position` of the recording's first
+    /// segment on disk, as media damage would.
+    #[cfg(test)]
+    pub(crate) fn damage(&self, position: u64) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let recorder = self.recorder.as_ref().expect("an available journal");
+        let (data, _) = recorder.store().segment_paths(0);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(data)
+            .expect("the segment opens");
+        let mut byte = [0u8; 1];
+        file.seek(SeekFrom::Start(position)).expect("seek");
+        file.read_exact(&mut byte).expect("read");
+        file.seek(SeekFrom::Start(position)).expect("seek");
+        file.write_all(&[byte[0] ^ 0xff]).expect("write");
+        file.sync_all().expect("sync");
+    }
+
     fn count_failure(&mut self, now: u64) {
         self.failed_at.get_or_insert(now);
         // Checked: at its end the count keeps its value.
         if let Some(next) = self.failed_appends.checked_add(1) {
             self.failed_appends = next;
         }
+    }
+}
+
+/// A verification of the journal's recording (karyos#702).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Integrity {
+    /// When it ran: host `CLOCK_MONOTONIC` nanoseconds.
+    pub at: u64,
+    /// Each range's outcome and reasons, the verifier's names, in order;
+    /// adjacent ranges with the same outcome and reasons are one, and at
+    /// most [`MAX_INTEGRITY_RANGES`] are kept.
+    pub ranges: Vec<RangeOutcome>,
+    /// Whether ranges past [`MAX_INTEGRITY_RANGES`] were left out.
+    pub truncated: bool,
+}
+
+impl Integrity {
+    fn of<'a>(at: u64, reports: impl Iterator<Item = &'a RangeReport>) -> Self {
+        let mut ranges: Vec<RangeOutcome> = Vec::new();
+        let mut truncated = false;
+        for report in reports {
+            let outcome = report.outcome.name();
+            let reasons: Vec<String> = report
+                .reasons
+                .iter()
+                .map(|reason| reason.name().to_owned())
+                .collect();
+            if let Some(last) = ranges.last_mut()
+                && last.end == report.start
+                && last.outcome == outcome
+                && last.reasons == reasons
+            {
+                last.end = report.end;
+                continue;
+            }
+            if ranges.len() == MAX_INTEGRITY_RANGES {
+                truncated = true;
+                break;
+            }
+            ranges.push(RangeOutcome {
+                start: report.start,
+                end: report.end,
+                outcome: outcome.to_owned(),
+                reasons,
+            });
+        }
+        Self {
+            at,
+            ranges,
+            truncated,
+        }
+    }
+}
+
+/// The anchor stores a verification of the journal reads: none.
+#[derive(Debug)]
+struct NoAnchors;
+
+impl AnchorEvidence for NoAnchors {
+    fn confirms(&self, _anchor: &Anchor) -> bool {
+        false
     }
 }
 

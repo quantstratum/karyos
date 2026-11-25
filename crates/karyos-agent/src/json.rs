@@ -246,6 +246,26 @@ fn journal_view(out: &mut Out<'_>, journal: &JournalView) {
         fields
             .key("alerts")
             .array(&journal.alerts, |out, alert| alert_json(out, alert));
+        fields
+            .key("integrity")
+            .option(journal.integrity.as_deref(), |out, ranges| {
+                out.array(ranges, |out, range| range_json(out, range));
+            });
+        fields
+            .key("integrity_truncated")
+            .bool(journal.integrity_truncated);
+    });
+}
+
+/// One range's integrity outcome, the verifier's names.
+fn range_json(out: &mut Out<'_>, range: &crate::retention::RangeOutcome) {
+    out.object(|fields| {
+        fields.number("start", range.start);
+        fields.number("end", range.end);
+        fields.string("outcome", &range.outcome);
+        fields
+            .key("reasons")
+            .array(&range.reasons, |out, reason| out.string(reason));
     });
 }
 
@@ -411,16 +431,9 @@ pub fn retention_answer(answer: &crate::retention::RetentionAnswer) -> String {
         }
         RetentionAnswer::Verified { operation, ranges } => {
             fields.number("operation", operation);
-            fields.key("ranges").array(ranges, |out, range| {
-                out.object(|fields| {
-                    fields.number("start", range.start);
-                    fields.number("end", range.end);
-                    fields.string("outcome", &range.outcome);
-                    fields
-                        .key("reasons")
-                        .array(&range.reasons, |out, reason| out.string(reason));
-                });
-            });
+            fields
+                .key("ranges")
+                .array(ranges, |out, range| range_json(out, range));
         }
         RetentionAnswer::NoAnswer { operation } => {
             fields.string("error", "no answer");

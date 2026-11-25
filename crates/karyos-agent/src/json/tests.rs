@@ -289,6 +289,16 @@ fn every_field() -> AgentView {
                 value: 60,
                 since: 70,
             }],
+            integrity: Some(vec![crate::retention::RangeOutcome {
+                start: 0,
+                end: 4096,
+                outcome: "inconsistent".to_owned(),
+                reasons: vec![
+                    "untrusted_evidence".to_owned(),
+                    "missing_evidence".to_owned(),
+                ],
+            }]),
+            integrity_truncated: false,
         }),
         agent: crate::api::AgentIdentity::new(Some("ns/pod-0".to_owned()), 4242, 99),
         rates: vec![crate::api::RateView::new(
@@ -315,6 +325,8 @@ fn a_journal_that_could_not_open_is_written_with_its_error() {
             failed_appends: 0,
             gap: None,
             alerts: Vec::new(),
+            integrity: None,
+            integrity_truncated: false,
         }),
         agent: crate::api::AgentIdentity::new(None, 7, 1),
         rates: Vec::new(),
@@ -324,7 +336,8 @@ fn a_journal_that_could_not_open_is_written_with_its_error() {
         concat!(
             r#"{"version":1,"drivers":[],"journal":{"recording":null,"unsealed":true,"#,
             r#""unavailable":true,"error":"no such directory","failed_appends":0,"#,
-            r#""gap":null,"alerts":[]},"agent":{"id":null,"pid":7,"started_ns":1},"rates":[]}"#
+            r#""gap":null,"alerts":[],"integrity":null,"integrity_truncated":false},"#,
+            r#""agent":{"id":null,"pid":7,"started_ns":1},"rates":[]}"#
         )
     );
 }
@@ -336,7 +349,8 @@ fn a_journal_that_could_not_open_is_written_with_its_error() {
 /// at the end of its driver, in `DriverView`'s declaration order; a guard
 /// record's `operator` and `parameters` (M10) at the end of the record;
 /// `catalog` (M11) at the end of each driver; `journal` (M10b) at the
-/// end of the view.
+/// end of the view; `integrity` and `integrity_truncated` (karyos#702) at
+/// the end of the journal.
 const V1: &str = concat!(
     r#"{"version":1,"drivers":["#,
     r#"{"dir":"/run/karyos/a","state":{"state":"attached"},"#,
@@ -369,7 +383,9 @@ const V1: &str = concat!(
     r#""attachment":{"since_ns":null,"attaches":1,"previous":{"instance":"00000000000000000000000000000abc","ended_ns":60,"reason":"driver_gone"}}}"#,
     r#"],"journal":{"recording":4,"unsealed":true,"unavailable":false,"error":null,"failed_appends":2,"#,
     r#""gap":{"position":96,"from":10,"to":70,"reason":"unclean_stop"},"#,
-    r#""alerts":[{"kind":"journal_gap","stream":0,"lane":0,"participant":96,"value":60,"since":70}]},"#,
+    r#""alerts":[{"kind":"journal_gap","stream":0,"lane":0,"participant":96,"value":60,"since":70}],"#,
+    r#""integrity":[{"start":0,"end":4096,"outcome":"inconsistent","reasons":["untrusted_evidence","missing_evidence"]}],"#,
+    r#""integrity_truncated":false},"#,
     r#""agent":{"id":"ns/pod-0","pid":4242,"started_ns":99},"#,
     r#""rates":[{"dir":"/run/a","stream_id":7,"session_id":-2,"version":3,"operation":11}]}"#,
 );
