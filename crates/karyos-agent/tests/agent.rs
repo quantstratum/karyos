@@ -1157,25 +1157,56 @@ fn the_view_shows_the_retention_state_of_a_running_archive() {
         Read(driver.subscribe(requests, Role::Required).unwrap()),
         Published(driver.publication(responses).unwrap()),
     );
-    // Two recordings, the first held: asked on the request stream.
+    // Two recordings, the first held: asked on the request stream, each
+    // driven until the Archive's own answer to it, `Ok`, within 30 s
+    // (#1268 review: no unbounded offer, no fixed count of duties).
     let mut asking = driver.concurrent_publication(requests).unwrap();
+    let mut answers = driver.subscribe(responses, Role::Optional).unwrap();
     let mut out = vec![0u8; MAX_REQUEST];
     let mut ask = |message: &ControlMessage<'_>,
                    driver: &mut IpcDriver,
                    server: &mut ControlServer<Host, Read, Published>| {
+        let correlation = match message {
+            ControlMessage::StartRecording(request) => request.correlation_id,
+            ControlMessage::HoldRecording(request) => request.correlation_id,
+            other => panic!("{other:?}"),
+        };
         let length = message.encode(&mut out).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !matches!(
             asking.offer(&out[..length]),
             Ok(karyos_client::ConcurrentOfferOutcome::Accepted { .. })
         ) {
+            assert!(
+                Instant::now() < deadline,
+                "request {correlation} never taken"
+            );
             let _ = driver.do_work().unwrap();
             server.duty();
         }
-        for _ in 0..500 {
+        let mut code = None;
+        while code.is_none() {
+            assert!(Instant::now() < deadline, "no answer to {correlation}");
             let _ = driver.do_work().unwrap();
             server.duty();
+            let _ = answers.poll(
+                |bytes, _| {
+                    if let Ok(ControlMessage::ControlResponse(response)) =
+                        ControlMessage::decode(bytes)
+                        && response.correlation_id == correlation
+                    {
+                        code = Some(response.code);
+                    }
+                },
+                MessageLimit::new(16),
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
+        assert_eq!(
+            code,
+            Some(karyos_archive::control::ResponseCode::Ok),
+            "request {correlation}"
+        );
     };
     for correlation_id in [1, 2] {
         ask(

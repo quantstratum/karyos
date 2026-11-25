@@ -1318,12 +1318,10 @@ fn verify_reports_the_immutable_flag_its_files_carry() {
 /// child another test of this binary forks while the agent's file was open
 /// shares it until the child execs, so `Locked` can be seen for that
 /// instant (karyos#1148). Retried, bounded.
-/// Opens the journal in `dir`, waiting while it is `Locked`, for 30 s at
-/// most. A handle this test dropped can still hold the lock for a moment:
-/// another test of the run that forks a child duplicates every open file,
-/// this one's journal included, until the child execs and closes it, so
-/// the flock outlives the drop (karyos#1067). A deadline, not a count of
-/// tries, which a loaded host stretched.
+/// Opens the journal in `dir`, retrying while it is `Locked` for about 30 s
+/// (the last try may follow a late sleep): a handle the test dropped can
+/// still hold the lock for a moment (karyos#1067). A time window, not a
+/// count of tries, which a loaded host stretched.
 pub(crate) fn open_journal(dir: &std::path::Path) -> IntegrityJournal<StdDisk> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {

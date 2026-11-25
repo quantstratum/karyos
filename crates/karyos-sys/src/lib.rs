@@ -69,6 +69,7 @@ mod retry;
 pub mod schedule_ring;
 #[cfg(target_os = "linux")]
 pub mod secure_dir;
+pub mod spawn_window;
 #[cfg(target_os = "linux")]
 pub mod xsk_map;
 // Used only by `log_buffer`, which Loom builds leave out.
