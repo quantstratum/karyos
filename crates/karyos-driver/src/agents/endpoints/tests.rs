@@ -242,6 +242,7 @@ fn a_reset_drains_every_returned_item() {
             authority: Authority::FIRST,
             route,
             max_pending: NonZeroU16::new(200).unwrap(),
+            etf: None,
         })
         .unwrap();
     for token in 0..150u64 {

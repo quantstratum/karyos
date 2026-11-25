@@ -939,7 +939,9 @@ fn server_of(observation: &Observation) -> Option<NodeId> {
         | Observation::Fenced { .. }
         | Observation::PromotionRefused { .. }
         | Observation::Expired { .. }
-        | Observation::Healed => None,
+        | Observation::Healed
+        | Observation::Triggered { .. }
+        | Observation::Leading { .. } => None,
     }
 }
 

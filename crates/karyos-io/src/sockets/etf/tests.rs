@@ -3,8 +3,12 @@
 //! The `etf` socket on a real kernel: a veth pair with an `etf` qdisc, a
 //! datagram whose `SCM_TXTIME` has passed comes back on the error queue as
 //! a `TXTIME` drop with its own time, and one in the future is
-//! accepted. Needs `CAP_NET_ADMIN` and the kernel's `sch_etf`; skipped
-//! where missing unless `KARYOS_ETF_REQUIRED` is set.
+//! accepted. Then the etf queue of an endpoint (ADR-0109): its datagrams
+//! leave from the endpoint's port, inbound datagrams reach only the
+//! endpoint socket, a time already past goes on the endpoint socket, late,
+//! and a forced drop is drained with its time. Needs `CAP_NET_ADMIN`,
+//! `CAP_NET_RAW` (a packet socket sees the frames) and the kernel's
+//! `sch_etf`; skipped where missing unless `KARYOS_ETF_REQUIRED` is set.
 
 #![allow(
     clippy::unwrap_used,
@@ -17,6 +21,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use super::*;
+use crate::backend::TxOptions;
 use crate::sockets::errqueue::TxtimeCode;
 
 fn required() -> bool {
@@ -142,9 +147,36 @@ mod rtnl {
     /// The root `etf` qdisc of `name`: `CLOCK_TAI`, `delta_ns`, no offload,
     /// no deadline mode.
     pub fn etf(name: &str, delta_ns: i32) -> Result<(), i32> {
+        etf_at(name, delta_ns, u32::MAX)
+    }
+
+    /// The root `prio` qdisc `1:` of `name` with two bands: socket
+    /// priority `etf_priority` maps to band 0 (class `1:1`), every other
+    /// priority to band 1, a default FIFO that sends at once.
+    pub fn prio(name: &str, etf_priority: u8) -> Result<(), i32> {
         let mut tcmsg = vec![0_u8; 20];
         tcmsg[4..8].copy_from_slice(&i32::try_from(index(name)?).unwrap().to_ne_bytes());
+        tcmsg[8..12].copy_from_slice(&0x0001_0000_u32.to_ne_bytes());
         tcmsg[12..16].copy_from_slice(&u32::MAX.to_ne_bytes());
+        // `struct tc_prio_qopt`: bands, then the 16 entry priomap.
+        let mut qopt = 2_i32.to_ne_bytes().to_vec();
+        let mut priomap = [1_u8; 16];
+        priomap[usize::from(etf_priority)] = 0;
+        qopt.extend_from_slice(&priomap);
+        tcmsg.extend(attr(1, b"prio\0"));
+        tcmsg.extend(attr(2, &qopt));
+        request(36, 0x400 | 0x200, &tcmsg)
+    }
+
+    /// An `etf` leaf under class `1:1` of [`prio`].
+    pub fn etf_leaf(name: &str, delta_ns: i32) -> Result<(), i32> {
+        etf_at(name, delta_ns, 0x0001_0001)
+    }
+
+    fn etf_at(name: &str, delta_ns: i32, parent: u32) -> Result<(), i32> {
+        let mut tcmsg = vec![0_u8; 20];
+        tcmsg[4..8].copy_from_slice(&i32::try_from(index(name)?).unwrap().to_ne_bytes());
+        tcmsg[12..16].copy_from_slice(&parent.to_ne_bytes());
         let mut parms = Vec::new();
         parms.extend_from_slice(&delta_ns.to_ne_bytes());
         parms.extend_from_slice(&11_i32.to_ne_bytes());
@@ -189,10 +221,14 @@ fn a_datagram_past_its_txtime_is_dropped_and_reported_with_its_time() {
     let socket = EtfSocket::open(SocketAddr::from((Ipv4Addr::new(10, 78, 0, 1), 0))).unwrap();
     let to = SocketAddr::from((Ipv4Addr::new(10, 78, 0, 9), 47_100));
     let past = tai_now_ns() - 1_000_000_000;
-    socket.send(to, b"too late", past).unwrap();
+    socket
+        .send(&SocketAddrAny::from(to), b"too late", past)
+        .unwrap();
     // A generous lead, so a loaded runner cannot make it late too.
     let future = tai_now_ns() + 200_000_000;
-    socket.send(to, b"on time", future).unwrap();
+    socket
+        .send(&SocketAddrAny::from(to), b"on time", future)
+        .unwrap();
     let mut entries = [ErrEntry::Truncated; 4];
     let mut found = 0;
     for _ in 0..100 {
@@ -227,4 +263,440 @@ fn so_txtime_is_set_on_the_route_socket() {
         Err(error) if !required() => eprintln!("SO_TXTIME unavailable here ({error}); skipped"),
         Err(error) => panic!("{error}"),
     }
+}
+
+/// The etf queue of an endpoint on a real kernel (ADR-0109): a veth pair
+/// `k<tag><pid>` with a root `etf` qdisc of `delta_ns` on its first end,
+/// the address `10.79.<net>.1` and a permanent neighbour `10.79.<net>.9`.
+/// `None` when skipped.
+mod route {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::num::NonZeroU16;
+    use std::ops::ControlFlow;
+
+    use super::{required, rtnl};
+    use crate::backend::{
+        Authority, Commit, EtfQueue, Exposure, GateDecision, InstanceId, RouteId, RxDatagram,
+        RxDrop, RxHandler, SenderGate, SenderToken, TxBackend, TxEntry, TxFrame, TxOptions,
+        TxQueueConfig, TxQueueId, TxReport,
+    };
+    use crate::sockets::endpoint::{SocketsConfig, SocketsEndpoint, SocketsRx, SocketsTx};
+    use crate::sockets::linux::LinuxSocket;
+
+    /// The socket priority of the etf queue: band 0 of the `prio` root,
+    /// the `etf` leaf. The endpoint socket's default priority 0 takes
+    /// band 1, which sends at once.
+    pub const PRIORITY: u8 = 3;
+
+    pub struct Route {
+        pub tx: SocketsTx<LinuxSocket>,
+        pub rx: SocketsRx<LinuxSocket>,
+        pub queue: TxQueueId,
+        pub local: SocketAddr,
+        pub peer: SocketAddr,
+        _pair: rtnl::Pair,
+    }
+
+    pub fn open(tag: char, net: u8, delta_ns: i32) -> Option<Route> {
+        let a = format!("k{tag}{:x}", std::process::id());
+        let b = format!("j{tag}{:x}", std::process::id());
+        if let Err(errno) = rtnl::veth(&a, &b) {
+            assert!(!required(), "veth setup failed with errno {errno}");
+            eprintln!("veth unavailable here (errno {errno}); skipped");
+            return None;
+        }
+        let pair = rtnl::Pair(a.clone());
+        let setup = rtnl::address(&a, [10, 79, net, 1])
+            .and_then(|()| rtnl::neighbour(&a, [10, 79, net, 9], [2, 0, 0, 0, 0, 9]))
+            .and_then(|()| rtnl::prio(&a, PRIORITY))
+            .and_then(|()| rtnl::etf_leaf(&a, delta_ns));
+        if let Err(errno) = setup {
+            assert!(
+                !required(),
+                "address, neighbour or etf qdisc setup failed with errno {errno}"
+            );
+            eprintln!("etf qdisc unavailable here (errno {errno}); skipped");
+            return None;
+        }
+        let mut config = SocketsConfig::new(SocketAddr::from((Ipv4Addr::new(10, 79, net, 1), 0)));
+        config.etf_route = true;
+        let endpoint =
+            SocketsEndpoint::open(&config, InstanceId::FIRST, LinuxSocket::new()).unwrap();
+        let local = endpoint.capabilities().local;
+        let (mut tx, rx) = endpoint.split().unwrap();
+        let peer = SocketAddr::from((Ipv4Addr::new(10, 79, net, 9), 47_100));
+        let route: RouteId = tx.add_route(peer).unwrap();
+        let queue = tx
+            .open_queue(TxQueueConfig {
+                authority: Authority::FIRST,
+                route,
+                max_pending: NonZeroU16::new(8).unwrap(),
+                etf: Some(EtfQueue {
+                    interface: rtnl::index(&a).unwrap(),
+                    priority: u32::from(PRIORITY),
+                    delta_ns: u32::try_from(delta_ns).unwrap(),
+                }),
+            })
+            .unwrap();
+        Some(Route {
+            tx,
+            rx,
+            queue,
+            local,
+            peer,
+            _pair: pair,
+        })
+    }
+
+    struct Permit;
+
+    impl SenderGate for Permit {
+        fn check(&mut self, candidate: &Exposure<'_>) -> GateDecision {
+            GateDecision::Permit {
+                count: NonZeroU16::new(u16::try_from(candidate.tokens.len()).unwrap()).unwrap(),
+            }
+        }
+    }
+
+    impl Route {
+        /// Commits `bytes` with `options` and flushes the queue; the
+        /// entry of the one datagram.
+        pub fn send(&mut self, bytes: &[u8], options: TxOptions) -> TxEntry {
+            let mut frame = self.tx.claim_tx(self.queue, bytes.len()).unwrap();
+            frame.bytes_mut().copy_from_slice(bytes);
+            frame
+                .commit(Commit {
+                    len: bytes.len(),
+                    token: SenderToken::new(1),
+                    options,
+                })
+                .unwrap();
+            let mut report = TxReport::new();
+            self.tx.flush(
+                crate::backend::FlushRequest {
+                    queue: self.queue,
+                    max_datagrams: NonZeroU16::new(8).unwrap(),
+                    max_bytes: u32::MAX,
+                },
+                &mut Permit,
+                &mut report,
+            );
+            let entry = report.pop_front().unwrap();
+            assert!(report.pop_front().is_none());
+            entry
+        }
+
+        /// Datagrams the endpoint socket receives within a few polls.
+        pub fn received(&mut self) -> u32 {
+            received_on(&mut self.rx, self.local)
+        }
+    }
+
+    /// Datagrams `rx`, bound at `local`, receives within a few polls.
+    pub fn received_on(rx: &mut SocketsRx<LinuxSocket>, local: SocketAddr) -> u32 {
+        struct Count(u32);
+        impl RxHandler for Count {
+            fn datagram(&mut self, _: RxDatagram<'_>) -> ControlFlow<()> {
+                self.0 += 1;
+                ControlFlow::Continue(())
+            }
+            fn dropped(&mut self, _: RxDrop) {}
+        }
+        let mut count = Count(0);
+        let budget = SocketsConfig::new(local).rx_budget().unwrap();
+        for _ in 0..50 {
+            crate::backend::RxBackend::poll_rx(rx, budget, &mut count);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        count.0
+    }
+}
+
+/// UDP source ports of IPv4 frames to `to` seen by a packet socket within
+/// `wait`, whose payload starts with `marker`.
+fn captured_sources(capture: &OwnedFd, to: SocketAddr, marker: &[u8], wait: Duration) -> Vec<u16> {
+    let SocketAddr::V4(to) = to else {
+        panic!("IPv4 only")
+    };
+    let mut ports = Vec::new();
+    let mut frame = [0_u8; 2048];
+    let deadline = std::time::Instant::now() + wait;
+    while std::time::Instant::now() < deadline {
+        let Ok((len, _)) =
+            rustix::net::recv(capture, &mut frame[..], rustix::net::RecvFlags::DONTWAIT)
+        else {
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        };
+        // Ethernet, then IPv4 with its header length, then UDP.
+        let frame = &frame[..len];
+        if len < 14 + 20 + 8 || frame[12..14] != [0x08, 0x00] || frame[23] != 17 {
+            continue;
+        }
+        let ip = &frame[14..];
+        let header = usize::from(ip[0] & 0x0F) * 4;
+        let udp = &ip[header..];
+        let payload = &udp[8..];
+        if ip[16..20] == to.ip().octets()
+            && udp[2..4] == to.port().to_be_bytes()
+            && payload.starts_with(marker)
+        {
+            ports.push(u16::from_be_bytes([udp[0], udp[1]]));
+        }
+    }
+    ports
+}
+
+/// A packet socket seeing every IPv4 frame of the host (`CAP_NET_RAW`).
+fn capture() -> OwnedFd {
+    rustix::net::socket_with(
+        AddressFamily::PACKET,
+        SocketType::RAW,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        Some(rustix::net::eth::IP),
+    )
+    .unwrap()
+}
+
+#[test]
+fn an_etf_queue_datagram_leaves_from_the_endpoint_port() {
+    let Some(mut route) = route::open('a', 1, 50_000_000) else {
+        return;
+    };
+    let capture = capture();
+    let entry = route.send(b"etf-source", TxOptions::txtime(tai_now_ns() + 100_000_000));
+    assert!(!entry.late);
+    let ports = captured_sources(
+        &capture,
+        route.peer,
+        b"etf-source",
+        Duration::from_millis(400),
+    );
+    assert!(
+        !ports.is_empty() && ports.iter().all(|port| *port == route.local.port()),
+        "the etf socket sends from the endpoint's port {}: {ports:?}",
+        route.local.port()
+    );
+}
+
+#[test]
+fn inbound_datagrams_never_land_on_the_etf_socket() {
+    let Some(mut route) = route::open('b', 2, 50_000_000) else {
+        return;
+    };
+    // 64 sources, so the reuseport hash alone would spread them.
+    for _ in 0..64 {
+        let sender =
+            std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::new(10, 79, 2, 1), 0))).unwrap();
+        for _ in 0..4 {
+            sender.send_to(b"inbound", route.local).unwrap();
+        }
+    }
+    assert_eq!(
+        route.received(),
+        256,
+        "every inbound datagram reaches the endpoint socket"
+    );
+}
+
+/// Datagrams waiting on `fd` now.
+fn pending_on(fd: &OwnedFd) -> u32 {
+    let mut count = 0;
+    let mut buffer = [0_u8; 64];
+    while rustix::net::recv(fd, &mut buffer[..], rustix::net::RecvFlags::DONTWAIT).is_ok() {
+        count += 1;
+    }
+    count
+}
+
+/// Sends 4 datagrams from each of 64 new sockets on `from` to `to`, and
+/// counts what reaches `first` and `second`, draining both after each
+/// sender so no receive buffer fills (the default one holds fewer than 256
+/// small datagrams on some kernels).
+fn spray(from: std::net::IpAddr, to: SocketAddr, first: &OwnedFd, second: &OwnedFd) -> (u32, u32) {
+    let (mut to_first, mut to_second) = (0, 0);
+    for _ in 0..64 {
+        let sender = std::net::UdpSocket::bind(SocketAddr::new(from, 0)).unwrap();
+        for _ in 0..4 {
+            sender.send_to(b"spray", to).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(1));
+        to_first += pending_on(first);
+        to_second += pending_on(second);
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    (to_first + pending_on(first), to_second + pending_on(second))
+}
+
+/// A reuseport group of a first socket at `local` and an etf socket: the
+/// hash alone hands the etf socket some of 256 datagrams from 64 sources
+/// (the control), and none once the program is attached to the first.
+fn steering_in_group(local: SocketAddr) {
+    let family = if local.is_ipv4() {
+        AddressFamily::INET
+    } else {
+        AddressFamily::INET6
+    };
+    let first = rustix::net::socket_with(
+        family,
+        SocketType::DGRAM,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        None,
+    )
+    .unwrap();
+    if local.is_ipv6() {
+        rustix::net::sockopt::set_ipv6_v6only(&first, true).unwrap();
+    }
+    rustix::net::sockopt::set_socket_reuseport(&first, true).unwrap();
+    rustix::net::bind(&first, &local).unwrap();
+    let local = SocketAddr::try_from(rustix::net::getsockname(&first).unwrap()).unwrap();
+    let etf = match EtfSocket::open_in_group(local, u32::from(route::PRIORITY)) {
+        Ok(etf) => etf,
+        Err(error) if !required() => {
+            eprintln!("SO_TXTIME unavailable here ({error}); skipped");
+            return;
+        }
+        Err(error) => panic!("{error}"),
+    };
+    let (to_first, to_etf) = spray(local.ip(), local, &first, &etf.fd);
+    assert_eq!(to_first + to_etf, 256);
+    assert!(
+        to_etf > 0,
+        "without the program the hash spreads the group: {to_first} and {to_etf}"
+    );
+    crate::linux_sys::attach_reuseport_first(first.as_fd()).unwrap();
+    assert_eq!(
+        spray(local.ip(), local, &first, &etf.fd),
+        (256, 0),
+        "with the program every datagram reaches the first socket"
+    );
+}
+
+#[test]
+fn the_program_steers_an_ipv4_group_and_the_hash_alone_does_not() {
+    steering_in_group(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+}
+
+#[test]
+fn the_program_steers_an_ipv6_group_and_the_hash_alone_does_not() {
+    let probe = std::net::UdpSocket::bind("[::1]:0");
+    if let Err(error) = probe {
+        assert!(!required(), "IPv6 loopback unavailable: {error}");
+        eprintln!("IPv6 loopback unavailable here ({error}); skipped");
+        return;
+    }
+    steering_in_group(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)));
+}
+
+#[test]
+fn an_ipv6_etf_socket_joins_the_endpoint_group() {
+    // The endpoint socket is `IPV6_V6ONLY`; an etf socket that were not
+    // would land in another group and miss the steering program.
+    use crate::backend::{Authority, EtfQueue, InstanceId, TxQueueConfig};
+    use crate::sockets::endpoint::{SocketsConfig, SocketsEndpoint};
+    use crate::sockets::linux::LinuxSocket;
+    if std::net::UdpSocket::bind("[::1]:0").is_err() {
+        assert!(!required(), "IPv6 loopback unavailable");
+        eprintln!("IPv6 loopback unavailable here; skipped");
+        return;
+    }
+    let mut config = SocketsConfig::new(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)));
+    config.etf_route = true;
+    let endpoint = SocketsEndpoint::open(&config, InstanceId::FIRST, LinuxSocket::new()).unwrap();
+    let local = endpoint.capabilities().local;
+    let (mut tx, mut rx) = endpoint.split().unwrap();
+    let route = tx
+        .add_route(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 47_101)))
+        .unwrap();
+    let opened = tx.open_queue(TxQueueConfig {
+        authority: Authority::FIRST,
+        route,
+        max_pending: std::num::NonZeroU16::new(1).unwrap(),
+        etf: Some(EtfQueue {
+            interface: 1,
+            priority: 0,
+            delta_ns: 1,
+        }),
+    });
+    if let Err(error) = opened {
+        assert!(!required(), "the IPv6 etf queue opens: {error}");
+        eprintln!("IPv6 etf queue unavailable here ({error}); skipped");
+        return;
+    }
+    // The endpoint's receive buffer holds all 256 (the etf route's RX
+    // buffer is sized by the endpoint configuration).
+    for _ in 0..64 {
+        let sender = std::net::UdpSocket::bind(SocketAddr::new(local.ip(), 0)).unwrap();
+        for _ in 0..4 {
+            sender.send_to(b"spray", local).unwrap();
+        }
+    }
+    assert_eq!(
+        route::received_on(&mut rx, local),
+        256,
+        "every inbound datagram reaches the IPv6 endpoint socket"
+    );
+}
+
+#[test]
+fn a_past_time_goes_on_the_endpoint_socket_late() {
+    let Some(mut route) = route::open('c', 3, 50_000_000) else {
+        return;
+    };
+    let capture = capture();
+    let past = tai_now_ns() - 1_000_000_000;
+    let entry = route.send(b"late", TxOptions::txtime(past));
+    assert!(entry.late);
+    // At the endpoint's priority it takes the immediate band and reaches
+    // the wire, from the endpoint's port.
+    let ports = captured_sources(&capture, route.peer, b"late", Duration::from_millis(300));
+    assert!(
+        !ports.is_empty() && ports.iter().all(|port| *port == route.local.port()),
+        "the past datagram reaches the peer from the endpoint's port: {ports:?}"
+    );
+    assert!(matches!(
+        entry.outcome,
+        crate::backend::TxItemOutcome::Submitted { .. }
+    ));
+    // Had it gone to the etf socket, the qdisc would have reported it.
+    std::thread::sleep(Duration::from_millis(100));
+    let mut entries = [ErrEntry::Truncated; 4];
+    assert_eq!(route.tx.drain_etf(route.queue, &mut entries), Ok(0));
+}
+
+#[test]
+fn a_forced_drop_is_drained_with_its_time() {
+    // A 300 ms delta: the first datagram leaves 300 ms before its time,
+    // and the qdisc then drops any later datagram timed before it.
+    let Some(mut route) = route::open('d', 4, 300_000_000) else {
+        return;
+    };
+    let start = tai_now_ns();
+    let first = start + 1_000_000_000;
+    assert!(!route.send(b"first", TxOptions::txtime(first)).late);
+    // Past the first datagram's dequeue at `first - delta`.
+    while tai_now_ns() < start + 750_000_000 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let earlier = tai_now_ns() + 50_000_000;
+    assert!(earlier < first);
+    let entry = route.send(b"earlier", TxOptions::txtime(earlier));
+    assert!(!entry.late, "still ahead: it went to the etf socket");
+    let mut entries = [ErrEntry::Truncated; 4];
+    let mut found = 0;
+    for _ in 0..200 {
+        found += route
+            .tx
+            .drain_etf(route.queue, &mut entries[found..])
+            .unwrap();
+        if found > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        matches!(&entries[..found], [ErrEntry::Txtime { txtime_ns, code: TxtimeCode::InvalidParam | TxtimeCode::Missed, .. }] if *txtime_ns == earlier),
+        "the dropped datagram is drained with its own time: {:?}",
+        &entries[..found]
+    );
 }

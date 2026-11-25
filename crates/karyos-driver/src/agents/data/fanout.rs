@@ -840,6 +840,11 @@ impl<T: StreamTerms> Outbound<T> {
         required: &[SocketAddr],
         ipv4: Option<bool>,
     ) -> Result<(), super::OutboundError> {
+        // An authenticated publication is unicast single-path only
+        // (ADR-0086 open point 6).
+        if self.authenticated() {
+            return Err(super::OutboundError::Routes);
+        }
         let Some(ipv4) = ipv4 else {
             return Err(super::OutboundError::Routes);
         };
@@ -902,6 +907,7 @@ impl<T: StreamTerms> Outbound<T> {
     ) -> Result<(), super::OutboundError> {
         if self.routed.is_some()
             || self.fanout.is_some()
+            || self.authenticated()
             || policy.required().len() > max_destinations
         {
             return Err(super::OutboundError::Routes);
@@ -1227,6 +1233,7 @@ impl<T: StreamTerms> Outbound<T> {
                     authority: Authority::FIRST,
                     route,
                     max_pending,
+                    etf: None,
                 }) {
                     Ok(opened) if lane => {
                         if let Some(queue) = target.queues.get_mut(at) {
@@ -2200,6 +2207,7 @@ impl<T: StreamTerms> Outbound<T> {
                 (&sent_high, &closed),
                 budget,
                 now,
+                None,
             );
             let after = repair.counts().submitted;
             // What the catch-up submitted is the destination's: its
@@ -2431,6 +2439,7 @@ mod tests {
                 authority: Authority::FIRST,
                 route,
                 max_pending: NonZeroU16::MIN,
+                etf: None,
             })
             .unwrap();
         let frame = tx.claim_tx(queue, 8).unwrap();
@@ -2464,6 +2473,7 @@ mod tests {
                 authority: Authority::FIRST,
                 route,
                 max_pending: NonZeroU16::MIN,
+                etf: None,
             })
             .unwrap();
         let mut queues = [None; OPENED_QUEUES];
@@ -2542,6 +2552,7 @@ mod tests {
                 authority: Authority::FIRST,
                 route,
                 max_pending: NonZeroU16::MIN,
+                etf: None,
             })
             .unwrap();
         let frame = tx.claim_tx(queue, 1408).unwrap();

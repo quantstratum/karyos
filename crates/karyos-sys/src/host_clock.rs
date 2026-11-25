@@ -37,6 +37,53 @@ pub fn host_tai_ns() -> Option<u64> {
         .and_then(|ns| ns.checked_add(nanos))
 }
 
+/// One bracketed read of a PTP hardware clock against the host's raw
+/// monotonic clock (karyos#749): `CLOCK_MONOTONIC_RAW`, then the PHC
+/// through its dynamic clock id, then `CLOCK_MONOTONIC_RAW` again, each in
+/// nanoseconds. `CLOCK_MONOTONIC_RAW` is never slewed by NTP; on a host
+/// whose clock source is `tsc` it is the TSC at a fixed scale, which is how
+/// a calibration of it stands for the TSC without reading the counter
+/// itself (an instruction `karyos-sys` cannot issue without `unsafe`).
+/// `None` when the kernel refuses a read. A control-path call: nothing on
+/// the data path reads a PHC.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn phc_paired_read(phc: std::os::fd::BorrowedFd<'_>) -> Option<(u64, u64, u64)> {
+    fn ns(time: rustix::time::Timespec) -> Option<u64> {
+        let seconds = u64::try_from(time.tv_sec).ok()?;
+        let nanos = u64::try_from(time.tv_nsec).ok()?;
+        seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|ns| ns.checked_add(nanos))
+    }
+    let before = rustix::time::clock_gettime(rustix::time::ClockId::MonotonicRaw);
+    let target = rustix::time::clock_gettime_dynamic(rustix::time::DynamicClockId::Dynamic(phc));
+    let after = rustix::time::clock_gettime(rustix::time::ClockId::MonotonicRaw);
+    Some((ns(before)?, ns(target.ok()?)?, ns(after)?))
+}
+
+/// [`phc_paired_read`] the other way round (karyos#749): the PHC, then
+/// `CLOCK_MONOTONIC_RAW`, then the PHC again, so a fit of the reads has the
+/// PHC as its source and the raw clock as its target. A host that receives
+/// over a PTP link converts its PHC's times into its own raw clock with it.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn phc_paired_read_reversed(phc: std::os::fd::BorrowedFd<'_>) -> Option<(u64, u64, u64)> {
+    fn ns(time: rustix::time::Timespec) -> Option<u64> {
+        let seconds = u64::try_from(time.tv_sec).ok()?;
+        let nanos = u64::try_from(time.tv_nsec).ok()?;
+        seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|ns| ns.checked_add(nanos))
+    }
+    let read =
+        || rustix::time::clock_gettime_dynamic(rustix::time::DynamicClockId::Dynamic(phc)).ok();
+    let before = read()?;
+    let raw = rustix::time::clock_gettime(rustix::time::ClockId::MonotonicRaw);
+    let after = read()?;
+    Some((ns(before)?, ns(raw)?, ns(after)?))
+}
+
 /// Nanoseconds of this process's monotonic clock: on a host without
 /// cross-process IPC, one process is the whole scale. The scale starts at
 /// 1 ns, not 0: the first reading of a process is taken at its origin, and
@@ -82,6 +129,18 @@ mod tests {
     #[test]
     fn a_reading_is_never_zero() {
         assert!(host_monotonic_ns() > 0);
+    }
+
+    /// A descriptor that is no PTP clock is a refused read, not a
+    /// panic or a made-up time (karyos#749).
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn a_descriptor_that_is_no_phc_is_refused() {
+        use std::os::fd::AsFd;
+
+        let file = std::fs::File::open("/dev/null").unwrap();
+        assert_eq!(phc_paired_read(file.as_fd()), None);
+        assert_eq!(phc_paired_read_reversed(file.as_fd()), None);
     }
 
     #[test]

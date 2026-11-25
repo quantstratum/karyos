@@ -142,6 +142,20 @@ pub struct IpcConfig {
     /// Tool connections admitted at once (nonzero; [`DEFAULT_MAX_TOOLS`] is
     /// a small default); a `ToolHello` beyond it is refused with `LIMIT`.
     pub max_tools: usize,
+    /// The send buffer (`SO_SNDBUF`) requested on each accepted
+    /// connection, in bytes: nonzero and at most `i32::MAX` (the C `int`
+    /// of `setsockopt`), else the driver is refused with `InvalidConfig`.
+    /// The kernel decides what it keeps: Linux caps the request at
+    /// `net.core.wmem_max`, doubles it for its bookkeeping and applies its
+    /// minimum. The size it keeps bounds, through the kernel's socket
+    /// memory accounting, what the driver's unread messages to one client
+    /// take, and so how much a client that stopped reading lets queue
+    /// before its outbound queue fills and it is retired. `None` leaves
+    /// the host's default (`wmem_default` on Linux): the kernel memory per
+    /// client, and when a client that stops reading is retired, then
+    /// depend on the host's setting. A connection whose buffer cannot be
+    /// set is closed, not admitted (karyos#1067).
+    pub client_send_buffer: Option<u32>,
 }
 
 /// A connection waiting for its `Hello`.
@@ -474,6 +488,9 @@ impl<T: StreamTerms> Admission<T> {
             || config.max_fetch_bytes == 0
             || config.max_tools == 0
             || config.max_outbound_per_client < BOOTSTRAP_MESSAGES
+            || config
+                .client_send_buffer
+                .is_some_and(|bytes| bytes == 0 || i32::try_from(bytes).is_err())
         {
             return Err(DriverError::InvalidConfig);
         }
@@ -535,6 +552,17 @@ impl<T: StreamTerms> Admission<T> {
         self.next_region
     }
 
+    /// The send buffers of the connections accepted and not yet past
+    /// `Hello`, for the test of [`IpcConfig::client_send_buffer`].
+    #[cfg(all(test, target_os = "linux"))]
+    #[allow(clippy::unwrap_used, reason = "tests, as ADR-0007 allows")]
+    pub(crate) fn pending_send_buffers(&self) -> Vec<usize> {
+        self.pending
+            .iter()
+            .map(|pending| ipc::send_buffer(pending.socket.as_fd()).unwrap())
+            .collect()
+    }
+
     /// The instance and the region id counter, borrowed apart from the
     /// rest of the admission: the image table takes its lanes' region ids
     /// from it on the driver thread.
@@ -556,10 +584,25 @@ impl<T: StreamTerms> Admission<T> {
         self.probes = 0;
         // Accept up to the pending bound.
         let mut now = None;
-        while self.pending.len() < self.config.max_pending_hellos {
+        // At most the slots free at the start: a connection whose buffer
+        // cannot be set takes an attempt too, so a failing setsockopt with
+        // a full backlog never keeps this step accepting.
+        let attempts = self
+            .config
+            .max_pending_hellos
+            .saturating_sub(self.pending.len());
+        for _ in 0..attempts {
             let Ok(Some(socket)) = ipc::accept(self.listener.as_fd()) else {
                 break;
             };
+            if let Some(bytes) = self.config.client_send_buffer
+                && ipc::set_send_buffer(socket.as_fd(), bytes).is_err()
+            {
+                // Not bounded as configured: closed, never admitted.
+                drop(socket);
+                work.add(1);
+                continue;
+            }
             let since = *now.get_or_insert_with(|| driver.clock.now());
             self.pending.push(Pending { socket, since });
             work.add(1);
@@ -1861,5 +1904,138 @@ mod descriptor_tests {
             ..DriverConfig::default()
         };
         assert_eq!(descriptors_needed(&config, &NetworkConfig::default()), None);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod send_buffer_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        reason = "tests, as ADR-0007 allows"
+    )]
+
+    use super::IpcConfig;
+    use crate::SystemClock;
+    use crate::embedded::{DriverConfig, EmbeddedDriver};
+    use karyos_sys::term_bytes::SharedTerms;
+
+    type IpcDriver = EmbeddedDriver<SharedTerms>;
+    use std::time::{Duration, Instant};
+
+    /// The driver over a private directory under `name`, its accepted
+    /// connections given `client_send_buffer`.
+    fn driver(name: &str, client_send_buffer: Option<u32>) -> (IpcDriver, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("karyos-send-buffer-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let timeout = 5_000_000_000;
+        let driver = EmbeddedDriver::with_ipc(
+            DriverConfig::default(),
+            IpcConfig {
+                dir: dir.clone(),
+                max_pending_hellos: 2,
+                hello_timeout: timeout,
+                max_outbound_per_client: 8,
+                fetch_deadline: timeout,
+                max_exports_per_client: 16,
+                max_fetches_per_client: 4,
+                max_regions_per_fetch: 4,
+                max_fetch_bytes: 1 << 30,
+                max_tools: crate::DEFAULT_MAX_TOOLS,
+                client_send_buffer,
+            },
+            Box::new(SystemClock::new()),
+        )
+        .unwrap();
+        (driver, dir)
+    }
+
+    /// The send buffers of the connections the driver accepted, once it
+    /// accepted one.
+    fn accepted(driver: &mut IpcDriver, dir: &std::path::Path) -> Vec<usize> {
+        let _socket = karyos_sys::ipc::connect(dir, Duration::from_millis(20)).unwrap();
+        let start = Instant::now();
+        loop {
+            let _ = driver.do_work().unwrap();
+            let buffers = driver.admission.as_ref().unwrap().pending_send_buffers();
+            if !buffers.is_empty() {
+                return buffers;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "never accepted");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// karyos#1067: `client_send_buffer` is set on each accepted
+    /// connection, read back with `getsockopt`: the request, or twice it
+    /// where the kernel keeps its bookkeeping in it (Linux).
+    #[test]
+    fn the_client_send_buffer_is_set_on_each_accepted_connection() {
+        let (mut driver, dir) = driver("set", Some(4096));
+        let buffers = accepted(&mut driver, &dir);
+        // What the kernel keeps for the same request on a socket of the
+        // same kind (it caps, doubles and floors the request), and what it
+        // gives one nobody set: the accepted connection has the former,
+        // which differs from the latter, so a driver that skipped the
+        // setter fails here (#1254 review).
+        let (reference, _peer) = karyos_sys::ipc::seqpacket_pair().unwrap();
+        let untouched = karyos_sys::ipc::send_buffer(std::os::fd::AsFd::as_fd(&reference)).unwrap();
+        karyos_sys::ipc::set_send_buffer(std::os::fd::AsFd::as_fd(&reference), 4096).unwrap();
+        let requested = karyos_sys::ipc::send_buffer(std::os::fd::AsFd::as_fd(&reference)).unwrap();
+        assert_ne!(requested, untouched, "the request is the host default");
+        assert_eq!(buffers, [requested]);
+        drop(driver);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1254 review: a request `setsockopt` cannot take (above the C
+    /// `int`), or zero, refuses the driver, which would otherwise close
+    /// every connection it accepts.
+    #[test]
+    fn an_out_of_range_client_send_buffer_is_refused() {
+        for bytes in [0, u32::try_from(i32::MAX).unwrap() + 1, u32::MAX] {
+            let dir = std::env::temp_dir().join(format!(
+                "karyos-send-buffer-range-{bytes}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let refused = EmbeddedDriver::<SharedTerms>::with_ipc(
+                DriverConfig::default(),
+                IpcConfig {
+                    dir: dir.clone(),
+                    max_pending_hellos: 2,
+                    hello_timeout: 5_000_000_000,
+                    max_outbound_per_client: 8,
+                    fetch_deadline: 5_000_000_000,
+                    max_exports_per_client: 16,
+                    max_fetches_per_client: 4,
+                    max_regions_per_fetch: 4,
+                    max_fetch_bytes: 1 << 30,
+                    max_tools: crate::DEFAULT_MAX_TOOLS,
+                    client_send_buffer: Some(bytes),
+                },
+                Box::new(SystemClock::new()),
+            );
+            assert!(
+                matches!(refused, Err(crate::error::DriverError::InvalidConfig)),
+                "{bytes}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// `None` leaves the host's default: the same size as a socket the
+    /// driver did not touch.
+    #[test]
+    fn no_client_send_buffer_leaves_the_host_default() {
+        let (mut driver, dir) = driver("default", None);
+        let buffers = accepted(&mut driver, &dir);
+        let (untouched, _peer) = karyos_sys::ipc::seqpacket_pair().unwrap();
+        let default = karyos_sys::ipc::send_buffer(std::os::fd::AsFd::as_fd(&untouched)).unwrap();
+        assert_eq!(buffers, [default]);
+        drop(driver);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

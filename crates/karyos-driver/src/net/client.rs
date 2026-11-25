@@ -656,6 +656,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     });
             }
         }
+        // The embedded API's subscriptions that await their images.
+        let embedded = self.embedded_awaiting.iter().map(|(_, entry)| *entry);
+        self.awaiting_entries.extend(embedded);
     }
 
     /// Withdraws every awaiting cell (ADR-0100) that `matches` selects,

@@ -35,6 +35,10 @@ use karyos_io::sockets::endpoint::SocketsTx;
 use karyos_io::sockets::ops::SocketOps;
 use karyos_protocol::network::{Control, MAX_CONTROL_LENGTH};
 
+use karyos_protocol::protection::hmac_sha256::Domain;
+
+use crate::wire_auth::{ENVELOPE_LEN, Proof, Sealer};
+
 use super::EndpointId;
 
 /// The SM slot of one image (network-sessions.md S1: an SM slot per
@@ -375,6 +379,57 @@ fn wait_key(
         _ => None,
     };
     (control.kind(), alias)
+}
+
+/// Seals one encoded control: the `frames` bytes at the start of a buffer
+/// with room for the envelope, returning the sealed length, or `None` when
+/// it cannot be sealed (nothing is sent). A pairwise or sender control is
+/// sealed by the session's [`Sealer`] (domains 4 and 1), a SETUP or an
+/// RSP_SETUP by the channel's or pair's [`Proof`] (domains 5 and 6).
+pub trait ControlSeal {
+    /// The domain it seals in.
+    fn domain(&self) -> Domain;
+    /// Seals the control.
+    fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize>;
+}
+
+impl ControlSeal for Sealer {
+    fn domain(&self) -> Domain {
+        Sealer::domain(self)
+    }
+
+    fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
+        self.seal(buffer, frames).ok()
+    }
+}
+
+impl ControlSeal for Proof {
+    fn domain(&self) -> Domain {
+        Proof::domain(self)
+    }
+
+    fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
+        self.seal(buffer, frames).ok()
+    }
+}
+
+/// Whether `control` belongs in `domain` (ADR-0086 section 7a): SETUP in
+/// 5, RSP_SETUP in 6, the receiver's SM, NAK and RTTM in 4, the sender's
+/// PATH_HB, ERR and RTTM in 1. ERR UNBOUND is prebinding and stays bare.
+fn sealable_in(control: &Control, domain: Domain) -> bool {
+    match control {
+        Control::SetupAnnounce(_) | Control::SetupAnswer(_) => domain == Domain::SetupProof,
+        Control::Challenge(_) | Control::Solicit(_) | Control::Register(_) => {
+            domain == Domain::RspSetup
+        }
+        Control::Status(_) | Control::Nak(_) => domain == Domain::ReceiverToPublisher,
+        Control::NakReply(_) | Control::Registration(_) | Control::PathHeartbeat(_) => {
+            domain == Domain::Data
+        }
+        Control::Rttm(_) => matches!(domain, Domain::Data | Domain::ReceiverToPublisher),
+        // ERR UNBOUND, and any kind this profile does not name.
+        _ => false,
+    }
 }
 
 /// Datagrams one control queue holds: controls are sent at once.
@@ -781,6 +836,7 @@ impl ControlRoutes {
                 authority: Authority::FIRST,
                 route,
                 max_pending: NonZeroU16::new(CONTROL_QUEUE_DEPTH).unwrap_or(NonZeroU16::MIN),
+                etf: None,
             })
             .map_err(|error| {
                 if super::data::fanout::queue_limit(error) {
@@ -903,6 +959,31 @@ impl ControlRoutes {
         }
     }
 
+    /// [`ControlRoutes::send`] of a control on an authenticated channel:
+    /// sealed by `seal` in the domain its kind belongs to (ADR-0086
+    /// section 7a), encoded and sealed afresh at the send, so every
+    /// transmission takes a fresh envelope sequence. A sealed control never
+    /// waits for a later cycle; while another control to `address` waits
+    /// it is refused `Blocked`, and one that cannot be sealed is refused
+    /// `Encode` without anything being queued.
+    ///
+    /// # Errors
+    ///
+    /// As [`ControlRoutes::send`].
+    pub fn send_sealed<O: SocketOps>(
+        &mut self,
+        tx: &mut SocketsTx<O>,
+        address: SocketAddr,
+        control: &Control,
+        seal: &mut dyn ControlSeal,
+    ) -> Result<(), ControlSendError> {
+        self.send_waiting(tx);
+        if self.waiting.iter().any(|(at, _)| *at == address) {
+            return Err(ControlSendError::Blocked);
+        }
+        self.send_encoded(tx, address, control, false, Some(seal))
+    }
+
     fn send_now<O: SocketOps>(
         &mut self,
         tx: &mut SocketsTx<O>,
@@ -910,10 +991,32 @@ impl ControlRoutes {
         control: &Control,
         transient: bool,
     ) -> Result<(), ControlSendError> {
-        let mut bytes = [0u8; MAX_CONTROL_LENGTH];
-        let length = control
-            .encode(&mut bytes)
+        self.send_encoded(tx, address, control, transient, None)
+    }
+
+    fn send_encoded<O: SocketOps>(
+        &mut self,
+        tx: &mut SocketsTx<O>,
+        address: SocketAddr,
+        control: &Control,
+        transient: bool,
+        seal: Option<&mut dyn ControlSeal>,
+    ) -> Result<(), ControlSendError> {
+        let mut bytes = [0u8; MAX_CONTROL_LENGTH + ENVELOPE_LEN];
+        let plain = bytes
+            .get_mut(..MAX_CONTROL_LENGTH)
+            .ok_or(ControlSendError::Encode)?;
+        let mut length = control
+            .encode(plain)
             .map_err(|_| ControlSendError::Encode)?;
+        if let Some(seal) = seal {
+            if !sealable_in(control, seal.domain()) {
+                return Err(ControlSendError::Encode);
+            }
+            length = seal
+                .seal_control(&mut bytes, length)
+                .ok_or(ControlSendError::Encode)?;
+        }
         let encoded = bytes.get(..length).ok_or(ControlSendError::Encode)?;
         // A reply that reuses a destination's own route (karyos#977
         // review): failing, it must not take that route with it.

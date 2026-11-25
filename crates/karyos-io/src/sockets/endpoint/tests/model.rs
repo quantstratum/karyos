@@ -189,6 +189,7 @@ fn open_lanes(h: &mut Harness, count: usize, max_pending: u16) -> Vec<Lane> {
                 authority: Authority::FIRST,
                 route: h.route,
                 max_pending: nz(max_pending),
+                etf: None,
             })
             .unwrap();
         lanes.push(Lane::new(queue));
@@ -422,6 +423,7 @@ impl Model {
                 authority: Authority::FIRST,
                 route,
                 max_pending: nz(share),
+                etf: None,
             })
             .unwrap();
         let mut h = Harness {

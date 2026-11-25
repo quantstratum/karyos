@@ -896,6 +896,15 @@ pub enum Observation {
         /// The log's error.
         error: String,
     },
+    /// A server's core led a term for the first time (karyos#691: the
+    /// custom core's trace checking sees every election, not only those
+    /// whose leader commits).
+    Leading {
+        /// The server.
+        node: NodeId,
+        /// The term it leads.
+        term: u64,
+    },
     /// A server's commit index moved.
     Commit {
         /// The server.
@@ -1058,6 +1067,21 @@ pub enum Observation {
     /// The harness healed every link ([`super::workloads::Action::Heal`]):
     /// a mark in the order of observations.
     Healed,
+    /// A leader-relative trigger of a case acted, at harness step `at`
+    /// ([`super::workloads::LostReply`], C5 version 2's W5 retry).
+    Triggered {
+        /// The trigger: `"cut"`, `"lost"`, `"crash"`, `"restart"`, or
+        /// `"deadline"` when the deadline's step ended.
+        what: &'static str,
+        /// The server it acted on, the leader `L`.
+        node: NodeId,
+        /// The client concerned.
+        client: NodeId,
+        /// The step.
+        at: u64,
+        /// For `"lost"`: the request `R`, as (index, term, sequence).
+        request: Option<(u64, u64, u64)>,
+    },
     /// A server took a snapshot of its service and compacted its log
     /// below `first` (W5): what it dropped, the snapshot holds.
     Compacted {
@@ -1289,6 +1313,8 @@ pub struct ServerNode<C: ConsensusCore> {
     /// Requests this server took, by client and sequence: it answers them.
     pending: BTreeSet<(NodeId, u64)>,
     commit: Option<u64>,
+    /// The highest term its core was seen to lead ([`Observation::Leading`]).
+    led: Option<u64>,
     /// The configuration last recorded.
     configuration: Option<Configuration>,
     /// Why the disk cannot come back, when its crash could not be taken.
@@ -1453,6 +1479,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             service: TestService::default(),
             pending: BTreeSet::new(),
             commit,
+            led: None,
             configuration: None,
             lost: None,
             recorder,
@@ -1502,6 +1529,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             service: TestService::default(),
             pending: BTreeSet::new(),
             commit: None,
+            led: None,
             configuration: None,
             lost: None,
             recorder,
@@ -1553,7 +1581,33 @@ impl<C: ConsensusCore> ServerNode<C> {
 
     /// The service section of `store`'s latest snapshot, and its base.
     fn latest_service(store: &SnapshotStore<SimDisk>) -> Option<(SnapshotBase, Vec<u8>)> {
-        let info = store.latest()?;
+        Self::service_of(store, store.latest()?)
+    }
+
+    /// The snapshot a restarted node stands on: the newest the log's
+    /// commit reaches (compacted below it, or installed at it). One past
+    /// the commit is staged, an install a crash or a refusal cut short:
+    /// the log does not stand on it, and its service state is not yet the
+    /// node's (karyos#682).
+    fn active_service(
+        store: &SnapshotStore<SimDisk>,
+        commit: Option<u64>,
+    ) -> Option<(SnapshotBase, Vec<u8>)> {
+        let commit = commit?;
+        let info = store
+            .snapshots()
+            .iter()
+            .rev()
+            .find(|info| info.index <= commit)
+            .copied()?;
+        Self::service_of(store, info)
+    }
+
+    /// The service section of snapshot `info`, and its base.
+    fn service_of(
+        store: &SnapshotStore<SimDisk>,
+        info: karyos_cluster::snapshot::SnapshotInfo,
+    ) -> Option<(SnapshotBase, Vec<u8>)> {
         let sections = store.read(&info).ok()?;
         let service = sections
             .into_iter()
@@ -1680,15 +1734,22 @@ impl<C: ConsensusCore> ServerNode<C> {
         let Some(store) = self.snapshots.as_mut() else {
             return refuse(self, "no snapshot store".to_owned());
         };
-        if let Err(error) = store.write(
-            base.index,
-            base.term,
-            &[Section::new(
-                SectionKind::Service,
-                SERVICE_SECTION_VERSION,
-                &bytes,
-            )],
-        ) {
+        // A retry of an install a refusal or a crash cut short finds the
+        // snapshot staged: verified, it is reused, not written again.
+        let staged = store.latest().is_some_and(|info| {
+            info.index == base.index && info.term == base.term && store.verify(&info).is_ok()
+        });
+        if !staged
+            && let Err(error) = store.write(
+                base.index,
+                base.term,
+                &[Section::new(
+                    SectionKind::Service,
+                    SERVICE_SECTION_VERSION,
+                    &bytes,
+                )],
+            )
+        {
             return refuse(self, format!("write: {error}"));
         }
         if let Err(error) = log.install(base.index, base.term, store) {
@@ -2002,6 +2063,13 @@ impl<C: ConsensusCore> ServerNode<C> {
             let entry_term = configuration.index.and_then(|index| log.term(index));
             self.record_configuration(configuration, entry_term);
         }
+        if core.leads() && self.led < Some(core.term()) {
+            self.led = Some(core.term());
+            self.observe(Observation::Leading {
+                node,
+                term: core.term(),
+            });
+        }
         let committed = core.committed();
         if committed > self.commit
             && let Some(index) = committed
@@ -2072,8 +2140,6 @@ impl<C: ConsensusCore> ServerNode<C> {
                 }
             }
         }
-        let latest = self.snapshots.as_ref().and_then(Self::latest_service);
-        self.base = latest.as_ref().map(|(base, _)| *base);
         let opened = RaftLog::open_with(
             self.disk.clone(),
             Path::new(LOG_DIR),
@@ -2090,6 +2156,12 @@ impl<C: ConsensusCore> ServerNode<C> {
                 return;
             }
         };
+        let commit = log.hard_state().and_then(|state| state.commit);
+        let latest = self
+            .snapshots
+            .as_ref()
+            .and_then(|store| Self::active_service(store, commit));
+        self.base = latest.as_ref().map(|(base, _)| *base);
         let first = log.first_index();
         let entries: Vec<(u64, u64)> = log
             .last_index()

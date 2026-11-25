@@ -548,14 +548,20 @@ impl<R: RingOps> UringTx<R> {
     ///
     /// # Errors
     ///
-    /// `NotActive`, `RouteUnknown`, then the ledger's `QueueLimit`,
-    /// `OverCommitted` and `IdentityExhausted`.
+    /// `NotActive`, `RouteUnknown`, `EtfUnavailable` for an etf queue (the
+    /// `etf` route is the sockets backend's, ADR-0109 point 2), then the
+    /// ledger's `QueueLimit`, `OverCommitted` and `IdentityExhausted`.
     pub fn open_queue(&mut self, config: TxQueueConfig) -> Result<TxQueueId, QueueError> {
         if self.state != State::Active {
             return Err(QueueError::NotActive);
         }
         if self.routes.get(config.route).is_none() {
             return Err(QueueError::RouteUnknown);
+        }
+        if config.etf.is_some() {
+            return Err(QueueError::EtfUnavailable {
+                reason: crate::backend::Reason::Platform,
+            });
         }
         let id = self.ledger.open_queue(config)?;
         match self.runs.get_mut(usize::from(id.index())) {
@@ -935,6 +941,7 @@ impl<R: RingOps> UringTx<R> {
             token: meta.token,
             len: meta.len,
             outcome,
+            late: false,
         })
     }
 
