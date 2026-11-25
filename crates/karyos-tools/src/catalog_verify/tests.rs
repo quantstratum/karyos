@@ -592,6 +592,7 @@ fn each_trust_file_error_is_typed_with_its_line() {
 fn run_checks_errors_keep_their_path_and_source() {
     let archive = archive("typed-errors");
     let args = |trust: Option<PathBuf>, anchors: Vec<([u8; 32], PathBuf)>| VerifyArgs {
+        recording: None,
         dir: archive.dir(),
         trust,
         anchors,
@@ -928,6 +929,137 @@ fn sign_time_evidence(archive: &Archive, entries: &Path, journal_id: u64) {
         ),
     )
     .unwrap();
+}
+
+/// A whole data frame of trace stream `message`, aligned.
+fn trace_frame(message: &karyos_trace::stream::StreamMessage) -> Vec<u8> {
+    use karyos_sys::frame::{FRAME_ALIGNMENT, Flags, FrameType, HEADER_LENGTH, Lane, Word0};
+    let mut payload = [0u8; karyos_trace::stream::MAX_MESSAGE_BYTES];
+    let length = message.encode(&mut payload).unwrap();
+    let frame = HEADER_LENGTH as usize + length;
+    let word0 = Word0::new(
+        i32::try_from(frame).unwrap(),
+        Flags::new(true, true, false, false, Lane::ZERO),
+        FrameType::Data,
+    );
+    let mut bytes = vec![0u8; HEADER_LENGTH as usize];
+    bytes[..8].copy_from_slice(&word0.pack().to_le_bytes());
+    bytes.extend_from_slice(&payload[..length]);
+    bytes.resize(frame.next_multiple_of(FRAME_ALIGNMENT as usize), 0);
+    bytes
+}
+
+/// ADR-0117 point 5 and 10: a trace recording (recording 7, its first
+/// message the self message) holding a loss message reports the loss
+/// beside its verdict, which is never `met`; `--recording` reports one
+/// recording alone and needs a requirement.
+#[test]
+fn verify_reports_a_trace_recordings_losses_and_one_recording_alone() {
+    use karyos_archive::integrity::time::{Source, SyncState};
+    use karyos_archive::integrity::time_evidence::{Entry, EntryStore, NO_BOUND, entries_dir};
+    use karyos_trace::stream::{DriverSelf, StreamLoss, StreamMessage};
+
+    let root = std::env::temp_dir().join(format!("karyos-verify-trace-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let archive = Archive { root };
+    let dir = archive.dir();
+    std::fs::create_dir_all(entries_dir(&dir)).unwrap();
+    std::fs::create_dir_all(archive.anchors()).unwrap();
+    let mut bytes = trace_frame(&StreamMessage::DriverSelf(DriverSelf {
+        namespace: 1,
+        namespace_inode: 9,
+        clock: [0, 0, 0, 5, 77],
+        granularity: 1000,
+    }));
+    bytes.extend(trace_frame(&StreamMessage::Loss(StreamLoss {
+        journal: 7,
+        first: 3,
+        last: 4,
+    })));
+    let length = bytes.len() as u64;
+    let mut recording = SegmentStore::create(
+        StdDisk,
+        &dir,
+        7,
+        Geometry::new(4096, 8192).unwrap(),
+        SyncPolicy::None,
+        0,
+    )
+    .unwrap();
+    recording.append(0, &bytes).unwrap();
+    recording.sync().unwrap();
+    drop(recording);
+    let mut sealed = open_journal(&dir);
+    sealed.seal_segment(7, 0, &bytes, false).unwrap();
+    drop(sealed);
+    // One entry of the met kind covers the whole range: only the loss
+    // keeps the verdict from `met`.
+    let met = Entry {
+        source: Source::Gnss,
+        sync_state: SyncState::Synchronised,
+        clock: [0, 0, 0, 5, 77],
+        recording: 7,
+        start: 0,
+        end: length,
+        min_time: 1000,
+        max_time: 2000,
+        granularity: 1,
+        bound_min_ns: 150,
+        bound_max_ns: 160,
+        calibration: [0xAA; 32],
+        utc_reference: [0xBB; 32],
+        tick_fs: 1_000_000,
+    };
+    assert_ne!(met.bound_max_ns, NO_BOUND);
+    let mut store = EntryStore::open(StdDisk, &dir).unwrap();
+    store.append(&met).unwrap();
+    drop(store);
+    sign_time_evidence(&archive, &entries_dir(&dir), 1);
+    let (_, out, err) = time_run(&archive, &["--time-requirement", "1000:1"]);
+    assert_eq!(err, "", "{out}");
+    assert!(
+        out.contains(&format!("time recording 7 [0, {length}) clock 5:77 met")),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "time recording 7 [0, {length}) loss journal 7 sequences [3, 4] no_evidence"
+        )),
+        "{out}"
+    );
+    assert!(
+        out.ends_with("time verdict: no_evidence (capture incomplete: 1 losses)\n"),
+        "{out}"
+    );
+    let (_, out, _) = time_run(&archive, &["--time-requirement", "1000:1", "--json"]);
+    assert!(
+        out.contains(&format!(
+            "\"losses\":[{{\"recording\":7,\"start\":0,\"end\":{length},\"journal\":7,\"first\":3,\"last\":4}}]"
+        )),
+        "{out}"
+    );
+    // Another recording alone: nothing of 7's, so no evidence and no loss.
+    let (_, out, _) = time_run(
+        &archive,
+        &["--time-requirement", "1000:1", "--recording", "8"],
+    );
+    assert!(!out.contains("time recording 7"), "{out}");
+    assert!(out.ends_with("time verdict: no_evidence\n"), "{out}");
+    let (_, out, _) = time_run(
+        &archive,
+        &["--time-requirement", "1000:1", "--recording", "7"],
+    );
+    assert!(out.contains("loss journal 7"), "{out}");
+    assert_eq!(
+        usage(&["d", "--recording", "7"]),
+        UsageError::RecordingNeedsRequirement
+    );
+    for bad in ["0", "x"] {
+        assert_eq!(
+            usage(&["d", "--recording", bad, "--time-requirement", "1:1"]),
+            UsageError::Recording
+        );
+    }
 }
 
 fn time_run(archive: &Archive, extra: &[&str]) -> (u8, String, String) {

@@ -192,6 +192,14 @@ Archive:
                                     add this stream, publish the driver's trace mirror on it
                                     and record it at boot, required (ADR-0117); not a
                                     --stream; needs --archive
+  --archive-trace-clock <domain>:boot:<granularity-ns>
+                                    declare the trace recording's clock, CLOCK_MONOTONIC of
+                                    this boot and time namespace, so its observations get
+                                    time evidence (ADR-0117): the clock [0,0,0,domain,epoch],
+                                    the epoch derived from the boot id and the time
+                                    namespace (a literal epoch is refused); needs
+                                    --archive-trace-record, --archive-time-evidence and
+                                    --archive-calibration-journal
   --trace-network                   set the driver's network trace hooks, so network trace
                                     journals are mirrored (and recorded); needs --network on
 
@@ -428,7 +436,30 @@ pub struct TraceRecordOption {
     pub stream_id: i32,
     /// Its session alias.
     pub session_id: i32,
+    /// The clock its observations are declared in
+    /// (`--archive-trace-clock`), for time evidence; `None` declares
+    /// none, and the recording gets no entries.
+    pub clock: Option<TraceClockOption>,
+    /// How long a sealed range of it waits for the calibration journal
+    /// (`--archive-calibration-wait`), at a stop too.
+    pub calibration_wait: Duration,
 }
+
+/// The trace recording's declared clock (`--archive-trace-clock
+/// <domain>:boot:<granularity-ns>`, ADR-0117 point 2): the host's
+/// `CLOCK_MONOTONIC` in this boot and time namespace, whose epoch the
+/// daemon derives at start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceClockOption {
+    /// The clock's domain word.
+    pub domain: u64,
+    /// Its granularity, in ns, at least 1: an observation whose own
+    /// uncertainty is larger is out of session.
+    pub granularity: u64,
+}
+
+/// The default `--archive-calibration-wait`: 10 s.
+pub const DEFAULT_ARCHIVE_CALIBRATION_WAIT: Duration = Duration::from_secs(10);
 
 /// The head signer of an Archive (`--archive-signer`,
 /// `--archive-signer-key`, `--archive-trust`).
@@ -730,6 +761,9 @@ where
             "--archive-trace-record" => trace_record(&value).map(|trace| {
                 archive.trace = Some(trace);
             }),
+            "--archive-trace-clock" => trace_clock(&value).map(|clock| {
+                archive.trace_clock = Some(clock);
+            }),
             "--replica" => replica(&value).map(|replica| archive.replicas.push(replica)),
             "--replicate" => {
                 replicate(&value).map(|replicate| archive.replications.push(replicate))
@@ -949,6 +983,7 @@ const OPTIONS: &[&str] = &[
     "--archive-copy-location",
     "--archive-calibration-journal",
     "--archive-trace-record",
+    "--archive-trace-clock",
     "--archive-retain-for",
     "--archive-purge",
     "--archive-min-copies",
@@ -1372,6 +1407,7 @@ struct Archive {
     replicas: Vec<ReplicaOption>,
     trusted_network: bool,
     trace: Option<TraceRecordOption>,
+    trace_clock: Option<TraceClockOption>,
 }
 
 impl Archive {
@@ -1406,6 +1442,7 @@ impl Archive {
                 (!self.replicas.is_empty(), "--replica"),
                 (self.trusted_network, "--replication-trusted-network"),
                 (self.trace.is_some(), "--archive-trace-record"),
+                (self.trace_clock.is_some(), "--archive-trace-clock"),
             ] {
                 if given {
                     return Err(ArgsError::Needs {
@@ -1451,6 +1488,29 @@ impl Archive {
                 needs: "--archive-copy-location",
             });
         }
+        // The trace clock's evidence needs its recording, the store and
+        // the calibration journal (ADR-0117, point 8).
+        if self.trace_clock.is_some() {
+            for (given, needs) in [
+                (self.trace.is_some(), "--archive-trace-record"),
+                (self.time_evidence, "--archive-time-evidence"),
+                (
+                    self.calibration_journal.is_some(),
+                    "--archive-calibration-journal",
+                ),
+            ] {
+                if !given {
+                    return Err(ArgsError::Needs {
+                        option: "--archive-trace-clock",
+                        needs,
+                    });
+                }
+            }
+        }
+        let trace = self.trace.map(|trace| TraceRecordOption {
+            clock: self.trace_clock,
+            ..trace
+        });
         let (requests, responses, retention_responses) = self.control.ok_or(ArgsError::Needs {
             option: "--archive",
             needs: "--archive-control",
@@ -1512,7 +1572,7 @@ impl Archive {
             replications: self.replications,
             replicas: self.replicas,
             trusted_network: self.trusted_network,
-            trace: self.trace,
+            trace,
         }))
     }
 }
@@ -1523,6 +1583,26 @@ fn trace_record(value: &str) -> Option<TraceRecordOption> {
     Some(TraceRecordOption {
         stream_id: stream_id.parse().ok()?,
         session_id: session_id.parse().ok()?,
+        clock: None,
+        calibration_wait: DEFAULT_ARCHIVE_CALIBRATION_WAIT,
+    })
+}
+
+/// `<domain>:boot:<granularity-ns>`: the trace clock. The epoch is always
+/// derived (`boot`), never given; a granularity of 0 states none.
+fn trace_clock(value: &str) -> Option<TraceClockOption> {
+    let mut parts = value.split(':');
+    let domain = parts.next()?.parse().ok()?;
+    if parts.next()? != "boot" {
+        return None;
+    }
+    let granularity = parts.next()?.parse().ok().filter(|ns| *ns > 0)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(TraceClockOption {
+        domain,
+        granularity,
     })
 }
 
@@ -1700,6 +1780,74 @@ mod tests {
             Some(TraceRecordOption {
                 stream_id: 40,
                 session_id: 3,
+                clock: None,
+                calibration_wait: DEFAULT_ARCHIVE_CALIBRATION_WAIT,
+            })
+        );
+        // ADR-0117 point 8: the clock needs the recording, the store and
+        // the calibration journal; a literal epoch is refused.
+        let evidence = [
+            "--archive-trace-record",
+            "40:3",
+            "--archive-time-evidence",
+            "--archive-calibration-journal",
+            "j",
+        ];
+        let parsed = options(
+            &[
+                &archive[..],
+                &evidence[..],
+                &["--archive-trace-clock", "5:boot:1000"],
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            parsed.archive.unwrap().trace.unwrap().clock,
+            Some(TraceClockOption {
+                domain: 5,
+                granularity: 1000,
+            })
+        );
+        for value in ["5:77:1000", "5:boot:0", "5:boot", "5:boot:1:2", "x:boot:1"] {
+            assert_eq!(
+                run(&[
+                    &archive[..],
+                    &evidence[..],
+                    &["--archive-trace-clock", value]
+                ]
+                .concat()),
+                Err(ArgsError::InvalidValue {
+                    option: "--archive-trace-clock",
+                    value: value.into(),
+                })
+            );
+        }
+        for (index, needs) in [
+            (0, "--archive-trace-record"),
+            (2, "--archive-time-evidence"),
+            (3, "--archive-calibration-journal"),
+        ] {
+            let mut given: Vec<&str> = evidence.to_vec();
+            given.drain(index..if index == 2 { 3 } else { index + 2 });
+            assert_eq!(
+                run(&[
+                    &archive[..],
+                    &given[..],
+                    &["--archive-trace-clock", "5:boot:1000"]
+                ]
+                .concat()),
+                Err(ArgsError::Needs {
+                    option: "--archive-trace-clock",
+                    needs,
+                }),
+                "{given:?}"
+            );
+        }
+        assert_eq!(
+            run(&["--dir", "d", "--archive-trace-clock", "5:boot:1000"]),
+            Err(ArgsError::Needs {
+                option: "--archive-trace-clock",
+                needs: "--archive",
             })
         );
         assert_eq!(options(&archive).archive.unwrap().trace, None);

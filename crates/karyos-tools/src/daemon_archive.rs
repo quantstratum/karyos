@@ -571,6 +571,9 @@ impl DaemonArchive {
         };
         let mut control = vec![requests, responses];
         control.extend(retention_stream);
+        // The trace clock's epoch, derived at start: refused when the boot
+        // or namespace identity is unreadable (ADR-0117, point 3).
+        let declared = declared_trace_clock(options)?;
         let trace_stream = match &options.trace {
             Some(trace) => Some(
                 driver
@@ -633,7 +636,7 @@ impl DaemonArchive {
         let trace = match trace_stream {
             Some(stream) => {
                 control.push(stream);
-                let own = trace_self(options)?;
+                let own = trace_self(options, declared.as_ref())?;
                 let publication = driver.publication(stream).map_err(handle)?;
                 Some(TracePublisher::new(publication, driver.trace_mirror(), own))
             }
@@ -663,6 +666,21 @@ impl DaemonArchive {
             agent
                 .set_calibration_source(source)
                 .map_err(|error| ArchiveStartError::Agent(format!("{error:?}")))?;
+        }
+        // The trace recording the boot recordings start is declared
+        // before it is asked for (ADR-0117, point 9: one per run).
+        if let (Some(trace), Some(clock)) = (&options.trace, declared) {
+            agent
+                .declare_trace_recording(karyos_archive::agent::TraceRecording::new(
+                    trace.stream_id,
+                    trace.session_id,
+                    b"karyos:ipc".to_vec(),
+                    clock,
+                    trace.calibration_wait,
+                ))
+                .map_err(|error| {
+                    ArchiveStartError::Agent(format!("--archive-trace-clock: {error}"))
+                })?;
         }
         let host = DaemonHost {
             inner: DriverHost::new(driver),
@@ -850,23 +868,63 @@ impl DaemonArchive {
 /// The trace stream's self message (ADR-0117, point 1): the namespace word
 /// the driver writes for a journal in its own time namespace (T2's
 /// [`TimeNamespace::Same`]), the namespace's inode when readable, and the
-/// clock the trace recording declares (none yet: all zero).
+/// clock the trace recording declares (all zero when none).
 ///
 /// [`TimeNamespace::Same`]: karyos_sys::trace_mirror::TimeNamespace::Same
 ///
 /// # Errors
 ///
-/// None yet; the declared clock's derivation may refuse.
+/// None: the declared clock was derived before.
 fn trace_self(
     _options: &ArchiveOptions,
+    declared: Option<&karyos_archive::integrity::time_producer::EventClock>,
 ) -> Result<karyos_trace::stream::DriverSelf, ArchiveStartError> {
     let namespace_inode = karyos_sys::host_clock::time_identity().map_or(0, |(_, inode)| inode);
     Ok(karyos_trace::stream::DriverSelf {
         namespace: karyos_sys::trace_mirror::TimeNamespace::Same.code(),
         namespace_inode,
-        clock: [0; 5],
-        granularity: 0,
+        clock: declared.map_or([0; 5], |declared| declared.clock),
+        granularity: declared.map_or(0, |declared| declared.granularity),
     })
+}
+
+/// The trace recording's declared clock (`--archive-trace-clock`,
+/// ADR-0117 points 2 and 3): `[0, 0, 0, domain, epoch]`, the epoch
+/// [`boot_epoch`] of this process's boot and time namespace, the same
+/// derivation `karyos-tools calibrate --epoch boot` makes; `None` without
+/// the option.
+///
+/// [`boot_epoch`]: karyos_archive::integrity::time_producer::boot_epoch
+///
+/// # Errors
+///
+/// [`ArchiveStartError::Agent`] when the boot id or the time namespace
+/// cannot be read: the option is refused at start.
+fn declared_trace_clock(
+    options: &ArchiveOptions,
+) -> Result<Option<karyos_archive::integrity::time_producer::EventClock>, ArchiveStartError> {
+    declared_trace_clock_of(options, karyos_sys::host_clock::time_identity())
+}
+
+/// [`declared_trace_clock`] from `identity`, the boot id and time
+/// namespace inode as read.
+fn declared_trace_clock_of(
+    options: &ArchiveOptions,
+    identity: std::io::Result<([u8; 36], u64)>,
+) -> Result<Option<karyos_archive::integrity::time_producer::EventClock>, ArchiveStartError> {
+    let Some(clock) = options.trace.and_then(|trace| trace.clock) else {
+        return Ok(None);
+    };
+    let (boot, namespace) = identity.map_err(|error| {
+        ArchiveStartError::Agent(format!(
+            "--archive-trace-clock: the boot id or the time namespace is unreadable: {error}"
+        ))
+    })?;
+    let epoch = karyos_archive::integrity::time_producer::boot_epoch(&boot, namespace);
+    Ok(Some(karyos_archive::integrity::time_producer::EventClock {
+        clock: [0, 0, 0, clock.domain, epoch],
+        granularity: clock.granularity,
+    }))
 }
 
 /// A control stream's configuration from the daemon's term settings.
@@ -986,6 +1044,62 @@ mod tests {
         drop(room);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&archive);
+    }
+
+    /// ADR-0117 point 3: the trace clock's epoch is the boot and
+    /// namespace's; an unreadable identity refuses the option at start,
+    /// and without the option nothing is read.
+    #[test]
+    fn the_trace_clock_is_refused_when_the_identity_is_unreadable() {
+        let mut archive = crate::args::ArchiveOptions {
+            dir: "a".into(),
+            requests: 1,
+            responses: 2,
+            retention_responses: None,
+            records: Vec::new(),
+            min_free: 0,
+            seal_interval: crate::args::DEFAULT_ARCHIVE_SEAL_INTERVAL,
+            anchor_interval: std::time::Duration::from_secs(1),
+            signer: None,
+            copy_location: None,
+            retention: None,
+            time_evidence: true,
+            calibration_journal: Some("j".into()),
+            replications: Vec::new(),
+            replicas: Vec::new(),
+            trusted_network: false,
+            trace: None,
+        };
+        let unreadable = || Err(std::io::ErrorKind::NotFound.into());
+        assert_eq!(declared_trace_clock_of(&archive, unreadable()), Ok(None));
+        archive.trace = Some(crate::args::TraceRecordOption {
+            stream_id: 40,
+            session_id: 1,
+            clock: Some(crate::args::TraceClockOption {
+                domain: 5,
+                granularity: 1000,
+            }),
+            calibration_wait: std::time::Duration::ZERO,
+        });
+        let Err(ArchiveStartError::Agent(why)) = declared_trace_clock_of(&archive, unreadable())
+        else {
+            panic!("an unreadable identity was accepted");
+        };
+        assert!(why.contains("unreadable"), "{why}");
+        let boot = *b"0e0b5b5e-2d0d-4d4e-9c3a-6b1f5e8a7c21";
+        let clock = |inode| {
+            declared_trace_clock_of(&archive, Ok((boot, inode)))
+                .unwrap()
+                .unwrap()
+        };
+        let [.., domain, epoch] = clock(1).clock;
+        assert_eq!(domain, 5);
+        assert_eq!(
+            epoch,
+            karyos_archive::integrity::time_producer::boot_epoch(&boot, 1)
+        );
+        assert_ne!(clock(1).clock, clock(2).clock);
+        assert_eq!(clock(1).granularity, 1000);
     }
 
     /// An unreadable archive directory refuses the recording, never

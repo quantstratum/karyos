@@ -190,7 +190,11 @@ impl StreamMessage {
             Self::Record(record) => record.journal != 0,
             Self::Loss(loss) => loss.first <= loss.last,
         };
-        if valid { Ok(()) } else { Err(StreamError::Field) }
+        if valid {
+            Ok(())
+        } else {
+            Err(StreamError::Field)
+        }
     }
 
     /// Encodes the message into `out`; returns its length.
@@ -202,24 +206,21 @@ impl StreamMessage {
         self.check()?;
         let length = self.length();
         let have = out.len();
-        let out = out.get_mut(..length).ok_or(StreamError::Short {
-            need: length,
-            have,
-        })?;
+        let out = out
+            .get_mut(..length)
+            .ok_or(StreamError::Short { need: length, have })?;
         let mut put = |words: &mut dyn Iterator<Item = u64>| {
             for (chunk, word) in out.as_chunks_mut::<8>().0.iter_mut().zip(words) {
                 *chunk = word.to_le_bytes();
             }
         };
         match self {
-            Self::DriverSelf(own) => put(&mut [
-                header(KIND_SELF),
-                own.namespace,
-                own.namespace_inode,
-            ]
-            .into_iter()
-            .chain(own.clock)
-            .chain([own.granularity])),
+            Self::DriverSelf(own) => {
+                put(&mut [header(KIND_SELF), own.namespace, own.namespace_inode]
+                    .into_iter()
+                    .chain(own.clock)
+                    .chain([own.granularity]))
+            }
             Self::Facts(facts) => put(&mut [
                 header(KIND_FACTS),
                 facts.journal,
@@ -237,8 +238,9 @@ impl StreamMessage {
             ]
             .into_iter()
             .chain(record.words)),
-            Self::Loss(loss) => put(&mut [header(KIND_LOSS), loss.journal, loss.first, loss.last]
-                .into_iter()),
+            Self::Loss(loss) => {
+                put(&mut [header(KIND_LOSS), loss.journal, loss.first, loss.last].into_iter())
+            }
         }
         Ok(length)
     }
@@ -256,7 +258,11 @@ impl StreamMessage {
                 length: bytes.len(),
             });
         }
-        let word = |index: usize| chunks.get(index).map_or(0, |chunk| u64::from_le_bytes(*chunk));
+        let word = |index: usize| {
+            chunks
+                .get(index)
+                .map_or(0, |chunk| u64::from_le_bytes(*chunk))
+        };
         let head = word(0);
         let kind = head >> 40 & 0xFF;
         if head & 0xFFFF_FFFF != u64::from(STREAM_MAGIC)

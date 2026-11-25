@@ -30,12 +30,7 @@ struct Mirror {
 }
 
 impl MirrorSource for Mirror {
-    fn scan(
-        &mut self,
-        cursor: &mut u64,
-        max: u64,
-        deliver: &mut dyn FnMut(u64, u64, Option<&[u64; RECORD_WORDS]>),
-    ) -> u64 {
+    fn scan(&mut self, cursor: &mut u64, max: u64, deliver: &mut Deliver<'_>) -> u64 {
         let overwritten = self.oldest.saturating_sub(*cursor);
         *cursor = (*cursor).max(self.oldest);
         let end = self.oldest + self.ring.len() as u64;

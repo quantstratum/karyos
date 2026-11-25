@@ -285,6 +285,54 @@ impl GroupTimeEvidence {
     }
 }
 
+/// A trace recording (ADR-0117): the recording of `stream_id`,
+/// `session_id` on `channel` that the agent next starts is the host's
+/// trace stream ([`karyos_trace::stream`]), its observations of the
+/// declared `clock`. After each seal of it, the agent walks the sealed
+/// range's messages, folds each in-session record into an event at its
+/// position with its observation time (an interval of the clock's
+/// granularity each side), and produces its entries into the Archive's own
+/// `time-evidence/` store under the recording's id, waiting at most
+/// `calibration_wait` for the calibration journal to reach past a range,
+/// at a stop too. The declaration belongs to this run of the agent: a
+/// recording of an earlier run is never backfilled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TraceRecording {
+    /// The trace stream.
+    pub stream_id: i32,
+    /// Its session.
+    pub session_id: i32,
+    /// Its channel.
+    pub channel: Vec<u8>,
+    /// The declared clock `[0, 0, 0, domain, epoch]` and its granularity;
+    /// the zero tuple is refused ([`AgentError::ZeroEventClock`]).
+    pub clock: crate::integrity::time_producer::EventClock,
+    /// The longest a sealed range waits for the calibration journal.
+    pub calibration_wait: Duration,
+}
+
+impl TraceRecording {
+    /// The trace recording of `stream_id`, `session_id` on `channel`, of
+    /// `clock`, waiting at most `calibration_wait`.
+    #[must_use]
+    pub const fn new(
+        stream_id: i32,
+        session_id: i32,
+        channel: Vec<u8>,
+        clock: crate::integrity::time_producer::EventClock,
+        calibration_wait: Duration,
+    ) -> Self {
+        Self {
+            stream_id,
+            session_id,
+            channel,
+            clock,
+            calibration_wait,
+        }
+    }
+}
+
 impl StartGroup {
     /// Starts group `group_id` from its journal in `dir`: a restart, with
     /// no checkpoints ([`StartGroup::with_new`] makes the group,
@@ -1014,6 +1062,8 @@ enum Command {
         Box<dyn crate::integrity::time_producer::CalibrationSource>,
         Reply<()>,
     ),
+    /// A trace recording's declaration (ADR-0117).
+    TraceRecording(Box<TraceRecording>, Reply<()>),
     Shutdown(Reply<()>),
 }
 
@@ -1134,6 +1184,9 @@ impl core::fmt::Debug for Command {
             Self::TimeEvidence(entry, _) => f.debug_tuple("TimeEvidence").field(entry).finish(),
             Self::CalibrationSource(source, _) => {
                 f.debug_tuple("CalibrationSource").field(source).finish()
+            }
+            Self::TraceRecording(declared, _) => {
+                f.debug_tuple("TraceRecording").field(declared).finish()
             }
             Self::Shutdown(_) => f.write_str("Shutdown"),
         }
@@ -1445,6 +1498,21 @@ impl ArchiveHandle {
         source: Box<dyn crate::integrity::time_producer::CalibrationSource>,
     ) -> Result<(), AgentError> {
         self.call(|reply| Command::CalibrationSource(source, reply))
+    }
+
+    /// Declares the trace recording the agent starts next (ADR-0117), the
+    /// next start of its stream, session and channel; replaces an earlier
+    /// declaration not yet taken. Its entries go to the Archive's own
+    /// store, signed by its head signer like every other entry there.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::ZeroEventClock`]; [`AgentError::NoTimeEvidence`]
+    /// without an integrity journal or a `time-evidence/` store;
+    /// [`AgentError::NoTimeEvidenceJournal`] when the head signing names
+    /// no journal for the entries; and [`AgentError::Gone`].
+    pub fn declare_trace_recording(&self, declared: TraceRecording) -> Result<(), AgentError> {
+        self.call(|reply| Command::TraceRecording(Box::new(declared), reply))
     }
 
     /// [`ArchiveHandle::stop`], posted.
@@ -1827,6 +1895,23 @@ struct Active<D: Disk> {
     /// What it reads: a recording of a local stream answers its key's
     /// word before one of an image of the same key.
     origin: RecordedFrom,
+    /// Its time evidence, when it is the declared trace recording
+    /// (ADR-0117); `None` once production failed.
+    trace: Option<TraceProduction>,
+}
+
+/// A trace recording's time evidence production (ADR-0117, point 5).
+#[derive(Debug)]
+struct TraceProduction {
+    declared: TraceRecording,
+    /// The messages read so far, from the recording's start.
+    session: crate::integrity::trace_evidence::TraceSession,
+    /// The position entries are produced from: every range before it has
+    /// its entries.
+    next: u64,
+    /// The batch waiting for the calibrations: its end, pinned when it
+    /// began waiting, and when that was.
+    pending: Option<(u64, u64)>,
 }
 
 /// Clears a recording's word when the recording leaves the active set.
@@ -2209,6 +2294,7 @@ fn run<D>(
         replication_records: Vec::with_capacity(REPLICATION_QUEUE),
         replication_out: Vec::with_capacity(REPLICATION_QUEUE),
         calibrations: None,
+        trace_declared: None,
     };
     // Before the first command: a purge a crash cut short is completed or
     // cancelled before any retry reaches it (karyos#1121 review).
@@ -2290,6 +2376,8 @@ struct State<D: Disk> {
     /// Where groups' time evidence takes its calibration snapshots
     /// (karyos#1137).
     calibrations: Option<Box<dyn crate::integrity::time_producer::CalibrationSource>>,
+    /// The trace recording declared and not yet started (ADR-0117).
+    trace_declared: Option<TraceRecording>,
     disk: D,
     dir: PathBuf,
     config: AgentConfig,
@@ -3530,6 +3618,20 @@ where
         let before = integrity.journal.head();
         ok &= integrity.seal(&mut self.active, now);
         integrity.failed = !ok;
+        // A trace recording's sealed ranges get their entries (ADR-0117,
+        // point 5): a production failure stops that recording's entries
+        // only, never the seal.
+        for recording in &mut self.active {
+            let _ = produce_trace(
+                integrity,
+                recording.id,
+                &mut recording.recorder,
+                &mut recording.trace,
+                self.calibrations.as_deref_mut(),
+                now,
+                false,
+            );
+        }
         // Signing never fails the integrity work: an unavailable signer
         // leaves heads pending, and anchoring falls behind. A poisoned
         // signer is refused and counted, never skipped silently. The
@@ -3592,6 +3694,7 @@ where
                         self.active.swap_remove(index),
                         &mut self.catalog,
                         self.integrity.as_mut(),
+                        self.calibrations.as_deref_mut(),
                         StopReason::Normal,
                         now,
                     )
@@ -3610,6 +3713,7 @@ where
                                 // sealed; one it cannot serve stays
                                 // unsealed for the verifier.
                                 self.integrity.as_mut(),
+                                self.calibrations.as_deref_mut(),
                                 StopReason::Failed(kind),
                                 now,
                             )
@@ -3654,6 +3758,7 @@ where
                             recording,
                             &mut self.catalog,
                             self.integrity.as_mut(),
+                            self.calibrations.as_deref_mut(),
                             StopReason::Stopped,
                             now,
                         );
@@ -3819,6 +3924,20 @@ where
                 self.calibrations = Some(source);
                 let _ = reply.send(Ok(()));
             }
+            Command::TraceRecording(declared, reply) => {
+                let result = match self.integrity.as_ref() {
+                    _ if declared.clock.clock == [0; 5] => Err(AgentError::ZeroEventClock),
+                    Some(integrity) if integrity.no_time_journal => {
+                        Err(AgentError::NoTimeEvidenceJournal)
+                    }
+                    Some(integrity) if integrity.evidence.is_some() => {
+                        self.trace_declared = Some(*declared);
+                        Ok(())
+                    }
+                    _ => Err(AgentError::NoTimeEvidence),
+                };
+                let _ = reply.send(result);
+            }
             Command::Shutdown(reply) => {
                 let groups = std::mem::take(&mut self.groups);
                 for group in groups {
@@ -3835,6 +3954,7 @@ where
                         recording,
                         &mut self.catalog,
                         self.integrity.as_mut(),
+                        self.calibrations.as_deref_mut(),
                         StopReason::Shutdown,
                         now,
                     ) && first.is_ok()
@@ -4370,6 +4490,21 @@ where
                     word.set(id, position);
                     WordGuard(word)
                 });
+                // The declared trace recording's start takes the
+                // declaration: one per run (ADR-0117, point 9).
+                let trace = self
+                    .trace_declared
+                    .take_if(|declared| {
+                        declared.stream_id == start.stream_id
+                            && declared.session_id == start.session_id
+                            && declared.channel == start.channel
+                    })
+                    .map(|declared| TraceProduction {
+                        declared,
+                        session: crate::integrity::trace_evidence::TraceSession::new(),
+                        next: position,
+                        pending: None,
+                    });
                 self.active.push(Active {
                     id,
                     recorder,
@@ -4378,6 +4513,7 @@ where
                     lane: start.format.lane,
                     word,
                     origin: start.origin,
+                    trace,
                 });
                 Ok(id)
             }
@@ -4516,16 +4652,17 @@ where
 
 /// Closes a recording's store and stops it in the catalog, with the
 /// reason it ended for or else `reason`.
-fn finish<D: Disk>(
+fn finish<D: Disk + Clone>(
     recording: Active<D>,
     catalog: &mut Catalog<D>,
     integrity: Option<&mut Integrity<D>>,
+    calibrations: Option<&mut (dyn crate::integrity::time_producer::CalibrationSource + 'static)>,
     reason: StopReason,
     now: u64,
 ) -> Event {
     let id = recording.id;
     let position = recording.recorder.store().written();
-    match stop(recording, catalog, integrity, reason, now) {
+    match stop(recording, catalog, integrity, calibrations, reason, now) {
         Ok(ended) => Event::Ended { id, ended },
         Err(_) => Event::Failed {
             id,
@@ -4537,10 +4674,13 @@ fn finish<D: Disk>(
 
 /// Closes the store with everything durable, then appends `Stopped` at
 /// the durable position.
-fn stop<D: Disk>(
+fn stop<D: Disk + Clone>(
     recording: Active<D>,
     catalog: &mut Catalog<D>,
     integrity: Option<&mut Integrity<D>>,
+    mut calibrations: Option<
+        &mut (dyn crate::integrity::time_producer::CalibrationSource + 'static),
+    >,
     reason: StopReason,
     now: u64,
 ) -> Result<Ended, AgentError> {
@@ -4548,6 +4688,7 @@ fn stop<D: Disk>(
         id,
         mut recorder,
         word,
+        mut trace,
         ..
     } = recording;
     // Cleared first: a Gateway stops naming the recording before the close
@@ -4558,6 +4699,19 @@ fn stop<D: Disk>(
     if let Some(integrity) = integrity.as_deref_mut() {
         sealed = seal_last(integrity, id, &mut recorder, now);
         integrity.failed = !sealed;
+        // A trace recording's last ranges get their entries after the same
+        // wait (ADR-0117, point 7); past it they are `no_evidence`.
+        while sealed
+            && produce_trace(
+                integrity,
+                id,
+                &mut recorder,
+                &mut trace,
+                calibrations.as_deref_mut(),
+                now,
+                true,
+            )
+        {}
     }
     let start = recorder.store().start();
     // A list that cannot be read is no file list: the copy then records
@@ -4961,6 +5115,132 @@ fn produce_evidence<D: Disk + Clone>(
     evidence.timers = timers;
     evidence.pending = None;
     appended
+}
+
+/// Produces trace recording `id`'s time evidence entries for what the
+/// integrity journal sealed of it since the last (ADR-0117, point 5): the
+/// sealed range's frames read from `recorder`'s store and folded
+/// ([`crate::integrity::trace_evidence::fold`]), the producer run with the
+/// declared clock, each observation the interval of its granularity each
+/// side, and the entries appended to the Archive's own store under the
+/// recording's id, each within the seals ([`admit_time_evidence`]).
+///
+/// A batch's end is pinned when it starts waiting for a calibration
+/// snapshot that reaches past it (point 6), for at most the declared
+/// `calibration_wait`; then it is produced from the last snapshot, its
+/// unproven entries `no_evidence`. With `finish` (a stop, point 7) the
+/// whole sealed rest is one batch, and the wait happens here, reading the
+/// journal again until it reaches or the wait is over. A range with no
+/// record waits for the next one; at a stop it gets one entry of no clock.
+/// A read or store failure stops this recording's production: its later
+/// ranges stay uncovered, `no_evidence`. Returns whether entries were
+/// appended.
+fn produce_trace<D: Disk + Clone>(
+    integrity: &mut Integrity<D>,
+    id: u64,
+    recorder: &mut Recorder<D, Box<dyn FrameSource + Send>>,
+    slot: &mut Option<TraceProduction>,
+    calibrations: Option<&mut (dyn crate::integrity::time_producer::CalibrationSource + 'static)>,
+    now: u64,
+    finish: bool,
+) -> bool {
+    use crate::integrity::time_producer::{Event as Observed, Snapshot, produce_observed};
+    let Some(trace) = slot.as_mut() else {
+        return false;
+    };
+    let (Some(sealed), range) = (
+        integrity.journal.sealed_end(id),
+        integrity.journal.sealed_range(id),
+    ) else {
+        return false;
+    };
+    let Some(evidence) = integrity.evidence.as_mut() else {
+        return false;
+    };
+    // A pinned batch never grows, except at a stop.
+    let limit = match trace.pending {
+        Some((end, _)) if !finish => end,
+        _ => sealed,
+    };
+    if limit <= trace.next {
+        return false;
+    }
+    let Ok(bytes) = read_store(recorder.store_mut(), trace.next, limit) else {
+        *slot = None;
+        return false;
+    };
+    let clock = trace.declared.clock;
+    let mut session = trace.session.clone();
+    let folded = crate::integrity::trace_evidence::fold(&mut session, &clock, &bytes, trace.next);
+    let stop = folded.end;
+    let mut events = folded.events;
+    if stop <= trace.next {
+        return false;
+    }
+    if events.is_empty() {
+        if !finish {
+            return false;
+        }
+        events.push(Observed {
+            start: trace.next,
+            end: stop,
+            time: 0,
+            in_session: false,
+        });
+    }
+    let width = clock.granularity;
+    let wait = trace.declared.calibration_wait;
+    let snapshot = if finish {
+        wait_for_calibrations(calibrations, &clock, &events, wait)
+    } else {
+        let snapshot = calibrations.map_or_else(Snapshot::default, |source| source.snapshot());
+        if !snapshot.reaches_observed(&clock, &events, width) {
+            let wait = u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX);
+            let (_, since) = *trace.pending.get_or_insert((stop, now));
+            if now.saturating_sub(since) < wait {
+                return false;
+            }
+        }
+        snapshot
+    };
+    let mut appended = false;
+    for entry in produce_observed(id, &events, width, Some(&clock), &snapshot) {
+        if admit_time_evidence(range, &entry).is_err() || evidence.store.append(&entry).is_err() {
+            *slot = None;
+            return appended;
+        }
+        appended = true;
+    }
+    trace.next = stop;
+    trace.session = session;
+    trace.pending = None;
+    appended
+}
+
+/// The calibration snapshot a trace recording's last batch is produced
+/// from at a stop (ADR-0117, points 6 and 7): the journal read again until
+/// one snapshot reaches past every in-session event, or until `wait` is
+/// over; the last snapshot read either way.
+fn wait_for_calibrations(
+    calibrations: Option<&mut (dyn crate::integrity::time_producer::CalibrationSource + 'static)>,
+    clock: &crate::integrity::time_producer::EventClock,
+    events: &[crate::integrity::time_producer::Event],
+    wait: Duration,
+) -> crate::integrity::time_producer::Snapshot {
+    let Some(source) = calibrations else {
+        return crate::integrity::time_producer::Snapshot::default();
+    };
+    let started = std::time::Instant::now();
+    loop {
+        let snapshot = source.snapshot();
+        let waited = started.elapsed();
+        if snapshot.reaches_observed(clock, events, clock.granularity) || waited >= wait {
+            return snapshot;
+        }
+        std::thread::sleep(
+            Duration::from_millis(10).min(wait.checked_sub(waited).unwrap_or_default()),
+        );
+    }
 }
 
 /// Seals the last range of `id` before its store closes: everything

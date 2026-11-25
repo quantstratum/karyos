@@ -21,6 +21,9 @@ use crate::catalog::StopReason;
 use crate::disk::StdDisk;
 use crate::recorder::{Frames, SourceError};
 
+/// A trace recording's time evidence (ADR-0117).
+mod trace;
+
 /// A source of `chunks` from `position`, sealed after them when `seal`,
 /// revoked after them when `fail`.
 #[derive(Default)]

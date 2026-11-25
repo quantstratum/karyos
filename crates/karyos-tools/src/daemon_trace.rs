@@ -50,18 +50,17 @@ impl TraceSink for ClientPublication<SharedTerms> {
     }
 }
 
+/// What a [`MirrorSource`] scan delivers each record to: its journal,
+/// sequence and payload.
+pub type Deliver<'a> = dyn FnMut(u64, u64, Option<&[u64; RECORD_WORDS]>) + 'a;
+
 /// Where the publisher reads the trace mirror.
 pub trait MirrorSource {
     /// Scans the ring from `cursor`, at most `max` records: each record's
     /// journal, sequence and payload (`None` when it is not one whole
     /// trace record); returns the ring sequences proven overwritten
     /// before the cursor reached them.
-    fn scan(
-        &mut self,
-        cursor: &mut u64,
-        max: u64,
-        deliver: &mut dyn FnMut(u64, u64, Option<&[u64; RECORD_WORDS]>),
-    ) -> u64;
+    fn scan(&mut self, cursor: &mut u64, max: u64, deliver: &mut Deliver<'_>) -> u64;
 
     /// Each journal of the table: its number and facts (kind, time
     /// namespace word, provenance word). An entry being written on every
@@ -70,12 +69,7 @@ pub trait MirrorSource {
 }
 
 impl MirrorSource for TraceMirrorReader {
-    fn scan(
-        &mut self,
-        cursor: &mut u64,
-        max: u64,
-        deliver: &mut dyn FnMut(u64, u64, Option<&[u64; RECORD_WORDS]>),
-    ) -> u64 {
+    fn scan(&mut self, cursor: &mut u64, max: u64, deliver: &mut Deliver<'_>) -> u64 {
         self.scan_at_most(cursor, max, |record| {
             let words = if record.truncated {
                 None
@@ -219,11 +213,13 @@ impl<S: TraceSink, M: MirrorSource> TracePublisher<S, M> {
     fn read(&mut self) {
         let before = self.cursor;
         let mut records: Vec<(u64, u64, Option<[u64; RECORD_WORDS]>)> = Vec::new();
-        let overwritten = self.mirror.scan(&mut self.cursor, self.budget, &mut |journal,
-                                                                             sequence,
-                                                                             words| {
-            records.push((journal, sequence, words.copied()));
-        });
+        let overwritten = self.mirror.scan(
+            &mut self.cursor,
+            self.budget,
+            &mut |journal, sequence, words| {
+                records.push((journal, sequence, words.copied()));
+            },
+        );
         if overwritten > 0 {
             self.loss(0, before, before.saturating_add(overwritten - 1));
         }
@@ -255,7 +251,10 @@ impl<S: TraceSink, M: MirrorSource> TracePublisher<S, M> {
             }
             let last = self.last.entry(journal).or_insert(sequence);
             *last = (*last).max(sequence);
-            let generation = self.journals.get(&journal).map_or(0, |known| known.generation);
+            let generation = self
+                .journals
+                .get(&journal)
+                .map_or(0, |known| known.generation);
             match words {
                 Some(words) if journal != 0 => {
                     self.queue.push_back(StreamMessage::Record(StreamRecord {
@@ -274,8 +273,11 @@ impl<S: TraceSink, M: MirrorSource> TracePublisher<S, M> {
 
     fn loss(&mut self, journal: u64, first: u64, last: u64) {
         self.counts.losses = self.counts.losses.wrapping_add(1);
-        self.queue
-            .push_back(StreamMessage::Loss(StreamLoss { journal, first, last }));
+        self.queue.push_back(StreamMessage::Loss(StreamLoss {
+            journal,
+            first,
+            last,
+        }));
     }
 }
 

@@ -41,6 +41,40 @@ mod tests;
 /// nanoseconds, in femtoseconds.
 pub const HOST_MONOTONIC_TICK_FS: u64 = 1_000_000;
 
+/// The epoch of a host `CLOCK_MONOTONIC` clock declared `boot` (ADR-0117,
+/// point 3): the first 8 bytes, little-endian, of SHA-256 over the host's
+/// boot id as its 36 ASCII characters followed by the time namespace's
+/// inode as 8 bytes little-endian, with 0 replaced by 1 (0 is no epoch).
+/// `CLOCK_MONOTONIC` restarts at every boot and differs between time
+/// namespaces, so each pair gets its own epoch; two pairs sharing one is a
+/// 64-bit hash collision, accepted.
+#[must_use]
+pub fn boot_epoch(boot_id: &[u8; 36], namespace_inode: u64) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(boot_id);
+    hasher.update(namespace_inode.to_le_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut first = [0u8; 8];
+    first.copy_from_slice(digest.first_chunk::<8>().unwrap_or(&[0; 8]));
+    match u64::from_le_bytes(first) {
+        0 => 1,
+        epoch => epoch,
+    }
+}
+
+/// [`boot_epoch`] of this process's host boot and time namespace
+/// (`karyos_sys::host_clock::time_identity`), as `karyosd
+/// --archive-trace-clock` and `karyos-tools calibrate --epoch boot` both
+/// compute it, each in its own process.
+///
+/// # Errors
+///
+/// Either identity unreadable (and always off Linux): the caller refuses.
+pub fn host_boot_epoch() -> std::io::Result<u64> {
+    let (boot, namespace) = karyos_sys::host_clock::time_identity()?;
+    Ok(boot_epoch(&boot, namespace))
+}
+
 /// A capture session's declared event clock (ADR-0098 item 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventClock {
@@ -128,17 +162,49 @@ impl Snapshot {
     /// 3), on the same target-specific boundary `produce` checks.
     #[must_use]
     pub fn reaches(&self, clock: &EventClock, events: &[Event]) -> bool {
-        let key = clock.key();
         let largest = events.iter().map(|event| event.time).max().unwrap_or(0);
+        self.reaches_at(clock, events, largest, 0)
+    }
+
+    /// [`Snapshot::reaches`] for observations (ADR-0117, points 5 and 6):
+    /// each in-session event's time is the interval `[time - width, time +
+    /// width]`, which a calibration must cover, and the boundary is past
+    /// the largest in-session time. Out-of-session events are not of the
+    /// clock, so their times count for nothing.
+    #[must_use]
+    pub fn reaches_observed(&self, clock: &EventClock, events: &[Event], width: u64) -> bool {
+        let largest = in_session_largest(events);
+        self.reaches_at(clock, events, largest, width)
+    }
+
+    fn reaches_at(&self, clock: &EventClock, events: &[Event], largest: u64, width: u64) -> bool {
+        let key = clock.key();
         events.iter().filter(|event| event.in_session).all(|event| {
-            let t = i128::from(event.time);
+            let (low, high) = widened(event.time, width);
             self.calibrations.iter().any(|(calibration, _)| {
                 calibration.from == key
-                    && calibration.covers(t, t)
+                    && calibration.covers(low, high)
                     && complete(self, &key, &calibration.to, largest)
             })
         })
     }
+}
+
+/// The interval of an observation at `time` taken as `[time - width,
+/// time + width]`.
+fn widened(time: u64, width: u64) -> (i128, i128) {
+    let (time, width) = (i128::from(time), i128::from(width));
+    (time - width, time + width)
+}
+
+/// The largest time of the in-session events, 0 without one.
+fn in_session_largest(events: &[Event]) -> u64 {
+    events
+        .iter()
+        .filter(|event| event.in_session)
+        .map(|event| event.time)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Where the Archive agent takes its calibration snapshots: the host's
@@ -204,7 +270,53 @@ pub fn produce(
     clock: Option<&EventClock>,
     snapshot: &Snapshot,
 ) -> Vec<Entry> {
-    produce_marked(group, events, &vec![false; events.len()], clock, snapshot)
+    let largest = events.iter().map(|event| event.time).max().unwrap_or(0);
+    let shape = Shape { width: 0, largest };
+    produce_marked(
+        group,
+        events,
+        &vec![false; events.len()],
+        clock,
+        snapshot,
+        shape,
+    )
+}
+
+/// The entries of a recording whose events are observations (ADR-0117,
+/// point 5): as [`produce`], except that each observation's time is the
+/// interval `[time - width, time + width]` (the declared granularity, at
+/// least the observation's own uncertainty), so a calibration must cover
+/// the whole interval and each bound is computed over its ends; and the
+/// completeness boundary is past the largest in-session time only, an
+/// out-of-session event's time being of no declared clock.
+#[must_use]
+pub fn produce_observed(
+    recording: u64,
+    events: &[Event],
+    width: u64,
+    clock: Option<&EventClock>,
+    snapshot: &Snapshot,
+) -> Vec<Entry> {
+    let shape = Shape {
+        width,
+        largest: in_session_largest(events),
+    };
+    produce_marked(
+        recording,
+        events,
+        &vec![false; events.len()],
+        clock,
+        snapshot,
+        shape,
+    )
+}
+
+/// How the producer reads a run of events: the half-width of each
+/// event's interval, and the time the completeness boundary must pass.
+#[derive(Debug, Clone, Copy)]
+struct Shape {
+    width: u64,
+    largest: u64,
 }
 
 /// The entries of a recording whose events are a Cluster log history's
@@ -236,7 +348,9 @@ pub fn produce_cluster(
             !raw
         })
         .collect();
-    produce_marked(recording, events, &clamped, clock, snapshot)
+    let largest = events.iter().map(|event| event.time).max().unwrap_or(0);
+    let shape = Shape { width: 0, largest };
+    produce_marked(recording, events, &clamped, clock, snapshot, shape)
 }
 
 /// [`produce`], with the events `clamped` marks never proven.
@@ -246,10 +360,10 @@ fn produce_marked(
     clamped: &[bool],
     clock: Option<&EventClock>,
     snapshot: &Snapshot,
+    shape: Shape,
 ) -> Vec<Entry> {
     // A declaration of the reserved zero tuple declares nothing.
     let clock = clock.filter(|clock| clock.clock != [0; 5]);
-    let largest = events.iter().map(|event| event.time).max().unwrap_or(0);
     let mut entries: Vec<(Provenance, Entry)> = Vec::new();
     for (event, &clamped) in events.iter().zip(clamped) {
         let provenance = match clock {
@@ -257,7 +371,7 @@ fn produce_marked(
             None => Provenance::Unknown,
             Some(_) if clamped => Provenance::Declared,
             Some(clock) => {
-                proven(snapshot, &clock.key(), event.time, largest).unwrap_or(Provenance::Declared)
+                proven(snapshot, &clock.key(), event.time, shape).unwrap_or(Provenance::Declared)
             }
         };
         match entries.last_mut() {
@@ -289,7 +403,7 @@ fn produce_marked(
     }
     entries
         .into_iter()
-        .map(|(provenance, entry)| finish(provenance, entry, clock, snapshot))
+        .map(|(provenance, entry)| finish(provenance, entry, clock, snapshot, shape.width))
         .collect()
 }
 
@@ -313,22 +427,24 @@ fn complete(snapshot: &Snapshot, clock: &ClockKey, target: &ClockKey, largest: u
         })
 }
 
-/// The unique calibration of `clock` valid at `time` and the unique UTC
-/// reference valid over its converted interval, with the completeness
-/// boundary of that calibration's target past `largest` and the UTC
-/// conversion defined at `time`, or `None`.
-fn proven(snapshot: &Snapshot, clock: &ClockKey, time: u64, largest: u64) -> Option<Provenance> {
-    let t = i128::from(time);
+/// The unique calibration of `clock` valid over `time`'s interval and the
+/// unique UTC reference valid over its converted interval, with the
+/// completeness boundary of that calibration's target past the shape's
+/// largest time and the UTC conversion defined over the interval, or
+/// `None`.
+fn proven(snapshot: &Snapshot, clock: &ClockKey, time: u64, shape: Shape) -> Option<Provenance> {
+    let (from, to) = widened(time, shape.width);
+    let largest = shape.largest;
     let mut calibrations = snapshot
         .calibrations
         .iter()
         .enumerate()
-        .filter(|(_, (calibration, _))| calibration.from == *clock && calibration.covers(t, t));
+        .filter(|(_, (calibration, _))| calibration.from == *clock && calibration.covers(from, to));
     let (calibration_index, (calibration, _)) = calibrations.next()?;
     if calibrations.next().is_some() {
         return None;
     }
-    let (low, high) = calibration.convert(t, t)?;
+    let (low, high) = calibration.convert(from, to)?;
     let mut references = snapshot
         .references
         .iter()
@@ -347,7 +463,7 @@ fn proven(snapshot: &Snapshot, clock: &ClockKey, time: u64, largest: u64) -> Opt
     }
     // Defined at this timestamp (not inside an inserted second, nor past
     // the leap table), and the offset to UTC there, which partitions.
-    bound(time, calibration, reference)?;
+    bound(time, shape.width, calibration, reference)?;
     let middle = low.checked_add(high)?.div_euclid(2);
     let offset = reference
         .utc(u64::try_from(middle).ok()?)?
@@ -359,14 +475,19 @@ fn proven(snapshot: &Snapshot, clock: &ClockKey, time: u64, largest: u64) -> Opt
     ))
 }
 
-/// The bound at `time`: `time` converted through `calibration`, its
-/// midpoint as the nominal point, both ends and the midpoint to UTC by
-/// `reference`, and the larger distance from that point to the ends of
-/// the UTC interval widened by the reference's bound. `None` is
-/// `no_evidence`.
-fn bound(time: u64, calibration: &Calibration, reference: &UtcReference) -> Option<u64> {
-    let t = i128::from(time);
-    let (low, high) = calibration.convert(t, t)?;
+/// The bound at `time`: the interval `[time - width, time + width]`
+/// converted through `calibration` (`width` 0: the point), its midpoint as
+/// the nominal point, both ends and the midpoint to UTC by `reference`,
+/// and the larger distance from that point to the ends of the UTC interval
+/// widened by the reference's bound. `None` is `no_evidence`.
+fn bound(
+    time: u64,
+    width: u64,
+    calibration: &Calibration,
+    reference: &UtcReference,
+) -> Option<u64> {
+    let (from, to) = widened(time, width);
+    let (low, high) = calibration.convert(from, to)?;
     let middle = low.checked_add(high)?.div_euclid(2);
     let utc = |value: i128| reference.utc(u64::try_from(value).ok()?);
     let (low, high, middle) = (utc(low)?, utc(high)?, utc(middle)?);
@@ -384,6 +505,7 @@ fn finish(
     mut entry: Entry,
     clock: Option<&EventClock>,
     snapshot: &Snapshot,
+    width: u64,
 ) -> Entry {
     let Some(clock) = clock.filter(|_| provenance != Provenance::Unknown) else {
         return entry;
@@ -403,8 +525,9 @@ fn finish(
     entry.source = Source::from_code(reference.source as u8).unwrap_or(Source::NotStated);
     entry.sync_state =
         SyncState::from_code(reference.sync_state as u8).unwrap_or(SyncState::NotStated);
-    let bounds = bound(entry.min_time, calibration, reference).zip(bound(
+    let bounds = bound(entry.min_time, width, calibration, reference).zip(bound(
         entry.max_time,
+        width,
         calibration,
         reference,
     ));

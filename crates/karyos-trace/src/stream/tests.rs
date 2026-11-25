@@ -82,10 +82,7 @@ fn facts_record_and_loss_match_their_golden_vectors() {
         first: 10,
         last: 19,
     });
-    assert_eq!(
-        encoded(&loss),
-        bytes(&[0x0000_0401_5352_544B, 0, 10, 19])
-    );
+    assert_eq!(encoded(&loss), bytes(&[0x0000_0401_5352_544B, 0, 10, 19]));
     for message in [facts, record, loss] {
         assert_eq!(StreamMessage::decode(&encoded(&message)).unwrap(), message);
         assert_eq!(encoded(&message).len(), message.length());
