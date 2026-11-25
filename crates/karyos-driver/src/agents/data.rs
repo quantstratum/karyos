@@ -328,6 +328,10 @@ pub struct OutboundCounters {
     /// seal: no session key yet, or the key's usage limit reached
     /// (ADR-0086 section 6; manifest 4.3). Nothing is read or sent.
     pub seal_waits: u64,
+    /// Times a publication guarded by a remote guard could not send
+    /// because it is not admitted yet: its guard has not read open after
+    /// recovery and confirmation.
+    pub admission_waits: u64,
     /// Datagrams read but not sealed: an invariant failure, the frames
     /// left as a gap the receiver repairs, as a failed commit's.
     pub seal_failures: u64,
@@ -428,6 +432,12 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     picked: Vec<(TraceExtension, u64)>,
     /// How its sender frames are authenticated (domain 1, ADR-0086).
     auth: SenderAuth,
+    /// A remote guard's spec while the publication is admission-pending:
+    /// no incarnation is bound to an open epoch and nothing is sent until
+    /// the guard's word first reads `(e, Open)`.
+    pending_guard: Option<GuardSpec>,
+    /// Its remote guard's gate could not be built: it never sends.
+    admission_refused: bool,
     /// The redundant paths of a routed publication ([`Outbound::new_routed`]).
     routed: Option<Box<routed::Routed>>,
     /// The destinations of a multi-destination publication
@@ -683,6 +693,8 @@ impl<T: StreamTerms> Outbound<T> {
             fanout: None,
             registration: None,
             auth: SenderAuth::Off,
+            pending_guard: None,
+            admission_refused: false,
             route: None,
             idle_since: [None; 4],
             open_tried: None,
@@ -991,10 +1003,62 @@ impl<T: StreamTerms> Outbound<T> {
         }
     }
 
+    /// Guards the publication by a remote (followed) guard whose word is
+    /// `spec.word` (`crate::remote_guard::RemoteGuard::word`): it is
+    /// admission-pending, sending nothing (no DATA, repair, heartbeat or
+    /// EOS), until that word first reads `(e, Open)`, which happens only
+    /// after the guard's recovery and confirmation. Admission then binds
+    /// the incarnation to `e` exactly as [`Outbound::guard`] does for a
+    /// local guard (`spec.epoch` is ignored), and from then on its gate
+    /// aborts it for good on any other word (guards-and-abort.md, "The
+    /// sender gate and applied epoch", step 3).
+    pub fn guard_remote(&mut self, spec: GuardSpec) {
+        self.pending_guard = Some(spec);
+    }
+
+    /// Whether the publication waits for its remote guard's first open.
+    #[must_use]
+    pub fn admission_pending(&self) -> bool {
+        self.pending_guard.is_some() || self.admission_refused
+    }
+
+    /// Admits an admission-pending publication at `now` if its guard reads
+    /// open; returns whether it may send. A gate that cannot be built
+    /// leaves it pending (fail closed).
+    fn admit(&mut self, now: u64) -> bool {
+        if self.admission_refused {
+            self.counters.bump(|c| &mut c.admission_waits, 1);
+            return false;
+        }
+        let Some(spec) = self.pending_guard.as_ref() else {
+            return true;
+        };
+        let open = karyos_sys::guard::load_in(&*spec.word, 0)
+            .ok()
+            .filter(|state| state.open)
+            .map(|state| state.epoch);
+        let Some(epoch) = open else {
+            self.counters.bump(|c| &mut c.admission_waits, 1);
+            return false;
+        };
+        let Some(mut spec) = self.pending_guard.take() else {
+            return false;
+        };
+        spec.epoch = epoch;
+        if self.guard(spec, now).is_err() {
+            // Without a gate it never sends.
+            self.counters.bump(|c| &mut c.admission_waits, 1);
+            self.admission_refused = true;
+            return false;
+        }
+        true
+    }
+
     /// The guard's between gates step at `now`, for a publication not
     /// served this cycle (not established yet): a close applies and its
     /// applied epoch is published all the same.
     pub fn guard_tick(&mut self, now: u64) {
+        let _ = self.admit(now);
         if let Some(guard) = self.guard.as_deref_mut() {
             guard.set_now(now);
             guard.between_gates();
@@ -1139,8 +1203,9 @@ impl<T: StreamTerms> Outbound<T> {
                 *closed = LaneGate::aborting(&*guard, lane);
             }
         }
-        // An authenticated publication repairs only under its sealer.
-        if !self.auth.ready() {
+        // An authenticated publication repairs only under its sealer, and
+        // an admission-pending one not at all.
+        if !self.auth.ready() || self.admission_pending() {
             return 0;
         }
         let Some(repair) = self.repair.as_deref_mut() else {
@@ -1608,6 +1673,9 @@ impl<T: StreamTerms> Outbound<T> {
         now: u64,
         mut hook: Option<&mut (dyn NetworkTraceHook + 'static)>,
     ) -> Result<u32, AgentError> {
+        if !self.admit(now) {
+            return Ok(0);
+        }
         if self.fanout.is_some() {
             return self.serve_fanout(tx, budget, consumption, now);
         }

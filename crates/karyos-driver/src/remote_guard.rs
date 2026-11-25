@@ -248,9 +248,11 @@ impl RemoteGuard {
     /// (`karyos_sys::guard` encoding): `(epoch, Open)` only while open and
     /// confirmed; otherwise a closed word at the floor, or just above an
     /// open floor that lapsed or awaits confirmation, so no gate admits.
-    /// A gate holds a lane while the word is below the lane's open epoch
-    /// (not yet recovered or confirmed), and closes its incarnation for
-    /// good once it is at or above it and not open (a close or a lapse).
+    /// A publication it guards is admitted only once this word first
+    /// reads `(e, Open)` ([`crate::agents::data::Outbound::guard_remote`]);
+    /// its gate then aborts the incarnation for good on any other word,
+    /// as for a local guard (guards-and-abort.md, "The sender gate and
+    /// applied epoch", step 3).
     #[must_use]
     pub fn word(&self, now: u64) -> u64 {
         let closed = |epoch: u64| {
