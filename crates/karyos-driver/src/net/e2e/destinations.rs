@@ -42,6 +42,7 @@ pub(super) fn destinations(destinations: &[SocketAddr], reliable: bool) -> UdpCo
         reliable,
         flow_control: None,
         security: Security::Trusted,
+        etf: None,
     }
 }
 

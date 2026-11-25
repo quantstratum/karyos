@@ -162,6 +162,11 @@ fn a_purged_prefix_exports_only_the_retained_span() {
     );
     assert!(err.is_empty(), "{err}");
     assert!(!out.contains("recording 3 [0, 8) verified"), "{out}");
+    // The retained span is exported and verified, from the floor to the
+    // last sealed range (#1268 review: an empty export would pass the
+    // check above alone).
+    assert!(out.contains("recording 3 [8, 16) verified"), "{out}");
+    assert!(out.contains("recording 3 [40, 48) verified"), "{out}");
     let _ = std::fs::remove_file(&file);
 }
 

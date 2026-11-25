@@ -357,14 +357,16 @@ fn the_binding_round_trips_and_unknown_flags_are_refused() {
             max_horizon: 0,
             lateness_tolerance: 0,
             cancel_on_deadline: false,
+            etf_advance: 0,
         })
     );
-    for cancel_on_deadline in [true, false] {
+    for (cancel_on_deadline, etf_advance) in [(true, 0), (false, 250_000), (true, u64::MAX)] {
         let written = Binding {
             domain: 1,
             max_horizon: 1_000_000_000,
             lateness_tolerance: u64::MAX,
             cancel_on_deadline,
+            etf_advance,
         };
         write_binding(&ring, written).unwrap();
         assert_eq!(binding(&ring), Ok(written));
@@ -390,6 +392,7 @@ fn binding_default() -> Binding {
         max_horizon: 0,
         lateness_tolerance: 0,
         cancel_on_deadline: false,
+        etf_advance: 0,
     }
 }
 

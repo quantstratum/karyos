@@ -53,6 +53,7 @@ fn channel(group: SocketAddr, paths: Vec<Interface>) -> UdpConfig {
         reliable: true,
         flow_control: None,
         security: Security::Trusted,
+        etf: None,
     }
 }
 

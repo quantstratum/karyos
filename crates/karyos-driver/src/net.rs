@@ -369,6 +369,9 @@ struct NetPublication {
     traced: karyos_protocol::trace_hook::PublicationIdentity,
     /// Its lane count.
     lanes: u8,
+    /// On the `etf` route, the drop reports its sender received after
+    /// their entries were retired as sent (ADR-0109 point 7).
+    etf_late_drop_reports: u64,
     /// What it takes of each endpoint it sends on (karyos#859), held until
     /// its entry goes, when its removal has ended.
     demand: Vec<(EndpointId, TxDemand)>,
@@ -447,6 +450,9 @@ pub(crate) struct SenderChannel {
     /// A `control-mode=dynamic` publication's registration policy
     /// (karyos#644); `None` otherwise.
     pub(crate) registration: Option<crate::sessions::register::RegistrationPolicy>,
+    /// The etf queue of a timed publication on the `etf` route (ADR-0109);
+    /// `None` otherwise.
+    pub(crate) etf: Option<karyos_io::backend::EtfQueue>,
 }
 
 /// A network publication between incarnations (guards-and-abort.md, On
@@ -508,6 +514,16 @@ enum EndpointPurpose {
     Data,
     /// The driver's unicast control endpoint for SOLICITs (plan 169).
     Solicit,
+    /// One publication's endpoint on the `etf` route of timed sends
+    /// (ADR-0109 point 5), never shared: its socket sets `SO_REUSEPORT`
+    /// so the publication's etf socket can join its port, and its etf
+    /// leaf is the one `priority` maps to on its interface.
+    Etf {
+        /// The index of the interface holding its etf leaf.
+        interface: u32,
+        /// The `SO_PRIORITY` of its etf queue.
+        priority: u32,
+    },
 }
 
 /// What every handle of one subscription key shares, as
@@ -698,6 +714,10 @@ pub(crate) struct ScheduleViolation {
     pub(crate) incarnation: u64,
     /// The lane.
     pub(crate) lane: u8,
+    /// A missed deadline under cancel-on-deadline (`DeadlineMissed`,
+    /// ADR-0109 point 8), sealed with `SealReason::DeadlineMissed`, not a
+    /// breach of the publisher.
+    pub(crate) deadline: bool,
 }
 
 /// Schedule violations for the conductor to apply, drained every serve:
@@ -708,6 +728,27 @@ pub(crate) struct ScheduleViolation {
 struct ScheduleViolations {
     pending: Vec<ScheduleViolation>,
     dropped: u64,
+    /// Late etf drop reports (ADR-0109 point 7) for the conductor's error
+    /// log, bounded like `pending`; one past the bound is counted in the
+    /// publication's counter only.
+    etf_late: Vec<EtfLateReport>,
+    /// Late reports counted in their publication but not logged yet:
+    /// carried by the next record.
+    etf_unlogged: u64,
+}
+
+/// A late etf drop report of a live publication, for the conductor's
+/// error log (ADR-0109 point 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EtfLateReport {
+    /// The aggregate's registration.
+    pub(crate) registration: u64,
+    /// The lane.
+    pub(crate) lane: u8,
+    /// The report's time, in `CLOCK_TAI` nanoseconds.
+    pub(crate) txtime: u64,
+    /// Late reports before it that were counted but not logged.
+    pub(crate) unlogged: u64,
 }
 
 impl ScheduleViolations {
@@ -1029,6 +1070,14 @@ impl<T: StreamTerms> Network<T> {
                         .unwrap_or(config.agents.publications),
                 ),
                 dropped: 0,
+                etf_late: Vec::with_capacity(
+                    config
+                        .agents
+                        .publications
+                        .checked_mul(karyos_protocol::network::MAX_LANES)
+                        .unwrap_or(config.agents.publications),
+                ),
+                etf_unlogged: 0,
             },
             guard_deregister_failures: 0,
             control_groups: config.nak_control_groups,
@@ -1094,6 +1143,37 @@ impl<T: StreamTerms> Network<T> {
             })
     }
 
+    /// A new send endpoint bound to `bind` for a publication on the `etf`
+    /// route with the etf queue `etf` (ADR-0109 points 2 and 5): never
+    /// shared, opened with [`SocketsConfig::etf_route`].
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::TimedNetworkUnsupported`] with `EtfPriorityShared`
+    /// when another etf publication of this driver declares its priority on
+    /// the same interface (by index, whatever address it binds there);
+    /// [`DriverError::NetworkEndpoint`] when it cannot open.
+    pub(crate) fn hold_etf_endpoint(
+        &mut self,
+        bind: SocketAddr,
+        etf: karyos_io::backend::EtfQueue,
+    ) -> Result<EndpointId, DriverError> {
+        let purpose = EndpointPurpose::Etf {
+            interface: etf.interface,
+            priority: etf.priority,
+        };
+        if self
+            .send_endpoints
+            .iter()
+            .any(|entry| entry.purpose == purpose)
+        {
+            return Err(DriverError::TimedNetworkUnsupported {
+                reason: crate::error::TimedNetworkUnsupported::EtfPriorityShared,
+            });
+        }
+        self.hold_for(bind, None, purpose, false)
+    }
+
     /// The data endpoint bound to `bind`, joined to `multicast` if any,
     /// opened on first use; one more user holds it.
     fn hold_endpoint(
@@ -1144,6 +1224,7 @@ impl<T: StreamTerms> Network<T> {
         }
         let mut config = SocketsConfig::new(bind);
         config.multicast = multicast;
+        config.etf_route = matches!(purpose, EndpointPurpose::Etf { .. });
         config.tx_slots = self.endpoint_tables.tx_slots;
         config.max_queues = self.endpoint_tables.max_queues;
         config.max_routes = self.endpoint_tables.max_routes;
@@ -2532,6 +2613,7 @@ impl<T: StreamTerms> Network<T> {
             demand,
             per_destination,
             adds_pending: Vec::with_capacity(self.max_destinations),
+            etf_late_drop_reports: 0,
             max_destinations: self.max_destinations,
             limited: None,
             trace_closes: Vec::new(),
@@ -2590,6 +2672,21 @@ impl<T: StreamTerms> Network<T> {
     /// apply (timed-tx.md section 11, TT-6).
     pub(crate) fn pop_schedule_violation(&mut self) -> Option<ScheduleViolation> {
         self.schedule_violations.pending.pop()
+    }
+
+    /// The next late etf drop report a sender posted, for the conductor's
+    /// error log (ADR-0109 point 7).
+    pub(crate) fn pop_etf_late_report(&mut self) -> Option<EtfLateReport> {
+        self.schedule_violations.etf_late.pop()
+    }
+
+    /// The late etf drop reports of the publication `registration`
+    /// (ADR-0109 point 7); `None` for no such network publication.
+    pub(crate) fn etf_late_drop_reports(&self, registration: u64) -> Option<u64> {
+        self.publications
+            .iter()
+            .find(|entry| entry.registration == registration)
+            .map(|entry| entry.etf_late_drop_reports)
     }
 
     /// Schedule violation reports dropped since the last call, for the
@@ -3857,6 +3954,71 @@ fn publication_answer<T: StreamTerms>(
                 entry.drained = true;
             }
         }
+        // A late etf drop report: counted for the publication it names,
+        // and kept for the error log while there is room.
+        AgentEvent::EtfLateDropReport {
+            endpoint,
+            alias,
+            registration,
+            report,
+            count,
+        } => {
+            if let Some(entry) = find(publications, endpoint, alias, registration)
+                .and_then(|index| publications.get_mut(index))
+            {
+                entry.etf_late_drop_reports = entry.etf_late_drop_reports.saturating_add(count);
+                // Every report is counted; one the error log has no room
+                // for, or that came as a count only, is logged as a count
+                // with the next record.
+                let unlogged = count.saturating_sub(u64::from(report.is_some()));
+                match report {
+                    Some((lane, txtime))
+                        if violations.etf_late.len() < violations.etf_late.capacity() =>
+                    {
+                        let unlogged =
+                            unlogged.saturating_add(std::mem::take(&mut violations.etf_unlogged));
+                        violations.etf_late.push(EtfLateReport {
+                            registration,
+                            lane,
+                            txtime,
+                            unlogged,
+                        });
+                    }
+                    _ => {
+                        violations.etf_unlogged = violations
+                            .etf_unlogged
+                            .saturating_add(unlogged)
+                            .saturating_add(u64::from(report.is_some()));
+                    }
+                }
+            }
+        }
+        // A timed lane missed its deadline under cancel-on-deadline: sealed
+        // by the conductor's violation hook if it names the live
+        // publication (ADR-0109 point 8).
+        AgentEvent::DeadlineMissed {
+            endpoint,
+            alias,
+            registration,
+            incarnation,
+            lane,
+        } => {
+            let live = find(publications, endpoint, alias, registration)
+                .and_then(|index| publications.get(index))
+                .is_some_and(|entry| {
+                    entry.state == NetworkPublicationState::Active && lane < entry.lanes
+                });
+            if live {
+                violations.push(ScheduleViolation {
+                    registration,
+                    incarnation,
+                    lane,
+                    deadline: true,
+                });
+            } else {
+                violations.drop_one();
+            }
+        }
         // A timed lane's publisher breached its ring: applied by the
         // conductor if it names the live publication.
         AgentEvent::ScheduleViolated {
@@ -3876,6 +4038,7 @@ fn publication_answer<T: StreamTerms>(
                     registration,
                     incarnation,
                     lane,
+                    deadline: false,
                 });
             } else {
                 violations.drop_one();

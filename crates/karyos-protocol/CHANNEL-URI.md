@@ -204,6 +204,8 @@ The common URI rule binds every key added after the sixteen above.
 | `nak-control` | udp | `;` list of `socket-address`, one per path; multicast only; default none (the driver's table) |
 | `linger` | udp | duration, 0 to 60 s; default the driver's `publication_linger` (5 s) |
 | `path-skew` | udp | duration, 0 to 1 s; default the driver's skew windows (1 ms) |
+| `etf-priority` | udp | `decimal` `SO_PRIORITY`, 0 to 2^32 - 1; with `etf-delta`, a unicast `endpoint` and an `interface` address; default none |
+| `etf-delta` | udp | duration, positive, below 2^32 ns; with `etf-priority`; default none |
 | `require-abort-ack` | udp | `true` or `false`; default `false`. `true` is `SecurityUnsupported` with class `authenticated` until the authenticated capability is supported |
 
 - **`retransmit-window`** (owner item 63) is fixed at channel creation and
@@ -252,6 +254,20 @@ The common URI rule binds every key added after the sixteen above.
   same value; another is refused. A conflated view of an unreliable
   channel checks its far-window bound with the channel's value at its
   admission.
+
+- **`etf-priority`** and **`etf-delta`** (ADR-0109 point 2) declare
+  the `etf` leaf of a timed publication on the `etf` route: the
+  deployment maps `etf-priority` on the channel's `interface` to a TX
+  queue holding an `etf` leaf with `clockid CLOCK_TAI`, no deadline mode
+  and this `delta`. Karyos changes no qdisc and cannot probe one; the
+  declaration is recorded. One without the other is `InvalidValue` of the
+  one given, as is either without an `interface` address; with a
+  destination other than `endpoint` they are `NotApplicable`. The driver
+  refuses, typed (`TimedNetworkUnsupported`), a declaration on a
+  publication not timed on the `etf` route, the route without a
+  declaration, a `delta` above the publication's declared advance, and a
+  priority another etf publication of the driver declares on the same
+  interface.
 
 - **`require-abort-ack`** (owner item 8) asks that a remote
   `SESSION_ABORT` be acknowledged. It belongs to the authenticated

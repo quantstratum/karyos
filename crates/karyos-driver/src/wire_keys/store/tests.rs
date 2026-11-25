@@ -612,3 +612,50 @@ fn a_second_store_cannot_work_from_the_same_state() {
     assert!(!report.alarm());
     assert_eq!(epochs(&store), [(3, 1)]);
 }
+
+/// karyos#1067: the state directory's lock, through `Files::lock` on a
+/// `SecureDir`, is never refused while other threads spawn children: a
+/// child's fork-to-exec window holds a closed handle's lock for a moment,
+/// and `SecureDir::lock_exclusive` outlasts it.
+#[cfg(target_os = "linux")]
+#[test]
+#[cfg_attr(miri, ignore = "host syscalls")]
+fn the_state_directory_lock_is_never_refused_by_a_spawn() {
+    use karyos_sys::secure_dir::{SecureDir, effective_uid};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let base = std::env::temp_dir().join(format!("karyos-wire-keys-lock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("state")).unwrap();
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(base.join("state"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawners: Vec<_> = (0..4)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::process::Command::new("true").status();
+                }
+            })
+        })
+        .collect();
+    let (mut refused, mut tries) = (0u32, 0u32);
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(2) {
+        let dir =
+            SecureDir::open_beneath(&base, std::path::Path::new("state"), effective_uid()).unwrap();
+        if Files::lock(&dir).is_err() {
+            refused += 1;
+        }
+        tries += 1;
+    }
+    stop.store(true, Ordering::Relaxed);
+    for spawner in spawners {
+        spawner.join().unwrap();
+    }
+    assert!(tries > 0);
+    assert_eq!(refused, 0, "{refused} of {tries} locks refused");
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -123,6 +123,47 @@ fn files_are_refused_by_link_type_mode_and_size() {
     fs::remove_dir_all(&base).unwrap();
 }
 
+/// karyos#1067: opening and locking the directory again and again while
+/// other threads spawn children is never refused as `Locked`: a child's
+/// fork-to-exec window holds a closed descriptor's lock for a moment, and
+/// the lock outlasts it.
+#[test]
+#[cfg_attr(miri, ignore = "host syscalls")]
+fn relocks_raced_against_spawns_are_never_refused_as_locked() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let base = base("spawn");
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawners: Vec<_> = (0..4)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::process::Command::new("true").status();
+                }
+            })
+        })
+        .collect();
+    let (mut locked, mut tries) = (0u32, 0u32);
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(2) {
+        let dir = SecureDir::open_beneath(&base, Path::new("keys"), me()).unwrap();
+        match dir.lock_exclusive() {
+            Ok(()) => {}
+            Err(SecureDirError::Locked) => locked += 1,
+            Err(error) => panic!("{error:?}"),
+        }
+        tries += 1;
+    }
+    stop.store(true, Ordering::Relaxed);
+    for spawner in spawners {
+        spawner.join().unwrap();
+    }
+    assert!(tries > 0);
+    assert_eq!(locked, 0, "{locked} of {tries} relocks refused as Locked");
+    fs::remove_dir_all(&base).unwrap();
+}
+
 #[test]
 #[cfg_attr(miri, ignore = "host syscalls")]
 fn the_exclusive_lock_admits_one_opener_until_it_drops() {

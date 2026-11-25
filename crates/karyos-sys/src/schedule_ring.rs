@@ -10,10 +10,10 @@
 //! the `tail`; the sender alone writes the `head`.
 //!
 //! Layout, in `u64` words: an eight word header `[capacity, tail, head,
-//! domain, max_horizon, lateness_tolerance, flags, reserved]`, then
+//! domain, max_horizon, lateness_tolerance, flags, etf_advance]`, then
 //! `capacity` entries of two words, `[position, time]`. The capacity is a
 //! power of two, and entry `n` (counted from 0) lives in slot
-//! `n % capacity`. Words 3 to 6 are the lane's binding ([`Binding`],
+//! `n % capacity`. Words 3 to 7 are the lane's binding ([`Binding`],
 //! timed-tx.md section 11, TT-6b): the driver writes them when it creates
 //! the lane, before any handle is issued; the publisher only reads them,
 //! and the sender never does.
@@ -47,8 +47,7 @@
 use crate::sync::{AtomicU64, Ordering};
 
 /// Words before the first entry: capacity, tail, head, then the binding's
-/// domain, `max_horizon`, `lateness_tolerance` and flags, and a reserved
-/// word.
+/// domain, `max_horizon`, `lateness_tolerance`, flags and `etf_advance`.
 pub const HEADER_WORDS: usize = 8;
 /// Words of one entry: position, time.
 pub const ENTRY_WORDS: usize = 2;
@@ -60,6 +59,7 @@ const DOMAIN: usize = 3;
 const MAX_HORIZON: usize = 4;
 const LATENESS_TOLERANCE: usize = 5;
 const FLAGS: usize = 6;
+const ETF_ADVANCE: usize = 7;
 
 /// Bit 0 of the binding's flags word: cancel on deadline.
 const CANCEL_ON_DEADLINE: u64 = 1;
@@ -140,6 +140,10 @@ pub struct Binding {
     pub lateness_tolerance: u64,
     /// A missed deadline aborts the lane instead of sending late.
     pub cancel_on_deadline: bool,
+    /// The lane's route (word 7, ADR-0109): 0 for the software route; on
+    /// the `etf` route, its declared tolerated advance in nanoseconds,
+    /// how far before its time a message may be handed to the kernel.
+    pub etf_advance: u64,
 }
 
 /// Words a ring of `capacity` entries needs; `None` on overflow.
@@ -198,6 +202,7 @@ pub fn write_binding(ring: &[AtomicU64], binding: Binding) -> Result<(), Schedul
         (MAX_HORIZON, binding.max_horizon),
         (LATENESS_TOLERANCE, binding.lateness_tolerance),
         (FLAGS, flags),
+        (ETF_ADVANCE, binding.etf_advance),
     ] {
         word(ring, index)?.store(value, Ordering::Release);
     }
@@ -222,6 +227,7 @@ pub fn binding(ring: &[AtomicU64]) -> Result<Binding, ScheduleError> {
         max_horizon: load(MAX_HORIZON)?,
         lateness_tolerance: load(LATENESS_TOLERANCE)?,
         cancel_on_deadline: flags & CANCEL_ON_DEADLINE != 0,
+        etf_advance: load(ETF_ADVANCE)?,
     })
 }
 

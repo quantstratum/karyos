@@ -41,6 +41,7 @@ fn dynamic(control: SocketAddr) -> UdpConfig {
         reliable: false,
         flow_control: None,
         security: Security::Trusted,
+        etf: None,
     }
 }
 
