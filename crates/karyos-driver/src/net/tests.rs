@@ -142,7 +142,7 @@ fn a_shared_agent_panic_is_a_driver_error() {
 #[test]
 fn dropping_the_driver_joins_a_late_agent() {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::time::Instant;
 
     let mut network = NetworkConfig {
@@ -155,8 +155,8 @@ fn dropping_the_driver_joins_a_late_agent() {
         ..DriverConfig::default()
     })
     .unwrap();
-    let blocked = Arc::new(AtomicBool::new(true));
-    let command = Arc::clone(&blocked);
+    let gate = Arc::new(AtomicU8::new(crate::agents::BLOCK_ARMED));
+    let command = Arc::clone(&gate);
     driver
         .net
         .as_ref()
@@ -165,27 +165,47 @@ fn dropping_the_driver_joins_a_late_agent() {
         .sender
         .post(|_reply| AgentCommand::Block(command))
         .unwrap();
-    // The releaser records when it releases the agent, and the drop must
-    // return after that instant: it joined the late agent instead of
-    // detaching it. Not a fixed 50 ms: the releaser's timer started before
-    // the 20 ms wait below, which a loaded host stretched, leaving less
-    // than 50 ms when the drop started (karyos#1067; diagnosed by impl-d).
-    let release = Arc::clone(&blocked);
+    // The sender is blocked for certain before the drop (karyos#1067,
+    // #1268 review): its gate says so, no fixed wait.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while gate.load(Ordering::Acquire) != crate::agents::BLOCK_ENTERED {
+        assert!(Instant::now() < deadline, "the sender never blocked");
+        std::thread::yield_now();
+    }
+    // Released only once the drop started and its 1 ms stop timeout has
+    // long passed, so the stop has classified the sender late; the instant
+    // of the release is recorded.
+    let dropping = Arc::new(AtomicBool::new(false));
     let released = Arc::new(std::sync::Mutex::new(None::<Instant>));
-    let released_at = Arc::clone(&released);
-    let releaser = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(100));
-        *released_at.lock().unwrap() = Some(Instant::now());
-        release.store(false, Ordering::Release);
-    });
-    // Let the agent take the command before the driver stops it.
-    std::thread::sleep(Duration::from_millis(20));
+    let releaser = {
+        let (gate, dropping, released) = (
+            Arc::clone(&gate),
+            Arc::clone(&dropping),
+            Arc::clone(&released),
+        );
+        std::thread::spawn(move || {
+            while !dropping.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            *released.lock().unwrap() = Some(Instant::now());
+            gate.store(crate::agents::BLOCK_RELEASED, Ordering::Release);
+        })
+    };
+    dropping.store(true, Ordering::Release);
     drop(driver);
     let returned = Instant::now();
+    // The agent let its gate go when the drop returned, before the
+    // releaser is joined: the drop joined it, it did not detach it.
+    assert_eq!(
+        Arc::strong_count(&gate),
+        2,
+        "the agent still holds its gate"
+    );
     releaser.join().unwrap();
     let released = released.lock().unwrap().expect("never released");
     assert!(returned >= released, "the drop returned before the release");
-    assert_eq!(Arc::strong_count(&blocked), 1, "the agent was dropped");
+    assert_eq!(Arc::strong_count(&gate), 1);
 }
 
 /// Dropping a driver with running agent threads stops them.

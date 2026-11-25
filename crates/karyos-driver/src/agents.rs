@@ -588,6 +588,17 @@ impl<O: SocketOps> Half<O> {
     }
 }
 
+/// The gate of [`AgentCommand::Block`]: armed by the test (karyos#1067).
+#[cfg(test)]
+pub(crate) const BLOCK_ARMED: u8 = 0;
+/// The gate of [`AgentCommand::Block`]: the agent took the command and is
+/// blocked.
+#[cfg(test)]
+pub(crate) const BLOCK_ENTERED: u8 = 1;
+/// The gate of [`AgentCommand::Block`]: the test released the agent.
+#[cfg(test)]
+pub(crate) const BLOCK_RELEASED: u8 = 2;
+
 /// A conductor command. Each carries the reservation of its reply.
 #[derive(Debug)]
 pub enum AgentCommand<O: SocketOps, T: StreamTerms = HeapTerms> {
@@ -856,9 +867,12 @@ pub enum AgentCommand<O: SocketOps, T: StreamTerms = HeapTerms> {
     /// Test only: panic in the duty cycle.
     #[cfg(test)]
     Panic,
-    /// Test only: block the duty cycle until the flag is cleared.
+    /// Test only: block the duty cycle. The agent moves the gate from
+    /// [`BLOCK_ARMED`] to [`BLOCK_ENTERED`] when it takes the command, so a
+    /// test knows it is blocked, then spins until the test stores
+    /// [`BLOCK_RELEASED`] (karyos#1067).
     #[cfg(test)]
-    Block(Arc<AtomicBool>),
+    Block(Arc<AtomicU8>),
     /// Test only, sender: mark the publication `alias` on `endpoint` as
     /// needing an endpoint reset, as a send fault would (W4 E2).
     #[cfg(test)]
@@ -1254,8 +1268,14 @@ impl<O: SocketOps, T: StreamTerms> AgentCore<O, T> {
                     }
                 }
                 #[cfg(test)]
-                AgentCommand::Block(flag) => {
-                    while flag.load(Ordering::Acquire) {
+                AgentCommand::Block(gate) => {
+                    let _ = gate.compare_exchange(
+                        BLOCK_ARMED,
+                        BLOCK_ENTERED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                    while gate.load(Ordering::Acquire) != BLOCK_RELEASED {
                         std::thread::yield_now();
                     }
                 }
