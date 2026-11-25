@@ -520,3 +520,36 @@ fn a_source_sees_records_appended_while_it_reads() {
     assert_eq!(source.failures(), 1);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_generation_is_claimed_exclusively_and_a_collision_takes_the_next() {
+    let parent = temp_dir("generation-claim");
+    // A forced collision: the first two candidates are the same value.
+    let mut candidates = [7_u64, 7, 9].into_iter();
+    let first = super::claim_generation(&parent, || candidates.next().unwrap_or(11)).unwrap();
+    let second = super::claim_generation(&parent, || candidates.next().unwrap_or(11)).unwrap();
+    assert_eq!(
+        (first, second),
+        (7, 9),
+        "the second claim skips the taken 7"
+    );
+    assert!(
+        parent
+            .join(super::GENERATIONS_DIR)
+            .join(format!("{:016x}", 7))
+            .is_dir()
+    );
+    // Every candidate taken: refused, never a shared generation.
+    assert!(matches!(
+        super::claim_generation(&parent, || 7),
+        Err(super::JournalError::Generation)
+    ));
+    // Two journals made in one parent never share a generation.
+    for name in ["a", "b"] {
+        std::fs::create_dir_all(parent.join(name)).unwrap();
+    }
+    let a = super::CalibrationJournal::open(StdDisk, &parent.join("a")).unwrap();
+    let b = super::CalibrationJournal::open(StdDisk, &parent.join("b")).unwrap();
+    assert_ne!(a.durable().generation, b.durable().generation);
+    let _ = std::fs::remove_dir_all(&parent);
+}

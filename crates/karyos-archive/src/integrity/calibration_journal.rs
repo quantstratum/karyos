@@ -102,6 +102,9 @@ pub enum JournalError {
     /// Records of the batch were refused; nothing of it was appended.
     #[error("{} record(s) refused, none appended", .0.len())]
     Refused(Vec<(usize, Refusal)>),
+    /// Every candidate generation was already claimed beside the journal.
+    #[error("no unclaimed journal generation after {GENERATION_TRIES} candidates")]
+    Generation,
     /// An earlier append failed part way; reopen the journal to recover.
     #[error("an earlier append failed; the journal must be reopened")]
     Poisoned,
@@ -217,8 +220,57 @@ fn write_durable<D: Disk>(disk: &mut D, dir: &Path, durable: Durable) -> std::io
     disk.sync_dir(dir)
 }
 
-/// A new journal's generation: the creation time in nanoseconds mixed
-/// with the process id, never 0.
+/// The directory, beside a journal, where every generation made there
+/// is claimed, one subdirectory per generation.
+pub const GENERATIONS_DIR: &str = ".karyos-calibration-generations";
+
+/// The most candidates tried before a generation claim gives up.
+const GENERATION_TRIES: usize = 64;
+
+/// Claims a generation for a journal in `parent`: the first of
+/// `candidates` (each non-zero) whose subdirectory of [`GENERATIONS_DIR`]
+/// an exclusive `mkdir` creates. A candidate already claimed fails that
+/// `mkdir` and the next is tried, so no two journals of one parent ever
+/// share a generation, whatever their clocks or pids. The claim is synced
+/// (the new subdirectory's parent) before it is used.
+///
+/// # Errors
+///
+/// [`JournalError::Generation`] when every one of [`GENERATION_TRIES`]
+/// candidates is taken; the I/O error of a `mkdir` or sync otherwise.
+pub fn claim_generation(
+    parent: &Path,
+    mut candidates: impl FnMut() -> u64,
+) -> Result<u64, JournalError> {
+    let registry = parent.join(GENERATIONS_DIR);
+    match std::fs::create_dir(&registry) {
+        Ok(()) => sync_directory(parent)?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(JournalError::Io(error)),
+    }
+    for _ in 0..GENERATION_TRIES {
+        let candidate = candidates().max(1);
+        match std::fs::create_dir(registry.join(format!("{candidate:016x}"))) {
+            Ok(()) => {
+                sync_directory(&registry)?;
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(JournalError::Io(error)),
+        }
+    }
+    Err(JournalError::Generation)
+}
+
+/// Syncs the directory `dir` itself.
+fn sync_directory(dir: &Path) -> Result<(), JournalError> {
+    std::fs::File::open(dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(JournalError::Io)
+}
+
+/// A candidate generation: the creation time in nanoseconds mixed with the
+/// process id, never 0. Its uniqueness is [`claim_generation`]'s.
 fn new_generation() -> u64 {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -352,8 +404,9 @@ impl<D: Disk + Clone> CalibrationJournal<D> {
             None => {
                 // Never committed: whatever a crash left in the store
                 // before the first commit was never visible.
+                let parent = dir.parent().unwrap_or(dir);
                 let fresh = Durable {
-                    generation: new_generation(),
+                    generation: claim_generation(parent, new_generation)?,
                     position: 0,
                 };
                 if store.written() > 0 {
