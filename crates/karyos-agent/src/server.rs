@@ -817,7 +817,12 @@ impl Server {
         let forbidden = || (json::error("forbidden", None), Served::Refused);
         let (answer, served) = match (peer, parse(&line)) {
             (None, _) => (json::error("not authorized", None), Served::Refused),
-            (Some(_), Request::View) => (json::view(&agent.view()), Served::View),
+            // The journal's head in the view is past every record written
+            // before it (R-CORE-14, karyos#725).
+            (Some(_), Request::View) => {
+                agent.settle_journal();
+                (json::view(&agent.view()), Served::View)
+            }
             (Some((_, role)), Request::Capabilities) => (
                 json::capabilities(&agent.capabilities(
                     role.may_close(),

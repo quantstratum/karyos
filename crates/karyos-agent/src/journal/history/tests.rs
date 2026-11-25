@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use super::super::{GapReason, JournalRetention};
 use super::*;
+use karyos_sys::frame::FRAME_ALIGNMENT;
 
 /// A fresh journal directory for test `name`.
 fn dir(name: &str) -> PathBuf {
@@ -232,6 +233,81 @@ fn a_full_page_is_bounded_work() {
     assert!(
         slowest < crate::server::WRITE_DEADLINE,
         "a full page took {slowest:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Codex on #1274: an aligned cursor inside a record is not a record,
+/// found by walking the frames of its term, never read as a header; a
+/// head that padding now starts at still is one.
+#[test]
+fn a_cursor_inside_a_record_is_not_a_record() {
+    let dir = dir("inside");
+    let mut journal = Journal::open(&dir, 1).unwrap();
+    let position = close(&mut journal, 1, 10);
+    let recording = journal.recording();
+    let inside = position + u64::from(FRAME_ALIGNMENT);
+    assert_eq!(
+        journal.history(Some(HistoryCursor::new(recording, inside)), 1),
+        Err(HistoryRefusal::NotARecord { position: inside })
+    );
+    // Heads given out while the journal grew past a term: each reads on,
+    // padding included.
+    let mut heads = Vec::new();
+    let mut time = 11;
+    while journal.head().unwrap().position < u64::from(super::super::TERM_LENGTH) + 1024 {
+        heads.push(journal.head().unwrap());
+        let _ = close(&mut journal, time, time);
+        time += 1;
+    }
+    for head in heads {
+        let page = journal.history(Some(head), 1).unwrap();
+        assert_eq!(page.records.len(), 1, "{head:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Codex on #1274: a damaged frame length is refused `corrupt` at its
+/// position before anything is read on it, never allocated.
+#[test]
+fn a_damaged_frame_length_is_corrupt() {
+    let dir = dir("damaged");
+    let mut journal = Journal::open(&dir, 1).unwrap();
+    let position = close(&mut journal, 1, 10);
+    let _ = close(&mut journal, 2, 11);
+    // The length's third byte: some 16 MiB, past any term.
+    journal.damage(position + 2);
+    assert_eq!(
+        journal.history(None, HISTORY_MAX),
+        Err(HistoryRefusal::Corrupt { position })
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Codex on #1274: the head the view takes follows every record written
+/// before it, a close's record not yet durable included, once the
+/// journal is settled.
+#[test]
+fn a_settled_head_follows_every_record_written() {
+    let dir = dir("settle");
+    let mut journal = Journal::open(&dir, 1).unwrap();
+    let mut record = JournalRecord::new(Kind::CloseOutcome, 5);
+    record.guard = 3;
+    let position = journal.append(&record, 5).unwrap();
+    assert!(journal.head().unwrap().position <= position);
+    journal.settle(6);
+    let head = journal.head().unwrap();
+    assert!(head.position > position);
+    assert!(!journal.unavailable());
+    // Nothing written since: settling again changes nothing.
+    journal.settle(7);
+    assert_eq!(journal.head(), Some(head));
+    assert!(
+        journal
+            .history(Some(head), HISTORY_MAX)
+            .unwrap()
+            .records
+            .is_empty()
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

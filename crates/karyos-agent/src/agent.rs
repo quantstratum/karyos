@@ -1567,6 +1567,15 @@ impl Agent {
         })
     }
 
+    /// Makes every journal record already written durable before a view
+    /// is taken, so the view's `journal.head` follows every record
+    /// written before it (R-CORE-14; karyos#725; [`Journal::settle`]).
+    pub fn settle_journal(&mut self) {
+        if let Some(journal) = self.journal.as_mut() {
+            journal.settle(host_monotonic_ns());
+        }
+    }
+
     /// A page of the operations journal's history (R-CORE-14;
     /// karyos#725): up to `count` records from `from`, or from the
     /// retention floor (see [`crate::journal::history`]).

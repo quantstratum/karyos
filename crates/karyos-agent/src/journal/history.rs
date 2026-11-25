@@ -32,7 +32,9 @@
 //!   record is served as kind `undecodable`, never skipped.
 //! - **The handoff.** The view (`view`) states the journal's `head`: the
 //!   position of the first record not yet in the journal when the view
-//!   was taken. The view and the head are taken on the agent's one
+//!   was taken. The server makes every record already written durable
+//!   ([`Journal::settle`]) before it takes the view, so no record written
+//!   before the view lies past its head. The view and the head are taken on the agent's one
 //!   polling thread, which also makes every append, so a reader that
 //!   reads the view and then follows the history from its `head` misses
 //!   no record written after the view and sees none written before it
@@ -197,6 +199,28 @@ impl Journal {
         ))
     }
 
+    /// Makes every record already written durable, and seals it, as a
+    /// durable append does: the view takes its `head` after this, so a
+    /// record written before the view is never after its head (the
+    /// handoff). Nothing to do when everything written is durable; a sync
+    /// that fails leaves the journal unavailable, as a failed append
+    /// does.
+    pub fn settle(&mut self, now: u64) {
+        let Some(recorder) = self.recorder.as_mut() else {
+            return;
+        };
+        let written = recorder.store().written();
+        if recorder.store().durable() >= written {
+            return;
+        }
+        if recorder.sync().is_ok_and(|durable| durable >= written) {
+            self.seal();
+        } else {
+            self.recorder = None;
+            self.count_failure(now);
+        }
+    }
+
     /// Up to `count` records (at most [`HISTORY_MAX`]) of the journal's
     /// history from `from`, or from the floor when `from` is `None`, up to
     /// the journal's durable end (see the module).
@@ -204,8 +228,8 @@ impl Journal {
     /// # Errors
     ///
     /// [`HistoryRefusal`]: a journal unavailable, a cursor of another
-    /// recording, below the floor, past the durable end or not at a
-    /// frame, or a frame that cannot be read.
+    /// recording, below the floor, past the durable end or not where a
+    /// frame starts, or a frame that cannot be read.
     pub fn history(
         &mut self,
         from: Option<HistoryCursor>,
@@ -215,6 +239,8 @@ impl Journal {
         let recorder = self.recorder.as_mut().ok_or(HistoryRefusal::Unavailable)?;
         let floor = recorder.store().start();
         let head = recorder.store().durable();
+        let term = u64::from(recorder.store().geometry().term_length());
+        let mut header = [0u8; HEADER_LENGTH as usize];
         let mut position = match from {
             None => floor,
             Some(cursor) if cursor.recording != recording => {
@@ -226,70 +252,64 @@ impl Journal {
             Some(cursor) if cursor.position > head => {
                 return Err(HistoryRefusal::Ahead { recording, head });
             }
-            Some(cursor) if !cursor.position.is_multiple_of(u64::from(FRAME_ALIGNMENT)) => {
-                return Err(HistoryRefusal::NotARecord {
+            Some(cursor) => {
+                // A frame never crosses a term and each term starts with
+                // one, so the frames from the cursor's term start (or the
+                // floor) reach the cursor exactly when a frame or a
+                // padding starts there: at most one term's headers read.
+                let not_a_record = HistoryRefusal::NotARecord {
                     position: cursor.position,
-                });
+                };
+                let in_term = cursor.position.checked_rem(term).ok_or(not_a_record)?;
+                let mut at = floor.max(cursor.position.saturating_sub(in_term));
+                while at < cursor.position {
+                    (_, at) =
+                        frame(recorder, at, head, term, &mut header).map_err(|()| not_a_record)?;
+                }
+                if at != cursor.position {
+                    return Err(not_a_record);
+                }
+                cursor.position
             }
-            Some(cursor) => cursor.position,
         };
-        let asked = position;
         let count = count.clamp(1, HISTORY_MAX);
         let mut records: Vec<HistoryRecord> = Vec::new();
-        let mut header = [0u8; HEADER_LENGTH as usize];
         let mut payload = Vec::new();
         while position < head {
-            let corrupt = if position == asked && from.is_some() {
-                HistoryRefusal::NotARecord { position }
-            } else {
-                HistoryRefusal::Corrupt { position }
-            };
-            recorder.read(position, &mut header).map_err(|_| corrupt)?;
-            let word0 = header
-                .get(..8)
-                .and_then(|bytes| bytes.try_into().ok())
-                .map(u64::from_le_bytes)
-                .and_then(|raw| Word0::unpack(raw).ok())
-                .ok_or(corrupt)?;
-            let extent = if word0.frame_type_code() == FrameType::Pad.code() {
-                header
-                    .get(24..32)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .map(i64::from_le_bytes)
-                    .and_then(|extent| u64::try_from(extent).ok())
-                    .ok_or(corrupt)?
-            } else {
+            let corrupt = HistoryRefusal::Corrupt { position };
+            let (data, end) =
+                frame(recorder, position, head, term, &mut header).map_err(|()| corrupt)?;
+            if data {
                 // The page ends before the first record past its count,
                 // the padding before it already crossed.
                 if records.len() == count {
                     break;
                 }
-                let length = u32::try_from(word0.frame_length())
-                    .ok()
-                    .filter(|length| *length >= HEADER_LENGTH)
+                // Within the frame, which `frame` bounded by its term.
+                let length = header
+                    .get(..8)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u64::from_le_bytes)
+                    .and_then(|raw| Word0::unpack(raw).ok())
+                    .map(|word0| word0.frame_length())
+                    .and_then(|length| u64::try_from(length).ok())
                     .ok_or(corrupt)?;
-                let body = usize::try_from(length.abs_diff(HEADER_LENGTH)).map_err(|_| corrupt)?;
-                payload.resize(body, 0);
+                let body = length
+                    .checked_sub(u64::from(HEADER_LENGTH))
+                    .and_then(|body| usize::try_from(body).ok())
+                    .ok_or(corrupt)?;
                 let at = position
                     .checked_add(u64::from(HEADER_LENGTH))
                     .ok_or(corrupt)?;
+                payload.resize(body, 0);
                 recorder.read(at, &mut payload).map_err(|_| corrupt)?;
                 records.push(HistoryRecord {
                     position,
                     next: 0,
                     record: JournalRecord::decode(&payload),
                 });
-                u64::from(length)
-                    .checked_next_multiple_of(u64::from(FRAME_ALIGNMENT))
-                    .ok_or(corrupt)?
-            };
-            if extent == 0 {
-                return Err(corrupt);
             }
-            position = position
-                .checked_add(extent)
-                .filter(|end| *end <= head)
-                .ok_or(corrupt)?;
+            position = end;
         }
         // Each record's `next` is the following record's position, past
         // any padding; the last one's, the page's.
@@ -306,4 +326,55 @@ impl Journal {
             next: position,
         })
     }
+}
+
+/// The frame at `position`, read into `header`: whether it is a record
+/// (else padding), and where it ends, aligned. `Err` unless it is a
+/// frame of the journal: its type, a length of at least a header, within
+/// its term and before `head`, so nothing larger than a term is ever
+/// read on its word.
+fn frame(
+    recorder: &mut super::JournalRecorder,
+    position: u64,
+    head: u64,
+    term: u64,
+    header: &mut [u8; HEADER_LENGTH as usize],
+) -> Result<(bool, u64), ()> {
+    recorder.read(position, header).map_err(|_| ())?;
+    let word = |range: core::ops::Range<usize>| {
+        header
+            .get(range)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_le_bytes)
+    };
+    let word0 = word(0..8)
+        .and_then(|raw| Word0::unpack(raw).ok())
+        .ok_or(())?;
+    let (data, extent) = if word0.frame_type_code() == FrameType::Pad.code() {
+        let extent = word(24..32)
+            .and_then(|extent| i64::try_from(extent).ok())
+            .and_then(|extent| u64::try_from(extent).ok())
+            .ok_or(())?;
+        (false, extent)
+    } else if word0.frame_type_code() == FrameType::Data.code() {
+        let length = u64::try_from(word0.frame_length())
+            .ok()
+            .filter(|length| *length >= u64::from(HEADER_LENGTH))
+            .ok_or(())?;
+        let extent = length
+            .checked_next_multiple_of(u64::from(FRAME_ALIGNMENT))
+            .ok_or(())?;
+        (true, extent)
+    } else {
+        return Err(());
+    };
+    let within = position
+        .checked_rem(term)
+        .and_then(|offset| offset.checked_add(extent))
+        .is_some_and(|reach| reach <= term);
+    let end = position.checked_add(extent).ok_or(())?;
+    if extent == 0 || !extent.is_multiple_of(u64::from(FRAME_ALIGNMENT)) || !within || end > head {
+        return Err(());
+    }
+    Ok((data, end))
 }
