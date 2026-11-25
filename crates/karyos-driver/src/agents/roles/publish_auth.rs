@@ -123,10 +123,6 @@ impl core::fmt::Debug for AbortAuthority {
 
 impl AbortAuthority {
     /// The authority of `signer` under `key_id` for `authority_id`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no authenticated channel opens yet")
-    )]
     pub(crate) fn new(
         signer: crate::authority::Ed25519Signer,
         key_id: u32,
@@ -173,10 +169,6 @@ impl AbortAuthority {
 }
 
 /// A placeholder boot id and nonce for the prototypes, never bound.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no authenticated channel opens yet")
-)]
 const NO_BOOT: [u64; 2] = [0, 0];
 
 impl PublicationAuth {
@@ -196,10 +188,6 @@ impl PublicationAuth {
     /// # Errors
     ///
     /// [`KeyError`] when a file does not fit its purpose.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no authenticated channel opens yet")
-    )]
     pub(crate) fn new(
         endpoint: EndpointId,
         alias: Alias,

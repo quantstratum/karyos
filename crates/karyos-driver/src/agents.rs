@@ -725,6 +725,27 @@ pub enum AgentCommand<O: SocketOps, T: StreamTerms = HeapTerms> {
         /// the `min` strategy with no required or tagged receiver.
         roles: Option<Box<crate::membership::PublicationRoles>>,
     },
+    /// Bind an authenticated channel's keys and selectors, checked by the
+    /// conductor at admission, ahead of the publication or subscription
+    /// they key (karyos#648). Answer [`AgentEvent::Configured`]; refused
+    /// for the other agent's binding, or a control budget the receiver
+    /// cannot reserve.
+    Authenticate {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The binding.
+        binding: Box<roles::AuthBinding>,
+    },
+    /// Apply the driver's key view to every live key of the role, as one
+    /// change (karyos#648; ADR-0086 section 7): posted to both agents in
+    /// the same conductor duty after each reload and expiry tick. Answer
+    /// [`AgentEvent::Configured`].
+    ApplyKeys {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The view.
+        keys: Arc<crate::net::wire::KeyView>,
+    },
     /// Set the agent's network trace hook, or remove it with `None`
     /// (P2.12 step 3). Journals still open close through the previous hook
     /// first. Answer [`AgentEvent::NetworkTraceSet`].
@@ -1265,6 +1286,8 @@ impl<O: SocketOps, T: StreamTerms> AgentCore<O, T> {
                 | AgentCommand::RemoveSubscription { .. }
                 | AgentCommand::AddSubscription { .. }
                 | AgentCommand::AddPublishedAlias { .. }
+                | AgentCommand::Authenticate { .. }
+                | AgentCommand::ApplyKeys { .. }
                 | AgentCommand::SetNetworkTrace { .. }
                 | AgentCommand::OpenNetworkJournal { .. }
                 | AgentCommand::CloseNetworkJournal { .. }
@@ -1609,6 +1632,22 @@ impl AgentCells {
     pub(crate) fn take(&mut self) -> impl Iterator<Item = Counter> + '_ {
         self.stored.clear();
         self.cells.drain(..).flatten()
+    }
+}
+
+/// The authenticated state of the sender and the receiver role (tests;
+/// karyos#648).
+#[cfg(test)]
+pub(crate) type AuthState = ((usize, usize, usize), (usize, usize, usize));
+
+/// The authenticated state of each role (tests; karyos#648).
+#[cfg(test)]
+impl<O: SocketOps, T: StreamTerms> NetworkAgents<O, T> {
+    pub(crate) fn auth_state(&self) -> AuthState {
+        (
+            self.sender.role.auth_state(),
+            self.receiver.role.auth_state(),
+        )
     }
 }
 

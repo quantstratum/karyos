@@ -77,7 +77,9 @@ pub use embedded::{
     FailedReason, NotReadyReason, Readiness, StreamConfig, StreamHandle, StreamState,
     stream_lane_bytes,
 };
-pub use error::{DriverError, EndpointLimit, TimedNetworkUnsupported, WalkerUnavailable};
+pub use error::{
+    AuthRefusal, DriverError, EndpointLimit, TimedNetworkUnsupported, WalkerUnavailable,
+};
 pub use generations::{GenerationInfo, Reconfiguration};
 pub use guards::{
     Audit, AuditOutcome, AuditRecord, GuardHandle, GuardRate, LaneRefusal, RateAuthority,

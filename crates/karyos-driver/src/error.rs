@@ -45,6 +45,44 @@ pub enum TimedNetworkUnsupported {
     HorizonPastLiveness,
 }
 
+/// Why an authenticated channel is refused at admission, before anything
+/// is established (karyos#648; ADR-0086 sections 4, 6 and 7, ADR-0118).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AuthRefusal {
+    /// The driver has no wire key store
+    /// ([`crate::EmbeddedDriver::start_wire_keys`]).
+    #[error("no wire key store")]
+    NoKeyStore,
+    /// The key store failed and names no key.
+    #[error("the wire key store is disabled")]
+    KeyStoreDisabled,
+    /// No valid channel key of the configured id, purpose and stream.
+    #[error("no valid channel key")]
+    ChannelKey,
+    /// No valid pairwise key of the configured id for its one receiver.
+    #[error("no valid pairwise key")]
+    PairwiseKey,
+    /// No valid authority key of the configured id, authority and guard
+    /// that may abort.
+    #[error("no valid authority key")]
+    AuthorityKey,
+    /// Not one unicast receiver: fan-out, multicast, several or dynamic
+    /// destinations, redundant or paired paths, a receiver identity other
+    /// than the configured one, an unanswerable authority endpoint, or a
+    /// second handle of the key under other keys.
+    #[error("not a single unicast receiver")]
+    Ambiguous,
+    /// The verify budget of the authority's control endpoint cannot be
+    /// reserved: the receiver's peer table is full.
+    #[error("the signed control budget cannot be reserved")]
+    ControlBudget,
+    /// A remote guard needs the driver's durable guard state
+    /// ([`crate::EmbeddedDriver::start_guard_state`]), or a guarded
+    /// publication names both a local and a remote guard.
+    #[error("no durable guard state")]
+    GuardState,
+}
+
 /// Errors returned by the embedded driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
@@ -426,6 +464,16 @@ pub enum DriverError {
         /// The stream id.
         stream: u64,
     },
+    /// An authenticated channel was refused at admission (karyos#648).
+    #[error("authenticated channel refused: {reason}")]
+    AuthenticatedRefused {
+        /// Why.
+        reason: AuthRefusal,
+    },
+    /// The wire key store could not start
+    /// ([`crate::EmbeddedDriver::start_wire_keys`]).
+    #[error("the wire key store cannot start: {0}")]
+    KeyStoreStart(crate::wire_keys::store::StoreError),
     /// A network publication's timed lanes cannot take this yet.
     #[error("a timed network publication does not support {reason}")]
     TimedNetworkUnsupported {

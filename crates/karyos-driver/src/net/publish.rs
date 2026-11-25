@@ -630,6 +630,27 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(net) = self.net.as_mut() else {
             return Err(DriverError::NetworkUnavailable);
         };
+        // An authenticated channel serves one unicast receiver with its
+        // keys valid now; anything else is refused before anything exists
+        // (karyos#648; ADR-0086 open point 6, ADR-0076 clause 4).
+        let auth = super::wire::authenticated(channel.security)?;
+        if let Some(auth) = &auth {
+            let single = matches!(channel.destination, Destination::Unicast(_))
+                && channel.paths.is_empty()
+                && required_destinations.is_empty()
+                && allowlist.is_none()
+                && roles.is_none();
+            if !single {
+                return Err(DriverError::AuthenticatedRefused {
+                    reason: crate::error::AuthRefusal::Ambiguous,
+                });
+            }
+            net.wire_keys()
+                .ok_or(DriverError::AuthenticatedRefused {
+                    reason: crate::error::AuthRefusal::NoKeyStore,
+                })?
+                .publication(auth)?;
+        }
         // The channel's `fc` is the strategy (owner item 7, karyos#637):
         // typed roles name the same one, and `max` or `tagged:<group>`
         // without roles runs on a membership with no required or tagged
@@ -797,6 +818,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             linger,
             path_skew,
             registration,
+            auth,
         };
         let added = self.attach_sender(&handle, channel, FIRST_INCARNATION, false);
         if let Err(error) = added {
@@ -1123,6 +1145,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             linger: _,
             path_skew,
             registration,
+            auth,
         } = channel;
         let mut readers = Vec::with_capacity(usize::from(handle.lanes()));
         let mut term = None;
@@ -1296,7 +1319,48 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 Ok(outbound)
             })
             .map_err(|_| DriverError::InvalidConfig)
-            .and_then(|outbound| {
+            .and_then(|mut outbound| {
+                // An authenticated incarnation binds its keys now, checked
+                // again against the current view, and its sender seals or
+                // sends nothing without them (karyos#648).
+                let binding = match &auth {
+                    None => None,
+                    Some(auth) => {
+                        outbound
+                            .require_auth()
+                            .map_err(|_| DriverError::AuthenticatedRefused {
+                                reason: crate::error::AuthRefusal::Ambiguous,
+                            })?;
+                        let wire =
+                            net.wire_keys_mut()
+                                .ok_or(DriverError::AuthenticatedRefused {
+                                    reason: crate::error::AuthRefusal::NoKeyStore,
+                                })?;
+                        let binding = wire.publication_binding(auth, &publication(endpoint))?;
+                        // A remotely guarded incarnation is
+                        // admission-pending until the followed guard's word
+                        // first reads open, and holds no live incarnation
+                        // until then (guards-and-abort.md, step 3).
+                        if let Some((_, mirror)) = &binding.follow {
+                            if guard.is_some() {
+                                return Err(DriverError::AuthenticatedRefused {
+                                    reason: crate::error::AuthRefusal::GuardState,
+                                });
+                            }
+                            outbound.guard_remote(crate::agents::data::GuardSpec {
+                                word: Arc::clone(mirror) as Arc<dyn karyos_client::SharedWords>,
+                                cell: Arc::new(karyos_sys::applied_epoch::AppliedEpoch::new()),
+                                epoch: 0,
+                                rate: None,
+                                reserve: None,
+                                empty_since: None,
+                                policy: None,
+                                frontier: Arc::default(),
+                            });
+                        }
+                        Some(binding)
+                    }
+                };
                 net.add_publication(
                     handle.registration(),
                     publication(endpoint),
@@ -1304,6 +1368,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     guard,
                     roles,
                     kept,
+                    binding,
                 )
             });
         if posted.is_err() {

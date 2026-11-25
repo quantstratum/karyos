@@ -25,7 +25,7 @@ thiserror.workspace = true
 
 [features]
 # Hooks only tests use: hidden API, never in a release build (karyos#852).
-test-hooks = []
+test-hooks = ["karyos-protocol/test-hooks"]
 
 [dev-dependencies]
 # Cross-checks the erased HMAC of the key state fingerprints.

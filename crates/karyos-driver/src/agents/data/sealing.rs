@@ -233,6 +233,13 @@ impl<T: StreamTerms> Outbound<T> {
         }
     }
 
+    /// Whether an installed authenticated sealer still seals (tests): a
+    /// withdrawn one stays installed as a tombstone.
+    #[cfg(test)]
+    pub(crate) fn sealer_live(&self) -> bool {
+        matches!(&self.auth, SenderAuth::Sealing(sealer) if sealer.can_seal())
+    }
+
     /// The installed sealer's party (tests).
     #[cfg(test)]
     pub(crate) fn sealer_party(&self) -> Option<crate::wire_auth::Party> {

@@ -184,10 +184,6 @@ impl SubscriptionAuth {
     /// # Errors
     ///
     /// [`KeyError`] when a file does not fit its purpose.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no authenticated channel opens yet")
-    )]
     pub(crate) fn new(
         endpoint: crate::agents::EndpointId,
         alias: Alias,

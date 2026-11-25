@@ -1271,6 +1271,7 @@ fn entry(first: u32, stream_id: i32, later: &[u32]) -> crate::net::NetSubscripti
         *slot = Some(crate::agents::EndpointId(*path));
     }
     crate::net::NetSubscription {
+        auth: None,
         endpoint: crate::agents::EndpointId(first),
         stream_id,
         reliable: true,

@@ -238,6 +238,55 @@ pub enum Security {
     /// No authentication or encryption.
     #[default]
     Trusted,
+    /// The authenticated class (ADR-0086, ADR-0107, ADR-0118) with the key
+    /// ids and the single unicast receiver it binds at admission. Built in
+    /// code by tests only (`test-hooks`, karyos#648): `security=authenticated`
+    /// is still refused at parse until its capability gate passes.
+    #[cfg(feature = "test-hooks")]
+    Authenticated(AuthenticatedChannel),
+}
+
+/// What an authenticated channel binds at publication and subscription
+/// admission (karyos#648; ADR-0086 sections 4, 6 and 7, ADR-0118): the
+/// key ids each side must find valid in its driver's key store, and the
+/// one unicast receiver the channel serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthenticatedChannel {
+    /// The channel key (`purpose=channel`): SETUP proofs and the session's
+    /// DATA.
+    pub channel_key_id: u32,
+    /// The receiver's pairwise key (`purpose=pairwise`): RSP_SETUP and the
+    /// receiver's controls.
+    pub pairwise_key_id: u32,
+    /// The single unicast receiver: the pairwise key's `receiver_id` and the
+    /// subscription's receiver identity.
+    pub receiver_id: u64,
+    /// The abort and guard authority of the publication (ADR-0118 (a): only
+    /// the authority that guards a publication may abort it); `None` when
+    /// nothing may abort it remotely.
+    pub authority: Option<ChannelAuthority>,
+}
+
+/// The abort and guard authority an authenticated channel names
+/// (ADR-0118; design guards-and-abort.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelAuthority {
+    /// Its key: `authority-signing` at the publisher, which signs the
+    /// publication's aborts, and `authority-public` at the receiver.
+    pub key_id: u32,
+    /// The `authority_id` its key file names.
+    pub authority_id: u64,
+    /// The guard it serves for this publication, nonzero; its file must
+    /// list it.
+    pub guard_id: u64,
+    /// Its guard control endpoint: the only source of its signed controls,
+    /// whose verify budget the receiver reserves at admission.
+    pub control: SocketAddr,
+    /// At a publisher holding the authority's public key (a remotely
+    /// guarded publication): the receiver id it follows the guard as, its
+    /// entry in the authority's configuration, nonzero. Unused where the
+    /// publisher holds the authority's signing key.
+    pub follower_id: u64,
 }
 
 /// How a multi-destination channel learns its receivers (ADR-0056).

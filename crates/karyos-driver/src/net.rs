@@ -447,6 +447,9 @@ pub(crate) struct SenderChannel {
     /// A `control-mode=dynamic` publication's registration policy
     /// (karyos#644); `None` otherwise.
     pub(crate) registration: Option<crate::sessions::register::RegistrationPolicy>,
+    /// An authenticated channel's key ids, receiver and authority, bound
+    /// again for each incarnation (karyos#648); `None` for a trusted one.
+    pub(crate) auth: Option<karyos_protocol::channel::AuthenticatedChannel>,
 }
 
 /// A network publication between incarnations (guards-and-abort.md, On
@@ -571,6 +574,9 @@ struct NetSubscription {
     /// admitted. A second handle naming `nak-control` must ask for the same
     /// ones (karyos#1086 review).
     control_admitted: ControlAdmitted,
+    /// The authenticated channel every handle of the key shares
+    /// (karyos#648); `None` for a trusted one.
+    auth: Option<karyos_protocol::channel::AuthenticatedChannel>,
     /// Handles of this key; the receiver's entry goes with the last.
     users: usize,
 }
@@ -921,6 +927,10 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     /// Conflated views built from now on are not attached (tests).
     #[cfg(test)]
     defer_view_attach: bool,
+    /// The driver's one wire key store, once started (karyos#648): its
+    /// reload and expiry tick run in [`Network::duty`], and each new view
+    /// goes to both agents in the same duty.
+    wire: Option<wire::WireKeys>,
 }
 
 impl<T: StreamTerms> Network<T> {
@@ -1056,7 +1066,122 @@ impl<T: StreamTerms> Network<T> {
             ),
             #[cfg(test)]
             defer_view_attach: false,
+            wire: None,
         })
+    }
+
+    /// Starts the driver's one wire key store over the key directory
+    /// `keys` and the state directory `state` at the wall `clock` (the
+    /// host's when `None`), and posts its first view to both agents.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::KeyStoreStart`] when the store cannot start, and
+    /// [`DriverError::InvalidConfig`] when one is started already.
+    pub(crate) fn start_wire_keys(
+        &mut self,
+        keys: wire::Dir,
+        state: wire::Dir,
+        clock: Option<fn() -> i64>,
+    ) -> Result<crate::wire_keys::store::Report, DriverError> {
+        if self.wire.is_some() {
+            return Err(DriverError::InvalidConfig);
+        }
+        let (keys, report) =
+            wire::WireKeys::start(keys, state, clock).map_err(DriverError::KeyStoreStart)?;
+        self.wire = Some(keys);
+        Ok(report)
+    }
+
+    /// The authenticated state of both roles of a shared runner
+    /// (tests): the sender's bound publications and installed sealers, the
+    /// receiver's bound subscriptions, authenticated images and withdrawn
+    /// image sealers.
+    #[cfg(test)]
+    pub(crate) fn auth_state(&self) -> Option<crate::agents::AuthState> {
+        match &self.agents {
+            Agents::Shared(agents) => Some(agents.auth_state()),
+            Agents::Threads(_) | Agents::Closed => None,
+        }
+    }
+
+    /// The driver's wire key store, once started.
+    pub(crate) fn wire_keys(&self) -> Option<&wire::WireKeys> {
+        self.wire.as_ref()
+    }
+
+    /// Holds the guard authority's control endpoints open and posts the
+    /// authority to the receiver, which answers only on them. An endpoint
+    /// that cannot open releases those already held.
+    pub(crate) fn post_guard_authority(
+        &mut self,
+        authority: crate::guard_authority::GuardAuthority,
+        controls: &[SocketAddr],
+        view: Arc<wire::KeyView>,
+    ) -> Result<(), DriverError> {
+        let mut endpoints = Vec::with_capacity(controls.len());
+        for &control in controls {
+            match self.hold_send_endpoint(control) {
+                Ok(endpoint) => endpoints.push(endpoint),
+                Err(error) => {
+                    for endpoint in endpoints {
+                        release(&mut self.send_endpoints, endpoint);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let binding = Box::new(crate::agents::roles::AuthBinding(
+            crate::agents::roles::Binding::Authority {
+                authority: Box::new(authority),
+                endpoints: endpoints.clone(),
+                view,
+            },
+        ));
+        let posted = self
+            .links
+            .receiver
+            .post(|reply| AgentCommand::Authenticate { reply, binding });
+        if posted.is_err() {
+            for endpoint in endpoints {
+                release(&mut self.send_endpoints, endpoint);
+            }
+            return Err(DriverError::NetworkBusy);
+        }
+        Ok(())
+    }
+
+    /// The driver's wire key store, once started, for admission.
+    pub(crate) fn wire_keys_mut(&mut self) -> Option<&mut wire::WireKeys> {
+        self.wire.as_mut()
+    }
+
+    /// The key store's duty (karyos#648): a reload every
+    /// [`crate::wire_keys::store::RELOAD_INTERVAL_S`] and the expiry tick;
+    /// a changed view is posted to both agents here, one after the other,
+    /// so both roles apply it in their next cycle. A view a ring refused
+    /// is posted to both again at the next duty.
+    fn wire_duty(&mut self) {
+        let Some(wire) = self.wire.as_mut() else {
+            return;
+        };
+        let Some(view) = wire.duty() else {
+            return;
+        };
+        let receiver = self
+            .links
+            .receiver
+            .post(|reply| AgentCommand::ApplyKeys {
+                reply,
+                keys: Arc::clone(&view),
+            })
+            .is_ok();
+        let sender = self
+            .links
+            .sender
+            .post(|reply| AgentCommand::ApplyKeys { reply, keys: view })
+            .is_ok();
+        wire.posted(receiver && sender);
     }
 
     /// The send endpoint bound to `bind`, opened on first use; one more
@@ -1202,6 +1327,10 @@ impl<T: StreamTerms> Network<T> {
     /// [`DriverError::ControlGroupConflict`] for a second handle whose
     /// channel names `nak-control` groups (`names_control`) other than
     /// those the key's paths joined.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the key's options, and its authenticated binding (karyos#648)"
+    )]
     pub(crate) fn add_subscription(
         &mut self,
         stream_id: i32,
@@ -1210,8 +1339,13 @@ impl<T: StreamTerms> Network<T> {
         max_term_length: u32,
         (reliable, own_port, names_control): (bool, bool, bool),
         (identity, conflated, register_at, path_skew): KeyOptions,
+        auth: Option<(
+            karyos_protocol::channel::AuthenticatedChannel,
+            wire::SubscriptionKeys,
+        )>,
     ) -> Result<NetworkSubscription, DriverError> {
         let group = multicast.is_some();
+        let channel_auth = auth.as_ref().map(|(channel, _)| *channel);
         // A URI subscription on port 0 (`own_port`) asks for an ephemeral
         // port of its own (karyos#656): never another's endpoint, which an
         // address with port 0 would otherwise match. The embedded calls
@@ -1257,6 +1391,14 @@ impl<T: StreamTerms> Network<T> {
             if entry.conflated != conflated {
                 release(&mut self.send_endpoints, endpoint);
                 return Err(DriverError::ConflationMismatch);
+            }
+            // Its images take one authenticated binding, or none: a second
+            // handle under other keys is ambiguous (karyos#648).
+            if entry.auth != channel_auth {
+                release(&mut self.send_endpoints, endpoint);
+                return Err(DriverError::AuthenticatedRefused {
+                    reason: crate::error::AuthRefusal::Ambiguous,
+                });
             }
             // It registers at one `control` address, or at none.
             if entry.register_at != register_at {
@@ -1352,6 +1494,25 @@ impl<T: StreamTerms> Network<T> {
         // A dynamic key's registration state, shared with its receiver.
         let registration = register_at
             .map(|_| std::sync::Arc::new(crate::sessions::register::RegistrationStatus::default()));
+        // An authenticated key's binding goes first, in the same ring, so
+        // the receiver never establishes an image of the key without it
+        // (karyos#648).
+        let bound = match auth {
+            None => Ok(()),
+            Some((channel, keys)) => {
+                self.post_subscription_binding(endpoint, stream_id, channel, keys)
+            }
+        };
+        if let Err(error) = bound {
+            release(&mut self.send_endpoints, endpoint);
+            if let Some((control, _)) = control {
+                release(&mut self.send_endpoints, control);
+            }
+            if let Some(solicit) = solicit {
+                release(&mut self.send_endpoints, solicit);
+            }
+            return Err(error);
+        }
         let posted = self
             .links
             .receiver
@@ -1479,9 +1640,52 @@ impl<T: StreamTerms> Network<T> {
             later_routes,
             control_held,
             control_admitted,
+            auth: channel_auth,
             users: 1,
         });
         Ok(handle)
+    }
+
+    /// Posts the receiver binding of the authenticated subscription to
+    /// `stream_id` on `endpoint`, its keys checked at admission.
+    fn post_subscription_binding(
+        &mut self,
+        endpoint: EndpointId,
+        stream_id: i32,
+        channel: karyos_protocol::channel::AuthenticatedChannel,
+        keys: wire::SubscriptionKeys,
+    ) -> Result<(), DriverError> {
+        use crate::agents::roles::{AuthBinding, Binding, BoundAuthority};
+
+        let alias = Alias {
+            session_id: 0,
+            stream_id,
+        };
+        let auth = crate::agents::roles::receive_auth::SubscriptionAuth::new(
+            endpoint,
+            alias,
+            &keys.channel,
+            &keys.pairwise,
+            channel.receiver_id,
+        )
+        .map_err(|_| DriverError::AuthenticatedRefused {
+            reason: crate::error::AuthRefusal::PairwiseKey,
+        })?;
+        let authority = channel.authority.map(|authority| BoundAuthority {
+            key_id: authority.key_id,
+            authority_id: authority.authority_id,
+            guard_id: authority.guard_id,
+            control: authority.control,
+        });
+        let binding = Box::new(AuthBinding(Binding::Subscription {
+            auth,
+            authority,
+            view: keys.view,
+        }));
+        self.links
+            .receiver
+            .post(|reply| AgentCommand::Authenticate { reply, binding })
+            .map_err(|_| DriverError::NetworkBusy)
     }
 
     /// The registration state of `subscription`, a `control-mode=dynamic`
@@ -1832,6 +2036,14 @@ impl<T: StreamTerms> Network<T> {
             endpoint,
             stream_id,
         } = subscription;
+        // Each handle of an authenticated key reserved its authority's
+        // control peer at admission (karyos#648).
+        let peer = self
+            .subscriptions
+            .get(index)
+            .and_then(|entry| entry.auth)
+            .and_then(|auth| auth.authority)
+            .map(|authority| authority.control);
         match self.subscriptions.get_mut(index) {
             // Another handle still holds the receiver's entry.
             Some(entry) if entry.users > 1 => {
@@ -1864,6 +2076,25 @@ impl<T: StreamTerms> Network<T> {
                         stream_id,
                     })
                     .map_err(|_| DriverError::NetworkBusy)?;
+                // Its keys, abort scope and peer reservation go with it.
+                // A full ring leaves them to the next binding of the key,
+                // which replaces them; until then they key nothing live.
+                if self
+                    .subscriptions
+                    .get(index)
+                    .is_some_and(|entry| entry.auth.is_some())
+                {
+                    let binding = Box::new(crate::agents::roles::AuthBinding(
+                        crate::agents::roles::Binding::Unbind {
+                            endpoint,
+                            stream_id,
+                        },
+                    ));
+                    let _ = self
+                        .links
+                        .receiver
+                        .post(|reply| AgentCommand::Authenticate { reply, binding });
+                }
                 let entry = self.subscriptions.swap_remove(index);
                 self.release_control_groups(&entry.control_held);
                 if let Some(control) = entry.control {
@@ -1879,6 +2110,9 @@ impl<T: StreamTerms> Network<T> {
                     release(&mut self.send_endpoints, control);
                 }
             }
+        }
+        if let (Some(peer), Some(wire)) = (peer, self.wire.as_mut()) {
+            wire.release(peer);
         }
         release(&mut self.send_endpoints, endpoint);
         Ok(true)
@@ -2320,6 +2554,10 @@ impl<T: StreamTerms> Network<T> {
     ///
     /// [`DriverError::NetworkBusy`] when an agent's ring is full; nothing
     /// is posted to the sender then.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the publication's parts, and its authenticated binding (karyos#648)"
+    )]
     pub(crate) fn add_publication(
         &mut self,
         registration: u64,
@@ -2331,6 +2569,7 @@ impl<T: StreamTerms> Network<T> {
         )>,
         roles: Option<Box<crate::membership::PublicationRoles>>,
         channel: SenderChannel,
+        auth: Option<wire::PublicationBinding>,
     ) -> Result<(), DriverError> {
         let (spec, guard_sender) = guard.map_or((None, None), |(spec, id)| (Some(spec), Some(id)));
         let frontier = spec
@@ -2462,14 +2701,35 @@ impl<T: StreamTerms> Network<T> {
         }
         let mut published = 0usize;
         for path in paths() {
-            let posted = self
-                .links
-                .receiver
-                .post(|reply| AgentCommand::AddPublishedAlias {
-                    reply,
-                    endpoint: path,
-                    alias,
-                });
+            // An authenticated publication's alias is bound first, so its
+            // receivers' envelopes never reach the bare path (karyos#648).
+            let bound = auth.is_none()
+                || self
+                    .links
+                    .receiver
+                    .post(|reply| AgentCommand::Authenticate {
+                        reply,
+                        binding: Box::new(crate::agents::roles::AuthBinding(
+                            crate::agents::roles::Binding::Published {
+                                endpoint: path,
+                                alias,
+                            },
+                        )),
+                    })
+                    .is_ok();
+            let posted = if bound {
+                self.links
+                    .receiver
+                    .post(|reply| AgentCommand::AddPublishedAlias {
+                        reply,
+                        endpoint: path,
+                        alias,
+                    })
+            } else {
+                Err(crate::agents::AgentError::Busy(
+                    crate::agents::AgentKind::Receiver,
+                ))
+            };
             if posted.is_err() {
                 // The paths already published are stale now; the capacity
                 // check above leaves room for them.
@@ -2494,16 +2754,46 @@ impl<T: StreamTerms> Network<T> {
         self.stale_aliases.retain(|key| !mine(key));
         let admission = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
         outbound.set_admission_slot(std::sync::Arc::clone(&admission));
-        let posted = self
-            .links
-            .sender
-            .post(|reply| AgentCommand::AddPublication {
-                reply,
-                publication,
-                outbound,
-                guard: spec,
-                roles,
-            });
+        // Its remote guard is followed, and its keys and abort authority
+        // reach the sender, ahead of it.
+        let bound = match auth {
+            None => true,
+            Some(binding) => {
+                let followed = binding.follow.is_none_or(|(follow, _)| {
+                    self.links
+                        .receiver
+                        .post(|reply| AgentCommand::Authenticate {
+                            reply,
+                            binding: Box::new(crate::agents::roles::AuthBinding(follow)),
+                        })
+                        .is_ok()
+                });
+                followed
+                    && self
+                        .links
+                        .sender
+                        .post(|reply| AgentCommand::Authenticate {
+                            reply,
+                            binding: Box::new(crate::agents::roles::AuthBinding(binding.sender)),
+                        })
+                        .is_ok()
+            }
+        };
+        let posted = if !bound {
+            Err(crate::agents::AgentError::Busy(
+                crate::agents::AgentKind::Receiver,
+            ))
+        } else {
+            self.links
+                .sender
+                .post(|reply| AgentCommand::AddPublication {
+                    reply,
+                    publication,
+                    outbound,
+                    guard: spec,
+                    roles,
+                })
+        };
         if posted.is_err() {
             // The receiver learned the aliases: they are stale now. The
             // capacity check above leaves room for them.
@@ -3016,6 +3306,7 @@ impl<T: StreamTerms> Network<T> {
         if let Some(agent) = self.failed {
             return Err(DriverError::NetworkAgent { agent });
         }
+        self.wire_duty();
         let work = match &mut self.agents {
             // The receiver first, as on a shared runner thread.
             Agents::Shared(agents) => guarded(AgentKind::Receiver, || agents.receiver.do_work(now))
@@ -4086,6 +4377,7 @@ pub mod control_group;
 mod publish;
 mod subscribe;
 pub(crate) mod trace;
+pub mod wire;
 
 #[cfg(test)]
 mod e2e;

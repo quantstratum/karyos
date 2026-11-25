@@ -318,6 +318,15 @@ pub struct ReceiverCounters {
     /// GUARD datagrams on an endpoint that is not one of the guard
     /// authority's control endpoints: refused before they are read.
     pub guard_challenges_wrong_endpoint: u64,
+    /// GUARD STATE or STATUS a followed guard could not persist its mark
+    /// for: nothing opened (karyos#648; an alarm).
+    pub guard_persist_failures: u64,
+    /// Followed guards latched closed by a STATUS below their durable mark
+    /// during recovery (ADR-0107 decision 6; a rollback alarm).
+    pub guard_rollbacks: u64,
+    /// STATUS_CHALLENGEs this authority could not answer because its
+    /// committed guard state is unreadable or a commit failed (an alarm).
+    pub authority_commit_failures: u64,
     /// Bare DATA, heartbeats, PATH_HB, ERR, RTTM REPLY, SETUP ANNOUNCE or
     /// SETUP ANSWER for an authenticated image (ADR-0086 section 2):
     /// dropped.
@@ -1036,6 +1045,10 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// The remote abort each authenticated subscription admits, by
     /// endpoint and stream: copied to each image at admission.
     abort_scopes: Vec<(EndpointId, i32, AbortScope)>,
+    /// The authority control endpoint whose verify budget each
+    /// authenticated subscription bound at admission reserved, by endpoint
+    /// and stream (karyos#648): released with its binding.
+    auth_peers: Vec<(EndpointId, i32, SocketAddr)>,
     /// The guards of other drivers this one follows.
     remote_guards: Vec<FollowedGuard>,
     /// Their durable epoch marks.
@@ -2323,6 +2336,7 @@ pub(super) fn roles<T: StreamTerms>(
             signed: None,
             authority_keys: Vec::new(),
             abort_scopes: Vec::new(),
+            auth_peers: Vec::new(),
             remote_guards: Vec::new(),
             guard_marks: None,
             guard_authority: None,
@@ -2600,6 +2614,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 if let Some(index) = found {
                     self.published.swap_remove(index);
                 }
+                // An authenticated alias's binding goes with it (karyos#648).
+                self.published_auth.retain(|held| *held != entry);
                 Some((reply, configured(found.is_some())))
             }
             AgentCommand::RemovePublication { reply, .. }
@@ -2610,6 +2626,13 @@ impl<T: StreamTerms> ReceiverRole<T> {
                     agent: AgentKind::Receiver,
                 },
             )),
+            AgentCommand::Authenticate { reply, binding } => {
+                Some((reply, configured(self.bind_auth(binding.0))))
+            }
+            AgentCommand::ApplyKeys { reply, keys } => {
+                self.apply_keys(&*keys);
+                Some((reply, configured(true)))
+            }
             AgentCommand::AddPublication {
                 reply, publication, ..
             } => Some((
@@ -3076,9 +3099,9 @@ impl<T: StreamTerms> ReceiverRole<T> {
     /// disabled store names no key, so every authenticated path stops.
     ///
     /// Called after each `KeyStore::reload` and on each clock tick, for
-    /// expiry, with [`crate::wire_auth::StoreKeys`]. No production caller
-    /// exists yet: no authenticated channel can open, and the reload timer
-    /// is wired with that enablement.
+    /// expiry, with the conductor's coordinated
+    /// [`crate::net::wire::KeyView`] (karyos#648), posted to both roles in
+    /// the same duty.
     pub fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
         // A changed set moves the generation: every prepared send made
         // under the previous one is dropped at submission.
@@ -6434,7 +6457,10 @@ impl<T: StreamTerms> Intake<'_, T> {
         let answer = match authority.answer(bytes, source, now) {
             Ok(answer) => answer,
             Err(ChallengeRefusal::Malformed) => return false,
-            Err(_) => {
+            Err(reason) => {
+                if reason == ChallengeRefusal::Uncommitted {
+                    self.role.count(|c| &mut c.authority_commit_failures);
+                }
                 self.role.count(|c| &mut c.guard_challenges_refused);
                 return true;
             }
@@ -6664,9 +6690,11 @@ impl<T: StreamTerms> Intake<'_, T> {
                     .find(|followed| followed.guard.guard_id() == state.guard_id);
                 let applied = match (guard, marks) {
                     (Some(followed), Some(marks)) => {
-                        followed.guard.on_state(&state, now, marks).is_ok()
+                        let before = followed.guard.phase(now);
+                        let result = followed.guard.on_state(&state, now, marks).map(|_| ());
+                        Some((result, before, followed.guard.phase(now)))
                     }
-                    _ => false,
+                    _ => None,
                 };
                 self.guard_outcome(applied);
                 self.role.publish_guard_words(now);
@@ -6685,12 +6713,14 @@ impl<T: StreamTerms> Intake<'_, T> {
                             receiver_boot_id: boot,
                             receiver_id: followed.receiver_id,
                         };
-                        followed
+                        let before = followed.guard.phase(now);
+                        let result = followed
                             .guard
                             .on_status(&status, receiver, now, marks)
-                            .is_ok()
+                            .map(|_| ());
+                        Some((result, before, followed.guard.phase(now)))
                     }
-                    _ => false,
+                    _ => None,
                 };
                 self.guard_outcome(applied);
                 self.role.publish_guard_words(now);
@@ -6702,11 +6732,33 @@ impl<T: StreamTerms> Intake<'_, T> {
     /// Counts a GUARD outcome. A STATE or STATUS changes no ACK, so it
     /// needs no digest entry: a resend runs the guard's own epoch and nonce
     /// checks again, which refuse it.
-    fn guard_outcome(&mut self, applied: bool) {
-        if applied {
-            self.role.count(|c| &mut c.guard_changes);
-        } else {
+    /// A persistence failure and a rollback latch are counted apart, as
+    /// alarms (karyos#648).
+    fn guard_outcome(
+        &mut self,
+        outcome: Option<(
+            Result<(), crate::remote_guard::GuardRefusal>,
+            crate::remote_guard::Phase,
+            crate::remote_guard::Phase,
+        )>,
+    ) {
+        use crate::remote_guard::{GuardRefusal, Phase};
+
+        let Some((result, before, after)) = outcome else {
             self.role.count(|c| &mut c.guard_refused);
+            return;
+        };
+        if matches!(after, Phase::Latched) && !matches!(before, Phase::Latched) {
+            self.role.count(|c| &mut c.guard_rollbacks);
+        }
+        match result {
+            Ok(()) => self.role.count(|c| &mut c.guard_changes),
+            Err(reason) => {
+                if reason == GuardRefusal::Persist {
+                    self.role.count(|c| &mut c.guard_persist_failures);
+                }
+                self.role.count(|c| &mut c.guard_refused);
+            }
         }
     }
 
@@ -7139,6 +7191,28 @@ impl<T: StreamTerms> SenderRole<T> {
                     outbound.force_needs_reset();
                 }
                 return None;
+            }
+            AgentCommand::Authenticate { reply, binding } => {
+                let accepted = self.bind_auth(binding.0);
+                return Some((
+                    reply,
+                    AgentEvent::Configured {
+                        agent: AgentKind::Sender,
+                        accepted,
+                        subscription: None,
+                    },
+                ));
+            }
+            AgentCommand::ApplyKeys { reply, keys } => {
+                self.apply_keys(&*keys);
+                return Some((
+                    reply,
+                    AgentEvent::Configured {
+                        agent: AgentKind::Sender,
+                        accepted: true,
+                        subscription: None,
+                    },
+                ));
             }
             AgentCommand::AddSubscription { reply, .. }
             | AgentCommand::AddPublishedAlias { reply, .. }
@@ -8227,9 +8301,9 @@ impl<T: StreamTerms> SenderRole<T> {
     /// authenticated publication stops.
     ///
     /// Called after each `KeyStore::reload` and on each clock tick, for
-    /// expiry, with [`crate::wire_auth::StoreKeys`]. No production caller
-    /// exists yet: no authenticated channel can open, and the reload timer
-    /// is wired with that enablement.
+    /// expiry, with the conductor's coordinated
+    /// [`crate::net::wire::KeyView`] (karyos#648), posted to both roles in
+    /// the same duty.
     pub fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
         self.key_generation.observe(keys);
         self.enc.apply_keys(keys);
@@ -10778,12 +10852,15 @@ fn established<T: StreamTerms>(sessions: &SendSessions, outbound: &Outbound<T>) 
         .any(|path| sessions.is_established(path, outbound.alias()))
 }
 
+mod bind_auth;
 mod path_intake;
 pub(crate) mod publish_auth;
 pub(crate) mod publish_enc;
 pub(crate) mod receive_auth;
 pub(crate) mod receive_enc;
 
+pub use bind_auth::AuthBinding;
+pub(crate) use bind_auth::{Binding, BoundAuthority};
 use publish_auth::{Establishing, PublicationAuth, receiver_control_alias};
 use receive_auth::{AuthReason, AuthRejections, ImageAuth, SubscriptionAuth};
 
