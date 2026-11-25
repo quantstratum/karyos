@@ -269,6 +269,12 @@ impl Authority {
         }
     }
 
+    /// The `key_id` of its key.
+    #[must_use]
+    pub fn key_id(&self) -> u32 {
+        self.key_id
+    }
+
     /// The authority id its key names.
     #[must_use]
     pub fn authority_id(&self) -> u64 {
@@ -366,6 +372,15 @@ impl<R: Clone> SignedIntake<R> {
             verified: 0,
             resends: 0,
         }
+    }
+
+    /// Replaces the trusted authorities after a key reload or expiry (H8
+    /// finding 4): a key no longer in `authorities` verifies nothing from
+    /// now on, and the digest cache is emptied, so no ACK is resent from
+    /// state applied under the old set.
+    pub fn replace_authorities(&mut self, authorities: Vec<Authority>) {
+        self.authorities = authorities;
+        self.cache = DigestCache::new();
     }
 
     /// A new duty cycle.

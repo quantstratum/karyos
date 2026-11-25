@@ -7557,6 +7557,83 @@ fn sender_controls_of_an_authenticated_publication_go_sealed_in_domain_1() {
     );
 }
 
+/// H8 finding 4: a key reload that leaves the channel file no longer
+/// signing withdraws the publication's installed session sealer and its
+/// prototype, so it sends nothing (fail closed); once the key is back, a
+/// new establishment keys it again.
+#[test]
+fn a_reload_without_the_channel_key_stops_an_authenticated_publication() {
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::ops::SendResult;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    use super::super::Half;
+    use super::publish_auth::PublicationAuth;
+    use crate::wire_auth::{FixedKeys, Party};
+
+    let (mut sender, _role) = receiver_with(AgentConfig::default());
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    for _ in 0..4 {
+        observer.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let endpoint = SocketsEndpoint::open(&loopback(), InstanceId::FIRST, socket).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    let mut halves = vec![(EndpointId(1), Half::Tx(Box::new(tx)))];
+    let channel_text = b"format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=1\npurpose=channel\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=1111111111111111111111111111111111111111111111111111111111111111\nchannel_id=7\nstream_id=6\n";
+    let pair_text = b"format=karyos-wire-key-v1\nkey_id=9\nfile_epoch=1\npurpose=pairwise\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=2222222222222222222222222222222222222222222222222222222222222222\nreceiver_id=66\npublisher_id=5\n";
+    let parse = |name: &str, text: &[u8]| crate::wire_keys::parse(name, text).unwrap();
+    let both = || FixedKeys {
+        files: vec![parse("3-1.key", channel_text), parse("9-1.key", pair_text)],
+    };
+    let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let (mut path, _log) = outbound(EndpointId(1), destination);
+    path.require_auth().unwrap();
+    sender.publications.push(path);
+    let auth = PublicationAuth::new(
+        EndpointId(1),
+        alias(),
+        identity(),
+        1,
+        &parse("3-1.key", channel_text),
+        &[&parse("9-1.key", pair_text)],
+    )
+    .unwrap();
+    let party = Party::Sender {
+        identity: identity(),
+        lane_count: 1,
+        receiver_boot_id: [7, 8],
+        nonce: [9, 9],
+    };
+    let sealer = auth.sealer(party).unwrap();
+    sender.authenticate_publication(auth);
+    sender.publications[0].install_sealer(sealer).unwrap();
+    let heartbeat = Control::PathHeartbeat(karyos_protocol::network::PathHeartbeat {
+        alias: alias(),
+        identity: identity(),
+    });
+    // The same key set changes nothing.
+    sender.apply_keys(&both());
+    assert!(sender.send_sender_control_for(&mut halves, EndpointId(1), destination, &heartbeat));
+    // The channel file revoked (only the pairwise key left): withdrawn.
+    sender.apply_keys(&FixedKeys {
+        files: vec![parse("9-1.key", pair_text)],
+    });
+    assert_eq!(sender.publications[0].sealer_party(), None);
+    assert!(!sender.send_sender_control_for(&mut halves, EndpointId(1), destination, &heartbeat));
+    assert_eq!(sender.counters().seal_failures, 1);
+    assert!(sender.publication_auth[0].sealer(party).is_err());
+    // The key back: a new establishment installs a sealer and it sends.
+    sender.apply_keys(&both());
+    let sealer = sender.publication_auth[0].sealer(party).unwrap();
+    sender.publications[0].install_sealer(sealer).unwrap();
+    assert!(sender.send_sender_control_for(&mut halves, EndpointId(1), destination, &heartbeat));
+}
+
 /// ADR-0086 section 2: a bare SM for a local authenticated publication is
 /// dropped at the intake and never reaches the sender; an envelope for it
 /// goes to the sender undecoded.

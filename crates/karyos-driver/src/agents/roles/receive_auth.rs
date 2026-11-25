@@ -21,8 +21,8 @@ use karyos_protocol::protection::Rejection;
 use karyos_protocol::protection::hmac_sha256::Opened;
 use karyos_protocol::protection::replay::Replay;
 
-use super::super::control::SharedSealer;
-use crate::wire_auth::{Checked, KeyError, Party, Refusal, Sealer, Verifier};
+use super::super::control::{ControlSeal, SharedSealer};
+use crate::wire_auth::{Checked, KeyError, KeySet, Party, Refusal, Sealer, Verifier};
 use crate::wire_keys::KeyFile;
 
 /// Why a received datagram was refused, one counter each (ADR-0086
@@ -139,10 +139,16 @@ impl AuthRejections {
 pub(crate) struct ImageAuth {
     verifier: Verifier,
     sealer: SharedSealer,
+    /// The `key_id` and file epoch of its sealer's pairwise key.
+    sealer_key: (u32, u32),
+    /// Its sealer was withdrawn by a key reload: it sends nothing until
+    /// the image is established again.
+    withdrawn: bool,
     /// Its binding's refusals: one key and one source, by reason.
     pub(crate) rejections: AuthRejections,
-    /// The wall clock in seconds, for the in-band epoch overlap.
-    wall: fn() -> i64,
+    /// The monotonic clock in nanoseconds, for the in-band epoch overlap
+    /// (H8 finding 7: never the wall clock).
+    clock: fn() -> u64,
 }
 
 /// An authenticated subscription's keys (ADR-0086 sections 4 and 7a):
@@ -160,7 +166,9 @@ pub(crate) struct SubscriptionAuth {
     rsp: crate::wire_auth::Proof,
     /// The channel key's domain 1 verifier for no establishment yet.
     sender: Verifier,
-    /// The pairwise key's domain 4 sealer for no boot id yet.
+    /// The pairwise key's domain 4 sealer for no boot id yet; withdrawn
+    /// while a key reload leaves no pairwise signing key: no image
+    /// installs until a later reload names one again.
     receiver: Sealer,
     /// Its refusals by reason: the SETUPs of its stream.
     pub(crate) rejections: AuthRejections,
@@ -233,6 +241,25 @@ impl SubscriptionAuth {
         })
     }
 
+    /// Applies the store's current key set (H8 finding 4): the SETUP and
+    /// RSP_SETUP proofs and the domain 1 prototype take the files that now
+    /// sign and verify, and the domain 4 prototype is re-keyed under the
+    /// pairwise signing key, or withdrawn while there is none, so no image
+    /// installs.
+    pub(crate) fn apply_keys(&mut self, keys: &dyn KeySet) {
+        self.setup.apply(keys);
+        self.rsp.apply(keys);
+        self.sender.apply(keys);
+        let signing = keys.signing(self.receiver.key_ref().0);
+        if self.receiver.signs_under(signing) {
+            return;
+        }
+        match signing.map(|file| self.receiver.rekeyed(file)) {
+            Some(Ok(rekeyed)) => self.receiver = rekeyed,
+            Some(Err(_)) | None => self.receiver.withdraw(),
+        }
+    }
+
     /// Checks a SETUP ANNOUNCE or ANSWER envelope on `alias` under the
     /// channel's SETUP proof (domain 5); changes nothing.
     ///
@@ -265,13 +292,19 @@ impl SubscriptionAuth {
         sender: Party,
         receiver: Party,
     ) -> Result<ImageAuth, KeyError> {
+        if !self.receiver.can_seal() {
+            return Err(KeyError::NoKey);
+        }
+        let prototype = &self.receiver;
         let verifier = self.sender.with_party(sender, alias)?;
-        let sealer = self.receiver.with_party(receiver, alias)?;
+        let sealer = prototype.with_party(receiver, alias)?;
         Ok(ImageAuth {
             verifier,
+            sealer_key: sealer.key_ref(),
             sealer: SharedSealer::new(sealer),
+            withdrawn: false,
             rejections: AuthRejections::default(),
-            wall: wall_seconds,
+            clock: monotonic_ns,
         })
     }
 }
@@ -308,21 +341,49 @@ impl ImageAuth {
         }
         Ok(Self {
             verifier,
+            sealer_key: sealer.key_ref(),
             sealer: SharedSealer::new(sealer),
+            withdrawn: false,
             rejections: AuthRejections::default(),
-            wall: wall_seconds,
+            clock: monotonic_ns,
         })
     }
 
-    /// Uses `wall` as the wall clock in seconds (tests).
+    /// Uses `clock` as the monotonic clock in nanoseconds (tests).
     #[cfg(test)]
-    pub(crate) fn set_wall(&mut self, wall: fn() -> i64) {
-        self.wall = wall;
+    pub(crate) fn set_clock(&mut self, clock: fn() -> u64) {
+        self.clock = clock;
     }
 
-    /// The wall clock reading one datagram is checked and committed at.
-    pub(crate) fn now(&self) -> i64 {
-        (self.wall)()
+    /// The monotonic reading one datagram is checked and committed at.
+    pub(crate) fn now(&self) -> u64 {
+        (self.clock)()
+    }
+
+    /// Applies the store's current key set (H8 finding 4): the domain 1
+    /// verifier keeps the windows of the channel file epochs that still
+    /// verify and erases the rest, and an expired previous in-band epoch
+    /// is erased; the domain 4 sealer, shared with the sender agent and
+    /// any cached SESSION_ABORT_ACK, is withdrawn for every holder once
+    /// its pairwise file no longer signs, and stays withdrawn: the image
+    /// sends nothing until it is established again (fail closed).
+    pub(crate) fn apply_keys(&mut self, keys: &dyn KeySet) {
+        self.verifier.apply(keys);
+        self.verifier.tick(self.now());
+        if self.withdrawn {
+            return;
+        }
+        let signing = keys.signing(self.sealer_key.0);
+        if signing.map(|file| (file.key_id, file.file_epoch)) != Some(self.sealer_key) {
+            self.sealer.withdraw();
+            self.withdrawn = true;
+        }
+    }
+
+    /// Whether its sealer was withdrawn by a key reload.
+    #[cfg(test)]
+    pub(crate) fn withdrawn(&self) -> bool {
+        self.withdrawn
     }
 
     /// Checks `datagram`'s fields, tag and replay window at `now`; changes
@@ -331,7 +392,7 @@ impl ImageAuth {
     /// # Errors
     ///
     /// The [`Refusal`].
-    pub(crate) fn check(&self, datagram: &[u8], now: i64) -> Result<Checked, Refusal> {
+    pub(crate) fn check(&self, datagram: &[u8], now: u64) -> Result<Checked, Refusal> {
         self.verifier.check(datagram, now)
     }
 
@@ -341,7 +402,7 @@ impl ImageAuth {
     /// # Errors
     ///
     /// The [`Refusal`]; nothing changes.
-    pub(crate) fn commit(&mut self, checked: Checked, now: i64) -> Result<Opened, Refusal> {
+    pub(crate) fn commit(&mut self, checked: Checked, now: u64) -> Result<Opened, Refusal> {
         self.verifier.commit(checked, now)
     }
 
@@ -371,13 +432,167 @@ pub(crate) fn envelope_alias(bytes: &[u8]) -> Option<Alias> {
     })
 }
 
-/// The wall clock in whole seconds since the Unix epoch. A clock before
-/// the epoch reads as the far future, which ends every in-band overlap
-/// early (fail closed) and never extends one.
-pub(crate) fn wall_seconds() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(i64::MAX, |elapsed| {
-            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
-        })
+/// The process's monotonic clock in nanoseconds, for the in-band epoch
+/// overlap (H8 finding 7): a wall clock correction never moves it back.
+/// After about 584 years it reads the last tick, which ends every overlap.
+pub(crate) fn monotonic_ns() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// The authorities of the signed domains a key set names (H8 finding 4):
+/// for each configured `key_id` in `applied`, the highest file that now
+/// verifies, as an [`crate::signed_control::Authority`]. Returns the new
+/// list only when it differs from the one `applied` records, which it then
+/// updates; a key no longer named, or a file that is no authority key, is
+/// left out (fail closed).
+pub(crate) fn authorities_for(
+    keys: &dyn KeySet,
+    applied: &mut [(u32, Option<u32>)],
+) -> Option<Vec<crate::signed_control::Authority>> {
+    let mut changed = false;
+    let mut authorities = Vec::with_capacity(applied.len());
+    for (key_id, epoch) in applied.iter_mut() {
+        let file = keys
+            .verifying(*key_id)
+            .into_iter()
+            .flatten()
+            .max_by_key(|file| file.file_epoch);
+        let authority = file.and_then(|file| {
+            crate::signed_control::Authority::from_file(file)
+                .ok()
+                .map(|authority| (file.file_epoch, authority))
+        });
+        let now = authority.as_ref().map(|(epoch, _)| *epoch);
+        if now != *epoch {
+            changed = true;
+            *epoch = now;
+        }
+        authorities.extend(authority.map(|(_, authority)| authority));
+    }
+    changed.then_some(authorities)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
+
+    use karyos_protocol::network::{Alias, Identity};
+
+    use super::super::super::control::ControlSeal;
+    use super::{ImageAuth, authorities_for};
+    use crate::wire_auth::{ENVELOPE_LEN, FixedKeys, Party, Sealer};
+    use crate::wire_keys::KeyFile;
+
+    const ALIAS: Alias = Alias {
+        session_id: 5,
+        stream_id: 6,
+    };
+
+    const IDENTITY: Identity = Identity {
+        driver_id: [1, 2],
+        registration_id: 3,
+        incarnation: 1,
+    };
+
+    fn channel(epoch: u32) -> KeyFile {
+        crate::wire_keys::parse(
+            &format!("3-{epoch}.key"),
+            format!("format=karyos-wire-key-v1\nkey_id=3\nfile_epoch={epoch}\npurpose=channel\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=1111111111111111111111111111111111111111111111111111111111111111\nchannel_id=7\nstream_id=6\n").as_bytes(),
+        )
+        .unwrap()
+    }
+
+    fn pairwise(epoch: u32) -> KeyFile {
+        crate::wire_keys::parse(
+            &format!("9-{epoch}.key"),
+            format!("format=karyos-wire-key-v1\nkey_id=9\nfile_epoch={epoch}\npurpose=pairwise\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=2222222222222222222222222222222222222222222222222222222222222222\nreceiver_id=66\npublisher_id=5\n").as_bytes(),
+        )
+        .unwrap()
+    }
+
+    const SENDER: Party = Party::Sender {
+        identity: IDENTITY,
+        lane_count: 1,
+        receiver_boot_id: [7, 8],
+        nonce: [9, 9],
+    };
+
+    const RECEIVER: Party = Party::Receiver {
+        identity: IDENTITY,
+        receiver_boot_id: [7, 8],
+        receiver_id: 66,
+    };
+
+    fn image() -> ImageAuth {
+        let mut auth =
+            ImageAuth::new([&channel(1)], &pairwise(1), SENDER, RECEIVER, ALIAS).unwrap();
+        auth.set_clock(|| 1_000);
+        auth
+    }
+
+    fn sealed(sealer: &mut Sealer) -> Vec<u8> {
+        let mut bytes = vec![0u8; 8 + ENVELOPE_LEN];
+        let length = sealer.seal(&mut bytes, 8).unwrap();
+        bytes.truncate(length);
+        bytes
+    }
+
+    /// H8 finding 4: once its pairwise file no longer signs (a reload that
+    /// rotated or revoked it, or a disabled store), an image's sealer is
+    /// withdrawn for every holder: a clone kept elsewhere, as a cached
+    /// SESSION_ABORT_ACK resend keeps one, seals nothing either, and it
+    /// stays withdrawn when the key returns.
+    #[test]
+    fn a_reload_withdraws_an_images_sealer_for_every_holder() {
+        let mut auth = image();
+        let mut held = auth.sealer();
+        let mut buffer = [0u8; 8 + ENVELOPE_LEN];
+        assert!(held.seal_control(&mut buffer, 8).is_some());
+        // The same key set: nothing changes.
+        auth.apply_keys(&FixedKeys {
+            files: vec![channel(1), pairwise(1)],
+        });
+        assert!(!auth.withdrawn());
+        assert!(held.seal_control(&mut buffer, 8).is_some());
+        // The pairwise key moved to epoch 2: epoch 1 no longer signs.
+        auth.apply_keys(&FixedKeys {
+            files: vec![channel(1), pairwise(1), pairwise(2)],
+        });
+        assert!(auth.withdrawn());
+        assert!(held.seal_control(&mut buffer, 8).is_none());
+        assert!(auth.sealer().seal_control(&mut buffer, 8).is_none());
+        auth.apply_keys(&FixedKeys {
+            files: vec![channel(1), pairwise(1)],
+        });
+        assert!(held.seal_control(&mut buffer, 8).is_none());
+    }
+
+    /// H8 finding 4: a disabled store names no key: the image's verifier
+    /// verifies nothing and its sealer is withdrawn.
+    #[test]
+    fn a_disabled_store_stops_an_image() {
+        let mut auth = image();
+        let mut sender = Sealer::new(&channel(1), SENDER, ALIAS).unwrap();
+        let first = sealed(&mut sender);
+        let now = auth.now();
+        assert!(auth.check(&first, now).is_ok());
+        auth.apply_keys(&FixedKeys::default());
+        assert!(auth.withdrawn());
+        let next = sealed(&mut sender);
+        assert!(auth.check(&next, now).is_err());
+    }
+
+    /// H8 finding 4: the trusted authorities follow the key set: a key no
+    /// longer named is dropped, and an unchanged set asks for no change
+    /// (so the digest cache is kept).
+    #[test]
+    fn the_authorities_follow_the_key_set() {
+        let mut applied = vec![(10_u32, Some(1_u32))];
+        let changed = authorities_for(&FixedKeys::default(), &mut applied);
+        assert_eq!(changed.map(|list| list.len()), Some(0));
+        assert_eq!(applied, vec![(10, None)]);
+        assert!(authorities_for(&FixedKeys::default(), &mut applied).is_none());
+    }
 }

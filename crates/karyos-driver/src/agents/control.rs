@@ -457,6 +457,8 @@ pub trait ControlSeal {
     fn domain(&self) -> Domain;
     /// Seals the control.
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize>;
+    /// Withdraws and erases its key: it seals nothing again (H8 finding 4).
+    fn withdraw(&mut self);
 }
 
 impl ControlSeal for Sealer {
@@ -466,6 +468,10 @@ impl ControlSeal for Sealer {
 
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
         self.seal(buffer, frames).ok()
+    }
+
+    fn withdraw(&mut self) {
+        Sealer::withdraw(self);
     }
 }
 
@@ -528,6 +534,16 @@ impl ControlSeal for SharedSealer {
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
         self.sealer.lock().ok()?.seal_control(buffer, frames)
     }
+
+    /// Withdraws the shared key for every holder at once: the image's
+    /// controls, its repairs and any cached SESSION_ABORT_ACK resend all
+    /// seal nothing again. A poisoned lock is still withdrawn.
+    fn withdraw(&mut self) {
+        self.sealer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .withdraw();
+    }
 }
 
 impl ControlSeal for Proof {
@@ -537,6 +553,10 @@ impl ControlSeal for Proof {
 
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
         self.seal(buffer, frames).ok()
+    }
+
+    fn withdraw(&mut self) {
+        Proof::withdraw(self);
     }
 }
 

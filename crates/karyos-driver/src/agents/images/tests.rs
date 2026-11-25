@@ -6944,8 +6944,8 @@ fn auth_keys(receiver_id: u64) -> (crate::wire_keys::KeyFile, crate::wire_keys::
     (channel, pairwise)
 }
 
-fn auth_wall() -> i64 {
-    1_795_000_000
+fn auth_wall() -> u64 {
+    1_795_000_000_000_000_000
 }
 
 /// `frames` sealed by `sealer` into one datagram.

@@ -205,6 +205,26 @@ impl<T: StreamTerms> Outbound<T> {
         }
     }
 
+    /// Withdraws the installed sealer unless it still seals under
+    /// `signing`, the file the key store now names to sign for its
+    /// `key_id` (H8 finding 4): its key is erased and the publication
+    /// sends nothing, as before its establishment, until a new
+    /// establishment installs a sealer of the current key. Returns whether
+    /// one was withdrawn.
+    pub(crate) fn withdraw_sealer_unless(
+        &mut self,
+        signing: Option<&crate::wire_keys::KeyFile>,
+    ) -> bool {
+        match &self.auth {
+            SenderAuth::Sealing(sealer) if !sealer.signs_under(signing) => {
+                // Dropping the box erases the key.
+                self.auth = SenderAuth::Pending;
+                true
+            }
+            SenderAuth::Off | SenderAuth::Pending | SenderAuth::Sealing(_) => false,
+        }
+    }
+
     /// The installed sealer's party (tests).
     #[cfg(test)]
     pub(crate) fn sealer_party(&self) -> Option<crate::wire_auth::Party> {

@@ -23,7 +23,7 @@ use karyos_protocol::protection::hmac_sha256::Domain;
 use super::receive_auth::{AuthReason, AuthRejections, envelope_alias};
 use crate::agents::EndpointId;
 use crate::wire_auth::{
-    BootDecision, BootTable, KeyError, Party, Proof, ProofKind, Sealer, Verifier,
+    BootDecision, BootTable, KeyError, KeySet, Party, Proof, ProofKind, Sealer, Verifier,
 };
 use crate::wire_keys::KeyFile;
 
@@ -67,7 +67,9 @@ pub(crate) struct PublicationAuth {
     /// Domain 5, signing: SETUP ANNOUNCE and ANSWER.
     pub(crate) setup: Proof,
     /// The channel signing key's sealer for no establishment yet: each
-    /// binding derives the session's domain 1 sealer from it.
+    /// binding derives the session's domain 1 sealer from it. Withdrawn
+    /// while a key reload leaves no channel signing key: nothing is
+    /// established until a later reload names one again.
     prototype: Sealer,
     receivers: Vec<ReceiverKeys>,
     boots: BootTable,
@@ -76,7 +78,9 @@ pub(crate) struct PublicationAuth {
     pub(crate) rejections: AuthRejections,
     /// Its abort authority, when this driver may abort its sessions.
     pub(crate) abort: Option<AbortAuthority>,
-    wall: fn() -> i64,
+    /// The monotonic clock in nanoseconds, for the in-band epoch overlap
+    /// (H8 finding 7: never the wall clock).
+    clock: fn() -> u64,
 }
 
 /// A control that verified.
@@ -97,6 +101,9 @@ pub(crate) struct AbortAuthority {
     pub(crate) signer: crate::authority::Ed25519Signer,
     pub(crate) key_id: u32,
     pub(crate) authority_id: u64,
+    /// The file epoch of its signing key, when known: a key reload that
+    /// names another withdraws it.
+    pub(crate) file_epoch: Option<u32>,
     seq: u64,
 }
 
@@ -124,8 +131,16 @@ impl AbortAuthority {
             signer,
             key_id,
             authority_id,
+            file_epoch: None,
             seq: 0,
         }
+    }
+
+    /// Whether it still signs under `keys`: its `key_id` has a signing
+    /// file, of its own file epoch when that is known.
+    fn signs_under(&self, keys: &dyn KeySet) -> bool {
+        keys.signing(self.key_id)
+            .is_some_and(|file| self.file_epoch.is_none_or(|epoch| epoch == file.file_epoch))
     }
 
     /// Signs `abort` into `out` in domain 3 and returns its length; `None`
@@ -246,14 +261,66 @@ impl PublicationAuth {
             receivers,
             rejections: AuthRejections::default(),
             abort: None,
-            wall: super::receive_auth::wall_seconds,
+            clock: super::receive_auth::monotonic_ns,
         })
     }
 
-    /// Uses `wall` as the wall clock in seconds (tests).
+    /// Uses `clock` as the monotonic clock in nanoseconds (tests).
     #[cfg(test)]
-    pub(crate) fn set_wall(&mut self, wall: fn() -> i64) {
-        self.wall = wall;
+    pub(crate) fn set_clock(&mut self, clock: fn() -> u64) {
+        self.clock = clock;
+    }
+
+    /// The channel key's `key_id`: its signing file is the one the
+    /// session's domain 1 sealer must still be under.
+    pub(crate) fn channel_key_id(&self) -> u32 {
+        self.setup.key_id()
+    }
+
+    /// Applies the store's current key set (H8 finding 4), as one change to
+    /// every key the publication holds: the SETUP proof and the domain 1
+    /// prototype follow the channel signing key (re-keyed, or withdrawn
+    /// while there is none); each receiver's RSP_SETUP proof, domain 4
+    /// prototype and bound verifier take the pairwise files that now
+    /// verify, keeping the windows of retained epochs, and the boot ids of
+    /// dropped epochs are forgotten; the abort authority is dropped once
+    /// its key no longer signs. The installed session sealer is the sender
+    /// role's to withdraw ([`super::SenderRole::apply_keys`]).
+    pub(crate) fn apply_keys(&mut self, keys: &dyn KeySet) {
+        let now = (self.clock)();
+        self.setup.apply(keys);
+        let channel = keys.signing(self.setup.key_id());
+        if !self.prototype.signs_under(channel) {
+            match channel.map(|file| self.prototype.rekeyed(file)) {
+                Some(Ok(rekeyed)) => self.prototype = rekeyed,
+                Some(Err(_)) | None => self.prototype.withdraw(),
+            }
+        }
+        for receiver in &mut self.receivers {
+            receiver.rsp.apply(keys);
+            receiver.prototype.apply(keys);
+            if let Some(bound) = receiver.bound.as_mut() {
+                bound.verifier.apply(keys);
+                bound.verifier.tick(now);
+            }
+            if let Some(lowest) = keys
+                .verifying(receiver.prototype.key_id())
+                .into_iter()
+                .flatten()
+                .map(|file| file.file_epoch)
+                .min()
+            {
+                self.boots.forget_before(receiver.receiver_id, lowest);
+            }
+        }
+        if self
+            .abort
+            .as_ref()
+            .is_some_and(|abort| !abort.signs_under(keys))
+        {
+            // Dropping the signer erases its key.
+            self.abort = None;
+        }
     }
 
     /// The session sealer of an establishment's domain 1 `party`.
@@ -262,6 +329,9 @@ impl PublicationAuth {
     ///
     /// [`KeyError::Scope`] for a party of another kind.
     pub(crate) fn sealer(&self, party: Party) -> Result<Sealer, KeyError> {
+        if !self.prototype.can_seal() {
+            return Err(KeyError::NoKey);
+        }
         self.prototype.with_party(party, self.alias)
     }
 
@@ -416,7 +486,7 @@ impl PublicationAuth {
         key_id: u32,
         identity: Identity,
     ) -> Result<Opened, AuthReason> {
-        let now = (self.wall)();
+        let now = (self.clock)();
         let receiver = self
             .receivers
             .iter_mut()
@@ -542,7 +612,7 @@ mod tests {
     fn publication(files: &[&KeyFile]) -> PublicationAuth {
         let mut auth =
             PublicationAuth::new(EndpointId(1), ALIAS, IDENTITY, 1, &channel(), files).unwrap();
-        auth.set_wall(|| 1_795_000_000);
+        auth.set_clock(|| 1_795_000_000_000_000_000);
         auth
     }
 
@@ -824,5 +894,54 @@ mod tests {
         assert_eq!(counts.get(AuthReason::Tag), 1);
         assert_eq!(counts.get(AuthReason::Inner), 2);
         assert_eq!(counts.get(AuthReason::Duplicate), 1);
+    }
+
+    /// H8 finding 4: a reload that drops the pairwise file erases the
+    /// bound receiver's verifier, so its SMs stop verifying; the abort
+    /// authority whose key no longer signs is dropped; the channel signing
+    /// key gone, nothing is established or sealed.
+    #[test]
+    fn a_reload_applies_to_every_key_of_a_publication() {
+        use crate::authority::Ed25519Signer;
+        use crate::wire_auth::FixedKeys;
+
+        let file = pairwise(1, '2');
+        let mut auth = publication(&[&file]);
+        auth.abort = Some(super::AbortAuthority::new(
+            Ed25519Signer::from_seed(&[9; 32]),
+            10,
+            10,
+        ));
+        assert!(open(&mut auth, &challenge(&file, [1, 1], [9, 9])).is_ok());
+        let mut sealer = receiver_sealer(&file, [1, 1]);
+        assert!(matches!(
+            open(&mut auth, &sm(&mut sealer, &status([1, 1]))),
+            Ok(Opened::Receiver(_))
+        ));
+        // The pairwise file revoked: the channel key alone remains.
+        auth.apply_keys(&FixedKeys {
+            files: vec![channel()],
+        });
+        assert_eq!(
+            open(&mut auth, &sm(&mut sealer, &status([1, 1]))).unwrap_err(),
+            AuthReason::Epoch
+        );
+        assert_eq!(
+            open(&mut auth, &challenge(&file, [2, 2], [8, 8])).unwrap_err(),
+            AuthReason::Key
+        );
+        assert!(auth.abort.is_none(), "key 10 no longer signs");
+        let party = Party::Sender {
+            identity: IDENTITY,
+            lane_count: 1,
+            receiver_boot_id: [1, 1],
+            nonce: [9, 9],
+        };
+        assert!(auth.sealer(party).is_ok());
+        // A disabled store: nothing is established or sealed.
+        auth.apply_keys(&FixedKeys::default());
+        assert!(auth.sealer(party).is_err());
+        let mut bytes = vec![0u8; 64 + ENVELOPE_LEN];
+        assert!(auth.setup.seal(&mut bytes, 8).is_err());
     }
 }

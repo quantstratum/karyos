@@ -34,7 +34,8 @@ const IDENTITY: Identity = Identity {
 
 const BOOT: [u64; 2] = [0xb0, 0x07];
 
-const NOW: i64 = 1_796_083_200;
+/// A monotonic reading in nanoseconds.
+const NOW: u64 = 1_796_083_200_000_000_000;
 
 fn sender(boot: [u64; 2], nonce: [u64; 2]) -> Party {
     Party::Sender {
@@ -419,16 +420,20 @@ fn the_previous_in_band_epoch_stops_verifying_after_its_overlap() {
     // The move to epoch 1 at NOW starts the overlap.
     assert!(verifier.open(&sealed(&mut new, b"n"), NOW).is_ok());
     assert!(verifier.open(&early, NOW).is_ok());
-    assert!(verifier.open(&at_edge, NOW + IN_BAND_OVERLAP_S - 1).is_ok());
+    assert!(
+        verifier
+            .open(&at_edge, NOW + IN_BAND_OVERLAP_NS - 1)
+            .is_ok()
+    );
     // From the deadline on, epoch 0 is gone even within its window.
     assert_eq!(
-        verifier.open(&too_late, NOW + IN_BAND_OVERLAP_S),
+        verifier.open(&too_late, NOW + IN_BAND_OVERLAP_NS),
         Err(Refusal::Envelope(Rejection::Epoch))
     );
     // The current epoch still verifies.
     assert!(
         verifier
-            .open(&sealed(&mut new, b"m"), NOW + IN_BAND_OVERLAP_S)
+            .open(&sealed(&mut new, b"m"), NOW + IN_BAND_OVERLAP_NS)
             .is_ok()
     );
 }
@@ -484,17 +489,139 @@ fn a_check_without_a_commit_changes_nothing() {
     // so it still verifies long after an overlap would have ended.
     let moved = sealed(&mut new, b"n");
     let _ = verifier.check(&moved, NOW).unwrap();
-    assert!(verifier.open(&late, NOW + IN_BAND_OVERLAP_S + 1).is_ok());
+    assert!(verifier.open(&late, NOW + IN_BAND_OVERLAP_NS + 1).is_ok());
     // Committed, the move happens and starts the overlap from then.
-    let checked = verifier.check(&moved, NOW + IN_BAND_OVERLAP_S + 1).unwrap();
+    let checked = verifier
+        .check(&moved, NOW + IN_BAND_OVERLAP_NS + 1)
+        .unwrap();
     assert!(
         verifier
-            .commit(checked, NOW + IN_BAND_OVERLAP_S + 1)
+            .commit(checked, NOW + IN_BAND_OVERLAP_NS + 1)
             .is_ok()
     );
     let past = sealed(&mut old, b"c");
     assert_eq!(
-        verifier.open(&past, NOW + 2 * IN_BAND_OVERLAP_S + 1),
+        verifier.open(&past, NOW + 2 * IN_BAND_OVERLAP_NS + 1),
         Err(Refusal::Envelope(Rejection::Epoch))
     );
+}
+
+/// H8 finding 7: the in-band overlap is measured on the monotonic clock
+/// and the previous slot is erased once it ends, so a clock that reads
+/// earlier again (a backward correction) never reopens it.
+#[test]
+fn an_expired_previous_epoch_never_reopens() {
+    let file = channel_file(1, 0x11);
+    let party = sender(BOOT, [1, 2]);
+    let mut verifier = Verifier::new([&file], party, ALIAS).unwrap();
+    let mut old = Sealer::at_seq(&file, party, ALIAS, 0, 100);
+    let mut new = Sealer::at_seq(&file, party, ALIAS, 1, 0);
+    let unseen = sealed(&mut old, b"a");
+    assert!(verifier.open(&sealed(&mut new, b"n"), NOW).is_ok());
+    // The overlap ends: a tick erases the previous slot.
+    verifier.tick(NOW + IN_BAND_OVERLAP_NS);
+    // A reading back inside the old overlap finds nothing to open with.
+    assert_eq!(
+        verifier.open(&unseen, NOW + 1),
+        Err(Refusal::Envelope(Rejection::Epoch))
+    );
+    // A commit past the end erases it as well.
+    let mut other = Verifier::new([&file], party, ALIAS).unwrap();
+    let mut old = Sealer::at_seq(&file, party, ALIAS, 0, 200);
+    let mut new = Sealer::at_seq(&file, party, ALIAS, 1, 0);
+    let unseen = sealed(&mut old, b"b");
+    assert!(other.open(&sealed(&mut new, b"n"), NOW).is_ok());
+    assert!(
+        other
+            .open(&sealed(&mut new, b"m"), NOW + IN_BAND_OVERLAP_NS)
+            .is_ok()
+    );
+    assert_eq!(
+        other.open(&unseen, NOW),
+        Err(Refusal::Envelope(Rejection::Epoch))
+    );
+}
+
+/// H8 finding 4: applying a key set keeps the window of a retained file
+/// epoch and erases a dropped one; an empty set (a disabled store)
+/// clears every key, and a later set restores verification.
+#[test]
+fn applying_a_key_set_keeps_retained_windows_and_drops_the_rest() {
+    let one = channel_file(1, 0x11);
+    let two = channel_file(2, 0x22);
+    let party = sender(BOOT, [1, 2]);
+    let mut verifier = Verifier::new([&one, &two], party, ALIAS).unwrap();
+    let mut under_one = Sealer::new(&one, party, ALIAS).unwrap();
+    let mut under_two = Sealer::new(&two, party, ALIAS).unwrap();
+    let seen = sealed(&mut under_two, b"a");
+    assert!(verifier.open(&seen, NOW).is_ok());
+    let old = sealed(&mut under_one, b"b");
+    verifier.apply(&FixedKeys {
+        files: vec![channel_file(2, 0x22)],
+    });
+    // Epoch 1 was dropped: its datagram no longer opens (only epoch 2's
+    // key is tried, and its tag fails).
+    assert_eq!(
+        verifier.open(&old, NOW),
+        Err(Refusal::Envelope(Rejection::Tag))
+    );
+    // Epoch 2 kept its window: the seen sequence is still a duplicate.
+    assert_eq!(
+        verifier.open(&seen, NOW),
+        Err(Refusal::Replay(Replay::Duplicate))
+    );
+    assert!(verifier.open(&sealed(&mut under_two, b"c"), NOW).is_ok());
+    // A disabled store names nothing: nothing verifies.
+    verifier.apply(&FixedKeys::default());
+    assert!(!verifier.has_keys());
+    assert_eq!(
+        verifier.open(&sealed(&mut under_two, b"d"), NOW),
+        Err(Refusal::Envelope(Rejection::Epoch))
+    );
+}
+
+/// H8 finding 4: a proof follows the key set: a revoked signing key stops
+/// sealing and verifying at once, and a new epoch re-keys it.
+#[test]
+fn applying_a_key_set_rekeys_or_clears_a_proof() {
+    let one = channel_file(1, 0x11);
+    let two = channel_file(2, 0x22);
+    let mut proof = Proof::new(ProofKind::Setup, ALIAS, Some(&one), [&one], 1).unwrap();
+    let mut buf = vec![0_u8; 128];
+    let len = proof.seal(&mut buf, 3).unwrap();
+    let under_one = buf[..len].to_vec();
+    assert!(proof.verify(&under_one).is_ok());
+    // The store revoked every file: nothing seals or verifies.
+    proof.apply(&FixedKeys::default());
+    assert_eq!(proof.seal(&mut buf, 3), Err(SealFailure::Exhausted));
+    assert!(proof.verify(&under_one).is_err());
+    // Epoch 2 admitted alone: it seals under epoch 2 and epoch 1 is gone.
+    proof.apply(&FixedKeys {
+        files: vec![channel_file(2, 0x22)],
+    });
+    let len = proof.seal(&mut buf, 3).unwrap();
+    let checker = Proof::new(ProofKind::Setup, ALIAS, None, [&two], 2).unwrap();
+    let proved = checker.verify(&buf[..len]).unwrap();
+    assert_eq!((proved.file_epoch, proved.current), (2, true));
+    assert!(proof.verify(&under_one).is_err());
+}
+
+/// H8 finding 4: a withdrawn sealer never seals again, and only the
+/// signing file of its own epoch keeps it.
+#[test]
+fn a_withdrawn_sealer_seals_nothing() {
+    let one = channel_file(1, 0x11);
+    let two = channel_file(2, 0x22);
+    let party = sender(BOOT, [1, 2]);
+    let mut sealer = Sealer::new(&one, party, ALIAS).unwrap();
+    assert!(sealer.signs_under(Some(&one)));
+    assert!(!sealer.signs_under(Some(&two)));
+    assert!(!sealer.signs_under(None));
+    sealer.withdraw();
+    assert!(!sealer.can_seal());
+    assert!(!sealer.signs_under(Some(&one)));
+    let mut buf = vec![0_u8; 128];
+    assert_eq!(sealer.seal(&mut buf, 3), Err(SealFailure::Withdrawn));
+    let derived = sealer.with_party(sender(BOOT, [3, 4]), ALIAS).unwrap();
+    assert!(!derived.can_seal());
 }

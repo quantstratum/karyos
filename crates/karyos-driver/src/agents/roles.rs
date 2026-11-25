@@ -996,6 +996,10 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// The receive order of the signed domains, with the authorities this
     /// driver trusts; `None` until one is configured.
     signed: Option<Box<SignedIntake<AckResend>>>,
+    /// The `key_id` of each authority key it was configured to trust, and
+    /// the file epoch the last key application found for it (H8 finding
+    /// 4): [`ReceiverRole::apply_keys`] rebuilds the trusted list from them.
+    authority_keys: Vec<(u32, Option<u32>)>,
     /// The guards of other drivers this one follows.
     remote_guards: Vec<FollowedGuard>,
     /// Their durable epoch marks.
@@ -2263,6 +2267,7 @@ pub(super) fn roles<T: StreamTerms>(
             enc: receive_enc::ReceiverEnc::default(),
             verified_setup: false,
             signed: None,
+            authority_keys: Vec::new(),
             remote_guards: Vec::new(),
             guard_marks: None,
             guard_authority: None,
@@ -2980,7 +2985,41 @@ impl<T: StreamTerms> ReceiverRole<T> {
         authorities: Vec<signed_control::Authority>,
         now: u64,
     ) {
+        self.authority_keys = authorities
+            .iter()
+            .map(|authority| (authority.key_id(), None))
+            .collect();
         self.signed = Some(Box::new(SignedIntake::new(authorities, now)));
+    }
+
+    /// Applies the key store's current key set to every live key of the
+    /// receive side, as one change (H8 finding 4; ADR-0086 section 7,
+    /// design wire-key-files section 2.3): each authenticated
+    /// subscription's proofs and prototypes, each authenticated image's
+    /// verifier (windows kept only for retained file epochs) and sealer
+    /// (withdrawn for every holder, cached SESSION_ABORT_ACKs included,
+    /// once its pairwise file no longer signs), and the authorities of the
+    /// signed domains, whose digest cache is emptied when they change. A
+    /// disabled store names no key, so every authenticated path stops.
+    ///
+    /// Called after each `KeyStore::reload` and on each clock tick, for
+    /// expiry, with [`crate::wire_auth::StoreKeys`]. No production caller
+    /// exists yet: no authenticated channel can open, and the reload timer
+    /// is wired with that enablement.
+    pub fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        for auth in &mut self.subscription_auth {
+            auth.apply_keys(keys);
+        }
+        for image in &mut self.images {
+            if let Some(auth) = image.auth.as_deref_mut() {
+                auth.apply_keys(keys);
+            }
+        }
+        if let Some(signed) = self.signed.as_deref_mut()
+            && let Some(authorities) = receive_auth::authorities_for(keys, &mut self.authority_keys)
+        {
+            signed.replace_authorities(authorities);
+        }
     }
 
     /// Follows `guard` as `receiver_id`, its challenges going bare on
@@ -3045,7 +3084,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
     /// Makes the image at `slot` authenticated (tests): its sender's
     /// datagrams verify under the channel key `channel` and its controls
     /// are sealed under the pairwise key `pairwise`, both for this
-    /// establishment, read at the wall clock `wall`. Returns the sender's
+    /// establishment, read at the monotonic clock `clock`. Returns the sender's
     /// and the receiver's parties. Nothing else makes an image
     /// authenticated yet.
     #[cfg(test)]
@@ -3054,7 +3093,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
         slot: SlotRef,
         channel: &crate::wire_keys::KeyFile,
         pairwise: &crate::wire_keys::KeyFile,
-        wall: fn() -> i64,
+        clock: fn() -> u64,
     ) -> Result<(crate::wire_auth::Party, crate::wire_auth::Party), crate::wire_auth::KeyError>
     {
         use crate::wire_auth::{KeyError, Party};
@@ -3077,7 +3116,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             receiver_id: image.receiver_id,
         };
         let mut auth = ImageAuth::new([channel], pairwise, sender, receiver, image.key.alias)?;
-        auth.set_wall(wall);
+        auth.set_clock(clock);
         image.auth = Some(Box::new(auth));
         Ok((sender, receiver))
     }
@@ -7674,6 +7713,32 @@ impl<T: StreamTerms> SenderRole<T> {
     }
 
     /// The index of the authenticated publication `alias` on `endpoint`.
+    /// Applies the key store's current key set to every live key of the
+    /// send side, as one change (H8 finding 4; ADR-0086 section 7, design
+    /// wire-key-files section 2.3): each authenticated publication's SETUP
+    /// proof, prototypes, receivers' verifiers (windows kept only for
+    /// retained file epochs) and abort authority, and its installed session
+    /// sealer, which is withdrawn once its channel file no longer signs:
+    /// the publication then sends nothing until a new establishment keys
+    /// it again (fail closed). A disabled store names no key, so every
+    /// authenticated publication stops.
+    ///
+    /// Called after each `KeyStore::reload` and on each clock tick, for
+    /// expiry, with [`crate::wire_auth::StoreKeys`]. No production caller
+    /// exists yet: no authenticated channel can open, and the reload timer
+    /// is wired with that enablement.
+    pub fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        for auth in &mut self.publication_auth {
+            auth.apply_keys(keys);
+            let signing = keys.signing(auth.channel_key_id());
+            for outbound in &mut self.publications {
+                if outbound.serves(auth.endpoint) && outbound.alias() == auth.alias {
+                    outbound.withdraw_sealer_unless(signing);
+                }
+            }
+        }
+    }
+
     fn publication_auth_index(&self, endpoint: EndpointId, alias: Alias) -> Option<usize> {
         self.publication_auth
             .iter()
