@@ -1049,6 +1049,12 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// authenticated subscription bound at admission reserved, by endpoint
     /// and stream (karyos#648): released with its binding.
     auth_peers: Vec<(EndpointId, i32, SocketAddr)>,
+    /// The installation id of each authenticated subscription's binding,
+    /// by endpoint and stream: its cleanup removes only that one (H8 R3-5).
+    auth_installs: Vec<(EndpointId, i32, u64)>,
+    /// The installation id of each followed guard's latest follow, by
+    /// guard id: an older unfollow leaves it (H8 R3-5).
+    follow_installs: Vec<(u64, u64)>,
     /// The guards of other drivers this one follows.
     remote_guards: Vec<FollowedGuard>,
     /// Their durable epoch marks.
@@ -1992,6 +1998,9 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     due: Vec<(EndpointId, SetupAnnounce)>,
     /// The authenticated publications' keys (ADR-0086).
     publication_auth: Vec<PublicationAuth>,
+    /// The publication incarnation each binding was added with, by
+    /// endpoint and alias: its removal drops that binding only (ADM-10).
+    publication_installs: Vec<(EndpointId, Alias, u64)>,
     /// The applied key generation, shared with the receiver role: a
     /// prepared datagram made under an older one is dropped unsent (H8
     /// finding 4).
@@ -2201,6 +2210,7 @@ pub(super) fn roles<T: StreamTerms>(
             budget: u32::try_from(config.control_capacity).unwrap_or(u32::MAX),
             due: Vec::with_capacity(config.publications),
             publication_auth: Vec::new(),
+            publication_installs: Vec::new(),
             enc: publish_enc::SenderEnc::default(),
             aborts: Vec::with_capacity(config.publications),
             abort_expiry: config.image_liveness_timeout,
@@ -2337,6 +2347,8 @@ pub(super) fn roles<T: StreamTerms>(
             authority_keys: Vec::new(),
             abort_scopes: Vec::new(),
             auth_peers: Vec::new(),
+            auth_installs: Vec::new(),
+            follow_installs: Vec::new(),
             remote_guards: Vec::new(),
             guard_marks: None,
             guard_authority: None,
@@ -2628,6 +2640,13 @@ impl<T: StreamTerms> ReceiverRole<T> {
             )),
             AgentCommand::Authenticate { reply, binding } => {
                 Some((reply, configured(self.bind_auth(binding.0))))
+            }
+            AgentCommand::AddAuthenticated { binding, add } => {
+                self.add_authenticated(binding.0, *add)
+            }
+            AgentCommand::RemoveAuthenticated { binding, remove } => {
+                let _ = self.bind_auth(binding.0);
+                self.command(*remove)
             }
             AgentCommand::ApplyKeys { reply, keys } => {
                 self.apply_keys(&*keys);
@@ -7212,7 +7231,12 @@ impl<T: StreamTerms> SenderRole<T> {
                 endpoint,
                 alias,
                 registration,
-            } => return Some((reply, self.remove(endpoint, alias, registration))),
+            } => {
+                // Its binding goes with it, its keys erased on drop
+                // (ADM-10).
+                self.unbind_publication(endpoint, alias, registration);
+                return Some((reply, self.remove(endpoint, alias, registration)));
+            }
             #[cfg(test)]
             AgentCommand::ForceReset { endpoint, alias } => {
                 if let Some(outbound) = self
@@ -7224,6 +7248,10 @@ impl<T: StreamTerms> SenderRole<T> {
                 }
                 return None;
             }
+            AgentCommand::AddAuthenticated { binding, add } => {
+                return self.add_authenticated(binding.0, *add);
+            }
+            AgentCommand::RemoveAuthenticated { remove, .. } => return self.command(*remove),
             AgentCommand::Authenticate { reply, binding } => {
                 let accepted = self.bind_auth(binding.0);
                 return Some((
@@ -8850,6 +8878,7 @@ impl<T: StreamTerms> SenderRole<T> {
                     ..
                 } if receiver_control_alias(control).is_some_and(|alias| {
                     self.publication_auth_index(endpoint, alias).is_some()
+                        || self.needs_auth_binding(endpoint, alias)
                 }) =>
                 {
                     self.count(|c| &mut c.auth_bare);
@@ -9084,6 +9113,11 @@ impl<T: StreamTerms> SenderRole<T> {
                         // sealed now (domain 5) or not at all: the waiting
                         // room would send it bare. It is announced again.
                         match self.publication_auth_index(endpoint, announce.alias) {
+                            // An authenticated publication whose binding
+                            // is missing announces nothing (ADM-9).
+                            None if self.needs_auth_binding(endpoint, announce.alias) => {
+                                self.count(|c| &mut c.auth_unbound);
+                            }
                             Some(index) => {
                                 let _ = self.send_setup(
                                     halves,

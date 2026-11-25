@@ -736,6 +736,24 @@ pub enum AgentCommand<O: SocketOps, T: StreamTerms = HeapTerms> {
         /// The binding.
         binding: Box<roles::AuthBinding>,
     },
+    /// An authenticated binding and the add it keys (`AddSubscription`,
+    /// `AddPublishedAlias` or `AddPublication`, which carries the reply),
+    /// as one command in one ring slot (karyos#648, H8 R3-5): the binding
+    /// is held only with the add, and a refused binding refuses it.
+    AddAuthenticated {
+        /// The binding.
+        binding: Box<roles::AuthBinding>,
+        /// The add, answered as it would be alone.
+        add: Box<AgentCommand<O, T>>,
+    },
+    /// An authenticated subscription's removal with the cleanup of its
+    /// installation, as one command (karyos#648, H8 R3-5).
+    RemoveAuthenticated {
+        /// The cleanup, naming its installation.
+        binding: Box<roles::AuthBinding>,
+        /// The `RemoveSubscription`, answered as it would be alone.
+        remove: Box<AgentCommand<O, T>>,
+    },
     /// Apply the driver's key view to every live key of the role, as one
     /// change (karyos#648; ADR-0086 section 7): posted to both agents in
     /// the same conductor duty after each reload and expiry tick. Answer
@@ -1325,6 +1343,8 @@ impl<O: SocketOps, T: StreamTerms> AgentCore<O, T> {
                 | AgentCommand::AddSubscription { .. }
                 | AgentCommand::AddPublishedAlias { .. }
                 | AgentCommand::Authenticate { .. }
+                | AgentCommand::AddAuthenticated { .. }
+                | AgentCommand::RemoveAuthenticated { .. }
                 | AgentCommand::ApplyKeys { .. }
                 | AgentCommand::SetNetworkTrace { .. }
                 | AgentCommand::OpenNetworkJournal { .. }

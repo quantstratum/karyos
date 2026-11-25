@@ -1107,5 +1107,168 @@ fn a_backward_wall_step_does_not_delay_a_revocation() {
     );
 }
 
+/// Leaves exactly one free slot in `driver`'s receiver command ring
+/// (tests): fills it, lets the receiver drain it, and fills it again
+/// but for one.
+fn one_receiver_slot(driver: &mut EmbeddedDriver) {
+    for _ in 0..10 {
+        let _ = driver.do_work().unwrap();
+    }
+    let capacity = driver.net.as_ref().unwrap().fill_receiver_ring();
+    assert!(capacity > 1);
+    for _ in 0..10 {
+        let _ = driver.do_work().unwrap();
+    }
+    // The ring and its reply slots are free again: as many as before
+    // fit, so all but one are taken now.
+    driver.net.as_ref().unwrap().ping_receiver(capacity - 1);
+}
+
+/// H8 R3-5: an authenticated subscription is one receiver command, so it
+/// is admitted with exactly one ring slot and bound once; with none it is
+/// refused, typed, and nothing of it is bound.
+#[test]
+fn an_authenticated_admission_needs_one_ring_slot_and_leaves_nothing_when_refused() {
+    let (mut subscriber, _) = keyed(&borrowed(&subscriber_files()));
+    let bind = SocketAddr::new(LOOPBACK, crate::test_ports::test_port());
+    subscriber
+        .add_network_subscription_as(
+            STREAM + 1,
+            &udp(Destination::Unicast(bind), Security::Trusted),
+            identity(RECEIVER),
+        )
+        .unwrap();
+    assert!(pump(&mut [&mut subscriber], |_| true));
+    let security = Security::Authenticated(auth(Some(authority(control()))));
+    let channel = udp(Destination::Unicast(bind), security);
+    // No slot: refused, and nothing reaches the receiver.
+    assert!(subscriber.net.as_ref().unwrap().fill_receiver_ring() > 0);
+    assert_eq!(
+        subscriber
+            .add_network_subscription_as(STREAM, &channel, identity(RECEIVER))
+            .unwrap_err(),
+        DriverError::NetworkBusy
+    );
+    let _ = subscriber.do_work().unwrap();
+    let _ = subscriber.do_work().unwrap();
+    assert_eq!(roles(&subscriber).1.0, 0, "nothing bound");
+    // Exactly one slot: the binding and the subscription go together.
+    one_receiver_slot(&mut subscriber);
+    subscriber
+        .add_network_subscription_as(STREAM, &channel, identity(RECEIVER))
+        .unwrap();
+    assert_eq!(
+        subscriber.net.as_ref().unwrap().fill_receiver_ring(),
+        0,
+        "it took the one slot there was"
+    );
+    let bound = pump(&mut [&mut subscriber], |drivers| roles(drivers[0]).1.0 == 1);
+    assert!(bound, "{:?}", roles(&subscriber));
+    assert_eq!(subscriber.net.as_ref().unwrap().subscription_count(), 2);
+}
+
+/// H8 R3-5: a cleanup names the installation it removes: once a
+/// subscription is removed and admitted again, its old Unbind, arriving
+/// late, leaves the replacement bound.
+#[test]
+fn a_late_unbind_never_removes_a_replacement_binding() {
+    let (mut subscriber, _) = keyed(&borrowed(&subscriber_files()));
+    let security = Security::Authenticated(auth(Some(authority(control()))));
+    let channel = udp(Destination::Unicast(ANY_PORT), security);
+    let first = subscriber
+        .add_network_subscription_as(STREAM, &channel, identity(RECEIVER))
+        .unwrap();
+    let (endpoint, old) = subscriber
+        .net
+        .as_ref()
+        .unwrap()
+        .auth_installation(STREAM)
+        .unwrap();
+    assert!(pump(&mut [&mut subscriber], |drivers| roles(drivers[0])
+        .1
+        .0
+        == 1));
+    subscriber.remove_network_subscription(first).unwrap();
+    let _ = subscriber.do_work().unwrap();
+    subscriber
+        .add_network_subscription_as(STREAM, &channel, identity(RECEIVER))
+        .unwrap();
+    let (_, new) = subscriber
+        .net
+        .as_ref()
+        .unwrap()
+        .auth_installation(STREAM)
+        .unwrap();
+    assert_ne!(old, new);
+    assert!(pump(&mut [&mut subscriber], |drivers| roles(drivers[0])
+        .1
+        .0
+        == 1));
+    // The old installation's cleanup, late.
+    assert!(
+        subscriber
+            .net
+            .as_ref()
+            .unwrap()
+            .post_binding(crate::agents::roles::Binding::Unbind {
+                endpoint,
+                stream_id: STREAM,
+                installation: old,
+            })
+    );
+    for _ in 0..10 {
+        let _ = subscriber.do_work().unwrap();
+    }
+    assert_eq!(roles(&subscriber).1.0, 1, "the replacement stays bound");
+}
+
+/// H8 R3-5: an Unfollow a full ring deferred names the follow it
+/// undoes: a publication of the same guard admitted before it is posted
+/// keeps the guard followed.
+#[test]
+fn a_deferred_unfollow_never_undoes_a_later_follow() {
+    let (marks, commits) = (Mem::default(), Mem::default());
+    let ([mut publisher, mut subscriber, mut authority_driver], handle) =
+        remotely_guarded(&marks, &commits);
+    let registration = handle.registration();
+    assert!(pump(
+        &mut [&mut publisher, &mut subscriber, &mut authority_driver],
+        |drivers| drivers[0]
+            .net
+            .as_ref()
+            .unwrap()
+            .publication_established(registration),
+    ));
+    assert_eq!(publisher.net.as_ref().unwrap().followed_guards(), Some(1));
+    // The removal's unfollow meets a full ring and is deferred.
+    assert!(publisher.net.as_ref().unwrap().fill_receiver_ring() > 0);
+    publisher.remove_aggregate(&handle).unwrap();
+    assert_eq!(publisher.wire_key_counters().unwrap().bindings_deferred, 1);
+    // One duty: the ring drains, the deferred unfollow is still held.
+    let _ = publisher.do_work().unwrap();
+    // A replacement guarded by the same guard, admitted now, posts its
+    // follow ahead of the deferred unfollow.
+    let security = Security::Authenticated(auth(Some(ChannelAuthority {
+        follower_id: 66,
+        ..authority(control())
+    })));
+    let to = subscriber.network_subscription_address(STREAM).unwrap();
+    publisher
+        .add_network_publication(
+            aggregate(STREAM + 1),
+            &udp(Destination::Unicast(to), security),
+        )
+        .unwrap();
+    for _ in 0..50 {
+        let _ = publisher.do_work().unwrap();
+    }
+    assert!(publisher.wire_key_counters().unwrap().bindings_deferred >= 1);
+    assert_eq!(
+        publisher.net.as_ref().unwrap().followed_guards(),
+        Some(1),
+        "the replacement's follow stays"
+    );
+}
+
 /// The H8 invariants of the authenticated class (karyos#648).
 mod invariants;

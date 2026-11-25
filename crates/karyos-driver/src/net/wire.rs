@@ -324,6 +324,8 @@ pub(crate) struct SubscriptionKeys {
     pub(crate) pairwise: KeyFile,
     /// The view the binding applies at once.
     pub(crate) view: Arc<KeyView>,
+    /// The binding's installation id, which its cleanup names.
+    pub(crate) installation: u64,
 }
 
 /// The driver's wire key store and its schedule.
@@ -357,6 +359,11 @@ pub(crate) struct WireKeys {
     followed: Vec<(u64, u64, SocketAddr)>,
     /// Receiver bindings a full ring refused, posted first at each duty.
     deferred: Vec<Box<crate::agents::roles::AuthBinding>>,
+    /// The last installation id handed out: every binding takes the next,
+    /// so a cleanup names exactly the installation it removes (H8 R3-5).
+    installations: u64,
+    /// The installation id of each followed guard's latest follow.
+    guard_installs: Vec<(u64, u64)>,
     /// The guard authority's committed epochs, until it starts.
     commits: Option<Dir>,
 }
@@ -431,6 +438,8 @@ impl WireKeys {
                 marks: None,
                 followed: Vec::new(),
                 deferred: Vec::new(),
+                installations: 0,
+                guard_installs: Vec::new(),
                 commits: None,
             },
             report,
@@ -635,6 +644,11 @@ impl WireKeys {
                 self.followed
                     .push((registration, authority.guard_id, authority.control));
             }
+            self.installations = self.installations.saturating_add(1);
+            let installation = self.installations;
+            self.guard_installs
+                .retain(|(guard, _)| *guard != authority.guard_id);
+            self.guard_installs.push((authority.guard_id, installation));
             let binding = crate::agents::roles::Binding::Follow {
                 authority: crate::agents::roles::BoundAuthority {
                     key_id: authority.key_id,
@@ -647,6 +661,7 @@ impl WireKeys {
                 marks,
                 mirror: Arc::clone(&mirror),
                 view: Arc::clone(&self.view),
+                installation,
             };
             (binding, mirror)
         });
@@ -658,13 +673,33 @@ impl WireKeys {
 
     /// The guard the removed publication `registration` followed, with its
     /// authority's control endpoint, when no other publication follows it.
-    pub(crate) fn unfollow(&mut self, registration: u64) -> Option<(u64, SocketAddr)> {
+    /// The binding that unfollows it names the guard's latest follow, so
+    /// a follow posted after it is never undone by it (H8 R3-5).
+    pub(crate) fn unfollow(&mut self, registration: u64) -> Option<crate::agents::roles::Binding> {
         let at = self
             .followed
             .iter()
             .position(|(held, ..)| *held == registration)?;
         let (_, guard_id, control) = self.followed.swap_remove(at);
-        (!self.followed.iter().any(|(_, held, _)| *held == guard_id)).then_some((guard_id, control))
+        if self.followed.iter().any(|(_, held, _)| *held == guard_id) {
+            return None;
+        }
+        let at = self
+            .guard_installs
+            .iter()
+            .position(|(guard, _)| *guard == guard_id)?;
+        let (_, installation) = self.guard_installs.swap_remove(at);
+        Some(crate::agents::roles::Binding::Unfollow {
+            guard_id,
+            control,
+            installation,
+        })
+    }
+
+    /// The next installation id.
+    pub(crate) fn next_installation(&mut self) -> u64 {
+        self.installations = self.installations.saturating_add(1);
+        self.installations
     }
 
     /// Keeps `binding`, which a full ring refused, for the next duty.
@@ -808,6 +843,7 @@ impl WireKeys {
             channel: duplicate(verifying),
             pairwise: duplicate(pairwise),
             view,
+            installation: self.next_installation(),
         })
     }
 

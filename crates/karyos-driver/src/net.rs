@@ -593,6 +593,8 @@ struct NetSubscription {
     /// The authenticated channel every handle of the key shares
     /// (karyos#648); `None` for a trusted one.
     auth: Option<karyos_protocol::channel::AuthenticatedChannel>,
+    /// Its binding's installation id, which its removal names (H8 R3-5).
+    auth_installation: u64,
     /// Handles of this key; the receiver's entry goes with the last.
     users: usize,
 }
@@ -1185,6 +1187,38 @@ impl<T: StreamTerms> Network<T> {
         posted
     }
 
+    /// Posts `count` pings to the receiver (tests).
+    #[cfg(test)]
+    pub(crate) fn ping_receiver(&self, count: usize) {
+        for _ in 0..count {
+            let _ = self
+                .links
+                .receiver
+                .post(|reply| AgentCommand::Ping { reply, token: 0 });
+        }
+    }
+
+    /// Posts `binding` to the receiver directly, as a cleanup a full ring
+    /// held back would arrive late (tests).
+    #[cfg(test)]
+    pub(crate) fn post_binding(&self, binding: crate::agents::roles::Binding) -> bool {
+        let binding = Box::new(crate::agents::roles::AuthBinding(binding));
+        self.links
+            .receiver
+            .post(|reply| AgentCommand::Authenticate { reply, binding })
+            .is_ok()
+    }
+
+    /// The installation id of the authenticated key of `stream_id`
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn auth_installation(&self, stream_id: i32) -> Option<(EndpointId, u64)> {
+        self.subscriptions
+            .iter()
+            .find(|entry| entry.stream_id == stream_id && entry.auth.is_some())
+            .map(|entry| (entry.endpoint, entry.auth_installation))
+    }
+
     /// The driver's wire key store, once started.
     pub(crate) fn wire_keys(&self) -> Option<&wire::WireKeys> {
         self.wire.as_ref()
@@ -1645,26 +1679,30 @@ impl<T: StreamTerms> Network<T> {
         // An authenticated key's binding goes first, in the same ring, so
         // the receiver never establishes an image of the key without it
         // (karyos#648).
+        // In the same command as the add, one ring slot (H8 R3-5).
+        let auth_installation = auth.as_ref().map_or(0, |(_, keys)| keys.installation);
         let bound = match auth {
-            None => Ok(()),
+            None => Ok(None),
             Some((channel, keys)) => {
-                self.post_subscription_binding(endpoint, stream_id, channel, keys)
+                Self::subscription_binding(endpoint, stream_id, channel, keys).map(Some)
             }
         };
-        if let Err(error) = bound {
-            release(&mut self.send_endpoints, endpoint);
-            if let Some((control, _)) = control {
-                release(&mut self.send_endpoints, control);
+        let binding = match bound {
+            Ok(binding) => binding,
+            Err(error) => {
+                release(&mut self.send_endpoints, endpoint);
+                if let Some((control, _)) = control {
+                    release(&mut self.send_endpoints, control);
+                }
+                if let Some(solicit) = solicit {
+                    release(&mut self.send_endpoints, solicit);
+                }
+                return Err(error);
             }
-            if let Some(solicit) = solicit {
-                release(&mut self.send_endpoints, solicit);
-            }
-            return Err(error);
-        }
-        let posted = self
-            .links
-            .receiver
-            .post(|reply| AgentCommand::AddSubscription {
+        };
+        let authenticated = binding.is_some();
+        let posted = self.links.receiver.post(|reply| {
+            let add = AgentCommand::AddSubscription {
                 reply,
                 endpoint,
                 stream_id,
@@ -1677,8 +1715,19 @@ impl<T: StreamTerms> Network<T> {
                 solicit_from: solicit,
                 register_at: register_at.zip(registration.clone()),
                 path_skew,
-            });
+            };
+            match binding {
+                Some(binding) => AgentCommand::AddAuthenticated {
+                    binding,
+                    add: Box::new(add),
+                },
+                None => add,
+            }
+        });
         if posted.is_err() {
+            if authenticated && let Some(wire) = self.wire.as_mut() {
+                wire.count_busy();
+            }
             release(&mut self.send_endpoints, endpoint);
             if let Some((control, _)) = control {
                 release(&mut self.send_endpoints, control);
@@ -1789,6 +1838,7 @@ impl<T: StreamTerms> Network<T> {
             control_held,
             control_admitted,
             auth: channel_auth,
+            auth_installation,
             users: 1,
         });
         Ok(handle)
@@ -1796,13 +1846,12 @@ impl<T: StreamTerms> Network<T> {
 
     /// Posts the receiver binding of the authenticated subscription to
     /// `stream_id` on `endpoint`, its keys checked at admission.
-    fn post_subscription_binding(
-        &mut self,
+    fn subscription_binding(
         endpoint: EndpointId,
         stream_id: i32,
         channel: karyos_protocol::channel::AuthenticatedChannel,
         keys: wire::SubscriptionKeys,
-    ) -> Result<(), DriverError> {
+    ) -> Result<Box<crate::agents::roles::AuthBinding>, DriverError> {
         use crate::agents::roles::{AuthBinding, Binding, BoundAuthority};
 
         let alias = Alias {
@@ -1825,21 +1874,12 @@ impl<T: StreamTerms> Network<T> {
             guard_id: authority.guard_id,
             control: authority.control,
         });
-        let binding = Box::new(AuthBinding(Binding::Subscription {
+        Ok(Box::new(AuthBinding(Binding::Subscription {
             auth,
             authority,
             view: keys.view,
-        }));
-        let posted = self
-            .links
-            .receiver
-            .post(|reply| AgentCommand::Authenticate { reply, binding });
-        if posted.is_err()
-            && let Some(wire) = self.wire.as_mut()
-        {
-            wire.count_busy();
-        }
-        posted.map_err(|_| DriverError::NetworkBusy)
+            installation: keys.installation,
+        })))
     }
 
     /// The registration state of `subscription`, a `control-mode=dynamic`
@@ -2258,29 +2298,36 @@ impl<T: StreamTerms> Network<T> {
                         })
                         .map_err(|_| DriverError::NetworkBusy)?;
                 }
-                self.links
-                    .receiver
-                    .post(|reply| AgentCommand::RemoveSubscription {
-                        reply,
-                        endpoint,
-                        stream_id,
-                    })
-                    .map_err(|_| DriverError::NetworkBusy)?;
-                // Its keys, abort scope and peer reservation go with it.
-                // A full ring leaves them to the next binding of the key,
-                // which replaces them; until then they key nothing live.
-                if self
+                // An authenticated key's cleanup goes in the same command,
+                // naming its installation (H8 R3-5).
+                let cleanup = self
                     .subscriptions
                     .get(index)
-                    .is_some_and(|entry| entry.auth.is_some())
-                {
-                    self.post_receiver_binding(Box::new(crate::agents::roles::AuthBinding(
-                        crate::agents::roles::Binding::Unbind {
+                    .filter(|entry| entry.auth.is_some())
+                    .map(|entry| entry.auth_installation);
+                self.links
+                    .receiver
+                    .post(|reply| {
+                        let remove = AgentCommand::RemoveSubscription {
+                            reply,
                             endpoint,
                             stream_id,
-                        },
-                    )));
-                }
+                        };
+                        match cleanup {
+                            Some(installation) => AgentCommand::RemoveAuthenticated {
+                                binding: Box::new(crate::agents::roles::AuthBinding(
+                                    crate::agents::roles::Binding::Unbind {
+                                        endpoint,
+                                        stream_id,
+                                        installation,
+                                    },
+                                )),
+                                remove: Box::new(remove),
+                            },
+                            None => remove,
+                        }
+                    })
+                    .map_err(|_| DriverError::NetworkBusy)?;
                 let entry = self.subscriptions.swap_remove(index);
                 self.release_control_groups(&entry.control_held);
                 if let Some(control) = entry.control {
@@ -2889,33 +2936,34 @@ impl<T: StreamTerms> Network<T> {
         for path in paths() {
             // An authenticated publication's alias is bound first, so its
             // receivers' envelopes never reach the bare path (karyos#648).
-            let bound = auth.is_none()
-                || self
-                    .links
-                    .receiver
-                    .post(|reply| AgentCommand::Authenticate {
-                        reply,
+            // In one command with its add (H8 R3-5).
+            let authenticated = auth.is_some();
+            let posted = self.links.receiver.post(|reply| {
+                let add = AgentCommand::AddPublishedAlias {
+                    reply,
+                    endpoint: path,
+                    alias,
+                };
+                if authenticated {
+                    AgentCommand::AddAuthenticated {
                         binding: Box::new(crate::agents::roles::AuthBinding(
                             crate::agents::roles::Binding::Published {
                                 endpoint: path,
                                 alias,
                             },
                         )),
-                    })
-                    .is_ok();
-            let posted = if bound {
-                self.links
-                    .receiver
-                    .post(|reply| AgentCommand::AddPublishedAlias {
-                        reply,
-                        endpoint: path,
-                        alias,
-                    })
-            } else {
-                Err(crate::agents::AgentError::Busy(
-                    crate::agents::AgentKind::Receiver,
-                ))
-            };
+                        add: Box::new(add),
+                    }
+                } else {
+                    add
+                }
+            });
+            if posted.is_err()
+                && authenticated
+                && let Some(wire) = self.wire.as_mut()
+            {
+                wire.count_busy();
+            }
             if posted.is_err() {
                 // The paths already published are stale now; the capacity
                 // check above leaves room for them.
@@ -2940,49 +2988,60 @@ impl<T: StreamTerms> Network<T> {
         self.stale_aliases.retain(|key| !mine(key));
         let admission = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
         outbound.set_admission_slot(std::sync::Arc::clone(&admission));
-        // Its remote guard is followed, and its keys and abort authority
-        // reach the sender, ahead of it.
-        let bound = match auth {
-            None => true,
-            Some(binding) => {
-                let followed = binding.follow.is_none_or(|(follow, _)| {
-                    self.links
-                        .receiver
-                        .post(|reply| AgentCommand::Authenticate {
-                            reply,
-                            binding: Box::new(crate::agents::roles::AuthBinding(follow)),
-                        })
-                        .is_ok()
-                });
-                followed
-                    && self
-                        .links
-                        .sender
-                        .post(|reply| AgentCommand::Authenticate {
-                            reply,
-                            binding: Box::new(crate::agents::roles::AuthBinding(binding.sender)),
-                        })
-                        .is_ok()
-            }
+        // Its remote guard is followed first, on the receiver; its keys
+        // and abort authority reach the sender in the same command as the
+        // publication, one ring slot (H8 R3-5).
+        let (sender_binding, follow) = match auth {
+            None => (None, None),
+            Some(binding) => (Some(binding.sender), binding.follow),
         };
-        if !bound && let Some(wire) = self.wire.as_mut() {
-            wire.count_busy();
-        }
-        let posted = if !bound {
-            Err(crate::agents::AgentError::Busy(
-                crate::agents::AgentKind::Receiver,
-            ))
-        } else {
+        let authenticated = sender_binding.is_some();
+        let followed = follow.is_none_or(|(follow, _)| {
             self.links
-                .sender
-                .post(|reply| AgentCommand::AddPublication {
+                .receiver
+                .post(|reply| AgentCommand::Authenticate {
+                    reply,
+                    binding: Box::new(crate::agents::roles::AuthBinding(follow)),
+                })
+                .is_ok()
+        });
+        let posted = if followed {
+            self.links.sender.post(|reply| {
+                let add = AgentCommand::AddPublication {
                     reply,
                     publication,
                     outbound,
                     guard: spec,
                     roles,
-                })
+                };
+                match sender_binding {
+                    Some(binding) => AgentCommand::AddAuthenticated {
+                        binding: Box::new(crate::agents::roles::AuthBinding(binding)),
+                        add: Box::new(add),
+                    },
+                    None => add,
+                }
+            })
+        } else {
+            Err(crate::agents::AgentError::Busy(
+                crate::agents::AgentKind::Receiver,
+            ))
         };
+        if posted.is_err() && authenticated {
+            // A follow already posted is undone by its own installation
+            // id, deferred if the ring is full; nothing else of the
+            // refused admission was posted.
+            if let Some(wire) = self.wire.as_mut() {
+                wire.count_busy();
+            }
+            if let Some(unfollow) = self
+                .wire
+                .as_mut()
+                .and_then(|wire| wire.unfollow(registration))
+            {
+                self.post_receiver_binding(Box::new(crate::agents::roles::AuthBinding(unfollow)));
+            }
+        }
         if posted.is_err() {
             // The receiver learned the aliases: they are stale now. The
             // capacity check above leaves room for them.
@@ -3116,14 +3175,12 @@ impl<T: StreamTerms> Network<T> {
         let reincarnating = self.end_reincarnation(registration);
         // The last publication guarded by a remote guard unfollows it
         // (karyos#648).
-        if let Some((guard_id, control)) = self
+        if let Some(unfollow) = self
             .wire
             .as_mut()
             .and_then(|wire| wire.unfollow(registration))
         {
-            self.post_receiver_binding(Box::new(crate::agents::roles::AuthBinding(
-                crate::agents::roles::Binding::Unfollow { guard_id, control },
-            )));
+            self.post_receiver_binding(Box::new(crate::agents::roles::AuthBinding(unfollow)));
         }
         let Some(entry) = self
             .publications

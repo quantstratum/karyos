@@ -19,6 +19,10 @@ use karyos_protocol::network::Alias;
 use super::publish_auth::{AbortAuthority, PublicationAuth};
 use super::receive_auth::SubscriptionAuth;
 use super::{AbortScope, ReceiverRole, SenderRole};
+use karyos_io::sockets::ops::SocketOps;
+
+use super::super::ring::Reservation;
+use super::super::{AgentCommand, AgentEvent, AgentKind};
 use crate::agents::EndpointId;
 use crate::embedded::StreamTerms;
 use crate::net::wire::KeyView;
@@ -50,12 +54,16 @@ pub(crate) enum Binding {
         auth: SubscriptionAuth,
         authority: Option<BoundAuthority>,
         view: Arc<KeyView>,
+        /// Its installation id, which its cleanup names.
+        installation: u64,
     },
-    /// Receiver: the subscription to `stream_id` on `endpoint` ended; its
-    /// keys, abort scope and control peer reservation go.
+    /// Receiver: the subscription to `stream_id` on `endpoint` installed
+    /// as `installation` ended; its keys, abort scope and control peer
+    /// reservation go. Another installation of the key is left as it is.
     Unbind {
         endpoint: EndpointId,
         stream_id: i32,
+        installation: u64,
     },
     /// Receiver: follow the remote guard of a local authenticated
     /// publication as `follower_id`, its challenges leaving from
@@ -69,10 +77,17 @@ pub(crate) enum Binding {
         marks: Option<Box<dyn crate::remote_guard::MarkStore + Send>>,
         mirror: Arc<karyos_client::HeapWords>,
         view: Arc<KeyView>,
+        /// Its installation id, which its cleanup names.
+        installation: u64,
     },
     /// Receiver: the last local publication guarded by `guard_id` went:
-    /// stop following it and release its control peer's reservation.
-    Unfollow { guard_id: u64, control: SocketAddr },
+    /// stop following it and release its control peer's reservation,
+    /// unless a later follow (another `installation`) took it over.
+    Unfollow {
+        guard_id: u64,
+        control: SocketAddr,
+        installation: u64,
+    },
     /// Receiver: be the guard authority, answering only on `endpoints`.
     Authority {
         authority: Box<crate::guard_authority::GuardAuthority>,
@@ -106,14 +121,161 @@ impl<T: StreamTerms> SenderRole<T> {
     }
 }
 
+impl<T: StreamTerms> SenderRole<T> {
+    /// An authenticated publication's binding and its `AddPublication`,
+    /// as one command (H8 R3-5): the binding is held only when the
+    /// publication is added, and a refused binding refuses the add.
+    pub(super) fn add_authenticated<O: SocketOps>(
+        &mut self,
+        binding: Binding,
+        add: AgentCommand<O, T>,
+    ) -> Option<(Reservation, AgentEvent<O, T>)> {
+        let key = match &binding {
+            Binding::Publication { auth, .. } => Some((auth.endpoint, auth.alias)),
+            _ => None,
+        };
+        let registration = match &add {
+            AgentCommand::AddPublication { publication, .. } => {
+                Some(publication.identity.registration_id)
+            }
+            _ => None,
+        };
+        if !self.bind_auth(binding) {
+            return match add {
+                AgentCommand::AddPublication {
+                    reply, publication, ..
+                } => Some((
+                    reply,
+                    AgentEvent::PublicationRefused {
+                        agent: AgentKind::Sender,
+                        endpoint: publication.endpoint,
+                        alias: publication.alias,
+                        registration: publication.identity.registration_id,
+                    },
+                )),
+                other => self.command(other),
+            };
+        }
+        let answer = self.command(add);
+        if let (Some(key), Some((_, AgentEvent::PublicationRefused { .. }))) = (key, &answer) {
+            self.publication_auth
+                .retain(|held| (held.endpoint, held.alias) != key);
+        } else if let (Some((endpoint, alias)), Some(registration)) = (key, registration) {
+            self.publication_installs
+                .retain(|(held, at, _)| (*held, *at) != (endpoint, alias));
+            self.publication_installs
+                .push((endpoint, alias, registration));
+        }
+        answer
+    }
+
+    /// Drops the binding of the publication `alias` on `endpoint` added
+    /// for `registration` (ADM-10): its SETUP proof, domain 1 prototype,
+    /// receivers' verifiers, boot table and abort signer, erased on drop.
+    /// A later publication's binding of the key is left as it is.
+    pub(super) fn unbind_publication(
+        &mut self,
+        endpoint: EndpointId,
+        alias: Alias,
+        registration: u64,
+    ) {
+        if !self
+            .publication_installs
+            .contains(&(endpoint, alias, registration))
+        {
+            return;
+        }
+        self.publication_installs
+            .retain(|(held, at, _)| (*held, *at) != (endpoint, alias));
+        self.publication_auth
+            .retain(|held| (held.endpoint, held.alias) != (endpoint, alias));
+    }
+
+    /// Whether the publication `alias` on `endpoint` is of the
+    /// authenticated class, bound or not (ADM-9).
+    pub(super) fn needs_auth_binding(&self, endpoint: EndpointId, alias: Alias) -> bool {
+        self.publications.iter().any(|outbound| {
+            outbound.serves(endpoint) && outbound.alias() == alias && outbound.needs_auth_binding()
+        })
+    }
+}
+
 impl<T: StreamTerms> ReceiverRole<T> {
+    /// An authenticated binding and the `AddSubscription` or
+    /// `AddPublishedAlias` it keys, as one command (H8 R3-5): one ring
+    /// slot, so neither goes without the other; a refused binding refuses
+    /// the add, and a refused add drops the binding it made.
+    pub(super) fn add_authenticated<O: SocketOps>(
+        &mut self,
+        binding: Binding,
+        add: AgentCommand<O, T>,
+    ) -> Option<(Reservation, AgentEvent<O, T>)> {
+        let installed = match &binding {
+            Binding::Subscription {
+                auth, installation, ..
+            } => Some((auth.endpoint, auth.stream_id, *installation)),
+            _ => None,
+        };
+        if !self.bind_auth(binding) {
+            let refused = |subscription| AgentEvent::Configured {
+                agent: AgentKind::Receiver,
+                accepted: false,
+                subscription,
+            };
+            return match add {
+                AgentCommand::AddSubscription {
+                    reply,
+                    endpoint,
+                    stream_id,
+                    ..
+                } => Some((reply, refused(Some((endpoint, stream_id))))),
+                AgentCommand::AddPublishedAlias { reply, .. } => Some((reply, refused(None))),
+                other => self.command(other),
+            };
+        }
+        let answer = self.command(add);
+        if let (
+            Some((endpoint, stream_id, installation)),
+            Some((
+                _,
+                AgentEvent::Configured {
+                    accepted: false, ..
+                },
+            )),
+        ) = (installed, &answer)
+        {
+            self.unbind_installation(endpoint, stream_id, installation);
+        }
+        answer
+    }
+
+    /// Drops the binding of `stream_id` on `endpoint` only when it is
+    /// `installation`'s.
+    fn unbind_installation(&mut self, endpoint: EndpointId, stream_id: i32, installation: u64) {
+        if self
+            .auth_installs
+            .contains(&(endpoint, stream_id, installation))
+        {
+            self.unbind(endpoint, stream_id);
+        }
+    }
+
     /// Holds a receiver binding, replacing any earlier one of its key;
     /// refuses a publication's, and a subscription whose authority's
     /// control budget cannot be reserved (nothing of it is kept then).
     pub(super) fn bind_auth(&mut self, binding: Binding) -> bool {
         match binding {
             Binding::Publication { .. } => false,
-            Binding::Unfollow { guard_id, control } => {
+            Binding::Unfollow {
+                guard_id,
+                control,
+                installation,
+            } => {
+                // A later follow of the guard keeps it (H8 R3-5).
+                if !self.follow_installs.contains(&(guard_id, installation)) {
+                    return true;
+                }
+                self.follow_installs.retain(|(held, _)| *held != guard_id);
                 let before = self.remote_guards.len();
                 self.remote_guards
                     .retain(|followed| followed.guard.guard_id() != guard_id);
@@ -131,7 +293,17 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 marks,
                 mirror,
                 view,
-            } => self.follow(authority, follower_id, endpoint, marks, mirror, &view),
+                installation,
+            } => {
+                let followed = self.follow(authority, follower_id, endpoint, marks, mirror, &view);
+                if followed {
+                    self.follow_installs
+                        .retain(|(held, _)| *held != authority.guard_id);
+                    self.follow_installs
+                        .push((authority.guard_id, installation));
+                }
+                followed
+            }
             Binding::Authority {
                 authority,
                 endpoints,
@@ -151,14 +323,16 @@ impl<T: StreamTerms> ReceiverRole<T> {
             Binding::Unbind {
                 endpoint,
                 stream_id,
+                installation,
             } => {
-                self.unbind(endpoint, stream_id);
+                self.unbind_installation(endpoint, stream_id, installation);
                 true
             }
             Binding::Subscription {
                 auth,
                 authority,
                 view,
+                installation,
             } => {
                 let (endpoint, stream_id) = (auth.endpoint, auth.stream_id);
                 self.unbind(endpoint, stream_id);
@@ -192,6 +366,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
                     ));
                 }
                 self.subscription_auth.push(auth);
+                self.auth_installs.push((endpoint, stream_id, installation));
                 // The trusted authorities and every key of the receive side
                 // follow the view the binding was checked against.
                 self.apply_keys(&*view);
@@ -270,6 +445,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
         let key = (endpoint, stream_id);
         self.subscription_auth
             .retain(|held| (held.endpoint, held.stream_id) != key);
+        self.auth_installs
+            .retain(|(held, stream, _)| (*held, *stream) != key);
         self.abort_scopes
             .retain(|(held, stream, _)| (*held, *stream) != key);
         let signed = &mut self.signed;

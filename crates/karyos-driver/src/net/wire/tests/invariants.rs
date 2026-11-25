@@ -86,7 +86,6 @@ fn inv_an_expired_key_withdraws_every_authenticated_path_at_the_next_tick() {
 /// prototype, pairwise verifiers, boot id table and abort signer). Key
 /// material is not retained past the publication it was admitted for.
 #[test]
-#[ignore = "H8 invariant: a removed authenticated publication keeps its keys in the sender role, fix pending"]
 fn inv_a_removed_authenticated_publication_drops_its_keys() {
     let (mut publisher, mut subscriber, handle, _subscription) = established_with_handles();
     publisher.remove_aggregate(&handle).unwrap();

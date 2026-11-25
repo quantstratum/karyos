@@ -207,7 +207,6 @@ fn inv_a_withdrawn_pairwise_key_never_challenges_bare() {
 /// (as it would not after a lost or refused `Authenticate`): every
 /// ANNOUNCE must be held back, never sent bare.
 #[test]
-#[ignore = "H8 invariant: an auth-required outbound without its sender binding announces bare, fix pending"]
 fn inv_an_auth_required_publication_without_its_binding_sends_nothing_bare() {
     use crate::agents::roles::receive_auth::SubscriptionAuth;
 

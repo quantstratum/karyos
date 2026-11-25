@@ -400,6 +400,12 @@ impl<T: StreamTerms> Outbound<T> {
         }
     }
 
+    /// Whether it is of the authenticated class (not the encrypted one):
+    /// it seals under a publication binding, or waits for one.
+    pub(crate) fn needs_auth_binding(&self) -> bool {
+        matches!(self.auth, SenderAuth::Sealing(_) | SenderAuth::Pending)
+    }
+
     /// Whether the publication is authenticated.
     #[must_use]
     pub fn authenticated(&self) -> bool {
