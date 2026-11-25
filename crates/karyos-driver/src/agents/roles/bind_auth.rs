@@ -70,6 +70,9 @@ pub(crate) enum Binding {
         mirror: Arc<karyos_client::HeapWords>,
         view: Arc<KeyView>,
     },
+    /// Receiver: the last local publication guarded by `guard_id` went:
+    /// stop following it and release its control peer's reservation.
+    Unfollow { guard_id: u64, control: SocketAddr },
     /// Receiver: be the guard authority, answering only on `endpoints`.
     Authority {
         authority: Box<crate::guard_authority::GuardAuthority>,
@@ -110,6 +113,17 @@ impl<T: StreamTerms> ReceiverRole<T> {
     pub(super) fn bind_auth(&mut self, binding: Binding) -> bool {
         match binding {
             Binding::Publication { .. } => false,
+            Binding::Unfollow { guard_id, control } => {
+                let before = self.remote_guards.len();
+                self.remote_guards
+                    .retain(|followed| followed.guard.guard_id() != guard_id);
+                if self.remote_guards.len() != before
+                    && let Some(intake) = self.signed.as_deref_mut()
+                {
+                    intake.release(control);
+                }
+                true
+            }
             Binding::Follow {
                 authority,
                 follower_id,
@@ -291,6 +305,11 @@ impl<T: StreamTerms> SenderRole<T> {
 
 #[cfg(test)]
 impl<T: StreamTerms> ReceiverRole<T> {
+    /// The remote guards followed (tests).
+    pub(crate) fn followed_guards(&self) -> usize {
+        self.remote_guards.len()
+    }
+
     /// The authenticated subscriptions bound, the authenticated images,
     /// and those whose sealer a key reload withdrew (tests).
     pub(crate) fn auth_state(&self) -> (usize, usize, usize) {

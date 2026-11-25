@@ -1105,9 +1105,57 @@ impl<T: StreamTerms> Network<T> {
         }
     }
 
+    /// The remote guards the Shared receiver follows (tests).
+    #[cfg(test)]
+    pub(crate) fn followed_guards(&self) -> Option<usize> {
+        match &self.agents {
+            Agents::Shared(agents) => Some(agents.followed_guards()),
+            Agents::Threads(_) | Agents::Closed => None,
+        }
+    }
+
+    /// Fills the receiver's command ring with pings (tests); returns how
+    /// many it took.
+    #[cfg(test)]
+    pub(crate) fn fill_receiver_ring(&self) -> usize {
+        let mut posted = 0;
+        while self
+            .links
+            .receiver
+            .post(|reply| AgentCommand::Ping { reply, token: 0 })
+            .is_ok()
+        {
+            posted += 1;
+        }
+        posted
+    }
+
     /// The driver's wire key store, once started.
     pub(crate) fn wire_keys(&self) -> Option<&wire::WireKeys> {
         self.wire.as_ref()
+    }
+
+    /// Posts `binding` to the receiver, or, when its ring is full, keeps it
+    /// for the next duty, counted: an unbind or unfollow is never lost.
+    fn post_receiver_binding(&mut self, binding: Box<crate::agents::roles::AuthBinding>) {
+        match self.links.receiver.prepare() {
+            Ok(prepared) => {
+                // Past the reservation only a gone agent fails, which
+                // fails the network.
+                let _ = self
+                    .links
+                    .receiver
+                    .commit(prepared, |reply| AgentCommand::Authenticate {
+                        reply,
+                        binding,
+                    });
+            }
+            Err(_) => {
+                if let Some(wire) = self.wire.as_mut() {
+                    wire.defer(binding);
+                }
+            }
+        }
     }
 
     /// Holds the guard authority's control endpoints open and posts the
@@ -1162,6 +1210,14 @@ impl<T: StreamTerms> Network<T> {
     /// so both roles apply it in their next cycle. A view a ring refused
     /// is posted to both again at the next duty.
     fn wire_duty(&mut self) {
+        // Bindings a full ring deferred go first, in order.
+        let deferred = self
+            .wire
+            .as_mut()
+            .map_or_else(Vec::new, wire::WireKeys::take_deferred);
+        for binding in deferred {
+            self.post_receiver_binding(binding);
+        }
         let Some(wire) = self.wire.as_mut() else {
             return;
         };
@@ -1682,10 +1738,16 @@ impl<T: StreamTerms> Network<T> {
             authority,
             view: keys.view,
         }));
-        self.links
+        let posted = self
+            .links
             .receiver
-            .post(|reply| AgentCommand::Authenticate { reply, binding })
-            .map_err(|_| DriverError::NetworkBusy)
+            .post(|reply| AgentCommand::Authenticate { reply, binding });
+        if posted.is_err()
+            && let Some(wire) = self.wire.as_mut()
+        {
+            wire.count_busy();
+        }
+        posted.map_err(|_| DriverError::NetworkBusy)
     }
 
     /// The registration state of `subscription`, a `control-mode=dynamic`
@@ -2084,16 +2146,12 @@ impl<T: StreamTerms> Network<T> {
                     .get(index)
                     .is_some_and(|entry| entry.auth.is_some())
                 {
-                    let binding = Box::new(crate::agents::roles::AuthBinding(
+                    self.post_receiver_binding(Box::new(crate::agents::roles::AuthBinding(
                         crate::agents::roles::Binding::Unbind {
                             endpoint,
                             stream_id,
                         },
-                    ));
-                    let _ = self
-                        .links
-                        .receiver
-                        .post(|reply| AgentCommand::Authenticate { reply, binding });
+                    )));
                 }
                 let entry = self.subscriptions.swap_remove(index);
                 self.release_control_groups(&entry.control_held);
@@ -2779,6 +2837,9 @@ impl<T: StreamTerms> Network<T> {
                         .is_ok()
             }
         };
+        if !bound && let Some(wire) = self.wire.as_mut() {
+            wire.count_busy();
+        }
         let posted = if !bound {
             Err(crate::agents::AgentError::Busy(
                 crate::agents::AgentKind::Receiver,
@@ -2909,6 +2970,17 @@ impl<T: StreamTerms> Network<T> {
     ) -> bool {
         // A reincarnation ends with its publication: nothing is added.
         let reincarnating = self.end_reincarnation(registration);
+        // The last publication guarded by a remote guard unfollows it
+        // (karyos#648).
+        if let Some((guard_id, control)) = self
+            .wire
+            .as_mut()
+            .and_then(|wire| wire.unfollow(registration))
+        {
+            self.post_receiver_binding(Box::new(crate::agents::roles::AuthBinding(
+                crate::agents::roles::Binding::Unfollow { guard_id, control },
+            )));
+        }
         let Some(entry) = self
             .publications
             .iter_mut()

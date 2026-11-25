@@ -8915,3 +8915,174 @@ fn a_challenge_on_another_endpoint_is_refused_before_the_authority() {
         "{after:?}"
     );
 }
+
+/// karyos#648 (H8 round 2, section 4): withdraws every key through the
+/// conductor's `ApplyKeys` on both agents (a view naming no key), then
+/// hands `item`, prepared and queued under the previous keys, to the
+/// sender: returns the sender's counters before and after its submission.
+fn submit_after_withdrawal(
+    rig: &mut Rig,
+    item: super::super::control::ControlItem,
+) -> (
+    crate::agents::roles::SenderCounters,
+    crate::agents::roles::SenderCounters,
+) {
+    let keys = std::sync::Arc::new(crate::net::wire::KeyView::withdrawn());
+    for link in [&rig.links.sender, &rig.links.receiver] {
+        link.post(|reply| AgentCommand::ApplyKeys {
+            reply,
+            keys: std::sync::Arc::clone(&keys),
+        })
+        .unwrap();
+    }
+    rig.sender_stopped = false;
+    rig.round(true);
+    let before = rig.agents.sender.role.counters();
+    rig.agents.receiver.role.post_to_sender(item);
+    rig.round(true);
+    (before, rig.agents.sender.role.counters())
+}
+
+/// Runs `rig`, its sender stopped every other round, until the receiver
+/// queues a control `pick` selects for the sender; returns it, unsent.
+fn queued(
+    rig: &mut Rig,
+    pick: impl Fn(&super::super::control::ControlItem) -> bool,
+) -> super::super::control::ControlItem {
+    for _ in 0..4000 {
+        rig.sender_stopped = true;
+        rig.round(true);
+        while let Some(item) = rig.agents.sender.role.take_control() {
+            if pick(&item) {
+                rig.sender_stopped = false;
+                return item;
+            }
+        }
+        rig.sender_stopped = false;
+        rig.round(true);
+    }
+    panic!("never queued");
+}
+
+/// karyos#648: a CHALLENGE (RSP_SETUP) queued sealed under the pairwise
+/// key is not sent once the key is withdrawn.
+#[test]
+fn a_queued_rsp_setup_is_not_sent_after_its_key_is_withdrawn() {
+    use super::super::control::ControlItem;
+    use karyos_protocol::network::Control;
+
+    let (mut rig, _b, _channel) = authenticated_rig();
+    let item = queued(&mut rig, |item| {
+        matches!(
+            item,
+            ControlItem::Outgoing {
+                control: Control::Challenge(_),
+                seal: Some(_),
+                ..
+            }
+        )
+    });
+    let (before, after) = submit_after_withdrawal(&mut rig, item);
+    assert!(after.seal_failures > before.seal_failures, "{after:?}");
+    assert_eq!(
+        rig.agents.sender.role.auth_state().1,
+        0,
+        "nothing established"
+    );
+}
+
+/// karyos#648: a followed guard's STATUS_CHALLENGE queued under the
+/// applied keys is not sent once they are withdrawn.
+#[test]
+fn a_queued_guard_challenge_is_not_sent_after_its_key_is_withdrawn() {
+    use super::super::control::ControlItem;
+
+    let (mut rig, _authority, _signer) = remotely_guarded_rig(MemoryMarks::default(), None);
+    let item = queued(&mut rig, |item| matches!(item, ControlItem::Raw { .. }));
+    let (before, after) = submit_after_withdrawal(&mut rig, item);
+    assert_eq!(after.raw_sent, before.raw_sent, "{after:?}");
+    assert!(after.seal_failures > before.seal_failures);
+}
+
+/// karyos#648: a pending SESSION_ABORT is not sent once the key view
+/// the conductor posts withdraws its authority: it ends interrupted.
+#[test]
+fn a_pending_abort_is_not_sent_after_the_coordinated_view_withdraws_it() {
+    use crate::agents::roles::publish_auth::AbortAuthority;
+    use crate::authority::Ed25519Signer;
+    use karyos_protocol::network::authenticated::GUARD_CLOSED;
+
+    let (mut rig, _b, _channel) = authenticated_rig();
+    let a = rig.publisher;
+    rig.agents.sender.role.set_abort_authority(
+        a,
+        alias(),
+        AbortAuthority::new(Ed25519Signer::from_seed(&[9; 32]), 10, 10),
+    );
+    let _slot = established(&mut rig);
+    let keys = std::sync::Arc::new(crate::net::wire::KeyView::withdrawn());
+    rig.links
+        .sender
+        .post(|reply| AgentCommand::ApplyKeys { reply, keys })
+        .unwrap();
+    rig.round(true);
+    assert!(
+        !rig.agents
+            .sender
+            .role
+            .request_abort(a, alias(), GUARD_CLOSED, 11, 3, rig.now)
+            || {
+                rig.round(true);
+                rig.agents.sender.role.counters().aborts_sent == 0
+            }
+    );
+    assert_eq!(rig.agents.sender.role.counters().aborts_sent, 0);
+}
+
+/// karyos#648: a SESSION_ABORT_ACK queued sealed under the image's key
+/// (the terminal ACK) is not sent once the key is withdrawn: the
+/// publisher never sees it.
+#[test]
+fn a_queued_terminal_ack_is_not_sent_after_its_key_is_withdrawn() {
+    use super::super::control::ControlItem;
+    use crate::agents::roles::publish_auth::AbortAuthority;
+    use crate::authority::Ed25519Signer;
+    use crate::signed_control::Authority;
+
+    let (mut rig, b, _channel) = authenticated_rig();
+    let signer = Ed25519Signer::from_seed(&[9; 32]);
+    let verifier = signer.verifier();
+    let a = rig.publisher;
+    rig.agents
+        .sender
+        .role
+        .set_abort_authority(a, alias(), AbortAuthority::new(signer, 10, 10));
+    rig.agents
+        .receiver
+        .role
+        .trust_authorities(vec![Authority::of(10, verifier, 10, &[11], true)], rig.now);
+    rig.agents.receiver.role.permit_abort(
+        b,
+        alias().stream_id,
+        crate::agents::roles::AbortScope {
+            authority_id: 10,
+            guard_id: 11,
+        },
+    );
+    let _slot = established(&mut rig);
+    assert!(rig.agents.sender.role.request_abort(
+        a,
+        alias(),
+        karyos_protocol::network::authenticated::GUARD_CLOSED,
+        11,
+        3,
+        rig.now
+    ));
+    let item = queued(&mut rig, |item| matches!(item, ControlItem::Raw { .. }));
+    let (before, after) = submit_after_withdrawal(&mut rig, item);
+    assert_eq!(after.raw_sent, before.raw_sent, "{after:?}");
+    for _ in 0..50 {
+        rig.round(true);
+    }
+    assert_eq!(rig.agents.sender.role.counters().abort_acks, 0);
+}

@@ -722,6 +722,9 @@ fn every_agent_cell_carries_the_counter_its_label_names() {
         registration_refusals: 8,
         registers_rate_limited: 9,
         setup_not_from_control: 10,
+        guard_persist_failures: 11,
+        guard_rollbacks: 12,
+        authority_commit_failures: 13,
         ..roles::ReceiverCounters::default()
     };
     let expected_receiver = [
@@ -735,6 +738,9 @@ fn every_agent_cell_carries_the_counter_its_label_names() {
         ("registration refusals received", 8),
         ("registers rate limited", 9),
         ("setup not from control", 10),
+        ("guard mark persist failures", 11),
+        ("guard rollbacks", 12),
+        ("guard authority commit failures", 13),
         ("receiver counters overflowed", 0),
     ];
     assert_eq!(RECEIVER_CELLS.len(), expected_receiver.len());

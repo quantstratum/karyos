@@ -1497,7 +1497,11 @@ pub(crate) const IMAGE_CELLS: [&str; 3] =
 /// (karyos#977) REGISTERs its per-`control` bucket held back, SETUPs
 /// dropped for not coming from `control`, and a gauge (0 or 1) for its
 /// counters' sticky `overflowed` flag.
-pub(crate) const RECEIVER_CELLS: [&str; 11] = [
+///
+/// Then (karyos#648) the guard alarms: marks a followed guard could not
+/// persist, followed guards latched by a rollback, and challenges a guard
+/// authority could not answer for an uncommitted state.
+pub(crate) const RECEIVER_CELLS: [&str; 14] = [
     "datagrams received",
     "datagrams dropped by backend",
     "invalid frames received",
@@ -1508,6 +1512,9 @@ pub(crate) const RECEIVER_CELLS: [&str; 11] = [
     "registration refusals received",
     "registers rate limited",
     "setup not from control",
+    "guard mark persist failures",
+    "guard rollbacks",
+    "guard authority commit failures",
     "receiver counters overflowed",
 ];
 
@@ -1566,6 +1573,9 @@ fn receiver_values(counters: &roles::ReceiverCounters) -> [u64; RECEIVER_CELLS.l
         counters.registration_refusals,
         counters.registers_rate_limited,
         counters.setup_not_from_control,
+        counters.guard_persist_failures,
+        counters.guard_rollbacks,
+        counters.authority_commit_failures,
         u64::from(counters.overflowed),
     ]
 }
@@ -1648,6 +1658,10 @@ impl<O: SocketOps, T: StreamTerms> NetworkAgents<O, T> {
             self.sender.role.auth_state(),
             self.receiver.role.auth_state(),
         )
+    }
+
+    pub(crate) fn followed_guards(&self) -> usize {
+        self.receiver.role.followed_guards()
     }
 }
 

@@ -161,6 +161,17 @@ impl KeyView {
         })
     }
 
+    /// A view naming no key, as a failed store's, distinct from any set
+    /// applied before (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn withdrawn() -> Self {
+        Self {
+            keys: Vec::new(),
+            fingerprint: u64::MAX,
+        }
+    }
+
     /// Whether it names nothing.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -203,6 +214,58 @@ pub struct WireKeyCounters {
     pub failures: u64,
     /// Views the agents' rings refused, posted again at the next tick.
     pub unposted: u64,
+    /// Authenticated admissions refused with `NetworkBusy` because a ring
+    /// had no room for a binding: nothing of them runs.
+    pub admissions_busy: u64,
+    /// Bindings (an unbind or unfollow) a full ring deferred to a later
+    /// duty, never dropped.
+    pub bindings_deferred: u64,
+}
+
+/// The driver's durable guard marks, shared by every follow binding that
+/// carries them, so a binding a full ring refused loses nothing: the
+/// receiver keeps the first copy it is given.
+#[derive(Clone)]
+pub(crate) struct SharedMarks(Arc<std::sync::Mutex<crate::remote_guard::GuardMarks<Dir>>>);
+
+impl core::fmt::Debug for SharedMarks {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SharedMarks").finish_non_exhaustive()
+    }
+}
+
+impl SharedMarks {
+    fn with<R>(
+        &self,
+        run: impl FnOnce(
+            &mut crate::remote_guard::GuardMarks<Dir>,
+        ) -> Result<R, crate::remote_guard::MarkError>,
+    ) -> Result<R, crate::remote_guard::MarkError> {
+        // A poisoned lock is unreadable: nothing opens (fail closed).
+        let mut marks = self
+            .0
+            .lock()
+            .map_err(|_| crate::remote_guard::MarkError::Unreadable)?;
+        run(&mut marks)
+    }
+}
+
+impl crate::remote_guard::MarkStore for SharedMarks {
+    fn load(&self, guard_id: u64) -> Result<u64, crate::remote_guard::MarkError> {
+        self.with(|marks| marks.load(guard_id))
+    }
+
+    fn latched(&self, guard_id: u64) -> Result<bool, crate::remote_guard::MarkError> {
+        self.with(|marks| marks.latched(guard_id))
+    }
+
+    fn persist(&mut self, guard_id: u64, epoch: u64) -> Result<(), crate::remote_guard::MarkError> {
+        self.with(|marks| marks.persist(guard_id, epoch))
+    }
+
+    fn latch(&mut self, guard_id: u64) -> Result<(), crate::remote_guard::MarkError> {
+        self.with(|marks| marks.latch(guard_id))
+    }
 }
 
 /// The keys an authenticated publication binds.
@@ -256,11 +319,14 @@ pub(crate) struct WireKeys {
     counters: WireKeyCounters,
     /// The last diagnostic events, for the operator.
     last_report: Report,
-    /// The followed guards' durable marks, until the first follow takes
-    /// them to the receiver.
-    marks: Option<Dir>,
-    /// Whether the receiver holds them.
-    marks_given: bool,
+    /// The followed guards' durable marks, shared with the receiver.
+    marks: Option<SharedMarks>,
+    /// The remote guard each remotely guarded publication follows, by
+    /// registration, with its authority's control endpoint: the last one
+    /// of a guard to go unfollows it.
+    followed: Vec<(u64, u64, SocketAddr)>,
+    /// Receiver bindings a full ring refused, posted first at each duty.
+    deferred: Vec<Box<crate::agents::roles::AuthBinding>>,
     /// The guard authority's committed epochs, until it starts.
     commits: Option<Dir>,
 }
@@ -313,7 +379,8 @@ impl WireKeys {
                 counters,
                 last_report,
                 marks: None,
-                marks_given: false,
+                followed: Vec::new(),
+                deferred: Vec::new(),
                 commits: None,
             },
             report,
@@ -432,7 +499,7 @@ impl WireKeys {
                         if !crate::agents::roles::answerable(authority.control) {
                             return Err(refused(AuthRefusal::Ambiguous));
                         }
-                        if self.marks.is_none() && !self.marks_given {
+                        if self.marks.is_none() {
                             return Err(refused(AuthRefusal::GuardState));
                         }
                         (None, Some(authority))
@@ -490,11 +557,15 @@ impl WireKeys {
         // first open; the mark store goes with the first follow.
         let follow = keys.follow.map(|authority| {
             let mirror = Arc::new(karyos_client::HeapWords::zeroed(1));
-            let marks = self.marks.take().map(|files| {
-                self.marks_given = true;
-                Box::new(crate::remote_guard::GuardMarks::new(files))
-                    as Box<dyn crate::remote_guard::MarkStore + Send>
-            });
+            let marks = self
+                .marks
+                .clone()
+                .map(|marks| Box::new(marks) as Box<dyn crate::remote_guard::MarkStore + Send>);
+            let registration = publication.identity.registration_id;
+            if !self.followed.iter().any(|(held, ..)| *held == registration) {
+                self.followed
+                    .push((registration, authority.guard_id, authority.control));
+            }
             let binding = crate::agents::roles::Binding::Follow {
                 authority: crate::agents::roles::BoundAuthority {
                     key_id: authority.key_id,
@@ -516,13 +587,42 @@ impl WireKeys {
         })
     }
 
+    /// The guard the removed publication `registration` followed, with its
+    /// authority's control endpoint, when no other publication follows it.
+    pub(crate) fn unfollow(&mut self, registration: u64) -> Option<(u64, SocketAddr)> {
+        let at = self
+            .followed
+            .iter()
+            .position(|(held, ..)| *held == registration)?;
+        let (_, guard_id, control) = self.followed.swap_remove(at);
+        (!self.followed.iter().any(|(_, held, _)| *held == guard_id)).then_some((guard_id, control))
+    }
+
+    /// Keeps `binding`, which a full ring refused, for the next duty.
+    pub(crate) fn defer(&mut self, binding: Box<crate::agents::roles::AuthBinding>) {
+        self.counters.bindings_deferred = self.counters.bindings_deferred.saturating_add(1);
+        self.deferred.push(binding);
+    }
+
+    /// The deferred bindings, oldest first, to post again.
+    pub(crate) fn take_deferred(&mut self) -> Vec<Box<crate::agents::roles::AuthBinding>> {
+        core::mem::take(&mut self.deferred)
+    }
+
+    /// Counts an authenticated admission a full ring refused.
+    pub(crate) fn count_busy(&mut self) {
+        self.counters.admissions_busy = self.counters.admissions_busy.saturating_add(1);
+    }
+
     /// Holds the durable guard state: the followed guards' marks and the
     /// authority's committed epochs (design guards-and-abort.md).
     pub(crate) fn set_guard_state(&mut self, marks: Dir, commits: Dir) -> Result<(), DriverError> {
-        if self.marks.is_some() || self.marks_given || self.commits.is_some() {
+        if self.marks.is_some() || self.commits.is_some() {
             return Err(DriverError::InvalidConfig);
         }
-        self.marks = Some(marks);
+        self.marks = Some(SharedMarks(Arc::new(std::sync::Mutex::new(
+            crate::remote_guard::GuardMarks::new(marks),
+        ))));
         self.commits = Some(commits);
         Ok(())
     }

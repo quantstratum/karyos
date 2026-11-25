@@ -721,7 +721,10 @@ fn a_remotely_guarded_publication_needs_durable_guard_state() {
 /// authority (committed epochs in `commits`) of guard 11, open at epoch 2,
 /// answering only on its configured control endpoint. Returns the
 /// drivers, publisher first, and the publication's registration.
-fn remotely_guarded(marks: &Mem, commits: &Mem) -> ([EmbeddedDriver; 3], u64) {
+fn remotely_guarded(
+    marks: &Mem,
+    commits: &Mem,
+) -> ([EmbeddedDriver; 3], crate::embedded::AggregateHandle) {
     let control = SocketAddr::new(LOOPBACK, crate::test_ports::test_port());
     let guard = ChannelAuthority {
         follower_id: 66,
@@ -770,7 +773,7 @@ fn remotely_guarded(marks: &Mem, commits: &Mem) -> ([EmbeddedDriver; 3], u64) {
             &[control],
         )
         .unwrap();
-    ([publisher, subscriber, authority_driver], registration)
+    ([publisher, subscriber, authority_driver], handle)
 }
 
 /// Item 3, end to end: the publisher follows the authority's guard from
@@ -781,8 +784,9 @@ fn remotely_guarded(marks: &Mem, commits: &Mem) -> ([EmbeddedDriver; 3], u64) {
 #[test]
 fn a_remote_guard_opens_the_publication_through_its_authority() {
     let (marks, commits) = (Mem::default(), Mem::default());
-    let ([mut publisher, mut subscriber, mut authority_driver], registration) =
+    let ([mut publisher, mut subscriber, mut authority_driver], handle) =
         remotely_guarded(&marks, &commits);
+    let registration = handle.registration();
     let opened = pump(
         &mut [&mut publisher, &mut subscriber, &mut authority_driver],
         |drivers| {
@@ -873,4 +877,74 @@ fn an_uncommitted_authority_answers_nothing_and_alarms() {
         authority_driver.net.as_ref().unwrap().receiver_counters()
     );
     assert_eq!(roles(&publisher).0.2, 1, "still admission-pending");
+}
+
+/// Follow-up (a) and (c): removing the last publication a remote guard
+/// guards unfollows it, and an unfollow a full receiver ring refuses is
+/// deferred, counted, and posted at a later duty, never lost.
+#[test]
+fn removing_a_remotely_guarded_publication_unfollows_its_guard_even_past_a_full_ring() {
+    let (marks, commits) = (Mem::default(), Mem::default());
+    let ([mut publisher, mut subscriber, mut authority_driver], handle) =
+        remotely_guarded(&marks, &commits);
+    let registration = handle.registration();
+    let opened = pump(
+        &mut [&mut publisher, &mut subscriber, &mut authority_driver],
+        |drivers| {
+            drivers[0]
+                .net
+                .as_ref()
+                .unwrap()
+                .publication_established(registration)
+        },
+    );
+    assert!(opened);
+    assert_eq!(publisher.net.as_ref().unwrap().followed_guards(), Some(1));
+    assert!(publisher.net.as_ref().unwrap().fill_receiver_ring() > 0);
+    publisher.remove_aggregate(&handle).unwrap();
+    assert_eq!(publisher.wire_key_counters().unwrap().bindings_deferred, 1);
+    let unfollowed = pump(&mut [&mut publisher], |drivers| {
+        drivers[0].net.as_ref().unwrap().followed_guards() == Some(0)
+    });
+    assert!(
+        unfollowed,
+        "the deferred unfollow never reached the receiver"
+    );
+}
+
+/// Follow-up (c): an authenticated admission whose binding finds the
+/// receiver's ring full is refused, typed (`NetworkBusy`), and counted;
+/// nothing of it is kept.
+#[test]
+fn a_full_ring_at_admission_refuses_and_counts() {
+    let (mut subscriber, _) = keyed(&borrowed(&subscriber_files()));
+    // The endpoint is open first, through a trusted subscription of
+    // another stream on the same address: only the binding meets the
+    // full ring.
+    let bind = SocketAddr::new(LOOPBACK, crate::test_ports::test_port());
+    subscriber
+        .add_network_subscription_as(
+            STREAM + 1,
+            &udp(Destination::Unicast(bind), Security::Trusted),
+            identity(RECEIVER),
+        )
+        .unwrap();
+    assert!(pump(&mut [&mut subscriber], |_| true));
+    assert!(subscriber.net.as_ref().unwrap().fill_receiver_ring() > 0);
+    let security = Security::Authenticated(auth(Some(authority(control()))));
+    let channel = udp(Destination::Unicast(bind), security);
+    assert_eq!(
+        subscriber
+            .add_network_subscription_as(STREAM, &channel, identity(RECEIVER))
+            .unwrap_err(),
+        DriverError::NetworkBusy
+    );
+    assert_eq!(subscriber.wire_key_counters().unwrap().admissions_busy, 1);
+    assert_eq!(subscriber.net.as_ref().unwrap().subscription_count(), 1);
+    // Its control peer was released: once the ring drains, the admission
+    // reserves it again and succeeds.
+    let _ = subscriber.do_work().unwrap();
+    subscriber
+        .add_network_subscription_as(STREAM, &channel, identity(RECEIVER))
+        .unwrap();
 }
