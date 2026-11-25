@@ -18,5 +18,9 @@ karyos-archive.workspace = true
 karyos-codec.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# The counting allocator of the client's allocation test (karyos#720).
+karyos-sys = { workspace = true, features = ["alloc-count"] }
+
 [lints]
 workspace = true

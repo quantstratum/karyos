@@ -20,6 +20,7 @@
 //! under its own `0.y.z` rule.
 
 pub mod backup;
+pub mod client;
 pub mod consensus;
 pub mod dedup;
 mod file;
