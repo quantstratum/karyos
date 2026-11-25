@@ -964,8 +964,11 @@ fn creation_syncs<C: ConsensusCore>(geometry: Geometry) -> Option<u64> {
     })
 }
 
-/// The script of the `index`th client of `case`.
-fn script(case: &Case, index: usize) -> Vec<Op> {
+/// The script of the `index`th client session of `case`: the operations
+/// [`run`] gives that session's client, which a client in a real process
+/// runs too (C5 v2, "Processes"; karyos#691).
+#[must_use]
+pub fn script(case: &Case, index: usize) -> Vec<Op> {
     (0..case.operations)
         .map(|operation| {
             if index == 0 && case.operations > 1 && operation + 1 == case.operations {
@@ -1659,6 +1662,58 @@ fn lost_reply_shown(observations: &[Observation]) -> Result<(), Failed> {
         return Err(Failed::NotShown("retry"));
     }
     Ok(())
+}
+
+/// The [`Outcome`] of `case` run outside the simulator, by real processes
+/// (C5 v2, "Processes"; karyos#691): `recorded` holds every server's and
+/// client's observations and the clients' history, merged in real-time
+/// order; `liveness`, `states` and `deduplicated` are as [`run`] takes
+/// them from its servers and clients. Safety is [`run`]'s own checks, so
+/// [`pass`] judges the run as it judges a simulated one. Such a run has
+/// no cluster trace and applies no fault: `trace` and `faults` are empty
+/// and `digest` 0.
+///
+/// # Errors
+///
+/// [`RunError::Unsupported`] when a server reported a capability its core
+/// lacks, as [`run`] does; [`RunError::Count`] for a case with a standby,
+/// which no process run takes, or a count beyond the node id range.
+pub fn outcome(
+    case: &Case,
+    recorded: &Recorder,
+    liveness: Result<(), Liveness>,
+    states: Vec<(NodeId, Option<u64>, u64)>,
+    deduplicated: u64,
+) -> Result<Outcome, RunError> {
+    if case.standby != 0 {
+        return Err(RunError::Count);
+    }
+    if recorded
+        .observations
+        .iter()
+        .any(|observation| matches!(observation, Observation::Unsupported { .. }))
+    {
+        return Err(RunError::Unsupported(Unsupported));
+    }
+    let primary = case
+        .servers
+        .checked_add(case.spares)
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or(RunError::Count)?;
+    let primary: Vec<NodeId> = (0..primary).collect();
+    Ok(Outcome {
+        safety: safety(case, recorded, &primary, &[]),
+        liveness,
+        observations: recorded.observations.clone(),
+        history: recorded.history.clone(),
+        trace: Vec::new(),
+        digest: 0,
+        states,
+        deduplicated,
+        promoted: false,
+        // A process run of W1 applies no fault.
+        faults: Vec::new(),
+    })
 }
 
 /// The safety checks of a run: every check over all of it, or with a

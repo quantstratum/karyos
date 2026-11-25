@@ -1,33 +1,68 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! A candidate core in a real process (plan issue 060, karyos#678: the
-//! adapter "runs unchanged under `karyos-sim` and in real processes").
+//! adapter "runs unchanged under `karyos-sim` and in real processes"; C5
+//! v2, "Processes", karyos#691).
 //!
-//! [`run_node`] drives the same [`ConsensusCore`] the simulator drives,
-//! through the same [`drive`], over C4's log on real files
+//! [`run_server`] drives the same [`ConsensusCore`] the simulator drives,
+//! through the same [`drive_into`], over C4's log on real files
 //! ([`StdDisk`]), with its messages in UDP datagrams between processes and
 //! its ticks from the process's monotonic clock ([`TICK_MS`] a tick).
 //! Nothing of the core changes: only its surroundings do.
 //!
-//! The run is a smoke test of that path, not a workload: the leader
-//! proposes `commands` numbered commands one at a time, every node applies
-//! what commits, and each reports how many distinct commands it applied
-//! and a digest of the applied order once it has them all. No client, no
-//! fault, no measurement.
+//! **The service is the harness's own.** A server serves
+//! `harness::node`'s test service ([`TestService`]: the append-only
+//! register, its per-client session table and deduplication, and its
+//! state digest) over the real log, as `harness::node::ServerNode` serves
+//! it over the simulated disk: a client's [`Command`] is proposed through
+//! [`ConsensusCore::propose_slice`]; a refusal that names another leader
+//! redirects the client there, any other `NotLeader` refuses it, and a
+//! backpressure says busy; each committed entry is applied once, and the
+//! server that took the request answers it, from the deduplication table
+//! for a retry. It records what `ServerNode` records, the same
+//! [`Observation`]s, each stamped from the host's monotonic clock
+//! ([`crate::record`]), so the run is checked by the harness's own checks
+//! and pass conditions.
+//!
+//! **The wire.** Between servers, a core's message is one or more UDP
+//! datagrams ([`MAX_DATAGRAM`] at most each; a larger message is cut into
+//! fragments and put back together on arrival, and a lost fragment loses
+//! the message, which the core's protocol resends). Between a client and
+//! a server, each harness message (`harness::node::Wire`: a request, a
+//! response, a refusal, a busy or a redirect) is one length-prefixed
+//! frame on a TCP connection on the server's address ([`frame`],
+//! [`unframe`]): a response to a read carries every value of the register,
+//! up to a mebibyte in W1, more than a datagram holds. The test's stop is
+//! one datagram ([`STOP`]).
+//!
+//! **Time.** One core tick is [`TICK_MS`] milliseconds of the process's
+//! monotonic clock: version 1's frozen tick, so a case's ticks (its
+//! `retry_after`, its `steps`, its `quiet`) are that many 10 ms of process
+//! time, and so are the cores' heartbeat and election timeouts, which
+//! each adapter counts in ticks.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::io::{self, Read as _, Write as _};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use karyos_archive::disk::StdDisk;
-use karyos_cluster::{Entry, LogError, RaftLog};
-use karyos_sim::harness::core::{ConsensusCore, DriveError, LogView, drive};
+use karyos_cluster::{LogError, RaftLog};
+use karyos_sim::harness::core::{
+    ConsensusCore, DriveError, LogView, NotLeader, ReadyBuf, Refused, drive_into,
+};
+use karyos_sim::harness::node::{
+    Breach, Command, Observation, Positions, SEAL_TICKS, TestService, Wire as Harness,
+};
 use karyos_sim::harness::probe::{self, Probed};
-use karyos_sim::harness::workloads;
+use karyos_sim::harness::standby::FIRST_GENERATION;
+use karyos_sim::harness::workloads::{self, Case};
 use karyos_sim::net::NodeId;
+
+use crate::record::{self, Item};
 
 /// A core whose messages cross a process boundary.
 pub trait Wire: ConsensusCore {
@@ -38,7 +73,7 @@ pub trait Wire: ConsensusCore {
     fn decode(bytes: &[u8]) -> Option<Self::Message>;
 }
 
-/// A probed core's messages are its inner core's. [`run_node`] counts
+/// A probed core's messages are its inner core's. [`run_server`] counts
 /// their encoding and decoding itself, so this delegates only.
 impl<C: Wire> Wire for Probed<C> {
     fn encode(message: &Self::Message) -> Option<Vec<u8>> {
@@ -53,50 +88,101 @@ impl<C: Wire> Wire for Probed<C> {
 /// The largest datagram a node sends or reads.
 pub const MAX_DATAGRAM: usize = 65_000;
 
-/// Milliseconds of the process clock per core tick. The simulator's tick
-/// is virtual; here a durable write is a real `fsync`, several
-/// milliseconds, so an election timeout of 10 ticks must be longer than a
-/// vote's persistence: at 1 ms a tick, elections time out before any vote
-/// is durable and no leader is ever elected. A setting of the runner, not
-/// of the core.
+/// A core datagram's header: its kind, the sender, the message's number
+/// from that sender, the fragment's position and the fragment count.
+const HEADER: usize = 1 + 4 + 4 + 2 + 2;
+
+/// A core message's bytes per datagram at most.
+const FRAGMENT: usize = MAX_DATAGRAM - HEADER;
+
+/// Fragments one message is cut into at most: 4 MB, past any W1 append.
+const MAX_FRAGMENTS: u16 = 64;
+
+/// Messages a node keeps half put together at most; the oldest goes first.
+const MAX_PARTIAL: usize = 64;
+
+/// The datagram kind of a core's message.
+const CORE: u8 = 0;
+
+/// The test's stop: one datagram of this byte. A server that gets it
+/// serves its case's `quiet` ticks more, then reports.
+pub const STOP: u8 = 1;
+
+/// The largest client frame read: a response holds the register at most.
+pub const MAX_FRAME: usize = 64 << 20;
+
+/// Milliseconds of the process clock per core tick: version 1's frozen
+/// tick (quantstratum-docs: karyos/evaluations/c5-raft-comparison-v1.md,
+/// Timing), in the simulator one step of virtual time. Every count of
+/// ticks, the cores' heartbeat and election timeouts and the case's retry,
+/// steps and quiet period, is that many of these on a real process. A
+/// durable write is a real `fsync` here, several milliseconds, so a tick
+/// much shorter would let elections time out before a vote is durable.
 pub const TICK_MS: u64 = 10;
 
 /// Datagrams a node reads at most per loop: a flood never starves its
 /// ticks.
 pub const MAX_READS_PER_LOOP: usize = 256;
 
-/// One node of a real-process run.
+/// The W1 cases a real-process run takes, by index: the harness's frozen
+/// W1 (`W1::skeleton().cases()`, every process count, payload and client
+/// count of ADR-0043), so every value of a run is its [`Case`]'s.
+#[must_use]
+pub fn w1_cases() -> Vec<Case> {
+    workloads::W1::skeleton().cases()
+}
+
+/// The id of client session `session` of `case`: after the servers, the
+/// spares and the standby, as `harness::workloads::run` numbers them.
+#[must_use]
+pub fn client_id(case: &Case, session: usize) -> Option<NodeId> {
+    case.servers
+        .checked_add(case.spares)?
+        .checked_add(case.standby)?
+        .checked_add(session)
+        .and_then(|id| NodeId::try_from(id).ok())
+}
+
+/// One server of a real-process run.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     /// Its id.
     pub id: NodeId,
-    /// Every node's id and UDP address, itself included.
+    /// Every server's id and address, itself included: UDP between
+    /// servers, TCP from clients, on the same address.
     pub peers: Vec<(NodeId, SocketAddr)>,
     /// The directory of its C4 log, created if missing; it must hold no
     /// log yet.
     pub dir: PathBuf,
-    /// Commands the leader proposes, numbered from 1.
-    pub commands: u64,
-    /// How long the run may take.
+    /// The case it serves.
+    pub case: Case,
+    /// How long it may serve without the test's stop.
     pub deadline: Duration,
-    /// How long a node keeps serving after it applied every command, so
-    /// that the others finish too.
-    pub linger: Duration,
 }
 
-/// What a node applied.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Report {
-    /// Distinct commands applied.
-    pub applied: u64,
-    /// A digest of every command applied, in the order applied.
+/// A server's state when it stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerState {
+    /// The service's last applied index.
+    pub applied: Option<u64>,
+    /// The service's state digest ([`TestService::digest`]).
     pub digest: u64,
-    /// Every command applied, in the order applied, a repeat included,
-    /// with the log index of the entry that carried it: a proposal retried
-    /// after 100 ms can commit twice, at two indexes, while an entry
-    /// applied twice repeats its index; the test tells them apart
-    /// (karyos#956 review).
-    pub sequence: Vec<(u64, u64)>,
+    /// Retries it answered from its deduplication table.
+    pub deduplicated: u64,
+    /// Whether its core led.
+    pub leads: bool,
+    /// Whether it was still serving: a drive error stops a server, as in
+    /// the simulator, until a restart this run never makes.
+    pub up: bool,
+}
+
+/// What a server reports: its stamped observations and its final state.
+#[derive(Debug, Clone)]
+pub struct Served {
+    /// Every observation, stamped ([`record::now`]), in order.
+    pub items: Vec<(u64, Item)>,
+    /// Its state at the end.
+    pub state: ServerState,
 }
 
 /// Why a real-process run stopped.
@@ -106,16 +192,16 @@ pub enum ProcessError {
     Io(io::Error),
     /// The log refused to open or create.
     Log(LogError),
-    /// Persistence failed.
-    Drive(DriveError),
-    /// The deadline passed with commands still unapplied.
-    Deadline(Report),
+    /// The log geometry.
+    Geometry,
+    /// The deadline passed without the test's stop.
+    Deadline,
     /// The configuration does not name this node.
     NotAPeer,
-    /// A peer's address is not on the loopback: the runner is a local
-    /// smoke test and speaks unauthenticated UDP, so it refuses to bind or
-    /// send off the host (karyos#956 review).
-    NotLoopback(std::net::SocketAddr),
+    /// A peer's address is not on the loopback: the runner speaks
+    /// unauthenticated UDP and TCP, so it refuses to bind or send off the
+    /// host (karyos#956 review).
+    NotLoopback(SocketAddr),
 }
 
 impl fmt::Display for ProcessError {
@@ -123,12 +209,8 @@ impl fmt::Display for ProcessError {
         match self {
             Self::Io(error) => write!(f, "i/o: {error}"),
             Self::Log(error) => write!(f, "log: {error:?}"),
-            Self::Drive(error) => write!(f, "drive: {error:?}"),
-            Self::Deadline(report) => write!(
-                f,
-                "deadline passed with {} commands applied",
-                report.applied
-            ),
+            Self::Geometry => f.write_str("the log geometry is refused"),
+            Self::Deadline => f.write_str("the deadline passed without a stop"),
             Self::NotAPeer => f.write_str("the node is not among its peers"),
             Self::NotLoopback(address) => {
                 write!(f, "{address} is not a loopback address")
@@ -143,33 +225,538 @@ impl From<io::Error> for ProcessError {
     }
 }
 
-/// Command `number`'s payload.
+/// Whether `error` only says that nothing is there yet.
+fn idle(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+    )
+}
+
+/// The ticks of the clock since `start`.
 #[must_use]
-pub fn command(number: u64) -> Vec<u8> {
-    let mut payload = b"real-process command ".to_vec();
-    payload.extend_from_slice(&number.to_le_bytes());
-    payload
+pub fn ticks_since(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .checked_div(TICK_MS)
+        .unwrap_or(0)
 }
 
-fn number_of(payload: &[u8]) -> Option<u64> {
-    let tail = payload.strip_prefix(b"real-process command ")?;
-    <[u8; 8]>::try_from(tail).ok().map(u64::from_le_bytes)
+/// `message`'s client frame: its length, a kind, then its fields, little
+/// endian; `None` for a message no client or server sends the other.
+#[must_use]
+pub fn frame<M>(message: &Harness<M>) -> Option<Vec<u8>> {
+    let mut body = Vec::new();
+    match message {
+        Harness::Request(command) => {
+            body.push(1);
+            body.extend_from_slice(&command.encode());
+        }
+        Harness::Response {
+            sequence,
+            bytes,
+            index,
+            generation,
+        } => {
+            body.push(2);
+            body.extend_from_slice(&sequence.to_le_bytes());
+            body.extend_from_slice(&index.to_le_bytes());
+            body.extend_from_slice(&generation.to_le_bytes());
+            body.extend_from_slice(bytes);
+        }
+        Harness::Refused { sequence } => {
+            body.push(3);
+            body.extend_from_slice(&sequence.to_le_bytes());
+        }
+        Harness::Busy { sequence } => {
+            body.push(4);
+            body.extend_from_slice(&sequence.to_le_bytes());
+        }
+        Harness::Redirect { server } => {
+            body.push(5);
+            body.extend_from_slice(&server.to_le_bytes());
+        }
+        _ => return None,
+    }
+    let mut framed = u32::try_from(body.len()).ok()?.to_le_bytes().to_vec();
+    framed.extend_from_slice(&body);
+    Some(framed)
 }
 
-/// A digest step (a hash: modular arithmetic is its definition).
-fn mix(digest: u64, number: u64) -> u64 {
-    (digest ^ number)
-        .wrapping_mul(0x0100_0000_01B3)
-        .rotate_left(17)
+/// The next whole frame's message in `buffer`, which loses its bytes:
+/// `Some(None)` for a frame that is no message, `None` while no whole
+/// frame is there. A length past [`MAX_FRAME`] is an error: the stream
+/// is not this protocol.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::InvalidData`].
+pub fn unframe<M>(buffer: &mut Vec<u8>) -> io::Result<Option<Option<Harness<M>>>> {
+    let Some(length) = buffer.first_chunk::<4>().copied() else {
+        return Ok(None);
+    };
+    let length = usize::try_from(u32::from_le_bytes(length)).unwrap_or(usize::MAX);
+    if length > MAX_FRAME {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let Some(end) = length.checked_add(4).filter(|end| *end <= buffer.len()) else {
+        return Ok(None);
+    };
+    let message = buffer.get(4..end).and_then(message_of);
+    let _ = buffer.drain(..end);
+    Ok(Some(message))
 }
 
-/// Runs node `config.id` of core `C` until it applied every command and
-/// lingered, or the deadline passed.
+fn message_of<M>(body: &[u8]) -> Option<Harness<M>> {
+    let (kind, rest) = body.split_first()?;
+    let u64_at = |at: usize| -> Option<u64> {
+        rest.get(at..)?
+            .first_chunk::<8>()
+            .map(|bytes| u64::from_le_bytes(*bytes))
+    };
+    Some(match kind {
+        1 => Harness::Request(Command::decode(rest)?),
+        2 => Harness::Response {
+            sequence: u64_at(0)?,
+            index: u64_at(8)?,
+            generation: u64_at(16)?,
+            bytes: rest.get(24..)?.to_vec(),
+        },
+        3 if rest.len() == 8 => Harness::Refused {
+            sequence: u64_at(0)?,
+        },
+        4 if rest.len() == 8 => Harness::Busy {
+            sequence: u64_at(0)?,
+        },
+        5 if rest.len() == 4 => Harness::Redirect {
+            server: NodeId::from_le_bytes(*rest.first_chunk::<4>()?),
+        },
+        _ => return None,
+    })
+}
+
+/// A TCP connection carrying client frames, read and written without
+/// blocking.
+#[derive(Debug)]
+pub struct Connection {
+    stream: TcpStream,
+    input: Vec<u8>,
+    output: Vec<u8>,
+    closed: bool,
+}
+
+impl Connection {
+    /// `stream`, set not to block.
+    ///
+    /// # Errors
+    ///
+    /// The socket's.
+    pub fn new(stream: TcpStream) -> io::Result<Self> {
+        stream.set_nonblocking(true)?;
+        stream.set_nodelay(true)?;
+        Ok(Self {
+            stream,
+            input: Vec::new(),
+            output: Vec::new(),
+            closed: false,
+        })
+    }
+
+    /// Whether the peer closed it or it failed.
+    #[must_use]
+    pub fn closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Queues `frame` for sending.
+    pub fn queue(&mut self, frame: &[u8]) {
+        self.output.extend_from_slice(frame);
+    }
+
+    /// Writes what it can of the queue, without reading: what arrived
+    /// waits for the next [`Connection::poll`].
+    pub fn flush(&mut self) {
+        while !self.closed && !self.output.is_empty() {
+            match self.stream.write(&self.output) {
+                Ok(0) => self.closed = true,
+                Ok(written) => {
+                    let _ = self.output.drain(..written.min(self.output.len()));
+                }
+                Err(error) if idle(&error) => break,
+                Err(_) => self.closed = true,
+            }
+        }
+    }
+
+    /// Writes what it can of the queue and reads what arrived; then every
+    /// whole message that arrived, in order.
+    pub fn poll<M>(&mut self, scratch: &mut [u8]) -> Vec<Harness<M>> {
+        self.flush();
+        while !self.closed {
+            match self.stream.read(scratch) {
+                Ok(0) => self.closed = true,
+                Ok(read) => self
+                    .input
+                    .extend_from_slice(scratch.get(..read).unwrap_or_default()),
+                Err(error) if idle(&error) => break,
+                Err(_) => self.closed = true,
+            }
+        }
+        let mut messages = Vec::new();
+        loop {
+            match unframe(&mut self.input) {
+                Ok(Some(Some(message))) => messages.push(message),
+                Ok(Some(None)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    self.closed = true;
+                    break;
+                }
+            }
+        }
+        messages
+    }
+}
+
+/// A message's fragments as they arrive.
+type Partial = BTreeMap<(NodeId, u32), Vec<Option<Vec<u8>>>>;
+
+/// A server's state around its core and log: what `ServerNode` keeps.
+struct Serving<M> {
+    id: NodeId,
+    service: TestService,
+    /// Requests it took, by client and sequence: it answers them.
+    pending: BTreeSet<(NodeId, u64)>,
+    commit: Option<u64>,
+    configuration: Option<karyos_sim::harness::core::Configuration>,
+    positions: Option<Positions>,
+    items: Vec<(u64, Item)>,
+    /// Messages to clients.
+    replies: Vec<(NodeId, Harness<M>)>,
+    ready: ReadyBuf<M>,
+    command: Vec<u8>,
+    /// Its clock, in ticks.
+    now: u64,
+    /// A drive error stopped it.
+    stopped: bool,
+}
+
+fn observe(items: &mut Vec<(u64, Item)>, observation: Observation) {
+    items.push((record::now(), Item::Observation(observation)));
+}
+
+impl<M> Serving<M> {
+    fn observe(&mut self, observation: Observation) {
+        observe(&mut self.items, observation);
+    }
+
+    /// `ServerNode`'s handling of a client's request.
+    fn request<C: ConsensusCore<Message = M>>(
+        &mut self,
+        core: &mut C,
+        log: &mut RaftLog<StdDisk>,
+        command: &Command,
+    ) {
+        let sequence = command.sequence;
+        if self.stopped {
+            self.replies
+                .push((command.client, Harness::Refused { sequence }));
+            return;
+        }
+        command.encode_into(&mut self.command);
+        match core.propose_slice(&self.command, &mut LogView::new(log)) {
+            Ok(()) => {
+                let _ = self.pending.insert((command.client, sequence));
+            }
+            Err(Refused::Backpressure(limit)) => {
+                self.observe(Observation::Backpressure {
+                    node: self.id,
+                    client: command.client,
+                    sequence,
+                    limit,
+                });
+                self.replies
+                    .push((command.client, Harness::Busy { sequence }));
+            }
+            Err(Refused::NotLeader(NotLeader {
+                leader: Some(leader),
+            })) if leader != self.id => {
+                self.observe(Observation::Redirected {
+                    node: self.id,
+                    client: command.client,
+                    sequence,
+                    to: leader,
+                });
+                self.replies
+                    .push((command.client, Harness::Redirect { server: leader }));
+            }
+            Err(Refused::NotLeader(_)) => self
+                .replies
+                .push((command.client, Harness::Refused { sequence })),
+        }
+    }
+
+    /// `ServerNode`'s duty: drive the core, apply what committed and
+    /// answer it, and record its configuration, commit and positions.
+    fn duty<C: ConsensusCore<Message = M>>(
+        &mut self,
+        core: &mut C,
+        log: &mut RaftLog<StdDisk>,
+        out: &mut Vec<(NodeId, M)>,
+    ) {
+        if self.stopped {
+            return;
+        }
+        let node = self.id;
+        let now = self.now;
+        let items = RefCell::new(std::mem::take(&mut self.items));
+        let Self {
+            service,
+            pending,
+            replies,
+            ready,
+            ..
+        } = self;
+        let driven = drive_into(
+            core,
+            log,
+            ready,
+            (None, None),
+            &mut |to, message, release| {
+                if let Some(release) = release {
+                    observe(
+                        &mut items.borrow_mut(),
+                        Observation::Released { node, to, release },
+                    );
+                }
+                out.push((to, message));
+            },
+            &mut |entry, applying| {
+                let deduplicated = service.deduplicated();
+                // The application is the declared path's apply stage once
+                // a probed core is past its warm-up (version 1's
+                // allocation gate counts "application"): the harness's
+                // test service, as the simulator's servers apply it.
+                let answer = probe::application(|| service.apply(entry));
+                let replayed = service.deduplicated() > deduplicated;
+                let response = answer.as_ref().map(|(_, ret)| ret.canonical());
+                let mut items = items.borrow_mut();
+                if let Some((command, ret)) = answer
+                    && pending.remove(&(command.client, command.sequence))
+                {
+                    if replayed {
+                        observe(
+                            &mut items,
+                            Observation::Deduplicated {
+                                node,
+                                client: command.client,
+                                sequence: command.sequence,
+                            },
+                        );
+                    }
+                    observe(
+                        &mut items,
+                        Observation::Reply {
+                            node,
+                            client: command.client,
+                            index: entry.index,
+                            term: entry.term,
+                            generation: FIRST_GENERATION,
+                            at: now,
+                        },
+                    );
+                    replies.push((
+                        command.client,
+                        Harness::Response {
+                            sequence: command.sequence,
+                            bytes: ret.canonical(),
+                            index: entry.index,
+                            generation: FIRST_GENERATION,
+                        },
+                    ));
+                }
+                observe(
+                    &mut items,
+                    Observation::Applied {
+                        node,
+                        entry: entry.clone(),
+                        applying,
+                        response,
+                    },
+                );
+            },
+            &mut |step| observe(&mut items.borrow_mut(), Observation::Drive { node, step }),
+        );
+        self.items = items.into_inner();
+        if let Err(error) = driven {
+            // The server stops, as `ServerNode` does until a restart.
+            let observation = match &error {
+                DriveError::Log(error) => match Breach::of(error) {
+                    Some(breach) => Observation::Contract {
+                        node,
+                        breach,
+                        error: error.to_string(),
+                    },
+                    None => Observation::OpenFailed {
+                        node,
+                        error: error.to_string(),
+                    },
+                },
+                DriveError::WorkBudget { readies } => Observation::Contract {
+                    node,
+                    breach: Breach::WorkBudget,
+                    error: format!("still ready after {readies} Readys"),
+                },
+            };
+            self.observe(observation);
+            self.stopped = true;
+            self.pending.clear();
+            return;
+        }
+        self.record_state(core, log);
+    }
+
+    /// The configuration, commit and positions, each when it changed.
+    fn record_state<C: ConsensusCore<Message = M>>(&mut self, core: &C, log: &RaftLog<StdDisk>) {
+        let node = self.id;
+        if let Some(configuration) = core.configuration()
+            && self.configuration.as_ref() != Some(&configuration)
+        {
+            let entry_term = configuration.index.and_then(|index| log.term(index));
+            self.observe(Observation::Configuration {
+                node,
+                configuration: configuration.clone(),
+                entry_term,
+            });
+            self.configuration = Some(configuration);
+        }
+        let committed = core.committed();
+        if committed > self.commit
+            && let Some(index) = committed
+        {
+            self.observe(Observation::Commit {
+                node,
+                term: core.term(),
+                leader: core.leads(),
+                index,
+                entry_term: log.term(index).unwrap_or(0),
+            });
+            self.commit = committed;
+        }
+        let positions = Positions {
+            received: core.received(),
+            written: log.last_index(),
+            durable: log.durable_index(),
+            committed: core.committed(),
+            applied: self.service.applied(),
+        };
+        if self.positions != Some(positions) {
+            self.observe(Observation::Positions { node, positions });
+            self.positions = Some(positions);
+        }
+    }
+}
+
+/// The core message in a datagram's fragment, once every fragment of it
+/// arrived: decoded as the declared path's encoding stage.
+fn arrived<C: Wire>(datagram: &[u8], partial: &mut Partial) -> Option<(NodeId, C::Message)> {
+    let (header, chunk) = datagram.split_at_checked(HEADER)?;
+    let (kind, header) = header.split_first()?;
+    if *kind != CORE {
+        return None;
+    }
+    let (from, header) = header.split_first_chunk::<4>()?;
+    let (number, header) = header.split_first_chunk::<4>()?;
+    let (position, header) = header.split_first_chunk::<2>()?;
+    let count = u16::from_le_bytes(*header.first_chunk::<2>()?);
+    let position = u16::from_le_bytes(*position);
+    let from = NodeId::from_le_bytes(*from);
+    if count == 0 || count > MAX_FRAGMENTS || position >= count {
+        return None;
+    }
+    if count == 1 {
+        // Decoding is the declared path's encoding stage once a probed
+        // core is past its warm-up (C5 v2, "Processes"); outside a
+        // measurement it counts nothing.
+        return probe::encoding(|| C::decode(chunk)).map(|message| (from, message));
+    }
+    // A fragment: kept until its message is whole (only a message larger
+    // than a datagram, not the common case, is put back together).
+    let key = (from, u32::from_le_bytes(*number));
+    let fragments = partial
+        .entry(key)
+        .or_insert_with(|| vec![None; usize::from(count)]);
+    if fragments.len() != usize::from(count) {
+        return None;
+    }
+    if let Some(slot) = fragments.get_mut(usize::from(position)) {
+        *slot = Some(chunk.to_vec());
+    }
+    if fragments.iter().any(Option::is_none) {
+        while partial.len() > MAX_PARTIAL {
+            let _ = partial.pop_first();
+        }
+        return None;
+    }
+    let fragments = partial.remove(&key)?;
+    probe::encoding(|| {
+        let whole: Vec<u8> = fragments.into_iter().flatten().flatten().collect();
+        C::decode(&whole)
+    })
+    .map(|message| (from, message))
+}
+
+/// Sends `message` to `address` as one or more datagrams, numbered
+/// `number`: its encoding, its datagrams and their frees, after the send,
+/// are one encoding step of the declared path once a probed core is past
+/// its warm-up (C5 v2, "Processes"; version 1's allocation gate counts
+/// "adapters and encoding included"); outside a measurement it counts
+/// nothing. The message itself is freed here too, as the outbox hands it
+/// over.
+fn send<C: Wire>(
+    socket: &UdpSocket,
+    id: NodeId,
+    number: u32,
+    message: C::Message,
+    address: SocketAddr,
+) {
+    probe::encoding(|| {
+        let Some(body) = C::encode(&message) else {
+            return;
+        };
+        let chunks: Vec<&[u8]> = if body.is_empty() {
+            vec![body.as_slice()]
+        } else {
+            body.chunks(FRAGMENT).collect()
+        };
+        let Ok(count) = u16::try_from(chunks.len()) else {
+            return;
+        };
+        if count > MAX_FRAGMENTS {
+            return;
+        }
+        for (position, chunk) in (0u16..).zip(chunks) {
+            let mut datagram = Vec::with_capacity(HEADER.saturating_add(chunk.len()));
+            datagram.push(CORE);
+            datagram.extend_from_slice(&id.to_le_bytes());
+            datagram.extend_from_slice(&number.to_le_bytes());
+            datagram.extend_from_slice(&position.to_le_bytes());
+            datagram.extend_from_slice(&count.to_le_bytes());
+            datagram.extend_from_slice(chunk);
+            // A lost datagram is the network's to lose.
+            let _ = socket.send_to(&datagram, address);
+        }
+        drop(message);
+    });
+}
+
+/// Runs server `config.id` of core `C`, serving `config.case`'s clients,
+/// until the test's stop and the case's quiet period after it.
 ///
 /// # Errors
 ///
 /// [`ProcessError`].
-pub fn run_node<C: Wire>(config: &NodeConfig) -> Result<Report, ProcessError> {
+pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> {
     if let Some((_, address)) = config
         .peers
         .iter()
@@ -186,107 +773,95 @@ pub fn run_node<C: Wire>(config: &NodeConfig) -> Result<Report, ProcessError> {
     let ids: Vec<NodeId> = config.peers.iter().map(|(id, _)| *id).collect();
     let socket = UdpSocket::bind(own)?;
     socket.set_read_timeout(Some(Duration::from_millis(1)))?;
+    let listener = TcpListener::bind(own)?;
+    listener.set_nonblocking(true)?;
     std::fs::create_dir_all(&config.dir)?;
-    let geometry = workloads::geometry().map_err(|_| ProcessError::NotAPeer)?;
-    // A fresh log: the run starts every node from nothing (a smoke test,
-    // not a recovery test; recovery is the simulator's to check).
+    let geometry = workloads::geometry().map_err(|_| ProcessError::Geometry)?;
+    // A fresh log: the run starts every node from nothing (W1 has no
+    // crash; recovery is the simulator's to check).
     let mut log = RaftLog::create(StdDisk, &config.dir, geometry, 1).map_err(ProcessError::Log)?;
+    log.set_seal_interval(SEAL_TICKS);
     let mut core = C::recover(config.id, &ids, &mut LogView::new(&mut log));
-    let start = Instant::now();
-    let mut seen = BTreeSet::new();
-    let mut report = Report {
-        applied: 0,
-        digest: 0,
-        sequence: Vec::new(),
+    let mut serving: Serving<C::Message> = Serving {
+        id: config.id,
+        service: TestService::default(),
+        pending: BTreeSet::new(),
+        commit: core.committed(),
+        configuration: None,
+        positions: None,
+        items: Vec::new(),
+        replies: Vec::new(),
+        ready: ReadyBuf::default(),
+        command: Vec::new(),
+        now: 0,
+        stopped: false,
     };
-    let mut next = 1u64;
-    let mut proposed_at: Option<Instant> = None;
-    let mut done_at: Option<Instant> = None;
+    serving.record_state(&core, &log);
+    let start = Instant::now();
     let mut buffer = vec![0u8; MAX_DATAGRAM];
+    let mut scratch = vec![0u8; 1 << 16];
     let mut outbox: Vec<(NodeId, C::Message)> = Vec::new();
+    let mut partial = Partial::new();
+    let mut connections: Vec<Connection> = Vec::new();
+    let mut clients: BTreeMap<NodeId, usize> = BTreeMap::new();
+    let mut number = 0u32;
+    let mut ticked: Option<u64> = None;
+    let mut stop_at: Option<u64> = None;
     loop {
-        let elapsed = start.elapsed();
-        if done_at.is_some_and(|at| at.elapsed() >= config.linger) {
-            return Ok(report);
+        let now = ticks_since(start);
+        serving.now = now;
+        if stop_at.is_some_and(|at| now >= at.saturating_add(config.case.quiet)) {
+            break;
         }
-        if elapsed >= config.deadline {
-            return Err(ProcessError::Deadline(report));
+        if start.elapsed() >= config.deadline {
+            return Err(ProcessError::Deadline);
+        }
+        // New clients.
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => connections.push(Connection::new(stream)?),
+                Err(error) if idle(&error) => break,
+                Err(error) => return Err(error.into()),
+            }
         }
         // Messages first, at most a loop's worth.
         for _ in 0..MAX_READS_PER_LOOP {
             match socket.recv_from(&mut buffer) {
                 Ok((length, _)) => {
-                    let Some((header, body)) =
-                        buffer.get(..length).and_then(|b| b.split_at_checked(4))
-                    else {
+                    let datagram = buffer.get(..length).unwrap_or_default();
+                    if datagram == [STOP] {
+                        stop_at = stop_at.or(Some(now));
                         continue;
-                    };
-                    let Ok(from) = <[u8; 4]>::try_from(header).map(NodeId::from_le_bytes) else {
+                    }
+                    if serving.stopped {
                         continue;
-                    };
-                    // Decoding is the declared path's encoding stage once a
-                    // probed core is past its warm-up (C5 v2,
-                    // "Processes"); outside a measurement it counts
-                    // nothing.
-                    if let Some(message) = probe::encoding(|| C::decode(body)) {
+                    }
+                    if let Some((from, message)) = arrived::<C>(datagram, &mut partial) {
                         core.step(from, message, &mut LogView::new(&mut log));
                     }
                 }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    break;
-                }
+                Err(error) if idle(&error) => break,
                 Err(error) => return Err(error.into()),
             }
         }
-        let now = u64::try_from(start.elapsed().as_millis())
-            .unwrap_or(u64::MAX)
-            .checked_div(TICK_MS)
-            .unwrap_or(0);
-        core.tick(now, &mut LogView::new(&mut log));
-        // The leader proposes the next command, again if it did not
-        // commit within 100 ms (a leader change can drop it).
-        if core.leads()
-            && next <= config.commands
-            && proposed_at.is_none_or(|at| at.elapsed() >= Duration::from_millis(100))
-            && core
-                .propose(command(next), &mut LogView::new(&mut log))
-                .is_ok()
-        {
-            proposed_at = Some(Instant::now());
-        }
-        drive(
-            &mut core,
-            &mut log,
-            &mut |to, message, _| outbox.push((to, message)),
-            &mut |entry: &Entry, _| {
-                // The application, the command read from the entry, is the
-                // declared path's apply stage once a probed core is past
-                // its warm-up (version 1's allocation gate counts
-                // "application"); what follows is the run's report on
-                // itself, kept outside the count.
-                if let Some(number) = probe::application(|| number_of(&entry.payload)) {
-                    report.sequence.push((entry.index, number));
-                    report.digest = mix(mix(report.digest, entry.index), number);
-                    if seen.insert(number) {
-                        report.applied = report.applied.saturating_add(1);
-                    }
+        // Clients' requests, each on the connection that sent it.
+        for (at, connection) in connections.iter_mut().enumerate() {
+            for message in connection.poll::<C::Message>(&mut scratch) {
+                if let Harness::Request(command) = message {
+                    let _ = clients.insert(command.client, at);
+                    serving.request(&mut core, &mut log, &command);
                 }
-            },
-            &mut |_| {},
-        )
-        .map_err(ProcessError::Drive)?;
-        if seen.contains(&next) {
-            next = next.saturating_add(1);
-            proposed_at = None;
+            }
         }
-        if done_at.is_none() && report.applied >= config.commands {
-            done_at = Some(Instant::now());
+        if ticked != Some(now) && !serving.stopped {
+            ticked = Some(now);
+            core.tick(now, &mut LogView::new(&mut log));
+            // The log's seal duty on the harness clock, as the simulator's
+            // servers run it (karyos#1050): a failed seal poisons the log,
+            // and the next drive stops the server.
+            let _ = log.tick(now);
         }
+        serving.duty(&mut core, &mut log, &mut outbox);
         for (to, message) in outbox.drain(..) {
             let Some(address) = config
                 .peers
@@ -296,26 +871,73 @@ pub fn run_node<C: Wire>(config: &NodeConfig) -> Result<Report, ProcessError> {
             else {
                 continue;
             };
-            // The message's encoding, its datagram and their frees, after
-            // the send, are one encoding step of the declared path once a
-            // probed core is past its warm-up (C5 v2, "Processes";
-            // version 1's allocation gate counts "adapters and encoding
-            // included"), so neither an allocation nor its free escapes
-            // the count; outside a measurement it counts nothing. The
-            // message itself is freed here too, as the outbox hands it
-            // over.
-            probe::encoding(|| {
-                let Some(body) = C::encode(&message) else {
-                    return;
-                };
-                let mut datagram = config.id.to_le_bytes().to_vec();
-                datagram.extend_from_slice(&body);
-                if datagram.len() <= MAX_DATAGRAM {
-                    // A lost datagram is the network's to lose.
-                    let _ = socket.send_to(&datagram, address);
-                }
-                drop(message);
-            });
+            number = number.wrapping_add(1);
+            send::<C>(&socket, config.id, number, message, address);
         }
+        for (client, message) in serving.replies.drain(..) {
+            if let (Some(connection), Some(framed)) = (
+                clients.get(&client).and_then(|at| connections.get_mut(*at)),
+                frame(&message),
+            ) {
+                connection.queue(&framed);
+            }
+        }
+        for connection in &mut connections {
+            connection.flush();
+        }
+    }
+    let state = ServerState {
+        applied: serving.service.applied(),
+        digest: serving.service.digest(),
+        deduplicated: serving.service.deduplicated(),
+        leads: !serving.stopped && core.leads(),
+        up: !serving.stopped,
+    };
+    Ok(Served {
+        items: serving.items,
+        state,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_client_message_round_trips_through_its_frame() {
+        let command = Command {
+            client: 3,
+            sequence: 2,
+            op: karyos_sim::harness::node::Op::Append(vec![1, 2, 3]),
+        };
+        for message in [
+            Harness::<()>::Request(command),
+            Harness::Response {
+                sequence: 2,
+                bytes: vec![0, 1],
+                index: 9,
+                generation: 1,
+            },
+            Harness::Refused { sequence: 2 },
+            Harness::Busy { sequence: 2 },
+            Harness::Redirect { server: 1 },
+        ] {
+            let mut buffer = frame(&message).unwrap_or_default();
+            // Split across two reads: nothing until the frame is whole.
+            let tail = buffer.split_off(3);
+            assert!(matches!(unframe::<()>(&mut buffer), Ok(None)));
+            buffer.extend_from_slice(&tail);
+            assert!(matches!(
+                unframe::<()>(&mut buffer),
+                Ok(Some(Some(ref got))) if *got == message
+            ));
+            assert!(buffer.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_frame_too_long_is_refused() {
+        let mut buffer = u32::MAX.to_le_bytes().to_vec();
+        assert!(unframe::<()>(&mut buffer).is_err());
     }
 }
