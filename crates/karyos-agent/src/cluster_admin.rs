@@ -798,7 +798,10 @@ fn record_outcome(
 
 /// Calls the gateway for `command` on a worker, waiting at most `wait`:
 /// `None` when no answer came in time, the call then finishing on its own.
-/// The worker holds `reservation` until it exits.
+/// The worker holds `reservation` while it calls the gateway, and releases
+/// it, with the gateway's lock, before it hands the reply over: a caller
+/// that has its answer finds the Cluster free for its next command, never
+/// `busy` from a worker that answered and has not exited yet (karyos#1067).
 fn call(
     gateway: &SharedGateway,
     command: &Command<'_>,
@@ -824,6 +827,8 @@ fn call(
                 operator,
                 relay,
             });
+            drop(gateway);
+            drop(_reservation);
             let _ = sender.send(reply);
         });
     spawned.ok()?;

@@ -30,6 +30,8 @@ enum Mode {
     Refuse,
     Silent,
     Slow,
+    /// Blocks in the gateway until the product's `release` is set.
+    Held,
 }
 
 /// What reached the product: command, parameters, operation, operator
@@ -41,6 +43,8 @@ type Sent = (String, Vec<u8>, u64, u32, u64);
 struct Product {
     sent: Arc<Mutex<Vec<Sent>>>,
     mode: Mode,
+    /// Releases a `Mode::Held` gateway.
+    release: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Product {
@@ -48,6 +52,7 @@ impl Product {
         Self {
             sent: Arc::default(),
             mode,
+            release: Arc::default(),
         }
     }
 }
@@ -80,6 +85,12 @@ impl ClusterGateway for Product {
             Mode::Silent => ClusterReply::NoAnswer,
             Mode::Slow => {
                 std::thread::sleep(Duration::from_millis(300));
+                ClusterReply::sequenced(1, 1, b"", None).unwrap()
+            }
+            Mode::Held => {
+                while !self.release.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 ClusterReply::sequenced(1, 1, b"", None).unwrap()
             }
         }
@@ -469,7 +480,10 @@ fn parameters_parse_as_bounded_hex() {
 #[test]
 fn a_command_while_another_is_in_flight_is_busy_unjournalled_and_unsent() {
     let dir = dir("busy");
-    let product = Product::new(Mode::Slow);
+    // Held in the gateway until released below, not slept for 300 ms: the
+    // first command is in flight for certain when the second comes,
+    // however late a loaded host runs this thread (karyos#1067).
+    let product = Product::new(Mode::Held);
     let clusters = clusters(&product);
     let mut used = HashSet::new();
     {
@@ -496,7 +510,8 @@ fn a_command_while_another_is_in_flight_is_busy_unjournalled_and_unsent() {
         );
         assert_eq!(second, ClusterAnswer::Busy);
         assert!(!used.contains(&2), "a busy id stays free");
-        // Once the worker exits the reservation is released.
+        // Once the worker is released and answers, the reservation goes.
+        product.release.store(true, Ordering::Release);
         let start = std::time::Instant::now();
         while clusters
             .find("seq")
@@ -651,4 +666,28 @@ fn a_clearance_is_offered_only_the_commands_it_may_make() {
         .unwrap();
     assert!(clusters.any_allowed(Clearance::Operator));
     assert!(!clusters.any_allowed(Clearance::None));
+}
+
+/// karyos#1067: a caller that has its answer can send its next command at
+/// once: the worker releases the reservation before it hands the reply
+/// over, so back-to-back commands to one Cluster are never `busy`.
+#[test]
+fn back_to_back_commands_are_never_busy() {
+    let dir = dir("back-to-back");
+    let product = Product::new(Mode::Sequence);
+    let clusters = clusters(&product);
+    let mut used = HashSet::new();
+    let mut journal = Journal::open(&dir, 10_000).unwrap();
+    for operation in 1..=1000 {
+        let answer = run(
+            Some(&mut journal),
+            &clusters,
+            &command("kill", operation, Clearance::Operator),
+            &mut used,
+        );
+        assert!(
+            matches!(answer, ClusterAnswer::Sequenced { .. }),
+            "command {operation}: {answer:?}"
+        );
+    }
 }
