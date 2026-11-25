@@ -333,6 +333,10 @@ impl Reference {
 impl ConsensusCore for Reference {
     type Message = Message;
 
+    fn is_configuration_entry(payload: &[u8]) -> bool {
+        decode_configuration(payload).is_some()
+    }
+
     fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
         // The configurations its log holds, written or durable. A failed
         // read leaves the bootstrap configuration, which the harness's

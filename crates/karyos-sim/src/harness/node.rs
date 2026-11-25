@@ -348,6 +348,9 @@ pub struct TestService {
     /// The log time: the largest event time applied, as the sessions
     /// section of a shipped snapshot records it (ADR-0111, decision 4).
     log_time: u64,
+    /// The last configuration entry applied, as the consensus section of
+    /// a shipped snapshot records the configuration (karyos#711).
+    configuration: Option<Vec<u8>>,
 }
 
 impl Default for TestService {
@@ -369,7 +372,20 @@ impl TestService {
             expired: 0,
             retention: retention.max(1),
             log_time: 0,
+            configuration: None,
         }
+    }
+
+    /// The core's configuration entry `payload` applied: kept, so its
+    /// snapshot carries the configuration at its base.
+    pub fn set_configuration(&mut self, payload: &[u8]) {
+        self.configuration = Some(payload.to_vec());
+    }
+
+    /// The last configuration entry applied, if any.
+    #[must_use]
+    pub fn configuration(&self) -> Option<&[u8]> {
+        self.configuration.as_deref()
     }
 
     /// Applies the committed `entry`; returns the command and its answer:
@@ -467,6 +483,12 @@ impl TestService {
         bytes.extend_from_slice(&self.deduplicated.to_le_bytes());
         bytes.extend_from_slice(&self.expired.to_le_bytes());
         bytes.extend_from_slice(&self.log_time.to_le_bytes());
+        // Only when there is one, so a service of a static membership
+        // encodes as before.
+        if let Some(configuration) = &self.configuration {
+            count(&mut bytes, configuration.len())?;
+            bytes.extend_from_slice(configuration);
+        }
         Some(bytes)
     }
 
@@ -529,6 +551,12 @@ impl TestService {
         let deduplicated = u64_at(&mut rest)?;
         let expired = u64_at(&mut rest)?;
         let log_time = u64_at(&mut rest)?;
+        let configuration = if rest.is_empty() {
+            None
+        } else {
+            let length = u32_at(&mut rest)?;
+            Some(take(&mut rest, length)?.to_vec())
+        };
         rest.is_empty().then_some(Self {
             values,
             answered,
@@ -537,6 +565,7 @@ impl TestService {
             expired,
             retention,
             log_time,
+            configuration,
         })
     }
 
@@ -2418,6 +2447,7 @@ impl<C: ConsensusCore> ServerNode<C> {
         self.base = Some(base);
         let digest = service.digest();
         let base_time = service.log_time();
+        let configuration = service.configuration().map(<[u8]>::to_vec);
         self.service = service;
         self.observe(Observation::Installed { node, base, digest });
         let budget = self.limits.map(|_| self.budget.clone());
@@ -2425,7 +2455,8 @@ impl<C: ConsensusCore> ServerNode<C> {
             base,
             &mut LogView::metered(log, budget.as_ref())
                 .with_base(Some(base))
-                .with_base_time(Some(base_time)),
+                .with_base_time(Some(base_time))
+                .with_base_configuration(configuration),
         ) {
             match refused {
                 super::core::InstallRefused::Unsupported => {
@@ -2477,12 +2508,20 @@ impl<C: ConsensusCore> ServerNode<C> {
     fn recovered(
         id: NodeId,
         peers: &[NodeId],
-        (limits, base, base_time): (Option<Limits>, Option<SnapshotBase>, Option<u64>),
+        (limits, base, restored): (Option<Limits>, Option<SnapshotBase>, Option<&TestService>),
         log: &mut RaftLog<SimDisk>,
     ) -> Result<C, Unsupported> {
         // The core sees the snapshot its node recovers over (karyos#903
-        // review), and its log time (ADR-0111).
-        let mut view = LogView::new(log).with_base(base).with_base_time(base_time);
+        // review), its log time (ADR-0111) and the configuration at its
+        // base (karyos#711).
+        let mut view = LogView::new(log)
+            .with_base(base)
+            .with_base_time(restored.map(TestService::log_time))
+            .with_base_configuration(
+                restored
+                    .and_then(TestService::configuration)
+                    .map(<[u8]>::to_vec),
+            );
         match limits {
             Some(limits) => C::recover_with(id, peers, &limits, &mut view),
             None => Ok(C::recover(id, peers, &mut view)),
@@ -2662,6 +2701,9 @@ impl<C: ConsensusCore> ServerNode<C> {
                     served.payload = Vec::new();
                 }
             }
+            if C::is_configuration_entry(&served.payload) {
+                self.service.set_configuration(&served.payload);
+            }
             let deduplicated = self.service.deduplicated();
             let answer = self.service.apply(&served);
             // A faulty service (tests): another valid answer, both recorded
@@ -2832,12 +2874,12 @@ impl<C: ConsensusCore> ServerNode<C> {
             .as_ref()
             .and_then(|store| Self::active_service(store, commit));
         self.base = latest.as_ref().map(|(base, _)| *base);
-        // The snapshot's log time: the C-TIME watermark of a log empty
-        // after it (ADR-0111, decision 4).
-        let base_time = latest
+        // The snapshot's service: its log time is the C-TIME watermark of
+        // a log empty after it (ADR-0111, decision 4), and it holds the
+        // configuration at its base (karyos#711).
+        let restored = latest
             .as_ref()
-            .and_then(|(_, bytes)| TestService::decode(bytes))
-            .map(|service| service.log_time());
+            .and_then(|(_, bytes)| TestService::decode(bytes));
         let first = log.first_index();
         let entries: Vec<(u64, u64)> = log
             .last_index()
@@ -2852,7 +2894,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             entries,
             durable: log.durable_index(),
         });
-        let recovering = (self.limits, self.base, base_time);
+        let recovering = (self.limits, self.base, restored.as_ref());
         let core = match Self::recovered(self.id, &self.peers, recovering, &mut log) {
             Ok(core) => core,
             // The core took its limits at its creation: it is not the

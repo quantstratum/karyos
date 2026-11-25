@@ -19,6 +19,7 @@
 //! `karyos-client` and `karyos-archive`, and the C ABI of `karyos-ffi`
 //! under its own `0.y.z` rule.
 
+#[cfg(feature = "backup")]
 pub mod backup;
 pub mod client;
 pub mod consensus;
@@ -28,6 +29,7 @@ pub mod guards;
 pub mod hard_state;
 pub mod log;
 pub mod mark;
+pub mod membership;
 pub mod service;
 pub mod snapshot;
 
