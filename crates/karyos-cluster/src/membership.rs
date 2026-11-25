@@ -34,6 +34,9 @@ use crate::service::{CORE_SCHEMA_ID, CORE_VERSION, CORE_VERSION_1};
 pub const MAX_LEARNERS: usize = 2;
 /// The most members, voters and learners.
 pub const MAX_MEMBERS: usize = MAX_VOTERS + MAX_LEARNERS;
+/// The fewest voters a change may leave: a cluster bootstraps with 3 or 5
+/// and passes through 4.
+pub const MIN_VOTERS: usize = 3;
 
 /// Why a membership is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -161,7 +164,8 @@ impl Membership {
 
     /// The membership after `change`; `None` when it does not apply: a
     /// member added again, a promotion of anyone but a learner, the removal
-    /// of a stranger or of the last voter, or a bound passed.
+    /// of a stranger, of a voter leaving fewer than [`MIN_VOTERS`], or a
+    /// bound passed.
     #[must_use]
     pub fn changed(&self, change: MembershipChange) -> Option<Self> {
         let mut voters = [0; MAX_VOTERS];
@@ -196,7 +200,7 @@ impl Membership {
                 }
             }
             MembershipChange::Remove(id) => {
-                if !self.contains(id) {
+                if !self.contains(id) || (self.is_voter(id) && self.voter_count <= MIN_VOTERS) {
                     return None;
                 }
                 for voter in self.voters().filter(|&voter| voter != id) {
@@ -351,6 +355,9 @@ mod tests {
         assert_eq!(four.quorum(), 3);
         let back = four.changed(MembershipChange::Remove(1)).unwrap();
         assert_eq!(back, Membership::new(&[2, 3, 4], &[]).unwrap());
+        // Never below three voters; a learner leaves freely.
+        assert_eq!(back.changed(MembershipChange::Remove(2)), None);
+        assert_eq!(joined.changed(MembershipChange::Remove(4)), Some(three));
         assert_eq!(three.changed(MembershipChange::AddLearner(2)), None);
         assert_eq!(three.changed(MembershipChange::Promote(2)), None);
         assert_eq!(three.changed(MembershipChange::Promote(9)), None);

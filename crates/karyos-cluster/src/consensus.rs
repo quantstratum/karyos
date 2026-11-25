@@ -743,8 +743,11 @@ pub struct Core {
     /// The membership it acts under: the latest configuration entry's,
     /// else `settled`.
     members: Membership,
-    /// The membership before the configuration entries below.
+    /// The membership before the configuration entries below, and the
+    /// index from which it is known: `None` for the bootstrap one, in
+    /// force from the log's start.
     settled: Membership,
+    settled_at: Option<u64>,
     /// The configuration entries its log holds, as (index, membership):
     /// the one before the latest, and the latest.
     prior: Option<(u64, Membership)>,
@@ -782,6 +785,7 @@ impl Core {
             commit,
             members,
             settled: members,
+            settled_at: None,
             prior: None,
             latest: None,
             peers,
@@ -860,16 +864,22 @@ impl Core {
         self.latest.or(self.prior).map(|(index, _)| index)
     }
 
-    /// The membership at index `index`, as far as it knows: the latest
-    /// configuration entry at or below it. What a driver keeps with a
-    /// snapshot whose base is `index`.
+    /// The membership at index `index`: the latest configuration entry at
+    /// or below it. What a driver keeps with a snapshot whose base is
+    /// `index`. `None` below the oldest configuration it still knows,
+    /// where it cannot say.
     #[must_use]
-    pub fn membership_at(&self, index: u64) -> Membership {
-        [self.latest, self.prior]
+    pub fn membership_at(&self, index: u64) -> Option<Membership> {
+        if let Some((_, membership)) = [self.latest, self.prior]
             .into_iter()
             .flatten()
             .find(|(at, _)| *at <= index)
-            .map_or(self.settled, |(_, membership)| membership)
+        {
+            return Some(membership);
+        }
+        self.settled_at
+            .is_none_or(|at| at <= index)
+            .then_some(self.settled)
     }
 
     /// The node's log holds a configuration entry at `index`: its driver
@@ -880,10 +890,15 @@ impl Core {
         if self.latest.is_some_and(|(latest, _)| index <= latest) {
             return;
         }
-        if let Some((_, older)) = self.prior {
+        debug_assert!(
+            index <= Based::new(log, self.base).last_index().saturating_add(1),
+            "a configuration entry past the log's end"
+        );
+        if let Some((at, older)) = self.prior {
             // Two entries on, the oldest is committed: a leader appends a
-            // change only once the one before is.
+            // change only once the one before is (the errata).
             self.settled = older;
+            self.settled_at = Some(at);
         }
         self.prior = self.latest;
         self.latest = Some((index, membership));
@@ -897,6 +912,7 @@ impl Core {
     /// at or below the base are replaced by it.
     pub fn restore_membership(&mut self, index: u64, membership: Membership) {
         self.settled = membership;
+        self.settled_at = Some(index);
         if self.prior.is_some_and(|(at, _)| at <= index) {
             self.prior = None;
         }
@@ -1252,7 +1268,10 @@ impl Core {
         out: &mut impl Effects,
     ) -> Result<(), StepError> {
         let log = &Based::new(log, self.base);
-        if from == self.config.id || !self.members.contains(from) {
+        // A node outside its own membership (joining, or removed) follows
+        // whoever leads: the voters it was started with may be gone.
+        let joining = !self.members.contains(self.config.id);
+        if from == self.config.id || (!joining && !self.members.contains(from)) {
             return Err(StepError::UnknownSender);
         }
         match message {
@@ -1391,8 +1410,11 @@ impl Core {
             }
             Role::PreCandidate | Role::Candidate => false,
         };
-        let granted =
-            term > self.term_vote.term && !live_leader && up_to_date(log, last_index, last_term);
+        // Only a voter grants: a learner's or a stranger's vote is no vote.
+        let granted = term > self.term_vote.term
+            && !live_leader
+            && self.members.is_voter(self.config.id)
+            && up_to_date(log, last_index, last_term);
         let reply_term = if granted { term } else { self.term_vote.term };
         out.send(
             from,
@@ -1438,6 +1460,7 @@ impl Core {
         let granted = term == self.term_vote.term
             && free
             && self.role != Role::Leader
+            && self.members.is_voter(self.config.id)
             && up_to_date(log, last_index, last_term);
         if granted {
             if self.term_vote.voted_for.is_none() {

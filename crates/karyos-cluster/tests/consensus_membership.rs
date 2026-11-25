@@ -546,11 +546,27 @@ fn a_truncated_configuration_entry_gives_way_to_the_one_before() {
     );
 }
 
+/// Voters 1 to 4: spare 4 added and promoted under `leader`.
+fn four_voters(cluster: &mut Cluster, leader: u64) {
+    cluster
+        .change(leader, MembershipChange::AddLearner(4))
+        .unwrap();
+    cluster.run(4);
+    cluster
+        .change(leader, MembershipChange::Promote(4))
+        .unwrap();
+    cluster.run(4);
+}
+
 #[test]
 fn a_removed_leader_steps_down_once_its_removal_commits() {
-    let (mut cluster, leader) = led(3, 6);
-    let two: Vec<u64> = [1, 2, 3].into_iter().filter(|&id| id != leader).collect();
-    let after = Membership::new(&two, &[]).unwrap();
+    let (mut cluster, leader) = led(4, 6);
+    four_voters(&mut cluster, leader);
+    let three: Vec<u64> = [1, 2, 3, 4]
+        .into_iter()
+        .filter(|&id| id != leader)
+        .collect();
+    let after = Membership::new(&three, &[]).unwrap();
     assert_eq!(
         cluster.change(leader, MembershipChange::Remove(leader)),
         Ok(after)
@@ -563,10 +579,10 @@ fn a_removed_leader_steps_down_once_its_removal_commits() {
     let index = cluster.node(leader).core.configuration_index().unwrap();
     assert!(cluster.node(leader).core.commit() >= index);
     assert_ne!(cluster.node(leader).core.role(), Role::Leader);
-    // The other two elect a leader of their own and go on.
+    // The other three elect a leader of their own and go on.
     cluster.run(200);
     let new = cluster.leader().unwrap();
-    assert!(two.contains(&new));
+    assert!(three.contains(&new));
     cluster.propose(new);
     cluster.run(3);
     assert_eq!(
@@ -575,6 +591,46 @@ fn a_removed_leader_steps_down_once_its_removal_commits() {
     );
     // The removed node never stands again.
     assert_ne!(cluster.node(leader).core.role(), Role::Leader);
+}
+
+/// The cluster moves entirely off its bootstrap voters 1 to 3, onto 4 to 6,
+/// one server at a time; then spare 7 joins. It was started with the
+/// bootstrap voters, none of which leads or is a member any more, and still
+/// follows the leader and catches up.
+#[test]
+fn a_joiner_follows_a_leader_outside_its_bootstrap_voters() {
+    let (mut cluster, leader) = led(7, 10);
+    let step = |cluster: &mut Cluster, leader: u64, change| {
+        cluster.change(leader, change).unwrap();
+        cluster.run(6);
+    };
+    for spare in [4, 5] {
+        step(&mut cluster, leader, MembershipChange::AddLearner(spare));
+        step(&mut cluster, leader, MembershipChange::Promote(spare));
+    }
+    for gone in [1, 2, 3].into_iter().filter(|&id| id != leader) {
+        step(&mut cluster, leader, MembershipChange::Remove(gone));
+    }
+    step(&mut cluster, leader, MembershipChange::AddLearner(6));
+    step(&mut cluster, leader, MembershipChange::Promote(6));
+    step(&mut cluster, leader, MembershipChange::Remove(leader));
+    cluster.run(300);
+    let new = cluster.leader().unwrap();
+    assert!([4, 5, 6].contains(&new), "{new}");
+    let four_to_six = Membership::new(&[4, 5, 6], &[]).unwrap();
+    assert_eq!(cluster.node(new).core.membership(), four_to_six);
+    step(&mut cluster, new, MembershipChange::AddLearner(7));
+    cluster.propose(new);
+    cluster.run(6);
+    assert_eq!(
+        cluster.node(7).core.membership(),
+        Membership::new(&[4, 5, 6], &[7]).unwrap()
+    );
+    assert_eq!(
+        cluster.node(7).log.last_index(),
+        cluster.node(new).log.last_index(),
+        "the joiner caught up"
+    );
 }
 
 #[test]
@@ -611,14 +667,17 @@ fn a_snapshot_restores_the_membership_at_its_base() {
     let core = &cluster.node(leader).core;
     assert_eq!(
         core.membership_at(start),
-        Membership::new(&[1, 2, 3], &[]).unwrap()
+        Some(Membership::new(&[1, 2, 3], &[]).unwrap())
     );
-    assert_eq!(core.membership_at(at), three_and(4));
+    assert_eq!(core.membership_at(at), Some(three_and(4)));
     // A node that knows none of it, restored over a snapshot at `at`.
     let mut fresh = Core::new(config(4, 9), TermVote::default(), 0).with_snapshot(at, 1);
     fresh.restore_membership(at, three_and(4));
     assert_eq!(fresh.membership(), three_and(4));
     assert_eq!(fresh.configuration_index(), None);
+    // Below the snapshot it cannot say.
+    assert_eq!(fresh.membership_at(at - 1), None);
+    assert_eq!(fresh.membership_at(at), Some(three_and(4)));
 }
 
 /// Raft's safety under membership changes, losses, reordering and
