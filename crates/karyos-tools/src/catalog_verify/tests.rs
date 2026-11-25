@@ -26,7 +26,9 @@ use karyos_archive::segment::{Geometry, SegmentStore, SyncPolicy};
 
 use super::*;
 
-const ARCHIVE: [u8; 32] = [7; 32];
+pub(crate) const ARCHIVE: [u8; 32] = [7; 32];
+/// The seed of the fixture's Archive signer.
+pub(crate) const SIGNER_SEED: [u8; 32] = [9; 32];
 pub(crate) const OPERATOR: [u8; 32] = [21; 32];
 pub(crate) const RECORDING: u64 = 3;
 
@@ -80,7 +82,7 @@ pub(crate) fn archive(name: &str) -> Archive {
     .unwrap();
     let mut journal = open_journal(&dir);
     let authority = TestKey::from_seed([1; 32]);
-    let mut signer = TestKey::from_seed([9; 32]);
+    let mut signer = TestKey::from_seed(SIGNER_SEED);
     let mut entry = RegistryEntry {
         action: RegistryAction::Register,
         algorithm: Algorithm::Ed25519,
