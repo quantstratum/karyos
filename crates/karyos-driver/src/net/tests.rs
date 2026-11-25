@@ -195,13 +195,10 @@ fn dropping_the_driver_joins_a_late_agent() {
     dropping.store(true, Ordering::Release);
     drop(driver);
     let returned = Instant::now();
-    // The agent let its gate go when the drop returned, before the
-    // releaser is joined: the drop joined it, it did not detach it.
-    assert_eq!(
-        Arc::strong_count(&gate),
-        2,
-        "the agent still holds its gate"
-    );
+    // The drop returned only after the release: a driver that detached the
+    // late sender would have returned at once, before it. (The releaser
+    // drops its own handle on the gate when it ends, so a count taken here
+    // would race; the count below is checked once it is joined.)
     releaser.join().unwrap();
     let released = released.lock().unwrap().expect("never released");
     assert!(returned >= released, "the drop returned before the release");
