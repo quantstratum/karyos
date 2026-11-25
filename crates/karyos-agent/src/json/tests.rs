@@ -316,6 +316,7 @@ fn every_field() -> AgentView {
                 record: [0x01; 32],
             }],
             purge_pending: false,
+            head: Some(crate::journal::HistoryCursor::new(4, 4096)),
         }),
         agent: crate::api::AgentIdentity::new(Some("ns/pod-0".to_owned()), 4242, 99),
         rates: vec![crate::api::RateView::new(
@@ -348,6 +349,7 @@ fn a_journal_that_could_not_open_is_written_with_its_error() {
             policy: None,
             purged: Vec::new(),
             purge_pending: false,
+            head: None,
         }),
         agent: crate::api::AgentIdentity::new(None, 7, 1),
         rates: Vec::new(),
@@ -358,7 +360,7 @@ fn a_journal_that_could_not_open_is_written_with_its_error() {
             r#"{"version":1,"drivers":[],"journal":{"recording":null,"unsealed":true,"#,
             r#""unavailable":true,"error":"no such directory","failed_appends":0,"#,
             r#""gap":null,"alerts":[],"integrity":null,"integrity_truncated":false,"#,
-            r#""hold":null,"policy":null,"purged":[],"purge_pending":false},"#,
+            r#""hold":null,"policy":null,"purged":[],"purge_pending":false,"head":null},"#,
             r#""agent":{"id":null,"pid":7,"started_ns":1},"rates":[]}"#
         )
     );
@@ -413,7 +415,7 @@ const V1: &str = concat!(
     r#""purged":[{"start":0,"end":65536,"counter":3,"#,
     r#""seals":"abababababababababababababababababababababababababababababababab","#,
     r#""record":"0101010101010101010101010101010101010101010101010101010101010101"}],"#,
-    r#""purge_pending":false},"#,
+    r#""purge_pending":false,"head":{"recording":4,"position":4096}},"#,
     r#""agent":{"id":"ns/pod-0","pid":4242,"started_ns":99},"#,
     r#""rates":[{"dir":"/run/a","stream_id":7,"session_id":-2,"version":3,"operation":11}]}"#,
 );
@@ -462,7 +464,8 @@ fn capability_names_are_closed_in_v1_and_extensible() {
             "submit",
             "clocks",
             "rate-limits",
-            "cluster-command"
+            "cluster-command",
+            "journal-history"
         ]
     );
     let known = Capability {
