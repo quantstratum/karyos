@@ -1005,6 +1005,25 @@ pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
         /// The lane.
         lane: u8,
     },
+    /// Posted unsolicited, once per lane, into a free slot and again each
+    /// cycle until posted: a timed lane under cancel-on-deadline missed its
+    /// deadline as its sender saw it (a head past its time plus tolerance
+    /// before it was exposed, or an `etf` drop; ADR-0109 point 8), and the
+    /// sender sends nothing more of it. The conductor seals the lane with
+    /// `SealReason::DeadlineMissed` if the identity still names the live
+    /// publication's incarnation, and drops the event otherwise.
+    DeadlineMissed {
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// Its alias.
+        alias: karyos_protocol::network::Alias,
+        /// Its registration.
+        registration: u64,
+        /// The incarnation the sender serves.
+        incarnation: u64,
+        /// The lane.
+        lane: u8,
+    },
     /// Posted unsolicited, once per report, into a free slot and again each
     /// cycle until posted: on the `etf` route, a drop report arrived after
     /// its entry was retired as sent (ADR-0109 point 7). Nothing was
@@ -1889,6 +1908,7 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         role.report_drained(|event| events.try_post(event).is_ok());
         // A schedule violation's report, likewise.
         role.report_violations(|event| events.try_post(event).is_ok());
+        role.report_deadlines(|event| events.try_post(event).is_ok());
         role.report_etf_late(|event| events.try_post(event).is_ok());
         role.report_removals(|event| events.try_post(event).is_ok());
         role.report_limits(|event| events.try_post(event).is_ok());

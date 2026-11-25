@@ -281,6 +281,9 @@ struct Timed {
     /// Per lane, whether its consumer's violation was reported to the
     /// conductor (`AgentEvent::ScheduleViolated`, posted once).
     reported: Vec<bool>,
+    /// Per lane, whether its missed deadline was reported to the conductor
+    /// (`AgentEvent::DeadlineMissed`, posted once).
+    missed_reported: Vec<bool>,
 }
 
 /// The etf route's drop handling of one publication (ADR-0109 points 6
@@ -1026,6 +1029,48 @@ impl<T: StreamTerms> Outbound<T> {
         }
     }
 
+    /// Returns, through the timed gate, the heads still queued on each lane
+    /// that missed its deadline under cancel-on-deadline (ADR-0109 point
+    /// 8): they will never be sent, so their TX slots and their schedule
+    /// entries are freed, each counted dropped. A lane its guard aborts is
+    /// [`Self::cancel_aborted`]'s.
+    fn cancel_missed<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) {
+        let Self {
+            guard,
+            sender,
+            tracks,
+            readers,
+            counters,
+            timed: Some(timed),
+            ..
+        } = self
+        else {
+            return;
+        };
+        for lane in 0..readers.len() {
+            let guarded = guard
+                .as_deref()
+                .is_some_and(|guard| LaneGate::aborting(guard, lane));
+            if guarded
+                || !timed.state.deadline_missed(lane)
+                || sender.pending(lane).unwrap_or(0) == 0
+            {
+                continue;
+            }
+            let mut gate = DataGate {
+                lanes: tracks,
+                held: false,
+                guard: guard.as_deref_mut(),
+            };
+            if sender
+                .cancel(tx, lane, &mut timed.state.view(&mut gate))
+                .is_err()
+            {
+                counters.bump(|c| &mut c.queue_failures, 1);
+            }
+        }
+    }
+
     /// The guard's between gates step at `now`, for a publication not
     /// served this cycle (not established yet): a close applies and its
     /// applied epoch is published all the same.
@@ -1546,6 +1591,28 @@ impl<T: StreamTerms> Outbound<T> {
             })
     }
 
+    /// The first timed lane that missed a deadline under cancel-on-deadline
+    /// and is not reported yet (ADR-0109 point 8): the sender cannot seal
+    /// its buffer, so it reports it (`AgentEvent::DeadlineMissed`) for the
+    /// conductor to seal with `SealReason::DeadlineMissed`.
+    pub(crate) fn deadline_unreported(&self) -> Option<usize> {
+        let timed = self.timed.as_deref()?;
+        (0..timed.missed_reported.len()).find(|lane| {
+            timed.missed_reported.get(*lane) == Some(&false) && timed.state.deadline_missed(*lane)
+        })
+    }
+
+    /// `lane`'s missed deadline was reported: it is not reported again.
+    pub(crate) fn deadline_reported(&mut self, lane: usize) {
+        if let Some(reported) = self
+            .timed
+            .as_deref_mut()
+            .and_then(|timed| timed.missed_reported.get_mut(lane))
+        {
+            *reported = true;
+        }
+    }
+
     /// `lane`'s violation was reported: it is not reported again.
     pub(crate) fn violation_reported(&mut self, lane: usize) {
         if let Some(reported) = self
@@ -1601,11 +1668,13 @@ impl<T: StreamTerms> Outbound<T> {
             unacknowledged.push(VecDeque::with_capacity(capacity));
         }
         let reported = vec![false; consumers.len()];
+        let missed_reported = vec![false; consumers.len()];
         self.timed = Some(Box::new(Timed {
             state,
             consumers,
             unacknowledged,
             reported,
+            missed_reported,
         }));
         Ok(())
     }
@@ -1616,7 +1685,12 @@ impl<T: StreamTerms> Outbound<T> {
     /// kernel's `etf` leaf releases it then. Its timed gate's policies
     /// carry the declared advance ([`LatePolicy::advance`]) by which a
     /// head is handed over early. Its repair queue stays immediate.
-    pub(crate) fn set_etf(&mut self, etf: karyos_io::backend::EtfQueue, advance: u64) {
+    pub(crate) fn set_etf(
+        &mut self,
+        etf: karyos_io::backend::EtfQueue,
+        advance: u64,
+        cancel_on_deadline: bool,
+    ) {
         self.etf = Some(etf);
         let bound = self
             .readers
@@ -1625,7 +1699,12 @@ impl<T: StreamTerms> Outbound<T> {
             .and_then(|capacity| usize::try_from(capacity).ok())
             .unwrap_or(0);
         self.etf_drops = Some(Box::new(EtfDrops {
-            ledger: etf::EtfLedger::new(self.readers.len(), bound, self.reliable, advance),
+            ledger: etf::EtfLedger::new(
+                self.readers.len(),
+                bound,
+                (self.reliable, cancel_on_deadline),
+                advance,
+            ),
             reports: vec![karyos_io::sockets::errqueue::ErrEntry::Truncated; etf::DRAIN_BATCH],
             jobs: [None; MAX_LANES],
         }));
@@ -1679,6 +1758,18 @@ impl<T: StreamTerms> Outbound<T> {
                     match *entry {
                         ErrEntry::Txtime { txtime_ns, .. } => {
                             let _ = drops.ledger.drained(lane, txtime_ns);
+                            // Under cancel-on-deadline every drop report is
+                            // a miss the sender saw, a late one too (its
+                            // entry expired, but the qdisc did drop it): the
+                            // lane aborts (ADR-0109 point 8). On any other
+                            // lane `miss` changes nothing.
+                            if let Some(timed) = self.timed.as_deref_mut() {
+                                let aborting = self
+                                    .guard
+                                    .as_deref()
+                                    .is_some_and(|guard| LaneGate::aborting(guard, lane));
+                                let _ = timed.state.miss(lane, aborting);
+                            }
                         }
                         _ => drops.ledger.other_report(),
                     }
@@ -1842,6 +1933,7 @@ impl<T: StreamTerms> Outbound<T> {
             guard.between_gates();
         }
         self.cancel_aborted(tx);
+        self.cancel_missed(tx);
         // After the cancel, whose returned heads end their messages too.
         self.release_ended();
         self.handle_failure(tx, report.failure);
@@ -2227,6 +2319,16 @@ impl<T: StreamTerms> Outbound<T> {
                 .guard
                 .as_deref()
                 .is_some_and(|guard| guard.aborting(lane))
+            {
+                break;
+            }
+            // Nor does a timed lane that missed its deadline under
+            // cancel-on-deadline: its incarnation is aborted (ADR-0109
+            // point 8).
+            if self
+                .timed
+                .as_deref()
+                .is_some_and(|timed| timed.state.deadline_missed(lane))
             {
                 break;
             }

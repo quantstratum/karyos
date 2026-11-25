@@ -576,6 +576,31 @@ impl TimedState {
         forgotten
     }
 
+    /// Aborts `lane` for a missed deadline seen outside the gate (an `etf`
+    /// drop under cancel-on-deadline, ADR-0109 point 8): as a miss before
+    /// exposure, for good, counted once; a lane already missed, or one its
+    /// inner gate aborts (`inner_aborting`), changes nothing. Returns
+    /// whether it aborted the lane now.
+    pub fn miss(&mut self, lane: usize, inner_aborting: bool) -> bool {
+        let Some(state) = self.lanes.get_mut(lane) else {
+            return false;
+        };
+        if state.missed || !state.policy.cancel_on_deadline || inner_aborting {
+            return false;
+        }
+        state.missed = true;
+        let counts = &mut self.counts;
+        bump(&mut counts.deadline_aborts, &mut counts.overflows);
+        count(
+            state
+                .counters
+                .as_ref()
+                .and_then(|cells| cells.deadline_aborts.as_ref()),
+            &mut counts.overflows,
+        );
+        true
+    }
+
     /// Counts a message a reliable lane's reset read again.
     pub fn count_rewound(&mut self) {
         bump(&mut self.counts.rewound, &mut self.counts.overflows);

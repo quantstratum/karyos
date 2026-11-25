@@ -541,10 +541,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// once, outside the late policy, and counted as rewound, not late.
     /// NAK repairs go through the repair path, never the timed gate.
     ///
+    /// Under cancel-on-deadline (G7, ADR-0109 point 8) a head whose time
+    /// plus its tolerance passes before it is exposed, or on the `etf`
+    /// route a datagram the qdisc dropped, aborts the lane's incarnation:
+    /// the sender sends nothing more of it and reports it, and the
+    /// conductor seals it with `SealReason::DeadlineMissed`. A drop whose
+    /// report the kernel lost is not seen, so it is repaired or a gap, not
+    /// an abort.
+    ///
     /// # Errors
     ///
     /// [`DriverError::TimedNetworkUnsupported`] for a channel with paths,
-    /// the `Tai` domain, cancel-on-deadline or a `max_horizon` that, with
+    /// the `Tai` domain, the etf route's refusals, or a `max_horizon` that, with
     /// one `sender_heartbeat_interval`, reaches
     /// `image_liveness_timeout`;
     /// [`DriverError::InvalidConfig`] for lanes with no schedule ring; the
@@ -1225,7 +1233,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             let options = found.schedule.unwrap_or_default();
             policies.push(crate::timed_gate::LatePolicy {
                 tolerance: options.lateness_tolerance,
-                cancel_on_deadline: false,
+                cancel_on_deadline: options.cancel_on_deadline,
                 max_horizon: options.max_horizon,
                 advance: options.route.etf_advance(),
             });
@@ -1302,8 +1310,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     let now = karyos_sys::host_clock::host_monotonic_ns();
                     outbound.set_timed(&policies, counters, now)?;
                     if let Some(etf) = etf {
-                        let advance = policies.first().map_or(0, |policy| policy.advance);
-                        outbound.set_etf(etf, advance);
+                        let first = policies.first().copied().unwrap_or_default();
+                        outbound.set_etf(etf, first.advance, first.cancel_on_deadline);
                     }
                 }
                 // Its counters' cells (M2b), dropped with the outbound if
@@ -1355,8 +1363,6 @@ fn timed_supported(
         Some(reason)
     } else if options.domain == karyos_client::schedule::ClockDomain::Tai {
         Some(Unsupported::TaiDomain)
-    } else if options.cancel_on_deadline {
-        Some(Unsupported::CancelOnDeadline)
     } else if liveness.is_some_and(|(liveness, heartbeat)| {
         // A lane's last heartbeat can come one interval before its held
         // head: the silence is up to the horizon plus that interval.

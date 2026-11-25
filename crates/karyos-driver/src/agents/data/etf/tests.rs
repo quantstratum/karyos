@@ -9,7 +9,7 @@ use super::*;
 /// ranges wait for their catch-up in position order, merged.
 #[test]
 fn a_report_drops_every_entry_of_its_time() {
-    let mut ledger = EtfLedger::new(1, 8, true, 1_000);
+    let mut ledger = EtfLedger::new(1, 8, (true, false), 1_000);
     assert!(ledger.reserve(0, 100, (0, 64)));
     assert!(ledger.reserve(0, 100, (64, 128)));
     assert!(ledger.reserve(0, 200, (128, 192)));
@@ -36,7 +36,7 @@ fn a_report_drops_every_entry_of_its_time() {
 /// a range shrinks as its catch-up covers it.
 #[test]
 fn catch_ups_go_in_position_order() {
-    let mut ledger = EtfLedger::new(1, 8, true, 1_000);
+    let mut ledger = EtfLedger::new(1, 8, (true, false), 1_000);
     assert!(ledger.reserve(0, 100, (0, 64)));
     assert!(ledger.reserve(0, 300, (256, 320)));
     assert!(ledger.reserve(0, 200, (128, 192)));
@@ -55,7 +55,7 @@ fn catch_ups_go_in_position_order() {
 /// An unreliable lane's drop is a gap, counted; nothing is caught up.
 #[test]
 fn an_unreliable_drop_is_a_counted_gap() {
-    let mut ledger = EtfLedger::new(2, 4, false, 1_000);
+    let mut ledger = EtfLedger::new(2, 4, (false, false), 1_000);
     assert!(ledger.reserve(1, 100, (0, 64)));
     assert_eq!(ledger.drained(1, 100), 1);
     assert_eq!(ledger.counts().gaps, 1);
@@ -69,7 +69,7 @@ fn an_unreliable_drop_is_a_counted_gap() {
 /// makes room.
 #[test]
 fn a_full_list_holds_the_next_head() {
-    let mut ledger = EtfLedger::new(1, 2, true, 1_000);
+    let mut ledger = EtfLedger::new(1, 2, (true, false), 1_000);
     assert!(ledger.has_room(0));
     assert!(ledger.reserve(0, 100, (0, 64)));
     assert!(ledger.reserve(0, 200, (64, 128)));
@@ -86,7 +86,7 @@ fn a_full_list_holds_the_next_head() {
 #[test]
 fn expiry_retires_as_sent_and_a_later_report_is_late() {
     let advance = 1_000;
-    let mut ledger = EtfLedger::new(1, 4, true, advance);
+    let mut ledger = EtfLedger::new(1, 4, (true, false), advance);
     assert!(ledger.reserve(0, 100, (0, 64)));
     assert!(ledger.reserve(0, 500, (64, 128)));
     let edge = 100 + advance + EXPIRY_MARGIN;
@@ -102,7 +102,7 @@ fn expiry_retires_as_sent_and_a_later_report_is_late() {
 /// A reset forgets a lane's entries and catch-ups.
 #[test]
 fn a_reset_forgets_the_lane() {
-    let mut ledger = EtfLedger::new(1, 4, true, 1_000);
+    let mut ledger = EtfLedger::new(1, 4, (true, false), 1_000);
     assert!(ledger.reserve(0, 100, (0, 64)));
     assert!(ledger.reserve(0, 200, (64, 128)));
     assert_eq!(ledger.drained(0, 100), 1);
@@ -125,7 +125,7 @@ fn ranges_merge_where_they_touch() {
 /// range, and what it did not send goes back in position order.
 #[test]
 fn an_earlier_drop_during_a_catch_up_stays_pending() {
-    let mut ledger = EtfLedger::new(1, 8, true, 1_000);
+    let mut ledger = EtfLedger::new(1, 8, (true, false), 1_000);
     assert!(ledger.reserve(0, 100, (0, 64)));
     assert!(ledger.reserve(0, 200, (128, 192)));
     assert_eq!(ledger.drained(0, 200), 1);
@@ -144,7 +144,7 @@ fn an_earlier_drop_during_a_catch_up_stays_pending() {
 /// nearest neighbour, so nothing dropped is forgotten.
 #[test]
 fn pending_catch_ups_stay_within_their_allocation() {
-    let mut ledger = EtfLedger::new(1, 2, true, 1_000);
+    let mut ledger = EtfLedger::new(1, 2, (true, false), 1_000);
     let capacity = ledger.lanes[0].catch_ups.capacity();
     for index in 0..(capacity as u64 + 5) {
         ledger.give_back(0, (index * 100, index * 100 + 10));
@@ -173,7 +173,7 @@ fn pending_catch_ups_stay_within_their_allocation() {
 /// the publication's count misses none.
 #[test]
 fn late_reports_past_the_bound_are_still_counted() {
-    let mut ledger = EtfLedger::new(1, 1, true, 1_000);
+    let mut ledger = EtfLedger::new(1, 1, (true, false), 1_000);
     let total = DRAIN_BATCH as u64 + 6;
     for time in 0..total {
         assert_eq!(ledger.drained(0, time), 0);
@@ -190,4 +190,17 @@ fn late_reports_past_the_bound_are_still_counted() {
     // A refused count is put back.
     ledger.restore_unrecorded(3);
     assert_eq!(ledger.take_unrecorded(), 3);
+}
+
+/// Under cancel-on-deadline a drop aborts: no catch-up and no gap.
+#[test]
+fn a_drop_under_cancel_aborts() {
+    for reliable in [true, false] {
+        let mut ledger = EtfLedger::new(1, 4, (reliable, true), 1_000);
+        assert!(ledger.reserve(0, 100, (0, 64)));
+        assert_eq!(ledger.drained(0, 100), 1);
+        let counts = ledger.counts();
+        assert_eq!((counts.aborts, counts.caught_up, counts.gaps), (1, 0, 0));
+        assert_eq!(ledger.next_catch_up(0), None);
+    }
 }

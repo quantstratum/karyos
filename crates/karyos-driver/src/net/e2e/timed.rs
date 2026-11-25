@@ -1002,6 +1002,7 @@ fn a_schedule_violation_seals_the_lane_with_its_reason() {
             registration: publication.registration(),
             incarnation: 99,
             lane: 0,
+            deadline: false,
         });
     let _ = a.do_work().unwrap();
     assert_eq!(a.counters.value(Event::ScheduleViolationsDropped), 1);
@@ -1014,4 +1015,36 @@ fn a_schedule_violation_seals_the_lane_with_its_reason() {
             .schedule_faults,
         1
     );
+}
+
+/// ADR-0109 point 8 (#625): cancel-on-deadline on a timed network
+/// publication, the software route. A message whose time plus its
+/// tolerance has passed before it is exposed aborts its lane's
+/// incarnation: the sender reports the miss and the conductor seals the
+/// lane with `DeadlineMissed`, through the hook a schedule violation
+/// takes. Before #625 the add was refused.
+#[test]
+fn a_missed_deadline_seals_a_network_lane() {
+    let options = ScheduleOptions::default()
+        .with_cancel_on_deadline(true)
+        .with_lateness_tolerance(1_000_000);
+    let (mut a, mut b, publication, _reader) = timed_pair(4, options, true);
+    let stream = publication.lane(Lane::ZERO).unwrap();
+    let mut lane = a.publication(stream).unwrap();
+    // 50 ms in the past, far beyond the 1 ms tolerance.
+    let past = karyos_sys::host_clock::host_monotonic_ns() - 50_000_000;
+    assert!(matches!(
+        lane.offer_at(&[1; 16], past).unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0]
+            .stream_ref(stream)
+            .is_ok_and(|found| found.conductor.seal_reason().is_some())
+    });
+    assert_eq!(
+        a.stream_ref(stream).unwrap().conductor.seal_reason(),
+        Some(karyos_sys::log_buffer::SealReason::DeadlineMissed)
+    );
+    assert_clean(&mut a);
 }

@@ -802,6 +802,7 @@ impl<O: SocketOps> Endpoints<O> {
             | AgentEvent::PublicationDraining { .. }
             | AgentEvent::SenderSessionDrained { .. }
             | AgentEvent::ScheduleViolated { .. }
+            | AgentEvent::DeadlineMissed { .. }
             | AgentEvent::EtfLateDropReport { .. }
             | AgentEvent::DestinationRemoved { .. }
             | AgentEvent::PublicationLimit { .. }

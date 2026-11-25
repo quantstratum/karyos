@@ -122,7 +122,8 @@ fn privileged_etf_receiver() {
 /// ADR-0109 point 8: over a real `etf` leaf, a reliable publication's
 /// dropped datagram is caught up on the immediate route and every message
 /// is delivered; an unreliable one's is a gap at the receiver, and the
-/// rest is delivered.
+/// rest is delivered; under cancel-on-deadline the drop aborts its lane's
+/// incarnation, sealed `DeadlineMissed`.
 #[test]
 #[ignore = "needs the privileged gate's veth pair, etf qdisc and peer namespace"]
 fn privileged_etf_drops_are_caught_up_or_gapped() {
@@ -130,7 +131,7 @@ fn privileged_etf_drops_are_caught_up_or_gapped() {
         return;
     }
     for (reliable, port) in [(true, 47_300u16), (false, 47_301)] {
-        let (got, counts) = run(reliable, port);
+        let (got, counts, sealed) = run((reliable, false), port);
         // One drop, matched by its report; the margin keeps late reports
         // at zero (ADR-0109 point 7).
         assert_eq!(
@@ -138,6 +139,7 @@ fn privileged_etf_drops_are_caught_up_or_gapped() {
             (1, 0),
             "{counts:?}, got {got:?}"
         );
+        assert_eq!(sealed, None);
         if reliable {
             assert_eq!((counts.caught_up, counts.gaps), (1, 0), "{counts:?}");
             assert_eq!(got, [(0, 0), (0, 1), (1, 0), (1, 1)], "delivered complete");
@@ -146,11 +148,41 @@ fn privileged_etf_drops_are_caught_up_or_gapped() {
             assert_eq!(got, [(0, 0), (0, 1), (1, 1)], "a gap where the drop was");
         }
     }
+    // Under cancel-on-deadline the drop aborts lane 1's incarnation: the
+    // conductor seals it `DeadlineMissed`, the sender catches nothing up,
+    // nothing behind the abort is sent, and lane 0 goes on. The dropped
+    // message was submitted and keeps that final record (G7): a receiver's
+    // NAK may still repair it, as for any submitted message.
+    let (got, counts, sealed) = run((true, true), 47_302);
+    assert_eq!(
+        (counts.dropped, counts.aborts),
+        (1, 1),
+        "{counts:?}, got {got:?}"
+    );
+    assert_eq!(
+        (counts.caught_up, counts.gaps, counts.late_drop_reports),
+        (0, 0, 0),
+        "{counts:?}"
+    );
+    assert_eq!(
+        sealed,
+        Some(karyos_sys::log_buffer::SealReason::DeadlineMissed)
+    );
+    let lane0: Vec<_> = got.iter().filter(|(lane, _)| *lane == 0).copied().collect();
+    assert_eq!(lane0, [(0, 0), (0, 1)], "lane 0 goes on: {got:?}");
+    assert!(!got.contains(&(1, 1)), "nothing behind the abort: {got:?}");
 }
 
 /// One run: the receiver in `peer`, the publication here; what the
 /// receiver got, sorted, and what the etf drop ledger counted.
-fn run(reliable: bool, port: u16) -> (Vec<(u8, u32)>, crate::agents::data::etf::EtfCounts) {
+fn run(
+    (reliable, cancel): (bool, bool),
+    port: u16,
+) -> (
+    Vec<(u8, u32)>,
+    crate::agents::data::etf::EtfCounts,
+    Option<karyos_sys::log_buffer::SealReason>,
+) {
     let exe = std::env::current_exe().unwrap();
     let mut child = Command::new("ip")
         .args(["netns", "exec", "peer"])
@@ -192,7 +224,8 @@ fn run(reliable: bool, port: u16) -> (Vec<(u8, u32)>, crate::agents::data::etf::
     config.stream.buffer.schedule_capacity = 8;
     let options = ScheduleOptions::default()
         .with_route(TimedRoute::Etf { advance: DELTA })
-        .with_max_horizon(2_000 * MS);
+        .with_max_horizon(2_000 * MS)
+        .with_cancel_on_deadline(cancel);
     let publication = a
         .add_timed_network_publication(
             config,
@@ -235,11 +268,10 @@ fn run(reliable: bool, port: u16) -> (Vec<(u8, u32)>, crate::agents::data::etf::
             if now < start + at {
                 break;
             }
-            let outcome = lanes[lane]
-                .offer_at(&index.to_le_bytes(), start + time)
-                .unwrap();
+            let outcome = lanes[lane].offer_at(&index.to_le_bytes(), start + time);
+            // Under cancel-on-deadline lane 1 may be sealed by then.
             assert!(
-                matches!(outcome, OfferOutcome::Accepted { .. }),
+                matches!(outcome, Ok(OfferOutcome::Accepted { .. })) || (cancel && lane == 1),
                 "{outcome:?}"
             );
             next += 1;
@@ -251,5 +283,10 @@ fn run(reliable: bool, port: u16) -> (Vec<(u8, u32)>, crate::agents::data::etf::
     let _ = child.wait().unwrap();
     got.sort_unstable();
     let counts = shared(&mut a).sender.etf_counts(0).unwrap();
-    (got, counts)
+    let sealed = a
+        .stream_ref(publication.lane(Lane::try_new(1).unwrap()).unwrap())
+        .unwrap()
+        .conductor
+        .seal_reason();
+    (got, counts, sealed)
 }

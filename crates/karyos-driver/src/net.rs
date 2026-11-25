@@ -714,6 +714,10 @@ pub(crate) struct ScheduleViolation {
     pub(crate) incarnation: u64,
     /// The lane.
     pub(crate) lane: u8,
+    /// A missed deadline under cancel-on-deadline (`DeadlineMissed`,
+    /// ADR-0109 point 8), sealed with `SealReason::DeadlineMissed`, not a
+    /// breach of the publisher.
+    pub(crate) deadline: bool,
 }
 
 /// Schedule violations for the conductor to apply, drained every serve:
@@ -3989,6 +3993,32 @@ fn publication_answer<T: StreamTerms>(
                 }
             }
         }
+        // A timed lane missed its deadline under cancel-on-deadline: sealed
+        // by the conductor's violation hook if it names the live
+        // publication (ADR-0109 point 8).
+        AgentEvent::DeadlineMissed {
+            endpoint,
+            alias,
+            registration,
+            incarnation,
+            lane,
+        } => {
+            let live = find(publications, endpoint, alias, registration)
+                .and_then(|index| publications.get(index))
+                .is_some_and(|entry| {
+                    entry.state == NetworkPublicationState::Active && lane < entry.lanes
+                });
+            if live {
+                violations.push(ScheduleViolation {
+                    registration,
+                    incarnation,
+                    lane,
+                    deadline: true,
+                });
+            } else {
+                violations.drop_one();
+            }
+        }
         // A timed lane's publisher breached its ring: applied by the
         // conductor if it names the live publication.
         AgentEvent::ScheduleViolated {
@@ -4008,6 +4038,7 @@ fn publication_answer<T: StreamTerms>(
                     registration,
                     incarnation,
                     lane,
+                    deadline: false,
                 });
             } else {
                 violations.drop_one();

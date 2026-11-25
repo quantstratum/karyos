@@ -31,10 +31,6 @@ pub enum TimedNetworkUnsupported {
     /// The `Tai` clock domain: the sender runs on the monotonic clock.
     #[error("the Tai clock domain")]
     TaiDomain,
-    /// Cancel-on-deadline: the sealing it needs is the conductor's, which
-    /// the sender agent does not hold.
-    #[error("cancel-on-deadline")]
-    CancelOnDeadline,
     /// A horizon that, with one heartbeat interval, reaches the image
     /// liveness timeout: a lane holding only a head that far ahead sends
     /// nothing (no DATA, and no idle heartbeat while a head is staged),
