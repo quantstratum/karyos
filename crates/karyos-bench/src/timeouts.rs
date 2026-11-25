@@ -13,9 +13,14 @@
 //!   scheduler, the host's load and any stall add to a timer, which is what
 //!   a node's election and heartbeat timers see.
 //! - **Round trips** ([`echo`], [`rtt`]): UDP datagrams of a fixed size
-//!   sent every `interval` to an echo on the other host; each answer's
-//!   round trip is a sample, and a datagram without answer within a second
-//!   is lost and counted, never a sample.
+//!   sent to an echo on the other host, stop and wait: each goes once the
+//!   last was answered or lost, and at least `interval` after it. Each
+//!   answer's round trip is a sample; a datagram without answer by its own
+//!   deadline ([`LOST_AFTER`] after it was sent, on the monotonic clock) is
+//!   lost and counted, never a sample, however late its answer comes. A
+//!   lost datagram delays the next by up to the deadline, so the report
+//!   states the cadence the run kept ([`Report::cadence_us`]) beside the
+//!   interval it was given.
 //! - **Load** ([`load_average`]): the one-minute load average, sampled once
 //!   a second through the run: its least, mean and most go in the report.
 //!
@@ -105,6 +110,10 @@ pub struct Report {
     pub tail: Tail,
     /// Datagrams without answer (a round trip's).
     pub lost: u64,
+    /// The mean time between one sample or send and the next, as the run
+    /// kept it, in microseconds: the period stretched by slow answers and
+    /// losses.
+    pub cadence_us: u64,
     /// The host's load while it ran.
     pub load: Load,
 }
@@ -114,7 +123,7 @@ impl Report {
     #[must_use]
     pub fn json(&self) -> String {
         format!(
-            "{{\"probe\":\"{}\",\"host\":\"{}\",\"peer\":{},\"period_us\":{},\"size\":{},\"count\":{},\"p50_us\":{},\"p99_us\":{},\"p999_us\":{},\"max_us\":{},\"lost\":{},\"load1_samples\":{},\"load1_min\":{:.2},\"load1_mean\":{:.2},\"load1_max\":{:.2}}}",
+            "{{\"probe\":\"{}\",\"host\":\"{}\",\"peer\":{},\"period_us\":{},\"size\":{},\"count\":{},\"p50_us\":{},\"p99_us\":{},\"p999_us\":{},\"max_us\":{},\"lost\":{},\"cadence_us\":{},\"load1_samples\":{},\"load1_min\":{:.2},\"load1_mean\":{:.2},\"load1_max\":{:.2}}}",
             self.probe,
             escape(&self.host),
             self.peer
@@ -129,6 +138,7 @@ impl Report {
             self.tail.p999_us,
             self.tail.max_us,
             self.lost,
+            self.cadence_us,
             self.load.samples,
             self.load.min,
             self.load.mean,
@@ -213,11 +223,21 @@ pub fn pause(run: Duration, tick: Duration) -> Report {
         peer: None,
         period_us: u64::try_from(tick.as_micros()).unwrap_or(u64::MAX),
         size: None,
+        cadence_us: cadence(start.elapsed(), samples.len()),
         tail: Tail::of(&samples),
         lost: 0,
         load: Load::of(&loads),
     }
 }
+
+/// The mean of `elapsed` over `count` steps, in microseconds.
+fn cadence(elapsed: Duration, count: usize) -> u64 {
+    let count = u128::try_from(count).unwrap_or(u128::MAX).max(1);
+    u64::try_from(elapsed.as_micros() / count).unwrap_or(u64::MAX)
+}
+
+/// How long a datagram waits for its answer before it is lost.
+pub const LOST_AFTER: Duration = Duration::from_secs(1);
 
 /// Answers every datagram on `bind` with itself, for `run`.
 ///
@@ -255,14 +275,30 @@ fn datagram(sequence: u64, size: usize) -> Vec<u8> {
     bytes
 }
 
-/// Sends `count` datagrams of `size` bytes to the echo at `to`, one every
-/// `interval`, and takes each answer's round trip; one without answer
-/// within a second is lost.
+/// Sends `count` datagrams of `size` bytes to the echo at `to`, stop and
+/// wait, at least `interval` apart, and takes each answer's round trip;
+/// one without answer within [`LOST_AFTER`] is lost.
 ///
 /// # Errors
 ///
 /// The socket's errors.
 pub fn rtt(to: SocketAddr, count: u64, interval: Duration, size: usize) -> io::Result<Report> {
+    rtt_within(to, count, interval, size, LOST_AFTER)
+}
+
+/// [`rtt`], a datagram lost once `lost_after` has passed since it was sent
+/// without its answer.
+///
+/// # Errors
+///
+/// The socket's errors.
+pub fn rtt_within(
+    to: SocketAddr,
+    count: u64,
+    interval: Duration,
+    size: usize,
+    lost_after: Duration,
+) -> io::Result<Report> {
     let bind: SocketAddr = if to.is_ipv4() {
         "0.0.0.0:0".parse().map_err(io::Error::other)?
     } else {
@@ -270,27 +306,40 @@ pub fn rtt(to: SocketAddr, count: u64, interval: Duration, size: usize) -> io::R
     };
     let socket = UdpSocket::bind(bind)?;
     socket.connect(to)?;
-    socket.set_read_timeout(Some(Duration::from_secs(1)))?;
     let mut samples = Vec::new();
     let mut loads = Vec::new();
     let mut lost = 0u64;
     let mut buf = [0u8; 1500];
-    let mut next_load = Instant::now();
+    let start = Instant::now();
+    let mut next_load = start;
     for sequence in 0..count {
         if Instant::now() >= next_load {
             loads.extend(load_average());
             next_load += Duration::from_secs(1);
         }
         let sent = Instant::now();
+        let deadline = sent + lost_after;
         let _ = socket.send(&datagram(sequence, size))?;
-        // An answer to an earlier datagram, arriving late, is skipped.
+        // An answer to an earlier datagram, arriving late, is skipped; each
+        // wait is bounded by this datagram's own deadline.
         loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                lost += 1;
+                break;
+            }
+            socket.set_read_timeout(Some(left))?;
             match socket.recv(&mut buf) {
                 Ok(length) if length >= 8 => {
                     let mut seq = [0u8; 8];
                     seq.copy_from_slice(buf.get(..8).unwrap_or(&[0; 8]));
                     if u64::from_le_bytes(seq) == sequence {
-                        samples.push(micros(sent.elapsed()));
+                        let elapsed = sent.elapsed();
+                        if elapsed <= lost_after {
+                            samples.push(micros(elapsed));
+                        } else {
+                            lost += 1;
+                        }
                         break;
                     }
                 }
@@ -317,6 +366,10 @@ pub fn rtt(to: SocketAddr, count: u64, interval: Duration, size: usize) -> io::R
         peer: Some(to.to_string()),
         period_us: u64::try_from(interval.as_micros()).unwrap_or(u64::MAX),
         size: Some(size.max(8)),
+        cadence_us: cadence(
+            start.elapsed(),
+            usize::try_from(count).unwrap_or(usize::MAX),
+        ),
         tail: Tail::of(&samples),
         lost,
         load: Load::of(&loads),
@@ -384,5 +437,40 @@ mod tests {
         assert!(report.json().contains(&format!("\"peer\":\"{address}\"")));
         assert!(report.json().contains("\"size\":64,"));
         assert_eq!(server.join().unwrap().unwrap(), 50);
+        assert!(report.json().contains("\"cadence_us\":"));
+    }
+
+    /// An echo that answers every datagram `delay` late: past each
+    /// datagram's deadline, so every one is lost and none is a sample, and
+    /// the run keeps the deadline's cadence, not the answers'.
+    #[test]
+    fn an_answer_past_its_deadline_is_lost_and_never_a_sample() {
+        let echo = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = echo.local_addr().unwrap();
+        echo.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            let mut answered = 0;
+            while let Ok((length, from)) = echo.recv_from(&mut buf) {
+                std::thread::sleep(Duration::from_millis(80));
+                let _ = echo.send_to(&buf[..length], from).unwrap();
+                answered += 1;
+            }
+            answered
+        });
+        let report = rtt_within(
+            address,
+            4,
+            Duration::from_millis(1),
+            64,
+            Duration::from_millis(30),
+        )
+        .unwrap();
+        assert_eq!((report.lost, report.tail.count), (4, 0), "{report:?}");
+        assert!(
+            (30_000..80_000).contains(&report.cadence_us),
+            "the deadline's cadence: {report:?}"
+        );
+        assert_eq!(server.join().unwrap(), 4);
     }
 }

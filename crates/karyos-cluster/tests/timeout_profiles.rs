@@ -213,6 +213,9 @@ struct Run {
     changes: u64,
     /// Time in the window with no leader.
     leaderless_us: u64,
+    /// Whether it elected a first leader and observed its whole window: a
+    /// run that did not counts no change, and proves nothing.
+    observed: bool,
     /// Whether the window ended with a leader to crash.
     crashed: bool,
     /// The time from the crash until a surviving node led.
@@ -275,6 +278,7 @@ fn run(profile: &TimeoutProfile, (pause, rtt): (Tail, Tail), seed: u64) -> Run {
             if let Some(since) = leaderless_since.take() {
                 result.leaderless_us += start + WINDOW_US - since;
             }
+            result.observed = true;
             // The window ends: the leader crashes, if there is one.
             match cores.iter().find(|(_, core)| core.role() == Role::Leader) {
                 Some((&leader, _)) => {
@@ -419,6 +423,8 @@ const HOLD_OUT: std::ops::RangeInclusive<u64> = 1_001..=1_000 + RUNS;
 #[derive(Debug, Default)]
 struct Summary {
     changes: u64,
+    /// Runs that elected a first leader and observed their whole window.
+    observed: u64,
     leaderless_us: u64,
     crashes: u64,
     recoveries: u64,
@@ -437,6 +443,7 @@ fn evaluate(
     for seed in seeds {
         let run = run(profile, tails, seed);
         summary.changes += run.changes;
+        summary.observed += u64::from(run.observed);
         summary.leaderless_us += run.leaderless_us;
         summary.crashes += u64::from(run.crashed);
         recoveries.extend(run.recovery_us);
@@ -459,10 +466,19 @@ fn candidate(profile: &TimeoutProfile, min: u32) -> TimeoutProfile {
     }
 }
 
+impl Summary {
+    /// Every run elected a leader and observed its whole window, with no
+    /// leader change in any.
+    const fn qualifies(&self, runs: u64) -> bool {
+        self.changes == 0 && self.observed == runs
+    }
+}
+
 /// The swept values, in ticks.
 const SWEEP: [u32; 9] = [4, 6, 8, 12, 16, 24, 32, 48, 64];
 
-/// The smallest swept value with no leader change on the choice seeds,
+/// The smallest swept value that qualifies on the choice seeds (every run
+/// elected a leader and observed its whole window, with no leader change),
 /// doubled.
 ///
 /// # Panics
@@ -472,14 +488,15 @@ fn rule(profile: &TimeoutProfile, tails: (Tail, Tail)) -> u32 {
     let floor = SWEEP
         .iter()
         .copied()
-        .find(|&min| evaluate(&candidate(profile, min), tails, CHOICE).changes == 0)
-        .unwrap_or_else(|| panic!("{}: no swept value is free of leader changes", profile.name));
+        .find(|&min| evaluate(&candidate(profile, min), tails, CHOICE).qualifies(RUNS))
+        .unwrap_or_else(|| panic!("{}: no swept value qualifies", profile.name));
     floor * 2
 }
 
-/// The shipped defaults follow the rule: each is twice a swept floor with
-/// no leader change, every smaller swept value has some, and the default
-/// itself has none on the choice seeds and on the hold-out ones, with a
+/// The shipped defaults follow the rule: each is twice a swept floor that
+/// qualifies (every run elected a leader and observed its whole window,
+/// with no leader change), no smaller swept value does, and the default
+/// itself qualifies on the choice seeds and on the hold-out ones, with a
 /// crash and a recovery in every run.
 #[test]
 fn the_defaults_follow_the_rule() {
@@ -499,22 +516,26 @@ fn the_defaults_follow_the_rule() {
             .iter()
             .position(|&min| min == floor)
             .unwrap_or_else(|| panic!("{}: floor {floor} is not swept", profile.name));
-        assert_eq!(
-            evaluate(&candidate(profile, floor), (pause, rtt), CHOICE).changes,
-            0,
-            "{}: leader changes at the floor",
+        let at_floor = evaluate(&candidate(profile, floor), (pause, rtt), CHOICE);
+        assert!(
+            at_floor.qualifies(RUNS),
+            "{}: the floor does not qualify: {at_floor:?}",
             profile.name
         );
         for &below in SWEEP.get(..at).unwrap_or(&[]) {
             assert!(
-                evaluate(&candidate(profile, below), (pause, rtt), CHOICE).changes > 0,
-                "{}: no leader change below the floor, at {below}",
+                !evaluate(&candidate(profile, below), (pause, rtt), CHOICE).qualifies(RUNS),
+                "{}: {below}, below the floor, qualifies",
                 profile.name
             );
         }
         for seeds in [CHOICE, HOLD_OUT] {
             let summary = evaluate(profile, (pause, rtt), seeds.clone());
-            assert_eq!(summary.changes, 0, "{} {seeds:?}", profile.name);
+            assert!(
+                summary.qualifies(RUNS),
+                "{} {seeds:?}: {summary:?}",
+                profile.name
+            );
             assert_eq!(
                 (summary.crashes, summary.recoveries),
                 (RUNS, RUNS),
@@ -555,4 +576,21 @@ fn sweep() {
             held.recovery_worst_us as f64 / 1000.0
         );
     }
+}
+
+/// A run that never elects a leader counts no change but does not
+/// qualify: the rule cannot take a value whose runs observed nothing.
+#[test]
+fn a_run_without_a_leader_does_not_qualify() {
+    let (profile, pause, rtt) = PROFILES[0];
+    // Ticks two minutes apart: no election timeout runs out before the
+    // bootstrap deadline, so no leader is elected.
+    let silent = TimeoutProfile {
+        tick_us: 120_000_000,
+        ..*profile
+    };
+    let run = run(&silent, (pause, rtt), 1);
+    assert_eq!((run.changes, run.observed), (0, false));
+    let summary = evaluate(&silent, (pause, rtt), 1..=2);
+    assert!(!summary.qualifies(2), "{summary:?}");
 }
