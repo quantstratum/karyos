@@ -50,6 +50,11 @@ pub enum ErrorCode {
     /// broken invariant); the walker's duty retries the claim abort. The
     /// key is the guard id.
     GuardSealFailed = 11,
+    /// On the `etf` route, a drop report arrived after its entry was
+    /// retired as sent (ADR-0109 point 7): nothing was resubmitted. The key
+    /// is the aggregate registration and the report's time; the message
+    /// names the lane.
+    EtfLateDropReport = 12,
 }
 
 /// The agent that reported an error.
