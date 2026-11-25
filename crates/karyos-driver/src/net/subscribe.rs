@@ -52,6 +52,7 @@ use crate::agents::images::DEFAULT_MAX_IMAGE_TERM_LENGTH;
 use crate::embedded::{AggregateHandle, EmbeddedDriver, StreamTerms};
 use crate::error::DriverError;
 use crate::membership::ReceiverIdentity;
+use karyos_sys::log_buffer::Role;
 
 /// The local address and multicast group of each later path of a
 /// channel with `paths` (redundant-paths.md): multicast IPv4 only, each
@@ -378,7 +379,63 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         &mut self,
         subscription: NetworkSubscription,
     ) -> Result<bool, DriverError> {
+        // Its awaiting entry goes with it (ADR-0100 decision 5): a cell
+        // registered for it and not placed yet ends at `Installed`, and one
+        // placed is withdrawn now.
+        if let Some(index) = self
+            .embedded_awaiting
+            .iter()
+            .position(|(awaiting, _)| *awaiting == subscription)
+        {
+            let (_, entry) = self.embedded_awaiting.swap_remove(index);
+            self.withdraw_awaiting(|awaiting| awaiting.parent == entry.parent);
+            self.refresh_awaiting();
+        }
         self.unsubscribe_network(subscription)
+    }
+
+    /// Makes `subscription` await its images as `role` (ADR-0100 decisions
+    /// 1 to 3, for an in-process subscription of the embedded API): each
+    /// image of its key built from now on gets a reader cell of `role` at
+    /// its join on every lane, which [`EmbeddedDriver::subscribe_image_of`]
+    /// adopts, so the reader starts at the image's first position whatever
+    /// the image received before. A required cell bounds the image's
+    /// consumption at the join until it is adopted, the subscription is
+    /// removed, or `image_join_deadline` passes. Calling it again for the
+    /// same subscription changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::NetworkUnavailable`] for a driver without a network.
+    pub fn await_network_images(
+        &mut self,
+        subscription: NetworkSubscription,
+        role: Role,
+    ) -> Result<(), DriverError> {
+        if self.net.is_none() {
+            return Err(DriverError::NetworkUnavailable);
+        }
+        if self
+            .embedded_awaiting
+            .iter()
+            .any(|(awaiting, _)| *awaiting == subscription)
+        {
+            return Ok(());
+        }
+        let parent = crate::embedded::EMBEDDED_AWAITING_PARENT | self.next_embedded_parent;
+        self.next_embedded_parent = self.next_embedded_parent.saturating_add(1);
+        self.embedded_awaiting.push((
+            subscription,
+            crate::agents::images::AwaitingEntry {
+                endpoint: subscription.endpoint(),
+                stream_id: subscription.stream_id(),
+                parent,
+                client: crate::embedded::EMBEDDED_AWAITING_CLIENT,
+                role,
+            },
+        ));
+        self.refresh_awaiting();
+        Ok(())
     }
 
     /// The aggregate exposing the image of `stream_id` and `session_id`,
