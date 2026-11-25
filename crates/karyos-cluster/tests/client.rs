@@ -55,7 +55,7 @@ fn registered(window: u32) -> (SessionTable, Registered, ClusterClient) {
 /// The answer, as the client reads it, to `request` applied on `table`;
 /// `applied` counts how often the command ran.
 fn apply(table: &mut SessionTable, request: Request, at: u64, applied: &mut u32) -> Answer {
-    match table.request(request, at, |reply| {
+    match table.request(request, b"op", at, |reply| {
         *applied += 1;
         reply[0] = 1;
         Some(1)
@@ -66,6 +66,7 @@ fn apply(table: &mut SessionTable, request: Request, at: u64, applied: &mut u32)
         Outcome::ReplyTooLarge => Answer::ReplyTooLarge,
         Outcome::SessionExpired => Answer::SessionExpired,
         Outcome::WindowFull => Answer::WindowFull,
+        Outcome::PayloadMismatch => Answer::PayloadMismatch,
         Outcome::OutOfOrder { expected } => Answer::OutOfOrder { expected },
         other => panic!("{other:?}"),
     }
@@ -344,11 +345,13 @@ fn the_advertised_window_is_read_and_held_to() {
     );
 }
 
-/// Sequences 0 and 1 delivered in reverse: the cluster refuses 1 typed,
+/// Sequences 0 and 1 delivered in reverse, under a log of an earlier
+/// build (sessions take sequences in order): the cluster refuses 1 typed,
 /// the client keeps it outstanding, and once 0 is applied a retry of 1 is.
 #[test]
 fn an_out_of_order_refusal_reaches_the_caller_typed_and_is_retried() {
     let (mut table, _, mut client) = registered(4);
+    table.set_exact(false);
     let mut applied = 0;
     let first = client.submit().unwrap();
     let second = client.submit().unwrap();
@@ -466,4 +469,42 @@ fn a_larger_window_on_a_new_session_is_reserved_whole() {
     });
     assert_eq!(allocations, 0);
     assert_eq!(client.submit(), Err(SubmitError::WindowFull { window: 16 }));
+}
+
+/// Under the exact identity, sequences delivered in reverse both apply,
+/// once each; a retry carrying another command is refused as a mismatch
+/// and reaches the caller as its outcome.
+#[test]
+fn reverse_delivery_applies_under_the_exact_identity_and_a_mismatch_is_typed() {
+    let (mut table, _, mut client) = registered(4);
+    let mut applied = 0;
+    let first = client.submit().unwrap();
+    let second = client.submit().unwrap();
+    for sent in [second, first] {
+        let answer = apply(&mut table, sent.request, 1, &mut applied);
+        let seen = events(|sink| client.replied(sent.key, 1, Reply::Outcome(answer), sink));
+        assert_eq!(
+            seen,
+            vec![Event::Completed {
+                sequence: sent.request.sequence,
+                answer: Answer::Applied
+            }]
+        );
+    }
+    assert_eq!(applied, 2);
+    let third = client.submit().unwrap();
+    let _ = apply(&mut table, third.request, 2, &mut applied);
+    let again = client.retry(third.request.sequence).unwrap();
+    let outcome = table.request(again.request, b"another", 3, |_| Some(0));
+    assert_eq!(outcome, Outcome::PayloadMismatch);
+    let reply = Reply::Outcome(Answer::PayloadMismatch);
+    let seen = events(|sink| client.replied(again.key, 1, reply, sink));
+    assert_eq!(
+        seen,
+        vec![Event::Completed {
+            sequence: 2,
+            answer: Answer::PayloadMismatch
+        }]
+    );
+    assert_eq!(applied, 3);
 }

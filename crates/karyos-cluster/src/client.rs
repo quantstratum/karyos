@@ -36,8 +36,10 @@
 //!   sequence): it may have been applied. The client never resends an
 //!   unknown request on its own (item 44); its caller does, by
 //!   [`ClusterClient::retry`], and deduplication makes that safe. An
-//!   unknown request keeps its place in the window: the cluster expects its
-//!   sequence before any later one, so giving it up takes a new session.
+//!   unknown request keeps its place in the window until it has an
+//!   outcome: the lowest unanswered sequence every request carries stays
+//!   at it, so the cluster keeps its reply for the retry; giving it up
+//!   takes a new session.
 //! - **Generations.** The client keeps the highest cluster generation it
 //!   has seen, raised only by an answer to one of its outstanding requests
 //!   or by [`ClusterClient::leader_changed`]; an answer or an announcement
@@ -106,8 +108,12 @@ pub enum Answer {
     SessionExpired,
     /// The session's window is full: not applied, retry later.
     WindowFull,
-    /// The sequence is past the one the session expects: not applied; the
-    /// earlier one comes first.
+    /// The identity applied before with another command: not applied, and
+    /// not a duplicate; a client's bug.
+    PayloadMismatch,
+    /// Under a log written by an earlier build, whose sessions take
+    /// sequences in order: the sequence is past the one the session
+    /// expects; not applied, the earlier one comes first.
     OutOfOrder {
         /// The sequence the session expects.
         expected: u64,
