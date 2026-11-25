@@ -165,18 +165,26 @@ fn dropping_the_driver_joins_a_late_agent() {
         .sender
         .post(|_reply| AgentCommand::Block(command))
         .unwrap();
+    // The releaser records when it releases the agent, and the drop must
+    // return after that instant: it joined the late agent instead of
+    // detaching it. Not a fixed 50 ms: the releaser's timer started before
+    // the 20 ms wait below, which a loaded host stretched, leaving less
+    // than 50 ms when the drop started (karyos#1067; diagnosed by impl-d).
     let release = Arc::clone(&blocked);
+    let released = Arc::new(std::sync::Mutex::new(None::<Instant>));
+    let released_at = Arc::clone(&released);
     let releaser = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(100));
+        *released_at.lock().unwrap() = Some(Instant::now());
         release.store(false, Ordering::Release);
     });
     // Let the agent take the command before the driver stops it.
     std::thread::sleep(Duration::from_millis(20));
-    let started = Instant::now();
     drop(driver);
-    let waited = started.elapsed();
+    let returned = Instant::now();
     releaser.join().unwrap();
-    assert!(waited >= Duration::from_millis(50), "{waited:?}");
+    let released = released.lock().unwrap().expect("never released");
+    assert!(returned >= released, "the drop returned before the release");
     assert_eq!(Arc::strong_count(&blocked), 1, "the agent was dropped");
 }
 

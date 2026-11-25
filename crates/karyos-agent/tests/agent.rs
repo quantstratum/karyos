@@ -1204,9 +1204,15 @@ fn the_view_shows_the_retention_state_of_a_running_archive() {
         AgentConfig::new(vec![dir.clone()]).with_archive(
             dir.clone(),
             CatalogConfig::new(ArchiveStreams::new(REQUESTS, RESPONSES).with_retention(STATE))
+                // The listing's deadline above this test's own wait: the
+                // driver and the Archive are served by this thread, which a
+                // loaded host slows, and a listing cut at 5 s ended its
+                // session and started over until the wait ran out
+                // (karyos#1067). This test checks the view, not the
+                // deadline, which `catalog.rs`'s own tests cover.
                 .with_timing(
                     Duration::from_secs(2),
-                    Duration::from_secs(5),
+                    Duration::from_secs(120),
                     Duration::from_millis(50),
                 ),
         ),

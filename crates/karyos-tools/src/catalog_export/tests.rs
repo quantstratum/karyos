@@ -8,7 +8,7 @@
 use std::ffi::OsString;
 
 use super::{run_export, run_verify_export};
-use crate::catalog_verify::tests::{OPERATOR, RECORDING, archive, hex};
+use crate::catalog_verify::tests::{OPERATOR, RECORDING, archive, hex, open_journal};
 
 fn run(
     f: fn(Vec<OsString>, &mut dyn std::io::Write, &mut dyn std::io::Write) -> u8,
@@ -135,7 +135,6 @@ fn an_existing_out_is_never_overwritten() {
 #[test]
 fn a_purged_prefix_exports_only_the_retained_span() {
     use karyos_archive::disk::StdDisk;
-    use karyos_archive::integrity::journal::IntegrityJournal;
     use karyos_archive::segment::{SegmentStore, SyncPolicy, recorded_geometry};
     let archive = archive("export-purged");
     let dir = archive.dir();
@@ -147,7 +146,7 @@ fn a_purged_prefix_exports_only_the_retained_span() {
         .store;
     let floor = store.purge_before(8).unwrap();
     drop(store);
-    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let mut journal = open_journal(&dir);
     journal.record_purge(RECORDING, 0, floor, [0; 32]).unwrap();
     drop(journal);
     let file = archive.dir().with_extension("kxe");
