@@ -95,11 +95,14 @@ pub mod trace_export;
     allow(dead_code, reason = "the attach that uses it is Linux only")
 )]
 mod trace_window;
+pub mod two_person;
 
 pub use trace_window::WindowConfig;
 
 #[cfg(target_os = "linux")]
 mod agent;
+#[cfg(target_os = "linux")]
+pub mod approval;
 #[cfg(target_os = "linux")]
 pub mod archive_retention;
 #[cfg(target_os = "linux")]

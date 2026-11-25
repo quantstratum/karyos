@@ -77,7 +77,15 @@
 //!   Cluster's registered admin command, `PARAMETERS` hex or `-`, for the
 //!   roles its registration names, a refusal journalled as
 //!   `{"error":"forbidden"}`, `unregistered command`, `unknown cluster` or
-//!   `operation id conflict` with nothing sent. A `join-put` line may
+//!   `operation id conflict` with nothing sent; `approve OPID` and
+//!   `withdraw OPID` (R-CORE-20, karyos#739; see [`crate::approval`]),
+//!   for every role, the agent checking the approver's role against the
+//!   operation and the withdrawer against its requester. With
+//!   `--two-person`, a marked `submit ... guard-reopen` or
+//!   `cluster-command` answers `{"operation":N,"outcome":
+//!   "pending_approval","expires_in_ms":N}` and sends nothing, and a
+//!   direct `guard-reopen` of a marked class `{"error":"two-person
+//!   required"}`; an unmarked deployment answers as before. A `join-put` line may
 //!   be up to [`MAX_JOIN_REQUEST`] bytes; past it, it is refused above the
 //!   bound `join.request_bytes`. A request this agent knows with arguments it does
 //!   not take is `{"error":"bad arguments","request":NAME}`.
@@ -828,7 +836,13 @@ impl Server {
                         requester,
                         reason.as_bytes(),
                     );
-                    (json::guard_answer(&answer), Served::Operated)
+                    // A marked reopen only through submit (karyos#739).
+                    let served = if answer == crate::operations::GuardAnswer::TwoPersonRequired {
+                        Served::Refused
+                    } else {
+                        Served::Operated
+                    };
+                    (json::guard_answer(&answer), served)
                 } else {
                     forbidden()
                 }
@@ -889,17 +903,16 @@ impl Server {
                 },
             ) => {
                 if may(role, kind) {
-                    match agent.guard_submit_for(
+                    // A marked reopen enters the approval flow (karyos#739).
+                    let answer = agent.submit_for(
                         (operation, token),
                         kind,
                         Path::new(dir),
                         guard,
                         requester,
                         reason.as_bytes(),
-                    ) {
-                        Ok(answer) => (json::guard_answer(&answer), Served::Operated),
-                        Err(refusal) => (json::error(refusal.text(), None), Served::Refused),
-                    }
+                    );
+                    (json::approval_answer(&answer), approval_served(&answer))
                 } else {
                     forbidden()
                 }
@@ -918,18 +931,26 @@ impl Server {
                 // and a refusal journalled, by the agent (karyos#772).
                 let parameters =
                     crate::cluster_admin::parse_parameters(parameters).unwrap_or_default();
-                let answer = agent.cluster_command_for(
+                // A marked command enters the approval flow (karyos#739).
+                let answer = agent.cluster_command_answer_for(
                     (cluster, command, &parameters),
                     operation,
                     (requester, clearance(role)),
                     reason.as_bytes(),
                 );
-                let served = match answer {
-                    crate::cluster_admin::ClusterAnswer::Rejected { .. }
-                    | crate::cluster_admin::ClusterAnswer::BadArguments => Served::Refused,
-                    _ => Served::Operated,
-                };
-                (json::cluster_answer(&answer), served)
+                (json::approval_answer(&answer), approval_served(&answer))
+            }
+            // Any role may ask; the agent checks the approver's role
+            // against the operation, and a withdrawer against its
+            // requester (karyos#739).
+            (Some((requester, role)), Request::Approve { operation }) => {
+                let answer =
+                    agent.approve_for(operation, requester, (role.may_reopen(), clearance(role)));
+                (json::approval_answer(&answer), approval_served(&answer))
+            }
+            (Some((requester, _)), Request::Withdraw { operation }) => {
+                let answer = agent.withdraw_for(operation, requester);
+                (json::approval_answer(&answer), approval_served(&answer))
             }
             (Some((requester, role)), Request::GapAck { position }) => {
                 if role.may_acknowledge() {
@@ -1204,6 +1225,14 @@ enum Request<'a> {
         command: &'a str,
         parameters: &'a str,
         reason: &'a str,
+    },
+    /// `approve OPID` (R-CORE-20, karyos#739).
+    Approve {
+        operation: u64,
+    },
+    /// `withdraw OPID` (R-CORE-20, karyos#739).
+    Withdraw {
+        operation: u64,
     },
     /// `legal-hold RECORDING [REASON]`, `hold-release RECORDING [REASON]`,
     /// `purge RECORDING BEFORE [REASON]` and `seal-verify RECORDING`
@@ -1491,6 +1520,24 @@ fn cluster_command(arguments: &str) -> Option<Request<'_>> {
     })
 }
 
+/// How an answer of the two-person flow (karyos#739) is counted: a refusal,
+/// or an operation made or pending.
+fn approval_served(answer: &crate::approval::ApprovalAnswer) -> Served {
+    use crate::approval::ApprovalAnswer;
+    use crate::cluster_admin::ClusterAnswer;
+    match answer {
+        ApprovalAnswer::Submit(_)
+        | ApprovalAnswer::Refused(_)
+        | ApprovalAnswer::Guard(crate::operations::GuardAnswer::TwoPersonRequired)
+        | ApprovalAnswer::Cluster(
+            ClusterAnswer::Rejected { .. }
+            | ClusterAnswer::BadArguments
+            | ClusterAnswer::TwoPersonRequired,
+        ) => Served::Refused,
+        _ => Served::Operated,
+    }
+}
+
 /// What `role` grants for a product Cluster's admin commands (karyos#772).
 const fn clearance(role: Role) -> crate::cluster_admin::Clearance {
     use crate::cluster_admin::Clearance;
@@ -1567,6 +1614,16 @@ fn request(rest: &str) -> Option<Request<'_>> {
         "submit" => submit(arguments).or(Some(Request::BadArguments("submit"))),
         "cluster-command" => {
             cluster_command(arguments).or(Some(Request::BadArguments("cluster-command")))
+        }
+        // One nonzero operation id (karyos#739).
+        "approve" | "withdraw" => {
+            let operation = number(arguments).filter(|id| *id != 0);
+            Some(match (name, operation) {
+                ("approve", Some(operation)) => Request::Approve { operation },
+                ("approve", None) => Request::BadArguments("approve"),
+                (_, Some(operation)) => Request::Withdraw { operation },
+                (_, None) => Request::BadArguments("withdraw"),
+            })
         }
         "legal-hold" | "hold-release" | "seal-verify" => {
             let (recording, reason) = arguments.split_once(' ').unwrap_or((arguments, ""));
@@ -2203,6 +2260,34 @@ mod tests {
 
     /// M10b: the guard requests and their arguments, a reason being the
     /// rest of the line.
+    /// karyos#739: `approve` and `withdraw` take one nonzero operation id.
+    #[test]
+    fn approve_and_withdraw_take_one_operation_id() {
+        assert!(matches!(
+            parse("KARYOS-AGENT 1 approve 41"),
+            Request::Approve { operation: 41 }
+        ));
+        assert!(matches!(
+            parse("KARYOS-AGENT 1 withdraw 41"),
+            Request::Withdraw { operation: 41 }
+        ));
+        for line in [
+            "KARYOS-AGENT 1 approve",
+            "KARYOS-AGENT 1 approve 0",
+            "KARYOS-AGENT 1 approve 41 42",
+            "KARYOS-AGENT 1 approve x",
+        ] {
+            assert!(
+                matches!(parse(line), Request::BadArguments("approve")),
+                "{line}"
+            );
+        }
+        assert!(matches!(
+            parse("KARYOS-AGENT 1 withdraw 0"),
+            Request::BadArguments("withdraw")
+        ));
+    }
+
     #[test]
     fn guard_requests_parse_with_their_reason() {
         assert_eq!(

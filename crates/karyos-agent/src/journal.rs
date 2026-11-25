@@ -171,6 +171,30 @@ pub enum Kind {
     /// An admin command the agent refused before sending it: its
     /// [`crate::cluster_admin::RefusalCode`] in `code`.
     ClusterRefused,
+    /// A marked operation entered the two-person flow (R-CORE-20,
+    /// karyos#739, ADR-0112), durable before it is answered
+    /// `pending_approval`: the operation id, the requester (`operator`,
+    /// `relay`), the reason, the class in `parameters` (1 a guard reopen,
+    /// 2 a Cluster command), the guard and the epoch it acts at
+    /// (`guard`, `expected`) and the wait in nanoseconds (`word`); after
+    /// the relay word the target (the driver's directory or the Cluster's
+    /// name), the command's name, this host's boot, the parameter bytes
+    /// and the target's instance ([`JournalRecord::bytes`],
+    /// [`JournalRecord::instance`]). It consumes the preview's token and
+    /// reserves the id.
+    ApprovalRequested,
+    /// A distinct principal approved the pending operation (`operator`
+    /// and `relay` the approver's), durable before it is dispatched.
+    ApprovalGranted,
+    /// The requester withdrew the pending operation.
+    ApprovalWithdrawn,
+    /// The operation ended without being sent, its
+    /// [`crate::approval::EndCode`] in `code` and its text in `reason`:
+    /// its deadline passed, the agent restarted while it was pending or
+    /// before its dispatch, or at approval its target had changed, its
+    /// Cluster was busy, its dispatch record could not be made durable or
+    /// its driver was unavailable.
+    ApprovalExpired,
 }
 
 impl Kind {
@@ -198,6 +222,10 @@ impl Kind {
             Self::ClusterRequest => 20,
             Self::ClusterOutcome => 21,
             Self::ClusterRefused => 22,
+            Self::ApprovalRequested => 23,
+            Self::ApprovalGranted => 24,
+            Self::ApprovalWithdrawn => 25,
+            Self::ApprovalExpired => 26,
         }
     }
 
@@ -225,6 +253,10 @@ impl Kind {
             20 => Self::ClusterRequest,
             21 => Self::ClusterOutcome,
             22 => Self::ClusterRefused,
+            23 => Self::ApprovalRequested,
+            24 => Self::ApprovalGranted,
+            25 => Self::ApprovalWithdrawn,
+            26 => Self::ApprovalExpired,
             _ => return None,
         })
     }
@@ -249,6 +281,18 @@ impl Kind {
         matches!(
             self,
             Self::ClusterRequest | Self::ClusterOutcome | Self::ClusterRefused
+        )
+    }
+
+    /// Whether it is one of the two-person flow's records (karyos#739),
+    /// which carry the approval fields after the relay word.
+    pub(crate) const fn is_approval(self) -> bool {
+        matches!(
+            self,
+            Self::ApprovalRequested
+                | Self::ApprovalGranted
+                | Self::ApprovalWithdrawn
+                | Self::ApprovalExpired
         )
     }
 }
@@ -299,6 +343,13 @@ pub struct JournalRecord {
     /// `<algorithm>:<hex digest>`; empty when none was attached, and for
     /// every other kind.
     pub evidence: Vec<u8>,
+    /// An approval record's parameter bytes, a Cluster command's
+    /// (karyos#739); empty for every other kind.
+    pub bytes: Vec<u8>,
+    /// An approval record's target instance (karyos#739): the driver's, or
+    /// the attach instance of the gateway that registered the Cluster; 0
+    /// for every other kind.
+    pub instance: u128,
 }
 
 impl JournalRecord {
@@ -321,6 +372,8 @@ impl JournalRecord {
             boot: Vec::new(),
             command: Vec::new(),
             evidence: Vec::new(),
+            bytes: Vec::new(),
+            instance: 0,
         }
     }
 
@@ -331,7 +384,9 @@ impl JournalRecord {
     /// word (karyos#708). A [`Kind::Submitted`] record always has the relay
     /// word, then its target and boot, each after its length word; a
     /// Cluster record (karyos#772) the relay word, then its target, command
-    /// and evidence the same way. A record no relay carried is byte for byte what
+    /// and evidence the same way; an approval record (karyos#739) the relay
+    /// word, then its target, command, boot, parameter bytes and instance
+    /// (16 little-endian bytes) the same way. A record no relay carried is byte for byte what
     /// it was before relays, and a reader of the layout that stops at the
     /// reason reads either.
     #[must_use]
@@ -352,12 +407,21 @@ impl JournalRecord {
         ];
         let mut out: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
         out.extend_from_slice(reason);
+        let instance = self.instance.to_le_bytes().to_vec();
         let fields: &[&Vec<u8>] = if self.kind == Kind::Submitted {
             // The relay word always, then the target and the boot, each
             // after its length word (karyos#738).
             &[&self.target, &self.boot]
         } else if self.kind.is_cluster() {
             &[&self.target, &self.command, &self.evidence]
+        } else if self.kind.is_approval() {
+            &[
+                &self.target,
+                &self.command,
+                &self.boot,
+                &self.bytes,
+                &instance,
+            ]
         } else {
             &[]
         };
@@ -394,7 +458,9 @@ impl JournalRecord {
         let mut boot = Vec::new();
         let mut command = Vec::new();
         let mut evidence = Vec::new();
-        let relay = if kind == Kind::Submitted || kind.is_cluster() {
+        let mut bytes = Vec::new();
+        let mut instance = 0;
+        let relay = if kind == Kind::Submitted || kind.is_cluster() || kind.is_approval() {
             // The relay word, then the fields by length.
             let (relay, mut rest) = tail.split_first_chunk::<8>()?;
             let mut field = || -> Option<Vec<u8>> {
@@ -407,6 +473,11 @@ impl JournalRecord {
             target = field()?;
             if kind == Kind::Submitted {
                 boot = field()?;
+            } else if kind.is_approval() {
+                command = field()?;
+                boot = field()?;
+                bytes = field()?;
+                instance = u128::from_le_bytes(field()?.try_into().ok()?);
             } else {
                 command = field()?;
                 evidence = field()?;
@@ -438,6 +509,8 @@ impl JournalRecord {
             boot,
             command,
             evidence,
+            bytes,
+            instance,
         })
     }
 }
@@ -572,14 +645,18 @@ pub struct Journal {
     /// The records the open read, for tests.
     #[cfg(test)]
     pub(crate) scanned: Vec<JournalRecord>,
-    /// The [`Kind::Submitted`] records the open read, until taken.
+    /// The records the agent rebuilds its operation ids from, until taken
+    /// ([`Journal::take_operations`]).
     operations: Vec<JournalRecord>,
 }
 
 impl Journal {
     /// The [`Kind::Submitted`] and [`Kind::ClusterRequest`] records the
     /// open read, oldest first, taken once (karyos#738, karyos#772): the
-    /// agent rebuilds its retained outcomes and caller ids from them.
+    /// agent rebuilds its retained outcomes and caller ids from them. With
+    /// them, the two-person flow's records and the dispatch records it
+    /// follows (karyos#739): [`Kind::ReopenRequest`],
+    /// [`Kind::ClusterOutcome`] and the four approval kinds.
     pub fn take_operations(&mut self) -> Vec<JournalRecord> {
         std::mem::take(&mut self.operations)
     }
@@ -1167,7 +1244,14 @@ fn scan(store: &mut SegmentStore<StdDisk>) -> Result<Scan, JournalError> {
                 }
                 #[cfg(test)]
                 found.all.push(record.clone());
-                if matches!(record.kind, Kind::Submitted | Kind::ClusterRequest) {
+                if matches!(
+                    record.kind,
+                    Kind::Submitted
+                        | Kind::ClusterRequest
+                        | Kind::ClusterOutcome
+                        | Kind::ReopenRequest
+                ) || record.kind.is_approval()
+                {
                     found.operations.push(record.clone());
                 }
                 found.last = Some(record);

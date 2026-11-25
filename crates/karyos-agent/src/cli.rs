@@ -11,7 +11,8 @@ usage: karyos-agent --api-dir DIR --driver DIR [--driver DIR]... \
 --role UID=ROLE [--role UID=ROLE]... [--refresh-ms MS] [--lag-bytes N] \
 [--lag-refreshes N] [--loss-quiet N] [--archive DIR=REQ,RESP[,STATE]]... \
 [--journal DIR] [--agent-id NAME] [--relay UID=ID]... \
-[--principal NAME=OPERATOR:ROLE]... [--relay-group GID] [--stop-timeout-ms MS]
+[--principal NAME=OPERATOR:ROLE]... [--relay-group GID] [--stop-timeout-ms MS] \
+[--two-person CLASS[,CLASS...]]... [--approval-wait MS]
 
 Serves API v1 (JSON) on DIR/agent.sock to the uids given a role (viewer,
 operator, risk-officer, administrator, registrar), reading each driver's
@@ -41,7 +42,13 @@ record and exits 0, within MS milliseconds (default 5000); past that
 deadline, on a second signal, or when the record cannot be made durable
 it exits nonzero and the next start records an unknown interval. A
 service manager sends SIGTERM and waits at least MS plus one refresh
-before SIGKILL. Linux only.
+before SIGKILL. --two-person marks operation classes for two people
+(R-CORE-20): guard-reopen, or cluster-command:CLUSTER/COMMAND (a guard
+close cannot be marked); a marked operation is answered pending_approval,
+performs nothing, and waits for approve OPID by another principal, or
+withdraw OPID by its requester, for --approval-wait MS milliseconds
+(default 600000, 10 minutes; at most 86400000, 24 hours); it needs the
+journal. Linux only.
 
 A request is one line: KARYOS-AGENT 1 view, or
 KARYOS-AGENT 1 guard-close DIR GUARD [REASON] (operator, risk-officer),
@@ -59,7 +66,8 @@ administrator (administrator), byte rate and burst 0 0 for no byte limit,
 or KARYOS-AGENT 1 guard-close-preview DIR GUARD [REASON] and
 guard-reopen-preview DIR GUARD [REASON], then submit OPID TOKEN
 guard-close|guard-reopen DIR GUARD [REASON] with the preview's token and
-the caller's operation id (the roles of the operation).
+the caller's operation id (the roles of the operation), or KARYOS-AGENT 1
+approve OPID and withdraw OPID for an operation pending approval.
 ";
 
 /// The default bound of a signal stop (karyos#710).
@@ -98,6 +106,10 @@ pub struct Args {
     /// How long a signal stop may take before the agent exits anyway,
     /// leaving an unclean stop (karyos#710); zero exits at once.
     pub stop_timeout: Duration,
+    /// The operation classes marked for two people (karyos#739).
+    pub two_person: Vec<crate::two_person::TwoPersonClass>,
+    /// How long a marked operation waits for its approval.
+    pub approval_wait: Duration,
 }
 
 /// Parses `args` (without the program name); `None` for anything this
@@ -116,6 +128,8 @@ pub fn parse(args: &[String]) -> Option<Args> {
     let mut principals: Vec<(String, u32, String)> = Vec::new();
     let mut relay_group = None;
     let mut stop_timeout = None;
+    let mut two_person: Vec<crate::two_person::TwoPersonClass> = Vec::new();
+    let mut approval_wait = None;
     let mut args = args.iter();
     while let Some(flag) = args.next() {
         let value = args.next()?;
@@ -176,6 +190,17 @@ pub fn parse(args: &[String]) -> Option<Args> {
                     return None;
                 }
                 principals.push((name.to_owned(), operator, role.to_owned()));
+            }
+            // A guard close is no class: it never waits (karyos#739).
+            "--two-person" => {
+                for class in crate::two_person::TwoPersonClass::parse_list(value)? {
+                    if !two_person.contains(&class) {
+                        two_person.push(class);
+                    }
+                }
+            }
+            "--approval-wait" if approval_wait.is_none() => {
+                approval_wait = Some(crate::two_person::parse_wait(value)?);
             }
             "--stop-timeout-ms" if stop_timeout.is_none() => {
                 stop_timeout = Some(Duration::from_millis(value.parse().ok()?));
@@ -250,6 +275,8 @@ pub fn parse(args: &[String]) -> Option<Args> {
         principals,
         relay_group,
         stop_timeout: stop_timeout.unwrap_or(DEFAULT_STOP_TIMEOUT),
+        two_person,
+        approval_wait: approval_wait.unwrap_or(crate::two_person::DEFAULT_WAIT),
     })
 }
 
@@ -261,6 +288,43 @@ mod tests {
 
     fn args(line: &str) -> Vec<String> {
         line.split_whitespace().map(str::to_owned).collect()
+    }
+
+    /// karyos#739: `--two-person` takes the classes, a guard close never;
+    /// `--approval-wait` defaults to 10 minutes and takes at most 24 hours.
+    #[test]
+    fn two_person_classes_and_the_wait_parse_within_their_bounds() {
+        use crate::two_person::{DEFAULT_WAIT, TwoPersonClass};
+        let base = "--api-dir /run/agent --driver /run/a --role 0=administrator";
+        let parsed = parse(&args(base)).unwrap();
+        assert!(parsed.two_person.is_empty());
+        assert_eq!(parsed.approval_wait, DEFAULT_WAIT);
+        let parsed = parse(&args(&format!(
+            "{base} --two-person guard-reopen,cluster-command:orders/kill \
+             --two-person guard-reopen --approval-wait 30000"
+        )))
+        .unwrap();
+        assert_eq!(
+            parsed.two_person,
+            [
+                TwoPersonClass::GuardReopen,
+                TwoPersonClass::ClusterCommand {
+                    cluster: "orders".to_owned(),
+                    command: "kill".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(parsed.approval_wait, Duration::from_secs(30));
+        for bad in [
+            "--two-person guard-close",
+            "--two-person guard-reopen,guard-close",
+            "--two-person cluster-command:orders",
+            "--approval-wait 0",
+            "--approval-wait 86400001",
+            "--approval-wait 1000 --approval-wait 2000",
+        ] {
+            assert_eq!(parse(&args(&format!("{base} {bad}"))), None, "{bad}");
+        }
     }
 
     #[test]

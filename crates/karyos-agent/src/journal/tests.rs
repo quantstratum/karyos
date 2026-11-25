@@ -342,7 +342,7 @@ fn the_retention_kinds_keep_the_existing_codes() {
     }
     // 17 and 18 are the rate change's (karyos#740), 19 a submit's
     // (karyos#738); 20 to 22 a Cluster admin command's (karyos#772); 23
-    // is no kind yet.
+    // to 26 the two-person flow's (karyos#739); 27 is no kind yet.
     assert_eq!(Kind::from_code(19), Some(Kind::Submitted));
     assert_eq!(Kind::Submitted.code(), 19);
     for (code, kind) in (20u64..).zip([
@@ -353,7 +353,70 @@ fn the_retention_kinds_keep_the_existing_codes() {
         assert_eq!(kind.code(), code);
         assert_eq!(Kind::from_code(code), Some(kind));
     }
-    assert_eq!(Kind::from_code(23), None);
+    for (code, kind) in (23u64..).zip([
+        Kind::ApprovalRequested,
+        Kind::ApprovalGranted,
+        Kind::ApprovalWithdrawn,
+        Kind::ApprovalExpired,
+    ]) {
+        assert_eq!(kind.code(), code);
+        assert_eq!(Kind::from_code(code), Some(kind));
+    }
+    assert_eq!(Kind::from_code(27), None);
+}
+
+/// karyos#739: an approval record round-trips with its target, command,
+/// boot, parameter bytes and instance; the records written before the
+/// approval kinds (a plain request, a relayed one, a submit and a Cluster
+/// record) decode as they did and encode back to the same bytes.
+#[test]
+fn approval_records_round_trip_and_older_records_decode_unchanged() {
+    let mut record = JournalRecord::new(Kind::ApprovalRequested, 9);
+    record.operation = 41;
+    record.operator = 50_002;
+    record.relay = 7;
+    record.reason = b"reopen after the drill".to_vec();
+    record.parameters = 2;
+    record.word = 600_000_000_000;
+    record.target = b"orders".to_vec();
+    record.command = b"kill".to_vec();
+    record.boot = b"boot-a".to_vec();
+    record.bytes = vec![0xab, 0xcd];
+    record.instance = u128::MAX - 3;
+    assert_eq!(JournalRecord::decode(&record.encode()), Some(record));
+    for kind in [
+        Kind::ApprovalGranted,
+        Kind::ApprovalWithdrawn,
+        Kind::ApprovalExpired,
+    ] {
+        let mut record = JournalRecord::new(kind, 10);
+        record.operation = 41;
+        record.code = 3;
+        assert_eq!(JournalRecord::decode(&record.encode()), Some(record));
+    }
+    // A plain request's bytes from before: unchanged.
+    let words: [u64; 11] = [1, 1, 7, 3, 0, 7, 1000, 0xD16E57, 0, 0, 5];
+    let mut payload: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    payload.extend_from_slice(b"drill");
+    let record = JournalRecord::decode(&payload).unwrap();
+    assert_eq!((record.bytes.len(), record.instance), (0, 0));
+    assert_eq!(record.encode(), payload);
+    // A relayed one, a submit and a Cluster record: unchanged too.
+    let mut relayed = request(Kind::ReopenRequest, 8, 3);
+    relayed.relay = 7;
+    let mut submitted = JournalRecord::new(Kind::Submitted, 11);
+    submitted.target = b"/run/a".to_vec();
+    submitted.boot = b"boot-a".to_vec();
+    let mut cluster = JournalRecord::new(Kind::ClusterOutcome, 12);
+    cluster.target = b"orders".to_vec();
+    cluster.command = b"kill".to_vec();
+    cluster.evidence = b"sha256:ab".to_vec();
+    for record in [relayed, submitted, cluster] {
+        let bytes = record.encode();
+        let decoded = JournalRecord::decode(&bytes).unwrap();
+        assert_eq!(decoded, record);
+        assert_eq!(decoded.encode(), bytes);
+    }
 }
 
 /// karyos#985: each durable append seals the recording to its durable end,

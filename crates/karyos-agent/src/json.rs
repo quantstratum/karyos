@@ -359,6 +359,7 @@ pub fn guard_answer(answer: &crate::operations::GuardAnswer) -> String {
         GuardAnswer::UnknownDriver => fields.string("error", "unknown driver"),
         GuardAnswer::Unattached => fields.string("error", "driver unavailable"),
         GuardAnswer::InstanceChanged => fields.string("error", "target changed"),
+        GuardAnswer::TwoPersonRequired => fields.string("error", "two-person required"),
     });
     text
 }
@@ -522,7 +523,40 @@ pub fn cluster_answer(answer: &crate::cluster_admin::ClusterAnswer) -> String {
         }
         ClusterAnswer::JournalUnavailable => fields.string("error", "journal unavailable"),
         ClusterAnswer::Busy => fields.string("error", "busy"),
+        ClusterAnswer::TwoPersonRequired => fields.string("error", "two-person required"),
     });
+    text
+}
+
+/// The answer of a request that may enter the two-person flow, of
+/// `approve` and of `withdraw` (R-CORE-20, karyos#739): pending
+/// `{"operation":N,"outcome":"pending_approval","expires_in_ms":N}`,
+/// withdrawn `{"operation":N,"outcome":"withdrawn"}`, an operation's
+/// outcome as [`guard_answer`] or [`cluster_answer`] write it, or a
+/// refusal `{"error":TEXT}`.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn approval_answer(answer: &crate::approval::ApprovalAnswer) -> String {
+    use crate::approval::ApprovalAnswer;
+    let mut text = String::new();
+    match answer {
+        ApprovalAnswer::Guard(answer) => return guard_answer(answer),
+        ApprovalAnswer::Cluster(answer) => return cluster_answer(answer),
+        ApprovalAnswer::Submit(refusal) => return error(refusal.text(), None),
+        ApprovalAnswer::Refused(refusal) => return error(refusal.text(), None),
+        ApprovalAnswer::Pending {
+            operation,
+            expires_in_ms,
+        } => Out(&mut text).object(|fields| {
+            fields.number("operation", *operation);
+            fields.string("outcome", "pending_approval");
+            fields.number("expires_in_ms", *expires_in_ms);
+        }),
+        ApprovalAnswer::Withdrawn { operation } => Out(&mut text).object(|fields| {
+            fields.number("operation", *operation);
+            fields.string("outcome", "withdrawn");
+        }),
+    }
     text
 }
 

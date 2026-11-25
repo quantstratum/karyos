@@ -104,6 +104,10 @@ fn serve(args: karyos_agent::cli::Args) -> ExitCode {
     if let Some(id) = args.agent_id {
         config = config.with_agent_id(id);
     }
+    // The classes marked for two people and their wait (karyos#739).
+    config = config
+        .with_two_person(args.two_person)
+        .with_approval_wait(args.approval_wait);
     let mut agent = Agent::new(config);
     // The retention operations go to the first configured Archive: they
     // name a recording, not a driver (karyos#967).
