@@ -260,6 +260,16 @@ impl PublicationAuth {
         })
     }
 
+    /// Forgets every receiver binding and boot id (a VM generation
+    /// change; karyos#648): each receiver binds again only through a fresh
+    /// RSP_SETUP, its bound domain 4 verifier erased with it.
+    pub(crate) fn unbind_all(&mut self) {
+        for receiver in &mut self.receivers {
+            receiver.bound = None;
+        }
+        self.boots = BootTable::new(self.receivers.len());
+    }
+
     /// Uses `clock` as the monotonic clock in nanoseconds (tests).
     #[cfg(test)]
     pub(crate) fn set_clock(&mut self, clock: fn() -> u64) {

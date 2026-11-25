@@ -9299,3 +9299,94 @@ fn a_refused_successor_keeps_the_driver_stopped() {
         "each ANNOUNCE under the old identity failed to seal: none went out"
     );
 }
+
+/// karyos#648 (ADR-0086 section 7, "Snapshot rollback and clones"): a VM
+/// generation change drops every authenticated binding and image,
+/// withdraws the session sealers and re-establishes through a fresh
+/// challenge under a fresh `receiver_boot_id`; DATA sealed under the old
+/// establishment, and a receiver control sealed under the old binding,
+/// are refused afterwards.
+#[test]
+fn a_generation_change_reestablishes_the_authenticated_class_and_refuses_what_came_before() {
+    use karyos_protocol::network::{ChallengeBlock, Control, RspChallenge};
+
+    use crate::wire_auth::{ENVELOPE_LEN, Party, Sealer};
+    use crate::wire_enc::VmGenerationWatch;
+    use crate::wire_enc::vm_generation::InjectedSignal;
+
+    let (mut rig, b, channel) = authenticated_rig();
+    let (_, pairwise) = auth_keys(77);
+    let (signal, injector) = InjectedSignal::new();
+    rig.agents
+        .receiver
+        .role
+        .enc_watch(VmGenerationWatch::new(Box::new(signal)));
+    let (quiet, _quiet) = InjectedSignal::new();
+    rig.agents
+        .sender
+        .role
+        .auth_watch(VmGenerationWatch::new(Box::new(quiet)));
+    let slot = established(&mut rig);
+    let old_boot = rig.agents.receiver.role.receiver_of(slot).receiver_boot_id;
+    let old_sender = rig
+        .agents
+        .sender
+        .role
+        .outbound(0)
+        .unwrap()
+        .sealer_party()
+        .unwrap();
+    injector.change();
+    rig.until(true, |rig| {
+        rig.agents
+            .sender
+            .role
+            .outbound(0)
+            .and_then(|outbound| outbound.sealer_party())
+            .is_some_and(|party| party != old_sender)
+    });
+    let Some(Party::Sender {
+        receiver_boot_id, ..
+    }) = rig.agents.sender.role.outbound(0).unwrap().sealer_party()
+    else {
+        panic!("a sender party");
+    };
+    assert_ne!(receiver_boot_id, old_boot, "bound under a fresh boot id");
+    assert!(!crate::wire_enc::vm_generation::quiesced(), "released");
+    // DATA sealed under the old establishment: never delivered.
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let mut old = Sealer::new(&channel, old_sender, alias()).unwrap();
+    let bytes = sealed(&mut old, &stale_frame(9, 0, 32));
+    let before = rig.agents.receiver.counters();
+    let receiver = &mut rig.agents.receiver;
+    receiver
+        .role
+        .inject_datagram(&receiver.sessions, b, source, &bytes, rig.now);
+    let after = rig.agents.receiver.counters();
+    assert_eq!(after.data_committed, before.data_committed, "{after:?}");
+    assert!(
+        after.auth_rejected + after.auth_unbound > before.auth_rejected + before.auth_unbound,
+        "{after:?}"
+    );
+    // A receiver control sealed under the old binding: refused.
+    let old_receiver = Party::Receiver {
+        identity: identity(),
+        receiver_boot_id: old_boot,
+        receiver_id: 77,
+    };
+    let mut sealer = Sealer::new(&pairwise, old_receiver, alias()).unwrap();
+    let control = Control::Challenge(RspChallenge {
+        alias: alias(),
+        identity: identity(),
+        challenge: ChallengeBlock {
+            receiver_boot_id: old_boot,
+            nonce: [9, 9],
+        },
+    });
+    let mut bytes = vec![0u8; karyos_protocol::network::MAX_CONTROL_LENGTH + ENVELOPE_LEN];
+    let length = control.encode(&mut bytes).unwrap();
+    let length = sealer.seal(&mut bytes, length).unwrap();
+    bytes.truncate(length);
+    let a = rig.publisher;
+    assert!(rig.agents.sender.role.open_sealed_for(a, &bytes).is_none());
+}

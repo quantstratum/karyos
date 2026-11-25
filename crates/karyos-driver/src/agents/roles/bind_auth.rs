@@ -285,6 +285,11 @@ impl<T: StreamTerms> ReceiverRole<T> {
 
 #[cfg(test)]
 impl<T: StreamTerms> SenderRole<T> {
+    /// Reads the VM generation signal with `watch` (tests).
+    pub(crate) fn auth_watch(&mut self, watch: crate::wire_enc::VmGenerationWatch) {
+        self.enc.watch(watch);
+    }
+
     /// The authenticated publications bound, the publications whose
     /// session sealer is installed and live, and those waiting for their
     /// remote guard's first open (tests).

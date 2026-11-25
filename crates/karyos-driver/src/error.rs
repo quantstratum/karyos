@@ -109,6 +109,11 @@ pub enum AuthRefusal {
     /// etf route is not designed yet, so it is refused, never run.
     #[error("an etf declaration on an authenticated channel")]
     Etf,
+    /// A VM generation change is not released: no authenticated key is
+    /// derived until every role redrew its identities (ADR-0086 section 7,
+    /// ADR-0114 section 10).
+    #[error("a VM generation change is not released")]
+    GenerationChange,
 }
 
 /// Errors returned by the embedded driver.

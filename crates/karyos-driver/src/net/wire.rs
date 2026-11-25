@@ -222,6 +222,9 @@ pub struct WireKeyCounters {
     pub bindings_deferred: u64,
     /// Authenticated admissions refused for an `etf` declaration.
     pub etf_refused: u64,
+    /// Authenticated admissions refused while a VM generation change was
+    /// not released.
+    pub generation_refused: u64,
 }
 
 /// The driver's durable guard marks, shared by every follow binding that
@@ -456,6 +459,9 @@ impl WireKeys {
         channel: &AuthenticatedChannel,
     ) -> Result<PublicationKeys, DriverError> {
         let view = &*self.view;
+        if crate::wire_enc::vm_generation::quiesced() {
+            return Err(refused(AuthRefusal::GenerationChange));
+        }
         if self.store.is_disabled() {
             return Err(refused(AuthRefusal::KeyStoreDisabled));
         }
@@ -616,6 +622,12 @@ impl WireKeys {
         self.counters.etf_refused = self.counters.etf_refused.saturating_add(1);
     }
 
+    /// Counts an authenticated admission refused while a VM generation
+    /// change was not released.
+    pub(crate) fn count_generation_refused(&mut self) {
+        self.counters.generation_refused = self.counters.generation_refused.saturating_add(1);
+    }
+
     /// Counts an authenticated admission a full ring refused.
     pub(crate) fn count_busy(&mut self) {
         self.counters.admissions_busy = self.counters.admissions_busy.saturating_add(1);
@@ -686,6 +698,10 @@ impl WireKeys {
         stream_id: i32,
     ) -> Result<SubscriptionKeys, DriverError> {
         let view = Arc::clone(&self.view);
+        if crate::wire_enc::vm_generation::quiesced() {
+            self.count_generation_refused();
+            return Err(refused(AuthRefusal::GenerationChange));
+        }
         if self.store.is_disabled() {
             return Err(refused(AuthRefusal::KeyStoreDisabled));
         }

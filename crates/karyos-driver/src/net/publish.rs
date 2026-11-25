@@ -663,11 +663,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     reason: crate::error::AuthRefusal::Ambiguous,
                 });
             }
-            net.wire_keys()
+            let wire = net
+                .wire_keys_mut()
                 .ok_or(DriverError::AuthenticatedRefused {
                     reason: crate::error::AuthRefusal::NoKeyStore,
-                })?
-                .publication(auth)?;
+                })?;
+            if let Err(error) = wire.publication(auth) {
+                if error
+                    == (DriverError::AuthenticatedRefused {
+                        reason: crate::error::AuthRefusal::GenerationChange,
+                    })
+                {
+                    wire.count_generation_refused();
+                }
+                return Err(error);
+            }
         }
         // The channel's `fc` is the strategy (owner item 7, karyos#637):
         // typed roles name the same one, and `max` or `tagged:<group>`

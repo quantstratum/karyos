@@ -363,6 +363,16 @@ impl<T: StreamTerms> Outbound<T> {
         }
     }
 
+    /// Takes out and erases the authenticated session sealer (a VM
+    /// generation change; karyos#648): the publication sends nothing until
+    /// a fresh establishment installs another. Nothing changes for a
+    /// publication of another class.
+    pub(crate) fn retire_auth_sealer(&mut self) {
+        if matches!(self.auth, SenderAuth::Sealing(_)) {
+            self.auth = SenderAuth::Pending;
+        }
+    }
+
     /// Whether the publication is authenticated.
     #[must_use]
     pub fn authenticated(&self) -> bool {

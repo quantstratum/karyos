@@ -846,7 +846,11 @@ impl<T: StreamTerms> ReceiverRole<T> {
     /// When no random word can be drawn the fence stays held and the next
     /// duty tries again (fail closed).
     pub(super) fn on_generation_change(&mut self, sessions: &SessionEnd<T>, now: u64) {
-        if self.enc.subscriptions.is_empty() && self.enc.published.is_empty() {
+        if self.enc.subscriptions.is_empty()
+            && self.enc.published.is_empty()
+            && self.subscription_auth.is_empty()
+            && self.published_auth.is_empty()
+        {
             return;
         }
         if self.enc.watch.is_none() {
@@ -875,6 +879,22 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 image.enc_seal = Some(SharedSealer::of(Refuse(ControlDomain::ReceiverToPublisher)));
             }
         }
+        // The authenticated class (ADR-0086 section 7, "Snapshot rollback
+        // and clones"; karyos#648): every authenticated image is retired,
+        // its binding and its domain 1 and 4 keys with it (the shared
+        // sealer is withdrawn for every holder), and the signed digest
+        // cache is emptied, so nothing made before the change is answered
+        // again. The durable guard marks stay.
+        while let Some(index) = self.images.iter().position(|image| image.auth.is_some()) {
+            let installed = self.images.swap_remove(index);
+            if let Some(auth) = installed.auth.as_deref() {
+                crate::agents::control::ControlSeal::withdraw(&mut auth.sealer());
+            }
+            self.retire(sessions, installed, false, now);
+        }
+        if let Some(intake) = self.signed.as_deref_mut() {
+            intake.forget(|_| true);
+        }
         // Step 3.
         let old = self.sessions.boot_id();
         let mut boot = [0_u64; 2];
@@ -884,8 +904,11 @@ impl<T: StreamTerms> ReceiverRole<T> {
             }
         }
         self.sessions.set_boot_id(boot);
-        // impl-e: the authenticated class's redraw goes here (ADR-0086
-        // section 7 under a fresh `receiver_boot_id`).
+        // The authenticated class re-establishes under the fresh
+        // `receiver_boot_id`: once the fence releases, the next SETUP of
+        // each publication is challenged afresh (a new nonce), and the
+        // publisher binds the new boot id (ADR-0086 section 7). While the
+        // fence is held no authenticated image installs.
         self.enc.seen = current;
         vm_generation::redrawn(current);
     }

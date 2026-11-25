@@ -525,7 +525,7 @@ impl<T: StreamTerms> SenderRole<T> {
     /// When no fresh `driver_id` can be drawn nothing is redrawn, the
     /// fence stays held and the next duty tries again (fail closed).
     pub(super) fn on_generation_change(&mut self, now: u64) {
-        if self.enc.publications.is_empty() {
+        if self.enc.publications.is_empty() && self.publication_auth.is_empty() {
             return;
         }
         if self.enc.watch.is_none() {
@@ -546,9 +546,23 @@ impl<T: StreamTerms> SenderRole<T> {
             for outbound in &mut self.publications {
                 outbound.retire_enc_sealer();
             }
-            if self.redraw(current) {
-                // impl-e: the authenticated class's redraw goes here
-                // (ADR-0086 section 7 under a fresh `driver_id`).
+            // The authenticated class, closed first as well (ADR-0086
+            // section 7, "Snapshot rollback and clones"; karyos#648): every
+            // receiver binding and boot id is forgotten and every session
+            // sealer is taken out of its `Outbound`, which erases it, and
+            // its SETUP side starts again, so it announces and binds only
+            // through a fresh challenge once the fence releases. While the
+            // fence is held no receiver control of it is opened.
+            for auth in &mut self.publication_auth {
+                auth.unbind_all();
+            }
+            for outbound in &mut self.publications {
+                outbound.retire_auth_sealer();
+            }
+            // Every fresh identity, of either class, is drawn before any is
+            // applied: a refused successor redraws nothing.
+            if self.auth_successors(current) && self.redraw(current) {
+                self.reidentify_auth(current);
                 self.enc.seen = current;
                 vm_generation::redrawn(current);
             }
@@ -559,6 +573,57 @@ impl<T: StreamTerms> SenderRole<T> {
                 if publication.setup.is_none() {
                     let _ = publication.rekey();
                 }
+            }
+        }
+    }
+
+    /// Whether every authenticated publication has a fresh `driver_id`
+    /// for each generation up to `current` (drawn now, kept by the fence's
+    /// table); nothing is applied.
+    fn auth_successors(&self, current: u64) -> bool {
+        let first = self.enc.seen.saturating_add(1);
+        self.publication_auth.iter().all(|auth| {
+            let Some(held) = self.sessions.identity(auth.endpoint, auth.alias) else {
+                return true;
+            };
+            let mut driver = held.driver_id;
+            (first..=current).all(|generation| {
+                vm_generation::successor(driver, generation).is_some_and(|next| {
+                    driver = next;
+                    true
+                })
+            })
+        })
+    }
+
+    /// Gives each authenticated publication its fresh `driver_id` for
+    /// `current` (ADR-0086 section 7 under a fresh identity; karyos#648):
+    /// its SETUP side starts again under it, so it announces and binds
+    /// only through a fresh challenge, and its repair path's ERRs name it.
+    /// A receiver quarantines the retired identity, never this one.
+    fn reidentify_auth(&mut self, current: u64) {
+        let first = self.enc.seen.saturating_add(1);
+        for auth in &self.publication_auth {
+            let (endpoint, alias) = (auth.endpoint, auth.alias);
+            let Some(held) = self.sessions.publication(endpoint, alias) else {
+                continue;
+            };
+            let mut identity = held.identity;
+            for generation in first..=current {
+                if let Some(next) = vm_generation::successor(identity.driver_id, generation) {
+                    identity.driver_id = next;
+                }
+            }
+            let _ = self.sessions.remove(endpoint, alias);
+            let _ = self
+                .sessions
+                .add(crate::sessions::send::Publication { identity, ..held });
+            if let Some(outbound) = self
+                .publications
+                .iter_mut()
+                .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+            {
+                outbound.set_repair_identity(identity);
             }
         }
     }

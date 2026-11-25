@@ -990,3 +990,88 @@ fn an_etf_declaration_is_refused_on_an_authenticated_channel() {
         assert_eq!((net.publication_count(), net.subscription_count()), (0, 0));
     }
 }
+
+/// karyos#648, a refused successor: while a VM generation change is not
+/// released (a role of the process never redraws), every authenticated
+/// path stops and stays stopped, a new authenticated admission is
+/// refused, typed and counted, and a trusted channel keeps running.
+#[test]
+fn a_held_generation_fence_stops_the_authenticated_class_and_trusted_keeps_running() {
+    use crate::wire_enc::VmGenerationWatch;
+    use crate::wire_enc::vm_generation::{self, InjectedSignal};
+
+    let (mut publisher, _, mut subscriber, _) = established();
+    // A role of the process that never redraws holds the fence.
+    vm_generation::register();
+    let (signal, injector) = InjectedSignal::new();
+    let mut watch = VmGenerationWatch::new(Box::new(signal));
+    injector.change();
+    assert_eq!(watch.poll(0), 1);
+    assert!(vm_generation::quiesced());
+    let stopped = pump(&mut [&mut publisher, &mut subscriber], |drivers| {
+        roles(drivers[0]).0.1 == 0 && roles(drivers[1]).1.1 == 0
+    });
+    assert!(
+        stopped,
+        "not stopped: {:?} {:?}",
+        roles(&publisher),
+        roles(&subscriber)
+    );
+    // A trusted channel is established and delivers meanwhile.
+    let mut trusted = driver_with(64);
+    trusted
+        .add_network_subscription_as(
+            STREAM + 2,
+            &udp(Destination::Unicast(ANY_PORT), Security::Trusted),
+            identity(RECEIVER),
+        )
+        .unwrap();
+    let to = trusted.network_subscription_address(STREAM + 2).unwrap();
+    let mut sender = driver_with(64);
+    let handle = sender
+        .add_network_publication(
+            aggregate(STREAM + 2),
+            &udp(Destination::Unicast(to), Security::Trusted),
+        )
+        .unwrap();
+    let running = pump(
+        &mut [&mut sender, &mut trusted, &mut publisher, &mut subscriber],
+        |drivers| {
+            drivers[0]
+                .net
+                .as_ref()
+                .unwrap()
+                .publication_established(handle.registration())
+                && !drivers[1].network_images(STREAM + 2).is_empty()
+        },
+    );
+    assert!(running, "the trusted channel runs");
+    assert!(vm_generation::quiesced(), "still held");
+    // The authenticated class stays stopped.
+    assert_eq!(roles(&publisher).0.1, 0);
+    assert_eq!(roles(&subscriber).1.1, 0);
+    // And no authenticated admission is taken.
+    let security = Security::Authenticated(auth(None));
+    assert_eq!(
+        publisher
+            .add_network_publication(
+                aggregate(STREAM + 1),
+                &udp(Destination::Unicast(SocketAddr::new(LOOPBACK, 9)), security),
+            )
+            .unwrap_err(),
+        refused(AuthRefusal::GenerationChange)
+    );
+    assert_eq!(
+        subscriber
+            .add_network_subscription_as(
+                STREAM + 1,
+                &udp(Destination::Unicast(ANY_PORT), security),
+                identity(RECEIVER),
+            )
+            .unwrap_err(),
+        refused(AuthRefusal::GenerationChange)
+    );
+    for driver in [&publisher, &subscriber] {
+        assert_eq!(driver.wire_key_counters().unwrap().generation_refused, 1);
+    }
+}

@@ -3864,6 +3864,12 @@ impl<T: StreamTerms> ReceiverRole<T> {
                     receiver_boot_id: boot,
                     receiver_id: named,
                 };
+                // No key is derived while a VM generation change is not
+                // released (karyos#648, as the encrypted class).
+                if crate::wire_enc::vm_generation::quiesced() {
+                    self.count(|c| &mut c.auth_install_refused);
+                    return Err(Some(chain.retire));
+                }
                 match subscription.image(key.alias, sender, receiver) {
                     Ok(auth) => Some(Box::new(auth)),
                     Err(_) => {
@@ -8396,6 +8402,12 @@ impl<T: StreamTerms> SenderRole<T> {
     ) -> Option<(Control, Option<Establishing>)> {
         if crate::wire_enc::is_envelope(bytes) {
             return self.open_enc(endpoint, bytes);
+        }
+        // Nothing binds or is answered while a VM generation change is not
+        // released (karyos#648): the publications stay stopped.
+        if crate::wire_enc::vm_generation::quiesced() {
+            self.count(|c| &mut c.auth_unbound);
+            return None;
         }
         let alias = receive_auth::envelope_alias(bytes);
         let index = alias.and_then(|alias| self.publication_auth_index(endpoint, alias));
