@@ -1,0 +1,423 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! The publisher side of ADR-0114 sections 4, 6a and 7.
+
+#![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
+
+use std::cell::Cell;
+
+use karyos_protocol::frame::Lane;
+use karyos_protocol::network::encrypted::{EncSetup, decode_setup};
+use karyos_protocol::network::{ChallengeBlock, Lanes, Nak, NakRange, RspChallenge, TermParams};
+use karyos_protocol::protection::aes_gcm_siv::{EncRejection, MAX_PLAINTEXT};
+
+use super::*;
+use crate::wire_enc::open_bootstrap;
+use crate::wire_enc::{EncOpener, MAX_SEALED, OpenRate, SECOND_NS};
+use crate::wire_keys::{KEY_LEN, parse};
+
+thread_local! {
+    static NOW: Cell<u64> = const { Cell::new(5 * SECOND_NS) };
+}
+
+fn clock() -> u64 {
+    NOW.with(Cell::get)
+}
+
+fn file(text: String, name: &str) -> KeyFile {
+    parse(name, text.as_bytes()).unwrap()
+}
+
+fn channel(epoch: u32, fill: u8) -> KeyFile {
+    let secret: String = (0..KEY_LEN).map(|_| format!("{fill:02x}")).collect();
+    file(
+        format!(
+            "format=karyos-wire-key-v1\nkey_id=3\nfile_epoch={epoch}\npurpose=channel\nprofile_id=16\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret={secret}\nchannel_id=7\nstream_id=6\n"
+        ),
+        &format!("3-{epoch}.key"),
+    )
+}
+
+fn pairwise(fill: u8) -> KeyFile {
+    let secret: String = (0..KEY_LEN).map(|_| format!("{fill:02x}")).collect();
+    file(
+        format!(
+            "format=karyos-wire-key-v1\nkey_id=9\nfile_epoch=1\npurpose=pairwise\nprofile_id=16\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret={secret}\nreceiver_id=66\npublisher_id=5\n"
+        ),
+        "9-1.key",
+    )
+}
+
+const ALIAS: Alias = Alias {
+    session_id: 9,
+    stream_id: 6,
+};
+const IDENTITY: Identity = Identity {
+    driver_id: [1, 1],
+    registration_id: 7,
+    incarnation: 1,
+};
+
+fn publication() -> PublicationEnc {
+    PublicationEnc::new(
+        EndpointId(1),
+        ALIAS,
+        IDENTITY,
+        &[&channel(1, 0x11)],
+        &[&pairwise(0x22)],
+        clock,
+    )
+    .unwrap()
+}
+
+/// One receiver start: its block and its keys.
+struct Peer {
+    boot: u64,
+    receiver: ReceiverIdentity,
+    rsp: EncSealer,
+    nonce: [u64; 2],
+}
+
+fn peer(boot: u64, pairwise_fill: u8, key_epoch: u32, keys: &ChannelKeys) -> Peer {
+    let receiver = ReceiverIdentity {
+        receiver_boot_id: id128([boot, boot]),
+        receiver_id: 66,
+    };
+    let files = PairwiseFiles::new(&[&pairwise(pairwise_fill)]).unwrap();
+    let rsp = EncSealer::new(
+        keys,
+        Some(&files),
+        KeyContext {
+            domain: Domain::RspSetup,
+            key_epoch,
+            party_epoch: 0,
+            session_id: ALIAS.session_id,
+            stream_id: ALIAS.stream_id,
+            publication: publication_of(&IDENTITY),
+            receiver: Some(receiver),
+            salt: Salt::Empty,
+        },
+        clock,
+    )
+    .unwrap();
+    Peer {
+        boot,
+        receiver,
+        rsp,
+        nonce: [boot + 100, boot + 100],
+    }
+}
+
+impl Peer {
+    fn challenge(&mut self) -> Vec<u8> {
+        let control = Control::Challenge(RspChallenge {
+            alias: ALIAS,
+            identity: IDENTITY,
+            challenge: ChallengeBlock {
+                receiver_boot_id: [self.boot, self.boot],
+                nonce: self.nonce,
+            },
+        });
+        seal_control(&mut self.rsp, &control)
+    }
+
+    fn data_keys(&self) -> (EncSealer, PairwiseFiles) {
+        let files = PairwiseFiles::new(&[&pairwise(0x22)]).unwrap();
+        let keys = ChannelKeys::new(&[&channel(1, 0x11)]).unwrap();
+        let sealer = EncSealer::new(
+            &keys,
+            Some(&files),
+            KeyContext {
+                domain: Domain::Receiver,
+                key_epoch: 1,
+                party_epoch: 0,
+                session_id: ALIAS.session_id,
+                stream_id: ALIAS.stream_id,
+                publication: publication_of(&IDENTITY),
+                receiver: Some(self.receiver),
+                salt: Salt::Challenge {
+                    receiver_boot_id: self.receiver.receiver_boot_id,
+                    nonce: id128(self.nonce),
+                },
+            },
+            clock,
+        )
+        .unwrap();
+        (sealer, files)
+    }
+
+    fn nak(&self) -> Control {
+        let boot = self.boot;
+        Control::Nak(Nak {
+            alias: ALIAS,
+            identity: IDENTITY,
+            receiver: Receiver {
+                receiver_boot_id: [boot, boot],
+                receiver_id: 66,
+            },
+            range: NakRange {
+                lane: Lane::ZERO,
+                length: 32,
+                start: 0,
+            },
+        })
+    }
+}
+
+fn seal_control(sealer: &mut EncSealer, control: &Control) -> Vec<u8> {
+    let mut bytes = vec![0_u8; MAX_SEALED];
+    let length = control.encode(&mut bytes).unwrap();
+    let sealed = sealer.seal(&mut bytes, length).unwrap();
+    bytes.truncate(sealed);
+    bytes
+}
+
+fn open(publication: &mut PublicationEnc, bytes: &[u8]) -> Result<EncOpened, EncRejection> {
+    let mut out = [0_u8; MAX_PLAINTEXT];
+    publication.open(bytes, &mut out)
+}
+
+fn keys() -> ChannelKeys {
+    ChannelKeys::new(&[&channel(1, 0x11)]).unwrap()
+}
+
+/// Section 7, "Pairwise proof first": an RSP_SETUP forged by a group
+/// holder binds nothing and is counted; the genuine one binds once, and a
+/// repeat neither re-derives nor rebinds.
+#[test]
+fn an_rsp_setup_binds_only_with_its_pairwise_proof() {
+    let mut publication = publication();
+    let mut forger = peer(5, 0x55, 1, &keys());
+    assert_eq!(
+        open(&mut publication, &forger.challenge()),
+        Err(EncRejection::Pairwise)
+    );
+    assert_eq!(publication.bound_receiver(), None);
+    assert_eq!(
+        publication.channel.rejections.get(EncRejection::Pairwise),
+        1
+    );
+    let mut genuine = peer(5, 0x22, 1, &keys());
+    let Ok(EncOpened::RspSetup(_, establishing)) = open(&mut publication, &genuine.challenge())
+    else {
+        panic!()
+    };
+    assert!(establishing.bind);
+    assert_eq!(publication.bound_receiver(), Some(genuine.receiver));
+    let Ok(EncOpened::RspSetup(_, again)) = open(&mut publication, &genuine.challenge()) else {
+        panic!()
+    };
+    assert!(!again.bind);
+    // Its NAK opens under the committed domain 4 key; a forged one with a
+    // valid outer tag and a wrong trailer is refused.
+    let (mut sealer, _) = genuine.data_keys();
+    let nak = genuine.nak();
+    assert_eq!(
+        open(&mut publication, &seal_control(&mut sealer, &nak)),
+        Ok(EncOpened::Receiver(nak))
+    );
+    let theirs = PairwiseFiles::new(&[&pairwise(0x55)]).unwrap();
+    let mut context = *sealer.context();
+    context.party_epoch = 0;
+    let mut forged = EncSealer::new(&keys(), Some(&theirs), context, clock).unwrap();
+    // Past the genuine sequence: the trailer, not the window, refuses it.
+    seal_control(&mut forged, &nak);
+    assert_eq!(
+        open(&mut publication, &seal_control(&mut forged, &nak)),
+        Err(EncRejection::Pairwise)
+    );
+}
+
+/// Section 7: an old RSP_SETUP followed by its old NAKs, replayed after
+/// the receiver restarted, changes no binding and moves no window.
+#[test]
+fn an_old_rsp_setup_and_its_naks_replayed_after_a_restart_change_nothing() {
+    let mut publication = publication();
+    let mut first = peer(5, 0x22, 1, &keys());
+    let old_challenge = first.challenge();
+    assert!(open(&mut publication, &old_challenge).is_ok());
+    let (mut old_sealer, _) = first.data_keys();
+    let old_nak = seal_control(&mut old_sealer, &first.nak());
+    assert!(open(&mut publication, &old_nak).is_ok());
+    // The receiver restarts with a new boot id.
+    let mut second = peer(6, 0x22, 1, &keys());
+    let Ok(EncOpened::RspSetup(_, establishing)) = open(&mut publication, &second.challenge())
+    else {
+        panic!()
+    };
+    assert!(establishing.bind);
+    for replay in [&old_challenge, &old_nak] {
+        assert_eq!(
+            open(&mut publication, replay),
+            Err(EncRejection::RetiredBoot)
+        );
+    }
+    assert_eq!(publication.bound_receiver(), Some(second.receiver));
+    let (mut sealer, _) = second.data_keys();
+    assert!(open(&mut publication, &seal_control(&mut sealer, &second.nak())).is_ok());
+}
+
+/// Section 7: an RSP_SETUP that verifies only under the previous file
+/// epoch never creates a binding.
+#[test]
+fn an_rsp_setup_under_the_previous_file_epoch_binds_nothing() {
+    let mut publication = PublicationEnc::new(
+        EndpointId(1),
+        ALIAS,
+        IDENTITY,
+        &[&channel(1, 0x11), &channel(2, 0x33)],
+        &[&pairwise(0x22)],
+        clock,
+    )
+    .unwrap();
+    let both = ChannelKeys::new(&[&channel(1, 0x11), &channel(2, 0x33)]).unwrap();
+    let mut old = peer(5, 0x22, 1, &both);
+    assert_eq!(
+        open(&mut publication, &old.challenge()),
+        Err(EncRejection::Epoch)
+    );
+    assert_eq!(publication.bound_receiver(), None);
+    let mut current = peer(5, 0x22, 2, &both);
+    assert!(open(&mut publication, &current.challenge()).is_ok());
+}
+
+/// Section 6a: every answer is an ENC ANSWER in domain 5 stating the
+/// sender's epochs; the session sealer's DATA opens under the receiver's
+/// domain 1 opener started at those epochs.
+#[test]
+fn the_answer_is_variant_3_and_the_session_opens_at_its_epochs() {
+    let mut publication = publication();
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    let Ok(EncOpened::RspSetup(_, establishing)) = open(&mut publication, &receiver.challenge())
+    else {
+        panic!()
+    };
+    let answer = SetupAnswer {
+        alias: ALIAS,
+        identity: IDENTITY,
+        term: TermParams {
+            term_length: 65_536,
+            initial_term_id: 0,
+            mtu: 1408,
+        },
+        challenge: ChallengeBlock {
+            receiver_boot_id: [5, 5],
+            nonce: receiver.nonce,
+        },
+        joins: Lanes::new(&[0]).unwrap(),
+    };
+    let mut bytes = [0_u8; MAX_SEALED];
+    let length = publication.seal_answer(answer, 0, &mut bytes).unwrap();
+    let mut out = [0_u8; MAX_PLAINTEXT];
+    let mut rate = OpenRate::default();
+    let opened = open_bootstrap(
+        &keys(),
+        None,
+        None,
+        &bytes[..length],
+        &mut out,
+        &mut rate,
+        clock(),
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    let Ok(EncSetup::Answer(enc)) = decode_setup(&out[..opened.frames]) else {
+        panic!()
+    };
+    assert_eq!((enc.key_epoch, enc.party_epoch), (1, 0));
+    assert_eq!(enc.answer, answer);
+    // The session's DATA.
+    let mut sealer = publication.data_sealer(&establishing).unwrap();
+    let mut opener = EncOpener::new(&keys(), None, *sealer.context(), clock()).unwrap();
+    let mut data = [0_u8; MAX_SEALED];
+    data[..32].copy_from_slice(&{
+        let mut frame = [0_u8; 32];
+        frame[..4].copy_from_slice(&32_i32.to_le_bytes());
+        frame[4] = 1;
+        frame[6] = 1;
+        frame
+    });
+    let length = sealer.seal(&mut data, 32).unwrap();
+    assert!(
+        opener
+            .open(&data[..length], &mut out, &mut rate, clock(), |_| Ok(()))
+            .is_ok()
+    );
+    let _ = &mut receiver;
+}
+
+/// The ANNOUNCE is sealed in domain 5 under the publication's own key and
+/// opens under a scratch derivation from its header.
+#[test]
+fn the_announce_is_sealed_in_domain_5() {
+    let mut publication = publication();
+    let announce = Control::SetupAnnounce(karyos_protocol::network::SetupAnnounce {
+        alias: ALIAS,
+        identity: IDENTITY,
+        term: TermParams {
+            term_length: 65_536,
+            initial_term_id: 0,
+            mtu: 1408,
+        },
+        lane_count: 1,
+    });
+    let mut bytes = [0_u8; MAX_SEALED];
+    let length = announce.encode(&mut bytes).unwrap();
+    let sealed = publication.seal_announce(&mut bytes, length).unwrap();
+    assert_eq!(sealed, length + 84);
+    let mut out = [0_u8; MAX_PLAINTEXT];
+    let mut rate = OpenRate::default();
+    let opened = open_bootstrap(
+        &keys(),
+        None,
+        None,
+        &bytes[..sealed],
+        &mut out,
+        &mut rate,
+        clock(),
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(opened.header.publication, Some(publication_of(&IDENTITY)));
+    assert!(matches!(
+        decode_setup(&out[..opened.frames]),
+        Ok(EncSetup::Announce(_))
+    ));
+}
+
+/// The sender role routes an encrypted envelope to its publication's keys
+/// before anything decodes it: a forged RSP_SETUP is refused and counted
+/// on that publication, and one for no encrypted publication is counted
+/// unattributed. Neither reaches the trusted path.
+#[test]
+fn the_sender_role_opens_an_envelope_only_under_its_publication_keys() {
+    let (mut sender, _): (super::super::SenderRole, super::super::ReceiverRole) =
+        super::super::roles(&crate::agents::AgentConfig::default()).unwrap();
+    sender.enc.publish(publication());
+    let mut forger = peer(5, 0x55, 1, &keys());
+    assert!(
+        sender
+            .open_sealed_for(EndpointId(1), &forger.challenge())
+            .is_none()
+    );
+    assert_eq!(
+        sender
+            .enc
+            .rejections(EndpointId(1), ALIAS)
+            .unwrap()
+            .get(EncRejection::Pairwise),
+        1
+    );
+    let mut other = peer(5, 0x22, 1, &keys());
+    let mut bytes = other.challenge();
+    bytes[24..28].copy_from_slice(&7_i32.to_le_bytes());
+    assert!(sender.open_sealed_for(EndpointId(1), &bytes).is_none());
+    assert_eq!(sender.enc.unattributed.get(EncRejection::Binding), 1);
+    // A genuine CHALLENGE verifies; with no outbound to key it installs
+    // nothing and is not answered.
+    assert!(
+        sender
+            .open_sealed_for(EndpointId(1), &other.challenge())
+            .is_none()
+    );
+}

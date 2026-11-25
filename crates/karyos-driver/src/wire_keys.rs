@@ -105,7 +105,8 @@ pub struct KeyFile {
     pub file_epoch: u32,
     /// The purpose.
     pub purpose: Purpose,
-    /// 1 for the symmetric purposes, 4 for the authority purposes.
+    /// 1 (`authenticated`) or 16 (`encrypted`) for the symmetric purposes,
+    /// 4 for the authority purposes.
     pub profile_id: u8,
     /// Start of validity, seconds since the Unix epoch, UTC.
     pub not_before: i64,
@@ -157,6 +158,57 @@ pub enum KeyFileError {
     /// The authority public key is refused.
     #[error("refused authority public key")]
     PublicKey(AuthorityKeyError),
+}
+
+/// The protection class a `channel` or `pairwise` file serves, by its
+/// `profile_id` (design section 2.2, "One class per file"; ADR-0114
+/// section 4a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Class {
+    /// `profile_id=1`: `authenticated` channels only (ADR-0086).
+    Authenticated,
+    /// `profile_id=16`: `encrypted` channels only (ADR-0114).
+    Encrypted,
+}
+
+impl Class {
+    /// The `profile_id` of the class.
+    #[must_use]
+    pub const fn profile_id(self) -> u8 {
+        match self {
+            Self::Authenticated => 1,
+            Self::Encrypted => 16,
+        }
+    }
+}
+
+impl KeyFile {
+    /// The class a symmetric file serves; `None` for the authority
+    /// purposes, which serve no channel class.
+    #[must_use]
+    pub fn class(&self) -> Option<Class> {
+        match (self.purpose, self.profile_id) {
+            (Purpose::Channel | Purpose::Pairwise, 1) => Some(Class::Authenticated),
+            (Purpose::Channel | Purpose::Pairwise, 16) => Some(Class::Encrypted),
+            _ => None,
+        }
+    }
+
+    /// Checks that a channel configuration of `class` may name this file
+    /// as its `purpose` key.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyFileError::ProfileMismatch`] for a file of the other class or
+    /// another purpose: a wrong-class configuration is refused, never
+    /// served.
+    pub fn serves(&self, class: Class, purpose: Purpose) -> Result<(), KeyFileError> {
+        if self.purpose == purpose && self.class() == Some(class) {
+            Ok(())
+        } else {
+            Err(KeyFileError::ProfileMismatch)
+        }
+    }
 }
 
 /// Parses a key file name, `<key_id>-<file_epoch>.key`.
@@ -272,16 +324,15 @@ pub fn parse(name: &str, bytes: &[u8]) -> Result<KeyFile, KeyFileError> {
         .filter(|v| *v >= 1)
         .ok_or(KeyFileError::Value { line: 3 })?;
     let profile = number(4)?;
-    let expected_profile: u8 = match purpose {
-        Purpose::Channel | Purpose::Pairwise => 1,
-        Purpose::AuthoritySigning | Purpose::AuthorityPublic => 4,
-    };
     // Compared before any narrowing, so `256` is a mismatch, not a range
-    // error (design section 2.2).
-    if profile != u64::from(expected_profile) {
-        return Err(KeyFileError::ProfileMismatch);
-    }
-    let profile_id = expected_profile;
+    // error (design section 2.2). A symmetric file serves one class: 1
+    // `authenticated` or 16 `encrypted` (ADR-0114 section 4a).
+    let profile_id = match (purpose, profile) {
+        (Purpose::Channel | Purpose::Pairwise, 1) => Class::Authenticated.profile_id(),
+        (Purpose::Channel | Purpose::Pairwise, 16) => Class::Encrypted.profile_id(),
+        (Purpose::AuthoritySigning | Purpose::AuthorityPublic, 4) => 4,
+        _ => return Err(KeyFileError::ProfileMismatch),
+    };
     let not_before = timestamp(value(5)).ok_or(KeyFileError::Value { line: 6 })?;
     let not_after = timestamp(value(6)).ok_or(KeyFileError::Value { line: 7 })?;
     let bound = match purpose {

@@ -17,12 +17,23 @@
 //! Unicast single-path only: a multi-destination or routed publication
 //! refuses authentication (ADR-0086 open point 6; ADR-0076 clause 4 is
 //! karyos#649). Nothing enables an authenticated channel yet.
+//!
+//! The `encrypted` class (ADR-0114, karyos#650) rides the same slot: an
+//! encrypted publication waits in [`SenderAuth::EncPending`] until its
+//! establishment installs the session's [`EncSealer`] (domain 1), which
+//! rolls its `party_epoch` before any budget of the profile is reached;
+//! every datagram grows by the encrypted envelope, 84 bytes. It never
+//! falls back to bare or authenticated datagrams.
 
 use thiserror::Error;
 
 use super::Outbound;
 use crate::embedded::StreamTerms;
 use crate::wire_auth::{ENVELOPE_LEN, Sealer};
+use crate::wire_enc::{DatagramSeal, EncSealer};
+use karyos_protocol::protection::aes_gcm_siv::{
+    Domain as EncDomain, ENVELOPE_LEN as ENC_ENVELOPE_LEN,
+};
 
 /// How a publication's sender frames are authenticated.
 #[derive(Debug, Default)]
@@ -34,6 +45,10 @@ pub(crate) enum SenderAuth {
     Pending,
     /// Authenticated under the session's sealer.
     Sealing(Box<Sealer>),
+    /// Encrypted, waiting for its session key: nothing leaves.
+    EncPending,
+    /// Encrypted under the session's domain 1 sealer.
+    Encrypting(Box<EncSealer>),
 }
 
 /// Why a publication cannot be authenticated.
@@ -62,6 +77,7 @@ impl SenderAuth {
         match self {
             Self::Off => 0,
             Self::Pending | Self::Sealing(_) => ENVELOPE_LEN,
+            Self::EncPending | Self::Encrypting(_) => ENC_ENVELOPE_LEN,
         }
     }
 
@@ -70,8 +86,10 @@ impl SenderAuth {
     pub(crate) fn ready(&self) -> bool {
         match self {
             Self::Off => true,
-            Self::Pending => false,
+            Self::Pending | Self::EncPending => false,
             Self::Sealing(sealer) => sealer.can_seal(),
+            // It rolls its epoch itself; a seal it refuses sends nothing.
+            Self::Encrypting(_) => true,
         }
     }
 
@@ -82,16 +100,19 @@ impl SenderAuth {
     pub(crate) fn seal(&mut self, datagram: &mut [u8], frames: usize) -> Option<usize> {
         match self {
             Self::Off => Some(frames),
-            Self::Pending => None,
+            Self::Pending | Self::EncPending => None,
             Self::Sealing(sealer) => sealer.seal(datagram, frames).ok(),
+            Self::Encrypting(sealer) => sealer.seal(datagram, frames).ok(),
         }
     }
 
-    /// The sealer, if one is installed.
-    pub(crate) fn sealer(&mut self) -> Option<&mut Sealer> {
+    /// The sealer of either class, if one is installed: repairs are sealed
+    /// under it like every other datagram.
+    pub(crate) fn sealer(&mut self) -> Option<&mut (dyn DatagramSeal + 'static)> {
         match self {
-            Self::Sealing(sealer) => Some(sealer),
-            Self::Off | Self::Pending => None,
+            Self::Sealing(sealer) => Some(&mut **sealer),
+            Self::Encrypting(sealer) => Some(&mut **sealer),
+            Self::Off | Self::Pending | Self::EncPending => None,
         }
     }
 }
@@ -111,8 +132,13 @@ impl<T: StreamTerms> Outbound<T> {
         if self.routed.is_some() || self.fanout.is_some() || self.registration.is_some() {
             return Err(AuthUnsupported::NotUnicast);
         }
-        if !matches!(self.auth, SenderAuth::Off) {
-            return Ok(());
+        match self.auth {
+            SenderAuth::Off => {}
+            SenderAuth::Pending | SenderAuth::Sealing(_) => return Ok(()),
+            // An encrypted publication never changes class.
+            SenderAuth::EncPending | SenderAuth::Encrypting(_) => {
+                return Err(AuthUnsupported::Started);
+            }
         }
         // Nothing bare may be queued or sent before: a staged datagram
         // would still leave unsealed (ADR-0086 section 2).
@@ -146,6 +172,9 @@ impl<T: StreamTerms> Outbound<T> {
                 return Err(AuthUnsupported::SameEstablishment);
             }
             SenderAuth::Pending | SenderAuth::Sealing(_) => {}
+            SenderAuth::EncPending | SenderAuth::Encrypting(_) => {
+                return Err(AuthUnsupported::NotAuthenticated);
+            }
         }
         if sealer.domain() != karyos_protocol::protection::hmac_sha256::Domain::Data {
             return Err(AuthUnsupported::SameEstablishment);
@@ -181,8 +210,112 @@ impl<T: StreamTerms> Outbound<T> {
     pub(crate) fn sealer_party(&self) -> Option<crate::wire_auth::Party> {
         match &self.auth {
             SenderAuth::Sealing(sealer) => Some(sealer.party()),
-            SenderAuth::Off | SenderAuth::Pending => None,
+            SenderAuth::Off
+            | SenderAuth::Pending
+            | SenderAuth::EncPending
+            | SenderAuth::Encrypting(_) => None,
         }
+    }
+
+    /// Makes the publication encrypted (ADR-0114): from now on it sends
+    /// nothing until [`Outbound::install_enc_sealer`] gives it the
+    /// session's domain 1 key. Its log must be sized for the encrypted
+    /// inner budget, the channel MTU (at most 1408) less the 84-byte
+    /// envelope.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthUnsupported::NotUnicast`] for a multi-destination, dynamic or
+    /// routed publication, and [`AuthUnsupported::Started`] once anything
+    /// was staged or sent bare, or the publication is already of another
+    /// class; nothing changes.
+    pub fn require_enc(&mut self) -> Result<(), AuthUnsupported> {
+        if self.routed.is_some() || self.fanout.is_some() || self.registration.is_some() {
+            return Err(AuthUnsupported::NotUnicast);
+        }
+        match self.auth {
+            SenderAuth::EncPending | SenderAuth::Encrypting(_) => return Ok(()),
+            SenderAuth::Pending | SenderAuth::Sealing(_) => return Err(AuthUnsupported::Started),
+            SenderAuth::Off => {}
+        }
+        let staged = self.tracks.iter().any(|track| !track.staged.is_empty())
+            || (0..self.readers.len()).any(|lane| self.sender.pending(lane).unwrap_or(0) > 0);
+        if self.counters.staged > 0 || staged {
+            return Err(AuthUnsupported::Started);
+        }
+        if let Some(repair) = self.repair.as_deref_mut() {
+            repair.reserve_envelope(ENC_ENVELOPE_LEN);
+        }
+        self.auth = SenderAuth::EncPending;
+        Ok(())
+    }
+
+    /// The current `party_epoch` of the session's encrypted sealer, which
+    /// its ENC ANSWER states.
+    pub(crate) fn enc_party_epoch(&self) -> Option<u16> {
+        match &self.auth {
+            SenderAuth::Encrypting(sealer) => Some(sealer.context().party_epoch),
+            _ => None,
+        }
+    }
+
+    /// Lends the installed encrypted sealer, to seal one of the
+    /// publication's sender controls in domain 1 under the same envelope
+    /// sequence as its DATA; [`Outbound::return_enc_sealer`] gives it back.
+    /// Moves a box: allocates nothing.
+    pub(crate) fn lend_enc_sealer(&mut self) -> Option<Box<EncSealer>> {
+        match core::mem::replace(&mut self.auth, SenderAuth::EncPending) {
+            SenderAuth::Encrypting(sealer) => Some(sealer),
+            other => {
+                self.auth = other;
+                None
+            }
+        }
+    }
+
+    /// Gives back the sealer [`Outbound::lend_enc_sealer`] lent.
+    pub(crate) fn return_enc_sealer(&mut self, sealer: Box<EncSealer>) {
+        if matches!(self.auth, SenderAuth::EncPending) {
+            self.auth = SenderAuth::Encrypting(sealer);
+        }
+    }
+
+    /// Moves the session's encrypted sealer `count` epochs on, as its
+    /// budgets would (tests).
+    #[cfg(test)]
+    pub(crate) fn roll_enc_epochs(&mut self, count: u16) {
+        if let SenderAuth::Encrypting(sealer) = &mut self.auth {
+            for _ in 0..count {
+                sealer.roll_now();
+            }
+        }
+    }
+
+    /// Installs the session's domain 1 sealer of an encrypted publication,
+    /// made at establishment. A new binding replaces it; its own sealer
+    /// is never installed twice, so no envelope sequence restarts under
+    /// one key.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthUnsupported::NotAuthenticated`] unless
+    /// [`Outbound::require_enc`] was called first, and
+    /// [`AuthUnsupported::SameEstablishment`] for a sealer of the
+    /// establishment already installed, or of another domain.
+    pub(crate) fn install_enc_sealer(&mut self, sealer: EncSealer) -> Result<(), AuthUnsupported> {
+        match &self.auth {
+            SenderAuth::EncPending => {}
+            SenderAuth::Encrypting(current) if current.context().salt != sealer.context().salt => {}
+            SenderAuth::Encrypting(_) => return Err(AuthUnsupported::SameEstablishment),
+            SenderAuth::Off | SenderAuth::Pending | SenderAuth::Sealing(_) => {
+                return Err(AuthUnsupported::NotAuthenticated);
+            }
+        }
+        if sealer.domain() != EncDomain::Sender {
+            return Err(AuthUnsupported::SameEstablishment);
+        }
+        self.auth = SenderAuth::Encrypting(Box::new(sealer));
+        Ok(())
     }
 
     /// Whether the publication is authenticated.

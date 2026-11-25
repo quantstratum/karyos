@@ -203,3 +203,101 @@ fn timestamps_follow_the_calendar() {
     assert_eq!(timestamp(b"2026-11-01T00:00:60Z"), None);
     assert_eq!(timestamp(b"2026-11-01 00:00:00Z"), None);
 }
+
+/// The `profile_id=16` channel file of section 2.7 (ADR-0114 section 4a):
+/// the canonical channel file with only its profile changed.
+fn encrypted_channel() -> String {
+    CHANNEL.replace("profile_id=1", "profile_id=16")
+}
+
+#[test]
+fn an_encrypted_class_file_parses_and_serves_only_its_class() {
+    let channel = parse("3-3.key", encrypted_channel().as_bytes()).unwrap();
+    assert_eq!(channel.profile_id, 16);
+    assert_eq!(channel.class(), Some(Class::Encrypted));
+    assert_eq!(channel.serves(Class::Encrypted, Purpose::Channel), Ok(()));
+    let pairwise = parse(
+        "16909060-3.key",
+        PAIRWISE.replace("profile_id=1", "profile_id=16").as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(pairwise.class(), Some(Class::Encrypted));
+    assert_eq!(pairwise.serves(Class::Encrypted, Purpose::Pairwise), Ok(()));
+    // One class per file: a configuration of the other class, or naming the
+    // file for another purpose, is refused.
+    let authenticated = parse("3-3.key", CHANNEL.as_bytes()).unwrap();
+    assert_eq!(authenticated.class(), Some(Class::Authenticated));
+    for (file, class, purpose) in [
+        (&channel, Class::Authenticated, Purpose::Channel),
+        (&authenticated, Class::Encrypted, Purpose::Channel),
+        (&channel, Class::Encrypted, Purpose::Pairwise),
+        (&pairwise, Class::Authenticated, Purpose::Pairwise),
+    ] {
+        assert_eq!(
+            file.serves(class, purpose),
+            Err(KeyFileError::ProfileMismatch),
+            "{class:?} {purpose:?}"
+        );
+    }
+    let signing = parse("10-1.key", SIGNING.as_bytes()).unwrap();
+    assert_eq!(signing.class(), None);
+}
+
+#[test]
+fn an_authenticated_channel_refuses_an_encrypted_class_file() {
+    use crate::wire_auth::{Party, Sealer};
+    use karyos_protocol::network::Alias;
+
+    let channel = parse("3-3.key", encrypted_channel().as_bytes()).unwrap();
+    let identity = Identity {
+        driver_id: [1, 2],
+        registration_id: 1,
+        incarnation: 1,
+    };
+    let party = Party::Sender {
+        identity,
+        lane_count: 1,
+        receiver_boot_id: [3, 4],
+        nonce: [5, 6],
+    };
+    let alias = Alias {
+        session_id: 1,
+        stream_id: 1001,
+    };
+    assert!(Sealer::new(&channel, party, alias).is_err());
+}
+
+#[test]
+fn the_encrypted_class_refusal_vectors_are_refused() {
+    // `profile_id=16` with an authority purpose.
+    for (name, text) in [("10-1.key", SIGNING), ("10-1.key", PUBLIC)] {
+        assert_eq!(
+            parse(
+                name,
+                text.replace("profile_id=4", "profile_id=16").as_bytes()
+            )
+            .map(|_| ()),
+            Err(KeyFileError::ProfileMismatch)
+        );
+    }
+    // `profile_id` 2, 3, 17 or 18 with any purpose.
+    for profile in ["2", "3", "17", "18"] {
+        for (name, text, from) in [
+            ("3-3.key", CHANNEL, "profile_id=1"),
+            ("16909060-3.key", PAIRWISE, "profile_id=1"),
+            ("10-1.key", SIGNING, "profile_id=4"),
+            ("10-1.key", PUBLIC, "profile_id=4"),
+        ] {
+            assert_eq!(
+                parse(
+                    name,
+                    text.replace(from, &format!("profile_id={profile}"))
+                        .as_bytes()
+                )
+                .map(|_| ()),
+                Err(KeyFileError::ProfileMismatch),
+                "{name} profile {profile}"
+            );
+        }
+    }
+}

@@ -56,6 +56,7 @@ pub mod spin;
 pub mod timed_gate;
 mod trace_journals;
 pub mod wire_auth;
+pub mod wire_enc;
 pub mod wire_keys;
 
 #[cfg(test)]

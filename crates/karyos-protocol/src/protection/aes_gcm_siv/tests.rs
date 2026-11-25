@@ -1307,3 +1307,65 @@ proptest! {
         prop_assert_eq!(state(&profile), before);
     }
 }
+
+/// A re-keyed value is the key [`AesGcmSiv::new`] makes for that context,
+/// with its counters and window from 0, and re-keying allocates nothing:
+/// the window's mutex is the one locked at construction.
+#[test]
+fn a_rekeyed_slot_equals_a_new_key_and_allocates_nothing() {
+    let mut slot = profile(Domain::Sender, 0, true);
+    let used = sealed(&slot, &[1; 32], 7);
+    let mut out = [0_u8; MAX_PLAINTEXT];
+    let opened = slot.open_into(&used, &mut out).unwrap();
+    slot.mark(opened.seq).unwrap();
+    let keys = [pairwise(PAIRWISE_EPOCH, &PAIRWISE_SECRET)];
+    let target = context(Domain::Receiver, 3, true);
+    let ((), allocations) = {
+        let (result, allocations) = count(|| slot.rekey(&IKM, target, &keys));
+        (result.unwrap(), allocations)
+    };
+    assert_eq!(allocations, 0);
+    let fresh = AesGcmSiv::new(&IKM, target, &keys).unwrap();
+    assert_eq!(state(&slot), state(&fresh));
+    assert_eq!(slot.context(), fresh.context());
+    assert_eq!(sealed(&slot, &[2; 32], 0), sealed(&fresh, &[2; 32], 0));
+    // A refused context changes nothing.
+    let mut bad = target;
+    bad.key_epoch = 0;
+    assert_eq!(slot.rekey(&IKM, bad, &keys), Err(ContextError::KeyEpoch));
+    assert_eq!(slot.context(), fresh.context());
+}
+
+/// What `rekey` erases (team lead requirement): every key-holding field
+/// erases itself on drop, and `rekey` drops each old value in place by
+/// assignment. The AEAD keeps only its key-generating AES-256 schedule
+/// (the per-nonce POLYVAL and AES subkeys are erased by `aes-gcm-siv`
+/// itself after each call); `aes` with `zeroize` makes that schedule
+/// `ZeroizeOnDrop`. The pairwise keys are HMAC states over `sha2` with
+/// `zeroize`; the derived key is held in `Zeroizing` only.
+#[test]
+fn every_key_holding_type_erases_itself_on_drop() {
+    const fn erased<T: zeroize::ZeroizeOnDrop>() {}
+    erased::<::aes::Aes256>();
+    erased::<sha2::Sha256>();
+    erased::<Zeroizing<[u8; KEY_LEN]>>();
+}
+
+/// After `rekey` the old key no longer opens what it sealed, and the new
+/// one opens its own datagrams.
+#[test]
+fn after_rekey_only_the_new_key_opens() {
+    let mut slot = profile(Domain::Sender, 2, true);
+    let old = sealed(&slot, &[1; 32], 0);
+    let mut out = [0_u8; MAX_PLAINTEXT];
+    assert!(slot.open_into(&old, &mut out).is_ok());
+    let mut other = IKM;
+    other[0] ^= 0xff;
+    slot.rekey(&other, context(Domain::Sender, 2, true), &[])
+        .unwrap();
+    assert_eq!(slot.open_into(&old, &mut out), Err(EncRejection::Tag));
+    let fresh = sealed(&slot, &[2; 32], 1);
+    assert!(slot.open_into(&fresh, &mut out).is_ok());
+    let original = profile(Domain::Sender, 2, true);
+    assert_eq!(original.open_into(&fresh, &mut out), Err(EncRejection::Tag));
+}

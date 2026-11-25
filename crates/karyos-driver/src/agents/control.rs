@@ -38,7 +38,7 @@ use karyos_protocol::network::{Control, MAX_CONTROL_LENGTH};
 
 use karyos_protocol::protection::hmac_sha256::Domain;
 
-use crate::wire_auth::{ENVELOPE_LEN, Proof, Sealer};
+use crate::wire_auth::{Proof, Sealer};
 
 use super::EndpointId;
 
@@ -271,11 +271,13 @@ pub enum ControlItem {
 }
 
 /// The bytes of one sealed control, in a fixed array: a control is at
-/// most [`MAX_CONTROL_LENGTH`] bytes and its envelope [`ENVELOPE_LEN`].
+/// most [`MAX_CONTROL_LENGTH`] bytes and its envelope at most
+/// [`crate::wire_enc::MAX_CONTROL_ENVELOPE`], the encrypted one with its
+/// pairwise trailer.
 #[derive(Clone, Copy)]
 pub struct SealedBytes {
     len: usize,
-    bytes: [u8; MAX_CONTROL_LENGTH + ENVELOPE_LEN],
+    bytes: [u8; MAX_CONTROL_LENGTH + crate::wire_enc::MAX_CONTROL_ENVELOPE],
 }
 
 impl core::fmt::Debug for SealedBytes {
@@ -290,7 +292,7 @@ impl SealedBytes {
     /// A copy of `datagram`; `None` when longer than any sealed control.
     #[must_use]
     pub fn copy(datagram: &[u8]) -> Option<Self> {
-        let mut bytes = [0u8; MAX_CONTROL_LENGTH + ENVELOPE_LEN];
+        let mut bytes = [0u8; MAX_CONTROL_LENGTH + crate::wire_enc::MAX_CONTROL_ENVELOPE];
         bytes.get_mut(..datagram.len())?.copy_from_slice(datagram);
         Some(Self {
             len: datagram.len(),
@@ -492,6 +494,16 @@ impl SharedSealer {
         let domain = sealer.domain();
         Self {
             sealer: Arc::new(Mutex::new(sealer)),
+            domain,
+        }
+    }
+
+    /// Shares any control `seal`: an encrypted class sealer (ADR-0114).
+    #[must_use]
+    pub fn of(seal: impl ControlSeal + Send + 'static) -> Self {
+        let domain = seal.domain();
+        Self {
+            sealer: Arc::new(Mutex::new(seal)),
             domain,
         }
     }
@@ -1117,7 +1129,7 @@ impl ControlRoutes {
         transient: bool,
         seal: Option<&mut dyn ControlSeal>,
     ) -> Result<(), ControlSendError> {
-        let mut bytes = [0u8; MAX_CONTROL_LENGTH + ENVELOPE_LEN];
+        let mut bytes = [0u8; MAX_CONTROL_LENGTH + crate::wire_enc::MAX_CONTROL_ENVELOPE];
         let plain = bytes
             .get_mut(..MAX_CONTROL_LENGTH)
             .ok_or(ControlSendError::Encode)?;

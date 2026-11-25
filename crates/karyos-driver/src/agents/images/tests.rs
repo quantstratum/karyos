@@ -8039,3 +8039,150 @@ fn a_restart_with_the_stored_mark_refuses_an_old_open() {
             .admission_pending()
     );
 }
+
+/// The channel key and the pairwise key of an encrypted channel (ADR-0114
+/// section 4a, `profile_id=16`).
+fn enc_keys(receiver_id: u64) -> (crate::wire_keys::KeyFile, crate::wire_keys::KeyFile) {
+    let channel = crate::wire_keys::parse(
+        "3-1.key",
+        b"format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=1\npurpose=channel\nprofile_id=16\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=3333333333333333333333333333333333333333333333333333333333333333\nchannel_id=7\nstream_id=6\n",
+    )
+    .unwrap();
+    let text = format!(
+        "format=karyos-wire-key-v1\nkey_id=9\nfile_epoch=1\npurpose=pairwise\nprofile_id=16\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=4444444444444444444444444444444444444444444444444444444444444444\nreceiver_id={receiver_id}\npublisher_id=5\n"
+    );
+    let pairwise = crate::wire_keys::parse("9-1.key", text.as_bytes()).unwrap();
+    (channel, pairwise)
+}
+
+/// A rig whose publication on A and subscription on B (as receiver 77)
+/// are encrypted before any DATA. The class still fails at channel parse:
+/// only this test constructor makes them encrypted.
+fn encrypted_rig() -> (Rig, EndpointId) {
+    use crate::agents::roles::publish_enc::PublicationEnc;
+    use crate::agents::roles::receive_enc::SubscriptionEnc;
+
+    let (mut rig, b) = Rig::new(Setup {
+        reliable: true,
+        identity: Some(identity_77(0)),
+        ..Setup::default()
+    });
+    let (channel, pairwise) = enc_keys(77);
+    let a = rig.publisher;
+    rig.agents.receiver.role.encrypt_published(a, alias());
+    rig.agents.receiver.role.encrypt_subscription(
+        SubscriptionEnc::new(b, alias().stream_id, &[&channel], &[&pairwise], 77).unwrap(),
+    );
+    rig.agents.sender.role.encrypt_publication(
+        PublicationEnc::new(
+            a,
+            alias(),
+            identity(),
+            &[&channel],
+            &[&pairwise],
+            crate::wire_enc::monotonic_ns,
+        )
+        .unwrap(),
+    );
+    // The publication arrives with the first duty; it is made encrypted
+    // before any DATA is staged.
+    rig.agents.do_work(rig.now).unwrap();
+    rig.agents
+        .sender
+        .role
+        .outbound_mut(0)
+        .unwrap()
+        .require_enc()
+        .unwrap();
+    (rig, b)
+}
+
+/// ADR-0114 sections 4 to 9 and 6b end to end on unicast (#650): the
+/// SETUP ANNOUNCE opens in domain 5, the CHALLENGE in domain 6 with its
+/// pairwise trailer, the ANSWER is an ENC ANSWER (variant 3), every DATA
+/// datagram is sealed in domain 1 and delivered, and the SMs, sealed in
+/// domain 4, come back and are accepted. Then the publisher moves two
+/// epochs on: the receiver sees DATA more than one epoch ahead, sends a
+/// SOLICIT in domain 6, and the ENC ANSWER that echoes it resynchronises
+/// the binding to the stated pair; delivery resumes. Nothing is refused
+/// for its tag, trailer or class on either side.
+#[test]
+fn an_encrypted_publisher_and_receiver_establish_deliver_and_resynchronise() {
+    use karyos_protocol::protection::aes_gcm_siv::EncRejection;
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let (mut rig, b) = encrypted_rig();
+    let a = rig.publisher;
+    let slot = established(&mut rig);
+    assert_eq!(
+        rig.agents.receiver.role.enc_epochs(slot),
+        Some((1, 0)),
+        "the image is encrypted at the answer's epochs"
+    );
+    assert!(
+        rig.agents.sender.role.counters().sm_accepted > 0,
+        "an SM came back in domain 4"
+    );
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let deliver =
+        |rig: &mut Rig,
+         subscriber: &mut karyos_sys::log_buffer::Subscription<std::sync::Arc<LogBuffer>>,
+         messages: &[Vec<u8>]| {
+            for message in messages {
+                let _ = rig.log.as_mut().unwrap().publications[0]
+                    .append(message, AppendOptions::default())
+                    .unwrap();
+            }
+            let mut delivered = Vec::new();
+            for _ in 0..3000 {
+                rig.round(true);
+                while let Some(message) = poll_message(subscriber) {
+                    delivered.push(message);
+                }
+                if delivered.len() == messages.len() {
+                    break;
+                }
+            }
+            delivered
+        };
+    let first: Vec<Vec<u8>> = (0..10u8)
+        .map(|i| vec![i; 100 + usize::from(i) * 60])
+        .collect();
+    assert_eq!(deliver(&mut rig, &mut subscriber, &first), first);
+    // The publisher's session sealer moves two epochs on: the receiver
+    // cannot follow without a resynchronisation.
+    rig.agents
+        .sender
+        .role
+        .outbound_mut(0)
+        .unwrap()
+        .roll_enc_epochs(2);
+    let second: Vec<Vec<u8>> = (10..20u8).map(|i| vec![i; 200]).collect();
+    assert_eq!(deliver(&mut rig, &mut subscriber, &second), second);
+    assert_eq!(
+        rig.agents.receiver.role.enc_epochs(slot),
+        Some((1, 2)),
+        "resynchronised to the stated pair"
+    );
+    let receiver = rig
+        .agents
+        .receiver
+        .role
+        .enc_rejections(b, alias().stream_id)
+        .unwrap();
+    assert!(
+        receiver.get(EncRejection::Epoch) > 0,
+        "DATA ahead was refused first"
+    );
+    for reason in [
+        EncRejection::Tag,
+        EncRejection::Pairwise,
+        EncRejection::MixedClass,
+        EncRejection::InnerRejected,
+        EncRejection::ResyncRefused,
+    ] {
+        assert_eq!(receiver.get(reason), 0, "{reason:?}: {receiver:?}");
+    }
+    let sender = rig.agents.sender.role.enc_rejections(a, alias()).unwrap();
+    assert_eq!(sender.total(), 0, "{sender:?}");
+}

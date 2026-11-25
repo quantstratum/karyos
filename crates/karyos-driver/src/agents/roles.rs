@@ -988,6 +988,8 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     published_auth: Vec<(EndpointId, Alias)>,
     /// The authenticated subscriptions.
     subscription_auth: Vec<SubscriptionAuth>,
+    /// The encrypted subscriptions, images and publications (ADR-0114).
+    enc: receive_enc::ReceiverEnc,
     /// A SETUP ANNOUNCE or ANSWER being handled verified under its
     /// subscription's SETUP proof.
     verified_setup: bool,
@@ -1425,7 +1427,11 @@ fn post_copies<T: StreamTerms>(
             destination: key.source,
             control: Control::Nak(nak),
             guard: Some(ItemGuard::Report(ReportGuard::take(&copy.slot))),
-            seal: image.auth.as_deref().map(ImageAuth::sealer),
+            seal: image
+                .auth
+                .as_deref()
+                .map(ImageAuth::sealer)
+                .or_else(|| image.enc_seal.clone()),
         };
         match to_sender.try_post(item) {
             Ok(()) => {
@@ -1616,6 +1622,9 @@ struct Installed<T: StreamTerms = HeapTerms> {
     /// its datagrams are opened before any inner frame is read and its
     /// controls sealed; `None` on a trusted channel.
     auth: Option<Box<ImageAuth>>,
+    /// Its domain 4 sealer on an encrypted channel (ADR-0114); `None`
+    /// otherwise.
+    enc_seal: Option<SharedSealer>,
     /// The `guard_epoch` of the SESSION_ABORT applied to it: a second one
     /// changes nothing.
     aborted: Option<u64>,
@@ -1923,6 +1932,8 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     due: Vec<(EndpointId, SetupAnnounce)>,
     /// The authenticated publications' keys (ADR-0086).
     publication_auth: Vec<PublicationAuth>,
+    /// The encrypted publications' keys (ADR-0114).
+    enc: publish_enc::SenderEnc,
     /// SESSION_ABORTs requested, sent at the next duty.
     aborts: Vec<RequestedAbort>,
     /// The last SESSION_ABORT_ACK verified (tests).
@@ -2121,6 +2132,7 @@ pub(super) fn roles<T: StreamTerms>(
             budget: u32::try_from(config.control_capacity).unwrap_or(u32::MAX),
             due: Vec::with_capacity(config.publications),
             publication_auth: Vec::new(),
+            enc: publish_enc::SenderEnc::default(),
             aborts: Vec::with_capacity(config.publications),
             #[cfg(test)]
             last_abort_ack: None,
@@ -2248,6 +2260,7 @@ pub(super) fn roles<T: StreamTerms>(
             auth_unattributed: AuthRejections::default(),
             published_auth: Vec::new(),
             subscription_auth: Vec::new(),
+            enc: receive_enc::ReceiverEnc::default(),
             verified_setup: false,
             signed: None,
             remote_guards: Vec::new(),
@@ -3694,6 +3707,11 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 }
             }
         };
+        // An encrypted subscription's image takes its keys at its verified
+        // ENC ANSWER's epochs, or is not installed (fail closed).
+        let Ok(enc_seal) = self.enc_keys(&key, identity, installed, named, chain.nonce, now) else {
+            return Err(Some(chain.retire));
+        };
         self.images.push(Installed {
             slot: installed,
             owner,
@@ -3743,6 +3761,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             group_tag,
             nonce: chain.nonce,
             auth,
+            enc_seal,
             aborted: None,
         });
         Ok(link)
@@ -4136,7 +4155,11 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 destination: image.key.source,
                 control: Control::Nak(nak),
                 guard: Some(ItemGuard::Report(ReportGuard::take(&report.slot))),
-                seal: image.auth.as_deref().map(ImageAuth::sealer),
+                seal: image
+                    .auth
+                    .as_deref()
+                    .map(ImageAuth::sealer)
+                    .or_else(|| image.enc_seal.clone()),
             };
             // A dropped item drops its guard: reported not submitted, and
             // the NAK stays due.
@@ -4194,7 +4217,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
                         // An authenticated image sends no group copy: its
                         // NAKs go sealed to the publisher only (unicast,
                         // ADR-0086 open point 6).
-                        if image.auth.is_some() {
+                        if image.auth.is_some() || image.enc_seal.is_some() {
                             tally(counters, |c| &mut c.group_nak_copies_skipped);
                             continue;
                         }
@@ -4318,7 +4341,11 @@ impl<T: StreamTerms> ReceiverRole<T> {
                     kind: RttmKind::Request,
                 }),
                 guard: Some(ItemGuard::Report(ReportGuard::take(&probe.slot))),
-                seal: image.auth.as_deref().map(ImageAuth::sealer),
+                seal: image
+                    .auth
+                    .as_deref()
+                    .map(ImageAuth::sealer)
+                    .or_else(|| image.enc_seal.clone()),
             };
             // A dropped item drops its guard: reported not submitted.
             match to_sender.try_post(item) {
@@ -4427,7 +4454,11 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 destination: image.key.source,
                 control: Control::Status(status),
                 guard: Some(ItemGuard::Sm(SmGuard::take(&image.sm))),
-                seal: image.auth.as_deref().map(ImageAuth::sealer),
+                seal: image
+                    .auth
+                    .as_deref()
+                    .map(ImageAuth::sealer)
+                    .or_else(|| image.enc_seal.clone()),
             };
             // The sender gone: the driver is stopping. The SM is then
             // recorded as sent all the same: nothing will send another.
@@ -4445,7 +4476,11 @@ impl<T: StreamTerms> ReceiverRole<T> {
             return;
         };
         let (slot_ref, founding) = (image.slot, image.key);
-        let seal = image.auth.as_deref().map(ImageAuth::sealer);
+        let seal = image
+            .auth
+            .as_deref()
+            .map(ImageAuth::sealer)
+            .or_else(|| image.enc_seal.clone());
         for path in 0..usize::from(self.path_config.max_paths) {
             let Some(key) = self.sessions.paths().key(slot_ref, path) else {
                 continue;
@@ -5474,6 +5509,10 @@ impl<T: StreamTerms> Intake<'_, T> {
                 })
                 .map(|auth| auth.rsp_sealer(alias))
         });
+        let seal = match seal {
+            Some(seal) => Some(seal),
+            None => self.enc_rsp_seal(endpoint, &control),
+        };
         self.forward(ControlItem::Outgoing {
             endpoint,
             destination: source,
@@ -6080,6 +6119,10 @@ impl<T: StreamTerms> Intake<'_, T> {
     /// takes the trusted path unchanged. A refusal changes nothing but its
     /// counter: no SOLICIT, no path queue, no state.
     fn bytes_in(&mut self, source: SocketAddr, bytes: &[u8]) {
+        // The encrypted class first (ADR-0114 section 9).
+        if self.encrypted_in(source, bytes) {
+            return;
+        }
         if receive_auth::is_envelope(bytes) {
             // The signed domains (GUARD 2, SESSION_ABORT 3) take their own
             // receive order (ADR-0086 section 2).
@@ -7645,6 +7688,9 @@ impl<T: StreamTerms> SenderRole<T> {
         endpoint: EndpointId,
         bytes: &[u8],
     ) -> Option<(Control, Option<Establishing>)> {
+        if crate::wire_enc::is_envelope(bytes) {
+            return self.open_enc(endpoint, bytes);
+        }
         let alias = receive_auth::envelope_alias(bytes);
         let index = alias.and_then(|alias| self.publication_auth_index(endpoint, alias));
         let (Some(alias), Some(index)) = (alias, index) else {
@@ -7764,6 +7810,11 @@ impl<T: StreamTerms> SenderRole<T> {
             Control::Rttm(rttm) => Some(rttm.alias),
             _ => None,
         };
+        if let Some(sent) = alias.and_then(|alias| {
+            self.send_enc_sender_control(halves, endpoint, destination, control, alias)
+        }) {
+            return sent;
+        }
         let Some(alias) =
             alias.filter(|alias| self.publication_auth_index(endpoint, *alias).is_some())
         else {
@@ -8140,7 +8191,12 @@ impl<T: StreamTerms> SenderRole<T> {
                                     self.send_setup(halves, endpoint, destination, &answer, index);
                             }
                             _ => {
-                                let _ = self.send(halves, endpoint, destination, &answer);
+                                if self
+                                    .send_enc_setup(halves, endpoint, destination, &answer)
+                                    .is_none()
+                                {
+                                    let _ = self.send(halves, endpoint, destination, &answer);
+                                }
                             }
                         }
                     }
@@ -8247,12 +8303,14 @@ impl<T: StreamTerms> SenderRole<T> {
                                 );
                             }
                             None => {
-                                let _ = self.send_or_wait(
-                                    halves,
-                                    endpoint,
-                                    destination,
-                                    &Control::SetupAnnounce(announce),
-                                );
+                                let control = Control::SetupAnnounce(announce);
+                                if self
+                                    .send_enc_setup(halves, endpoint, destination, &control)
+                                    .is_none()
+                                {
+                                    let _ =
+                                        self.send_or_wait(halves, endpoint, destination, &control);
+                                }
                             }
                         }
                     }
@@ -10145,7 +10203,9 @@ fn established<T: StreamTerms>(sessions: &SendSessions, outbound: &Outbound<T>) 
 
 mod path_intake;
 pub(crate) mod publish_auth;
+pub(crate) mod publish_enc;
 pub(crate) mod receive_auth;
+pub(crate) mod receive_enc;
 
 use publish_auth::{Establishing, PublicationAuth, receiver_control_alias};
 use receive_auth::{AuthReason, AuthRejections, ImageAuth, SubscriptionAuth};

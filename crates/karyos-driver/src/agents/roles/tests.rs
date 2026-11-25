@@ -1631,6 +1631,7 @@ fn installed_image_with(
         group_tag: 0,
         nonce: [0; 2],
         auth: None,
+        enc_seal: None,
         aborted: None,
     };
     (image, params)

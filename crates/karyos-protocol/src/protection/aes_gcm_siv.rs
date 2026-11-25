@@ -735,6 +735,56 @@ impl AesGcmSiv {
         Ok(profile)
     }
 
+    /// Re-keys this value in place for `context`, as [`AesGcmSiv::new`]
+    /// would make it: a new derived key, its counters from 0 and an empty
+    /// replay window. The window's mutex is the one locked at construction,
+    /// so a platform whose mutex sets itself up on first use (a lazily
+    /// boxed pthread mutex on macOS) allocates nothing here: a scratch or
+    /// rolled key reuses a slot made ahead of the data path. On a refusal
+    /// nothing changes.
+    ///
+    /// # Errors
+    ///
+    /// As [`AesGcmSiv::new`].
+    pub fn rekey(
+        &mut self,
+        ikm: &[u8],
+        context: KeyContext,
+        pairwise: &[PairwiseKey],
+    ) -> Result<(), ContextError> {
+        if ikm.is_empty() {
+            return Err(ContextError::EmptyKey);
+        }
+        context.validate()?;
+        if pairwise.len() > PAIRWISE_SLOTS {
+            return Err(ContextError::PairwiseSlots);
+        }
+        if context.domain.is_receiver() == pairwise.is_empty() {
+            return Err(ContextError::Pairwise);
+        }
+        let mut slots: [Option<PairwiseKey>; PAIRWISE_SLOTS] = [None, None];
+        for (slot, key) in slots.iter_mut().zip(pairwise) {
+            *slot = Some(key.clone());
+        }
+        let key = context.derive(ikm);
+        let key_ref: &Key<Aes256GcmSiv> = (&*key).into();
+        // Each old value is dropped in place by its assignment, and erases
+        // itself: the AES-256 schedule (`aes` with `zeroize`) and the
+        // pairwise HMAC states (`sha2` with `zeroize`). The derived key
+        // lives only in its `Zeroizing` buffer; nothing old is moved out.
+        self.aead = Aes256GcmSiv::new(key_ref);
+        self.context = context;
+        self.party = context.party();
+        *self.next_seq.get_mut() = 0;
+        *self.sealed_bytes.get_mut() = 0;
+        *self
+            .window
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner) = ReplayWindow::new();
+        self.pairwise = slots;
+        Ok(())
+    }
+
     /// The context of this key.
     #[must_use]
     pub fn context(&self) -> &KeyContext {

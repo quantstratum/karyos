@@ -37,6 +37,9 @@ pub const MAX_URI_LENGTH: usize = 2048;
 /// The largest MTU a channel may configure: jumbo frames up to 8 KiB
 /// (SPEC.md §5).
 pub const MAX_CHANNEL_MTU: u32 = 8192;
+/// The largest MTU an `encrypted` channel may configure (ADR-0114
+/// sections 6 and 11): the plaintext bound of its usage budgets.
+pub const MAX_ENCRYPTED_MTU: u32 = 1408;
 /// The most redundant paths of one channel (network-sessions.md S5,
 /// `max_paths`).
 pub const MAX_PATHS: usize = 4;
@@ -726,7 +729,17 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
             "authenticated" => Err(ChannelError::SecurityUnsupported {
                 class: "authenticated",
             }),
-            "encrypted" => Err(ChannelError::SecurityUnsupported { class: "encrypted" }),
+            // ADR-0114 sections 6 and 11: an `encrypted` channel takes
+            // `mtu` at most 1408, the size its usage budgets assume; a
+            // larger one is refused at parse whatever else holds. The
+            // class itself stays refused until its capability gate passes
+            // (ADR-0076), as `authenticated` is.
+            "encrypted" => match get(Key::Mtu).map(parse_mtu).transpose()? {
+                Some(mtu) if mtu > MAX_ENCRYPTED_MTU => {
+                    Err(invalid(Key::Mtu, "above 1408 on an `encrypted` channel"))
+                }
+                _ => Err(ChannelError::SecurityUnsupported { class: "encrypted" }),
+            },
             _ => Err(invalid(
                 Key::Security,
                 "`trusted`, `authenticated` or `encrypted`",

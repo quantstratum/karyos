@@ -1198,3 +1198,31 @@ fn path_skew_is_a_bounded_duration() {
         ChannelError::NotApplicable { key: "path-skew" }
     );
 }
+
+/// ADR-0114 sections 6 and 11: an `encrypted` channel above `mtu` 1408 is
+/// refused at parse for its MTU; at or below it the class is still refused
+/// until its capability gate passes, never downgraded.
+#[test]
+fn an_encrypted_channel_takes_mtu_at_most_1408() {
+    for mtu in [1409, 1500, 8192] {
+        assert!(matches!(
+            refused(&format!(
+                "karyos:udp?endpoint=10.0.0.5:1|security=encrypted|mtu={mtu}"
+            )),
+            ChannelError::InvalidValue { key: "mtu", .. }
+        ));
+    }
+    for mtu in [256, 1408] {
+        assert_eq!(
+            refused(&format!(
+                "karyos:udp?endpoint=10.0.0.5:1|security=encrypted|mtu={mtu}"
+            )),
+            ChannelError::SecurityUnsupported { class: "encrypted" }
+        );
+    }
+    // The same MTU is valid on a trusted channel.
+    assert!(
+        ChannelConfig::parse("karyos:udp?endpoint=10.0.0.5:1|security=trusted|mtu=8192").is_ok()
+    );
+    assert_eq!(MAX_ENCRYPTED_MTU, 1408);
+}
