@@ -39,6 +39,13 @@
 //! only; elsewhere each process has its own origin, so these runs are
 //! compiled for Linux only.
 //!
+//! **The smoke runs, on every platform.** PR A's 3- and 5-process runs of
+//! every variant stay, on macOS too (`*_processes_commit_and_apply_the_same_commands`):
+//! the same runner on W1's case of 32 clients and 32-byte payloads, judged
+//! per server only (every client finishes; every server ends up, at the
+//! same last applied index with the same state digest), with no stamp
+//! ordering across processes, and their run-record lines.
+//!
 //! **Timing.** One core tick is [`TICK_MS`] (10 ms) of process time,
 //! version 1's frozen tick: each adapter's heartbeat and election
 //! timeouts, in ticks, are that many 10 ms on a process, and so are the
@@ -150,7 +157,6 @@ pub fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-#[cfg(target_os = "linux")]
 use w1::*;
 
 // The W2 byte case's oracle, shared with `tests/w2_bytes.rs`.
@@ -158,9 +164,13 @@ use w1::*;
 #[path = "v2/oracle.rs"]
 mod oracle;
 
-#[cfg(target_os = "linux")]
+/// The runner of every multi-process run, compiled on every platform: the
+/// smoke runs use it everywhere, the W1 and W2 runs, which order events
+/// across processes by their stamps, on Linux only.
 mod w1 {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+    // What only the Linux runs use.
+    #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
     use std::io::Read as _;
     use std::net::{TcpListener, UdpSocket};
@@ -435,6 +445,11 @@ mod w1 {
         /// The last lines of each client process with a session that did
         /// not finish.
         pub stuck: Vec<String>,
+        /// Each server's id, last applied index, state digest and whether
+        /// it was up, from its own state line: no stamp ordering.
+        pub states: Vec<(NodeId, Option<u64>, u64, bool)>,
+        /// Client sessions whose script did not complete.
+        pub waiting: usize,
     }
 
     /// Runs case `index` of `cases()` for variant `core` on processes, one
@@ -671,12 +686,56 @@ mod w1 {
         let outcome = workloads::outcome(case, &recorded, liveness, up_states, deduplicated);
         // The stamp order of the trace, as the oracle reads it.
         traces.sort_by_key(|(stamp, _)| *stamp);
+        let states = states
+            .iter()
+            .map(|state| (state.id, state.applied, state.digest, state.up))
+            .collect();
         Ok(Ran {
             outcome,
             probes,
             trace: traces.into_iter().map(|(_, item)| item).collect(),
             stuck,
+            states,
+            waiting,
         })
+    }
+
+    /// PR A's smoke run, kept on every platform (karyos#678, karyos#690,
+    /// karyos#691; macOS included, where karyos#1272's serial runs are
+    /// checked): `servers` processes of `core` serve W1's case of 32
+    /// clients and 32-byte payloads, and every server applies the same
+    /// commands in the same order. Judged per server, never across
+    /// processes by stamps: every client finishes, every server is up,
+    /// and all end at the same last applied index with the same state
+    /// digest (the test service's digest covers every value in the order
+    /// applied); the probe measured entries past its warm-up. Its
+    /// run-record line is written as every run's.
+    pub fn processes_commit_and_apply_the_same_commands(core: &str, servers: usize) {
+        let index = case_of(servers, 32, 32);
+        let case = cases().into_iter().nth(index).unwrap();
+        let ran = run_case(core, index, &case);
+        assert_eq!(
+            ran.waiting, 0,
+            "{core} {}: clients unfinished: {:?}",
+            case.name, ran.stuck
+        );
+        assert_eq!(ran.states.len(), servers, "{core} {}", case.name);
+        let (_, applied, digest, _) = ran.states[0];
+        assert!(applied.is_some(), "{core} {}: {:?}", case.name, ran.states);
+        assert!(
+            ran.states
+                .iter()
+                .all(|state| state.3 && state.1 == applied && state.2 == digest),
+            "{core} {}: the servers disagree: {:?}",
+            case.name,
+            ran.states
+        );
+        assert!(
+            ran.probes.iter().any(|probe| probe.entries > 0),
+            "{core} {}: the probe measured no entry: {:?}",
+            case.name,
+            ran.probes
+        );
     }
 
     /// The index of the W1 case of `servers`, `payload` and `clients`.
@@ -759,6 +818,39 @@ fn a_malformed_argument_is_a_usage_error() {
             .unwrap();
         assert_eq!(status.code(), Some(2));
     }
+}
+
+#[test]
+fn raft_three_processes_commit_and_apply_the_same_commands() {
+    processes_commit_and_apply_the_same_commands("raft", 3);
+}
+
+#[test]
+fn raft_five_processes_commit_and_apply_the_same_commands() {
+    processes_commit_and_apply_the_same_commands("raft", 5);
+}
+
+/// OpenRaft on its manually pumped executor, the same type the simulator
+/// tests drive.
+#[test]
+fn openraft_three_processes_commit_and_apply_the_same_commands() {
+    processes_commit_and_apply_the_same_commands("openraft", 3);
+}
+
+#[test]
+fn openraft_five_processes_commit_and_apply_the_same_commands() {
+    processes_commit_and_apply_the_same_commands("openraft", 5);
+}
+
+/// The custom core (ADR-0105), over the runner's own encoding.
+#[test]
+fn custom_three_processes_commit_and_apply_the_same_commands() {
+    processes_commit_and_apply_the_same_commands("custom", 3);
+}
+
+#[test]
+fn custom_five_processes_commit_and_apply_the_same_commands() {
+    processes_commit_and_apply_the_same_commands("custom", 5);
 }
 
 /// W1's primary operating point (version 1: 3 servers, 256-byte payloads,
