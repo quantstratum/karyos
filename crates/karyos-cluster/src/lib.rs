@@ -22,6 +22,7 @@
 pub mod consensus;
 pub mod dedup;
 mod file;
+pub mod guards;
 pub mod hard_state;
 pub mod log;
 pub mod mark;
