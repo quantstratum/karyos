@@ -203,6 +203,10 @@ pub struct GateCounts {
     pub faults: u64,
     /// Guard words that broke the encoding, treated as closed.
     pub corrupt: u64,
+    /// Probes and checks held because the guard has not reached the lane's
+    /// open epoch yet: a remote guard still recovering or awaiting its
+    /// confirmation. Held, not aborted.
+    pub guard_pending: u64,
     /// Counts that would have overflowed and kept their last value.
     pub overflows: u64,
     /// Published rate policies the gate refused (a zero rate, or a byte
@@ -1237,7 +1241,7 @@ impl GuardGate {
                     epoch: state.epoch,
                     open: true,
                 });
-            if !open {
+            if !open && !not_yet_open(observed, state.epoch) {
                 self.apply_close(index, observed);
             }
         }
@@ -1298,6 +1302,17 @@ impl State {
     }
 }
 
+/// Whether `observed` is a valid guard word below the lane's open epoch
+/// `epoch`: the guard has not reached the epoch the lane was admitted
+/// under, so nothing is sent but the incarnation is not closed. A local
+/// guard never reads so (admission takes its current open epoch); a remote
+/// guard does while it recovers or awaits confirmation
+/// (`crate::remote_guard::RemoteGuard::word`). A corrupt word, the open
+/// epoch closed, or any later epoch still closes for good.
+fn not_yet_open(observed: Option<GuardState>, epoch: u64) -> bool {
+    observed.is_some_and(|state| state.epoch < epoch)
+}
+
 impl SenderGate for GuardGate {
     fn check(&mut self, candidate: &Exposure<'_>) -> GateDecision {
         bump(&mut self.counts.checks, &mut self.counts.overflows);
@@ -1318,6 +1333,10 @@ impl SenderGate for GuardGate {
                 epoch: state.epoch,
                 open: true,
             });
+        if !open && not_yet_open(observed, state.epoch) {
+            bump(&mut self.counts.guard_pending, &mut self.counts.overflows);
+            return GateDecision::Deny;
+        }
         if !open {
             self.deny_guard(index, observed);
             return GateDecision::Deny;
@@ -1402,6 +1421,10 @@ impl LaneGate for GuardGate {
         // The probe asks the gate's rule, so a lane closed by its guard
         // aborts and publishes here as at an exposure (one Acquire load).
         let observed = self.load();
+        if not_yet_open(observed, epoch) {
+            bump(&mut self.counts.guard_pending, &mut self.counts.overflows);
+            return false;
+        }
         if observed != Some(GuardState { epoch, open: true }) {
             self.deny_guard(lane, observed);
             return false;

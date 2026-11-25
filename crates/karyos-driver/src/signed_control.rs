@@ -48,7 +48,7 @@ const NS_PER_S: u128 = 1_000_000_000;
 
 /// A token bucket refilled on the monotonic clock.
 #[derive(Debug, Clone, Copy)]
-struct Bucket {
+pub(crate) struct Bucket {
     tokens: u32,
     capacity: u32,
     per_second: u32,
@@ -56,7 +56,7 @@ struct Bucket {
 }
 
 impl Bucket {
-    const fn full(capacity: u32, per_second: u32, now: u64) -> Self {
+    pub(crate) const fn full(capacity: u32, per_second: u32, now: u64) -> Self {
         Self {
             tokens: capacity,
             capacity,
@@ -81,12 +81,12 @@ impl Bucket {
             .min(now);
     }
 
-    fn has(&mut self, now: u64) -> bool {
+    pub(crate) fn has(&mut self, now: u64) -> bool {
         self.refill(now);
         self.tokens > 0
     }
 
-    fn take(&mut self) {
+    pub(crate) fn take(&mut self) {
         self.tokens = self.tokens.saturating_sub(1);
     }
 }

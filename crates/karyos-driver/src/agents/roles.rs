@@ -304,6 +304,10 @@ pub struct ReceiverCounters {
     pub guard_challenges: u64,
     /// Raw datagrams a full control ring dropped.
     pub ring_full_raw: u64,
+    /// GUARD STATUS answers signed and handed to the sender.
+    pub guard_statuses_sent: u64,
+    /// STATUS_CHALLENGEs this authority refused (by reason on it).
+    pub guard_challenges_refused: u64,
     /// Bare DATA, heartbeats, PATH_HB, ERR, RTTM REPLY, SETUP ANNOUNCE or
     /// SETUP ANSWER for an authenticated image (ADR-0086 section 2):
     /// dropped.
@@ -994,6 +998,8 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     remote_guards: Vec<FollowedGuard>,
     /// Their durable epoch marks.
     guard_marks: Option<Box<dyn MarkStore + Send>>,
+    /// The guard authority this driver is, answering STATUS_CHALLENGEs.
+    guard_authority: Option<Box<crate::guard_authority::GuardAuthority>>,
     /// Each image's RTT probes' settings.
     rtt: RttConfig,
     /// A multicast image's NAK timing.
@@ -2246,6 +2252,7 @@ pub(super) fn roles<T: StreamTerms>(
             signed: None,
             remote_guards: Vec::new(),
             guard_marks: None,
+            guard_authority: None,
             rtt: config.rtt,
             multicast: config.multicast,
             unicast_retry_slack: config.unicast_retry_slack,
@@ -2895,6 +2902,11 @@ impl<T: StreamTerms> ReceiverRole<T> {
         if let Some(intake) = self.signed.as_deref_mut() {
             intake.new_cycle();
         }
+        if let Some(authority) = self.guard_authority.as_deref_mut() {
+            authority.new_cycle();
+        }
+        // A lapse closes the gates' word as a close does.
+        self.publish_guard_words(now);
         let boot = self.sessions.boot_id();
         for at in 0..self.remote_guards.len() {
             let Some(followed) = self.remote_guards.get_mut(at) else {
@@ -2931,6 +2943,23 @@ impl<T: StreamTerms> ReceiverRole<T> {
         }
     }
 
+    /// Stores each followed guard's word for the sender gates that read
+    /// it: open only while open and confirmed (Release, as a local close).
+    fn publish_guard_words(&self, now: u64) {
+        for followed in &self.remote_guards {
+            if let Some(word) = followed
+                .mirror
+                .as_deref()
+                .and_then(|words| words.words().first())
+            {
+                let next = followed.guard.word(now);
+                if word.load(karyos_sys::sync::Ordering::Acquire) != next {
+                    word.store(next, karyos_sys::sync::Ordering::Release);
+                }
+            }
+        }
+    }
+
     /// Trusts `authorities` for the signed domains (tests).
     #[cfg(test)]
     pub(super) fn trust_authorities(
@@ -2952,14 +2981,27 @@ impl<T: StreamTerms> ReceiverRole<T> {
         endpoint: EndpointId,
         authority: SocketAddr,
         marks: Box<dyn MarkStore + Send>,
+        mirror: Option<Arc<karyos_client::HeapWords>>,
     ) {
         self.remote_guards.push(FollowedGuard {
             guard,
             receiver_id,
             endpoint,
             authority,
+            mirror,
         });
         self.guard_marks = Some(marks);
+        self.publish_guard_words(0);
+    }
+
+    /// Makes this driver the guard authority `authority` (tests); `None`
+    /// stops it answering.
+    #[cfg(test)]
+    pub(super) fn set_guard_authority(
+        &mut self,
+        authority: Option<crate::guard_authority::GuardAuthority>,
+    ) {
+        self.guard_authority = authority.map(Box::new);
     }
 
     /// The phase of the followed guard `guard_id` at `now` (tests).
@@ -6005,6 +6047,9 @@ struct FollowedGuard {
     endpoint: EndpointId,
     /// The authority's guard control address.
     authority: SocketAddr,
+    /// The guard word local sender gates read for it, written here on
+    /// every change and lapse; `None` when no publication is guarded by it.
+    mirror: Option<Arc<karyos_client::HeapWords>>,
 }
 
 /// A SESSION_ABORT requested of a publication.
@@ -6080,8 +6125,44 @@ impl<T: StreamTerms> Intake<'_, T> {
             }
             // A datagram kind a later protocol version decodes: not served.
             Ok(_) => self.role.count(|c| &mut c.unhandled),
+            // A guard authority answers a bare STATUS_CHALLENGE (design
+            // 4.2); anything else gated stays undecoded.
+            Err(_) if self.status_challenge(source, bytes) => {}
             Err(_) => self.role.count(|c| &mut c.decode_errors),
         }
+    }
+
+    /// A bare datagram at a guard authority: answered with a signed
+    /// STATUS to the receiver's configured endpoint when it is a
+    /// STATUS_CHALLENGE the authority serves. Returns whether it was a
+    /// STATUS_CHALLENGE, answered or refused.
+    fn status_challenge(&mut self, source: SocketAddr, bytes: &[u8]) -> bool {
+        use crate::guard_authority::ChallengeRefusal;
+
+        let now = self.now;
+        let Some(authority) = self.role.guard_authority.as_deref_mut() else {
+            return false;
+        };
+        let answer = match authority.answer(bytes, source, now) {
+            Ok(answer) => answer,
+            Err(ChallengeRefusal::Malformed) => return false,
+            Err(_) => {
+                self.role.count(|c| &mut c.guard_challenges_refused);
+                return true;
+            }
+        };
+        let Some(raw) = SealedBytes::copy(answer.datagram()) else {
+            self.role.count(|c| &mut c.guard_challenges_refused);
+            return true;
+        };
+        if self.forward(ControlItem::Raw {
+            endpoint: self.endpoint,
+            destination: answer.destination,
+            bytes: raw,
+        }) {
+            self.role.count(|c| &mut c.guard_statuses_sent);
+        }
+        true
     }
 
     /// A DATA datagram, through its path's queue when it has one.
@@ -6270,6 +6351,7 @@ impl<T: StreamTerms> Intake<'_, T> {
                     _ => false,
                 };
                 self.guard_outcome(applied);
+                self.role.publish_guard_words(now);
             }
             AuthControl::Status(status) => {
                 let boot = self.role.sessions.boot_id();
@@ -6293,6 +6375,7 @@ impl<T: StreamTerms> Intake<'_, T> {
                     _ => false,
                 };
                 self.guard_outcome(applied);
+                self.role.publish_guard_words(now);
             }
             _ => self.role.count(|c| &mut c.signed_refused),
         }

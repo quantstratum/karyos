@@ -7671,6 +7671,7 @@ fn a_followed_guard_recovers_only_through_its_own_challenge() {
         b,
         authority,
         Box::new(MemoryMarks::default()),
+        None,
     );
     let sign = |control: AuthControl, seq: u64| {
         let mut bytes = vec![0u8; 256];
@@ -7759,4 +7760,222 @@ fn a_followed_guard_recovers_only_through_its_own_challenge() {
         rig.agents.receiver.role.guard_phase(11, rig.now),
         Some(Phase::Open { epoch: 4, .. })
     ));
+}
+
+/// A heap guard word in `state`.
+fn guard_word(epoch: u64, open: bool) -> std::sync::Arc<karyos_client::HeapWords> {
+    let word = std::sync::Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(
+        karyos_sys::guard::encode(karyos_sys::guard::GuardState { epoch, open }).unwrap(),
+        karyos_sys::sync::Ordering::Release,
+    );
+    word
+}
+
+/// A rig whose publication on A is guarded, at open epoch 2, by guard 11
+/// of authority 10, which A's driver follows as receiver 66 through a
+/// mirror word its gate reads. With `authority`, B's driver is that
+/// authority, its guard word `authority`, answering A's challenges.
+/// `marks` are the follower's durable marks. Returns the rig, A's and B's
+/// addresses and the authority's signer.
+fn remotely_guarded_rig(
+    marks: MemoryMarks,
+    authority: Option<std::sync::Arc<karyos_client::HeapWords>>,
+) -> (Rig, SocketAddr, SocketAddr, crate::authority::Ed25519Signer) {
+    use std::sync::Arc;
+
+    use karyos_sys::applied_epoch::AppliedEpoch;
+
+    use crate::authority::Ed25519Signer;
+    use crate::guard_authority::{AuthorityGuard, GuardAuthority};
+    use crate::remote_guard::RemoteGuard;
+    use crate::signed_control::Authority;
+
+    let mirror = guard_word(1, false);
+    let (mut rig, b) = Rig::new(Setup {
+        guard: Some(super::super::data::GuardSpec {
+            word: Arc::clone(&mirror) as Arc<dyn karyos_client::SharedWords>,
+            cell: Arc::new(AppliedEpoch::new()),
+            epoch: 2,
+            empty_since: None,
+            rate: None,
+            reserve: None,
+            policy: None,
+            frontier: Default::default(),
+        }),
+        ..Setup::default()
+    });
+    let a = rig.publisher;
+    let a_at = rig.endpoints.local_address(a).unwrap();
+    let b_at = rig.endpoints.local_address(b).unwrap();
+    let signer = Ed25519Signer::from_seed(&[9; 32]);
+    let receiver = &mut rig.agents.receiver.role;
+    receiver.trust_authorities(
+        vec![Authority::of(10, signer.verifier(), 10, &[11], false)],
+        0,
+    );
+    let guard = RemoteGuard::load(10, 11, &marks);
+    receiver.follow_guard(guard, 66, a, b_at, Box::new(marks), Some(mirror));
+    if let Some(word) = authority {
+        let guards = vec![AuthorityGuard {
+            guard_id: 11,
+            word: word as Arc<dyn karyos_client::SharedWords>,
+            lifetime_ms: 5_000,
+            receivers: vec![(66, a_at)],
+        }];
+        receiver.set_guard_authority(Some(
+            GuardAuthority::new(10, 10, Ed25519Signer::from_seed(&[9; 32]), guards, 0).unwrap(),
+        ));
+    }
+    (rig, a_at, b_at, signer)
+}
+
+/// A GUARD STATE of guard 11 signed by `signer`.
+fn signed_state(signer: &crate::authority::Ed25519Signer, epoch: u64, seq: u64) -> Vec<u8> {
+    use karyos_protocol::network::authenticated::{AuthControl, GuardState, GuardWord};
+    use karyos_protocol::protection::signed::{SignedBinding, SignedDomain, seal_signed};
+
+    let mut bytes = vec![0u8; 256];
+    let body = AuthControl::State(GuardState {
+        authority_id: 10,
+        guard_id: 11,
+        word: GuardWord::from_epoch(epoch).unwrap(),
+        lifetime_ms: 5_000,
+    })
+    .encode(&mut bytes)
+    .unwrap();
+    let binding = SignedBinding {
+        domain: SignedDomain::Guard,
+        party_epoch: 0,
+        session_id: 0,
+        stream_id: 0,
+        key_id: 10,
+    };
+    let length = seal_signed(&mut bytes, body, &binding, seq, signer).unwrap();
+    bytes.truncate(length);
+    bytes
+}
+
+/// Appends one message and runs `rounds` rounds; returns how many DATA
+/// frames the receiver committed meanwhile.
+fn send_one(rig: &mut Rig, rounds: usize) -> u64 {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let before = rig.agents.receiver.counters().data_committed;
+    let _ = rig.log.as_mut().unwrap().publications[0]
+        .append(&[3; 100], AppendOptions::default())
+        .unwrap();
+    for _ in 0..rounds {
+        rig.round(true);
+    }
+    rig.agents.receiver.counters().data_committed - before
+}
+
+/// ADR-0086 section 7, design 4.1 and 4.4, end to end on two endpoints: a
+/// publication on A guarded by B's guard opens once A's driver recovers
+/// it through B's signed STATUS answering A's own challenge, sends while
+/// it is open and confirmed, and a signed `Closed` STATE stops every
+/// submission at once.
+#[test]
+fn a_remotely_guarded_publication_opens_on_the_authoritys_status_and_stops_on_its_close() {
+    use crate::remote_guard::Phase;
+
+    let (mut rig, _a, b_at, signer) =
+        remotely_guarded_rig(MemoryMarks::default(), Some(guard_word(2, true)));
+    let _slot = established(&mut rig);
+    rig.until(true, |rig| {
+        matches!(
+            rig.agents.receiver.role.guard_phase(11, rig.now),
+            Some(Phase::Open { epoch: 2, .. })
+        )
+    });
+    let counters = rig.agents.receiver.counters();
+    assert!(counters.guard_statuses_sent >= 1 && counters.guard_challenges >= 1);
+    assert!(send_one(&mut rig, 100) >= 1, "sends while open");
+    // The authority closes: its STATE is pushed to A.
+    let receiver = &mut rig.agents.receiver;
+    let a = rig.publisher;
+    receiver.role.inject_datagram(
+        &receiver.sessions,
+        a,
+        b_at,
+        &signed_state(&signer, 3, 0),
+        rig.now,
+    );
+    assert_eq!(
+        rig.agents.receiver.role.guard_phase(11, rig.now),
+        Some(Phase::Closed)
+    );
+    assert_eq!(send_one(&mut rig, 100), 0, "nothing after the close");
+}
+
+/// Design 4.4: with the authority silent, the `Open` lapses one lifetime
+/// after its last confirmation, and the publication stops sending.
+#[test]
+fn a_remote_guard_that_lapses_stops_its_publication() {
+    use crate::remote_guard::Phase;
+
+    let (mut rig, _a, _b_at, _signer) =
+        remotely_guarded_rig(MemoryMarks::default(), Some(guard_word(2, true)));
+    let _slot = established(&mut rig);
+    rig.until(true, |rig| {
+        matches!(
+            rig.agents.receiver.role.guard_phase(11, rig.now),
+            Some(Phase::Open { .. })
+        )
+    });
+    assert!(send_one(&mut rig, 100) >= 1);
+    // The authority goes silent; one lifetime passes.
+    rig.agents.receiver.role.set_guard_authority(None);
+    rig.now += 6_000 * MS;
+    rig.round(true);
+    assert_eq!(
+        rig.agents.receiver.role.guard_phase(11, rig.now),
+        Some(Phase::Closed)
+    );
+    assert_eq!(send_one(&mut rig, 100), 0, "nothing after the lapse");
+}
+
+/// ADR-0086 section 7: before recovery a remotely guarded publication
+/// sends nothing: with no authority answering, its guard stays closed.
+#[test]
+fn a_remotely_guarded_publication_sends_nothing_before_recovery() {
+    use crate::remote_guard::Phase;
+
+    let (mut rig, _a, _b_at, _signer) = remotely_guarded_rig(MemoryMarks::default(), None);
+    let _slot = established(&mut rig);
+    assert_eq!(send_one(&mut rig, 200), 0);
+    assert_eq!(
+        rig.agents.receiver.role.guard_phase(11, rig.now),
+        Some(Phase::Recovering)
+    );
+    assert!(rig.agents.receiver.counters().guard_challenges >= 1);
+}
+
+/// ADR-0086 section 7: after a restart the stored mark refuses an old
+/// OPEN: an authority restored below it latches the guard closed, and the
+/// old signed `Open` STATE is refused; the publication sends nothing.
+#[test]
+fn a_restart_with_the_stored_mark_refuses_an_old_open() {
+    use crate::remote_guard::Phase;
+
+    let mut marks = MemoryMarks::default();
+    marks.0.insert(11, 4);
+    let (mut rig, _a, b_at, signer) = remotely_guarded_rig(marks, Some(guard_word(2, true)));
+    let _slot = established(&mut rig);
+    rig.until(true, |rig| {
+        rig.agents.receiver.role.guard_phase(11, rig.now) == Some(Phase::Latched)
+    });
+    let refused = rig.agents.receiver.counters().guard_refused;
+    let receiver = &mut rig.agents.receiver;
+    let a = rig.publisher;
+    receiver.role.inject_datagram(
+        &receiver.sessions,
+        a,
+        b_at,
+        &signed_state(&signer, 2, 0),
+        rig.now,
+    );
+    assert_eq!(rig.agents.receiver.counters().guard_refused, refused + 1);
+    assert_eq!(send_one(&mut rig, 200), 0);
 }

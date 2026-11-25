@@ -29,6 +29,7 @@ pub mod error;
 mod generations;
 pub mod grant_audit;
 pub mod guard_ack;
+pub mod guard_authority;
 pub mod guard_gate;
 mod guard_streams;
 pub mod guards;

@@ -244,6 +244,34 @@ impl RemoteGuard {
         }
     }
 
+    /// The guard word a local sender gate reads for this guard at `now`
+    /// (`karyos_sys::guard` encoding): `(epoch, Open)` only while open and
+    /// confirmed; otherwise a closed word at the floor, or just above an
+    /// open floor that lapsed or awaits confirmation, so no gate admits.
+    /// A gate holds a lane while the word is below the lane's open epoch
+    /// (not yet recovered or confirmed), and closes its incarnation for
+    /// good once it is at or above it and not open (a close or a lapse).
+    #[must_use]
+    pub fn word(&self, now: u64) -> u64 {
+        let closed = |epoch: u64| {
+            let epoch = epoch.max(1);
+            let epoch = if epoch.is_multiple_of(2) {
+                epoch.saturating_add(1).min(karyos_sys::guard::MAX_EPOCH)
+            } else {
+                epoch
+            };
+            karyos_sys::guard::encode(karyos_sys::guard::GuardState { epoch, open: false })
+                .unwrap_or(karyos_sys::guard::created())
+        };
+        match self.phase(now) {
+            Phase::Open { epoch, .. } => {
+                karyos_sys::guard::encode(karyos_sys::guard::GuardState { epoch, open: true })
+                    .unwrap_or_else(|| closed(epoch))
+            }
+            Phase::Recovering | Phase::Closed | Phase::Latched => closed(self.floor),
+        }
+    }
+
     /// Whether the guard is open at `now`.
     #[must_use]
     pub fn is_open(&self, now: u64) -> bool {
