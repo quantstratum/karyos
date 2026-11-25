@@ -451,3 +451,50 @@ fn a_reload_with_no_key_left_clears_every_key() {
         Err(Refusal::Envelope(Rejection::Epoch))
     );
 }
+
+/// A checked datagram that its caller refuses (for its inner frames) and
+/// never commits consumes no sequence and moves no epoch: the same
+/// sequence still opens, and a next-epoch datagram checked only does not
+/// start the old epoch's overlap.
+#[test]
+fn a_check_without_a_commit_changes_nothing() {
+    let file = channel_file(1, 0x11);
+    let party = sender(BOOT, [1, 2]);
+    let mut verifier = Verifier::new([&file], party, ALIAS).unwrap();
+    let mut old = Sealer::at_seq(&file, party, ALIAS, 0, 7);
+    let mut new = Sealer::at_seq(&file, party, ALIAS, 1, 0);
+    let first = sealed(&mut old, b"a");
+    let late = sealed(&mut old, b"b");
+    let checked = verifier.check(&first, NOW).unwrap();
+    assert_eq!(checked.opened().seq, 7);
+    // Checked again: nothing was recorded.
+    let again = verifier.check(&first, NOW).unwrap();
+    assert_eq!(verifier.commit(again, NOW).unwrap().seq, 7);
+    // Now recorded: a duplicate.
+    assert_eq!(
+        verifier.check(&first, NOW),
+        Err(Refusal::Replay(Replay::Duplicate))
+    );
+    // A stale check of the same datagram cannot commit twice.
+    assert_eq!(
+        verifier.commit(checked, NOW),
+        Err(Refusal::Replay(Replay::Duplicate))
+    );
+    // The next epoch, checked and never committed: epoch 0 stays current,
+    // so it still verifies long after an overlap would have ended.
+    let moved = sealed(&mut new, b"n");
+    let _ = verifier.check(&moved, NOW).unwrap();
+    assert!(verifier.open(&late, NOW + IN_BAND_OVERLAP_S + 1).is_ok());
+    // Committed, the move happens and starts the overlap from then.
+    let checked = verifier.check(&moved, NOW + IN_BAND_OVERLAP_S + 1).unwrap();
+    assert!(
+        verifier
+            .commit(checked, NOW + IN_BAND_OVERLAP_S + 1)
+            .is_ok()
+    );
+    let past = sealed(&mut old, b"c");
+    assert_eq!(
+        verifier.open(&past, NOW + 2 * IN_BAND_OVERLAP_S + 1),
+        Err(Refusal::Envelope(Rejection::Epoch))
+    );
+}

@@ -7189,3 +7189,208 @@ fn an_authenticated_images_sm_and_nak_go_sealed_in_domain_4() {
     }
     let _ = auth.slot;
 }
+
+/// ADR-0086 section 7a (until the SETUP proof of slice 3b): a bare SETUP
+/// ANNOUNCE or ANSWER naming an authenticated image, from another source,
+/// creates no challenge, consumes none, binds no path and moves nothing
+/// but `auth_bare`.
+#[test]
+fn a_bare_setup_never_adds_a_path_to_an_authenticated_image() {
+    use karyos_protocol::network::{ChallengeBlock, Control, SetupAnswer};
+
+    let mut auth = auth_rig();
+    let other: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let boot = auth
+        .rig
+        .agents
+        .receiver
+        .role
+        .receiver_of(auth.slot)
+        .receiver_boot_id;
+    let sessions = auth.sessions();
+    let answer = SetupAnswer {
+        alias: alias(),
+        identity: identity(),
+        term: term(65_536),
+        challenge: ChallengeBlock {
+            receiver_boot_id: boot,
+            nonce: [1, 2],
+        },
+        joins: Lanes::new(&[0, 0]).unwrap(),
+    };
+    for (source, control) in [
+        (other, Control::SetupAnnounce(announce(65_536))),
+        (other, Control::SetupAnswer(answer)),
+        (auth.source, Control::SetupAnnounce(announce(65_536))),
+    ] {
+        let before = auth.counters();
+        let receiver = &mut auth.rig.agents.receiver;
+        receiver
+            .role
+            .inject_control(&receiver.sessions, auth.b, source, control, auth.rig.now);
+        only_changed(before, auth.counters(), |c| &mut c.auth_bare, 1);
+        assert_eq!(
+            auth.sessions(),
+            sessions,
+            "no challenge created or consumed"
+        );
+        assert!(
+            auth.rig.agents.sender.role.take_control().is_none(),
+            "no CHALLENGE"
+        );
+    }
+    assert_eq!(auth.counters().paths_bound, 0);
+}
+
+/// ADR-0086 sections 2 and 6: an envelope with a valid tag whose inner
+/// frames are not its binding's is refused for them without consuming its
+/// sequence, so the genuine datagram of that sequence still delivers. Each
+/// refusal is counted by its reason on the image's binding; an envelope
+/// for no binding is counted by reason in the unattributed bucket.
+#[test]
+fn refusals_are_counted_by_reason_and_an_inner_refusal_consumes_nothing() {
+    use crate::agents::roles::receive_auth::AuthReason;
+    use crate::wire_auth::Sealer;
+
+    let mut auth = auth_rig();
+    // Two sealers of one key, both from sequence 0.
+    let mut wrong = Sealer::new(&auth.channel, auth.sender, alias()).unwrap();
+    let mut right = Sealer::new(&auth.channel, auth.sender, alias()).unwrap();
+    let mut frame = stale_frame(9, 0, 32);
+    frame[12..16].copy_from_slice(&99i32.to_le_bytes());
+    let foreign = sealed(&mut wrong, &frame);
+    let before = auth.counters();
+    auth.inject(&foreign);
+    only_changed(before, auth.counters(), |c| &mut c.auth_inner_invalid, 1);
+    let genuine = sealed(&mut right, &stale_frame(9, 0, 32));
+    let before = auth.counters();
+    auth.inject(&genuine);
+    assert_eq!(auth.counters().data_committed, before.data_committed + 1);
+    // A replay and an altered tag, each in its own slot.
+    auth.inject(&genuine);
+    let mut altered = sealed(&mut right, &stale_frame(9, 64, 32));
+    let last = altered.len() - 1;
+    altered[last] ^= 1;
+    auth.inject(&altered);
+    let role = &auth.rig.agents.receiver.role;
+    let rejections = role.auth_rejections(auth.slot).unwrap();
+    assert_eq!(rejections.get(AuthReason::Inner), 1);
+    assert_eq!(rejections.get(AuthReason::Duplicate), 1);
+    assert_eq!(rejections.get(AuthReason::Tag), 1);
+    assert_eq!(rejections.counts().iter().sum::<u64>(), 3);
+    // For no binding: the unattributed bucket.
+    let mut stranger = Sealer::new(
+        &auth.channel,
+        auth.sender,
+        Alias {
+            session_id: 99,
+            ..alias()
+        },
+    )
+    .unwrap();
+    auth.inject(&sealed(&mut stranger, &frame));
+    let unattributed = auth.rig.agents.receiver.role.unattributed_auth_rejections();
+    assert_eq!(unattributed.get(AuthReason::Unbound), 1);
+    assert_eq!(unattributed.counts().iter().sum::<u64>(), 1);
+}
+
+/// ADR-0086 section 7a: an authenticated image's RTTM REQUEST leaves the
+/// sender's duty cycle sealed in domain 4 and opens as that REQUEST.
+#[test]
+fn an_authenticated_images_rttm_request_leaves_the_duty_cycle_sealed() {
+    use std::sync::{Arc, Mutex};
+
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+    use karyos_protocol::network::{Control, Datagram, RttmKind, classify};
+
+    use super::super::control::ControlItem;
+    use crate::wire_auth::Verifier;
+
+    let mut auth = auth_rig();
+    let mut request = None;
+    for _ in 0..2000 {
+        auth.rig.round(true);
+        while let Some(item) = auth.rig.agents.sender.role.take_control() {
+            if let ControlItem::Outgoing {
+                control: Control::Rttm(rttm),
+                ..
+            } = &item
+                && rttm.kind == RttmKind::Request
+            {
+                request = Some(item);
+            }
+        }
+        if request.is_some() {
+            break;
+        }
+    }
+    let item = request.expect("an RTTM REQUEST falls due");
+    let ControlItem::Outgoing {
+        control: expected, ..
+    } = &item
+    else {
+        unreachable!()
+    };
+    let expected = *expected;
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    observer.set_send_hook(Box::new(move |_, datagrams| {
+        for datagram in datagrams {
+            record.lock().unwrap().push(datagram.to_vec());
+        }
+    }));
+    observer.push_send(karyos_io::sockets::ops::SendResult::Sent {
+        sent: 1,
+        error: None,
+    });
+    let config = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let endpoint = SocketsEndpoint::open(&config, InstanceId::FIRST, socket).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    // On an endpoint the sender has no cached route for: the rig's own
+    // halves are real sockets.
+    let ControlItem::Outgoing {
+        destination,
+        control,
+        guard,
+        seal,
+        ..
+    } = item
+    else {
+        unreachable!()
+    };
+    assert!(seal.is_some(), "it carries the image's sealer");
+    let on = EndpointId(77);
+    let mut halves = vec![(on, super::super::Half::Tx(Box::new(tx)))];
+    auth.rig
+        .agents
+        .receiver
+        .role
+        .post_to_sender(ControlItem::Outgoing {
+            endpoint: on,
+            destination,
+            control,
+            guard,
+            seal,
+        });
+    let now = auth.rig.now;
+    let _ = auth.rig.agents.sender.role.duty(&mut halves, now).unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.len(),
+        1,
+        "sent once: {:?}",
+        auth.rig.agents.sender.role.counters()
+    );
+    assert!(classify(&seen[0]).is_err(), "never bare");
+    let mut verifier = Verifier::new([&auth.pairwise], auth.receiver, alias()).unwrap();
+    let opened = verifier.open(&seen[0], auth_wall()).unwrap();
+    let Datagram::Control(decoded) = classify(&seen[0][opened.start..][..opened.frames]).unwrap()
+    else {
+        panic!("not a control");
+    };
+    assert_eq!(decoded, expected);
+}

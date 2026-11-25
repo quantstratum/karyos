@@ -17,9 +17,110 @@
 use karyos_protocol::network::Alias;
 use karyos_protocol::protection::hmac_sha256::{Domain, FRAME_TYPE};
 
+use karyos_protocol::protection::Rejection;
+use karyos_protocol::protection::hmac_sha256::Opened;
+use karyos_protocol::protection::replay::Replay;
+
 use super::super::control::SharedSealer;
-use crate::wire_auth::{KeyError, Party, Refusal, Sealer, Verifier};
+use crate::wire_auth::{Checked, KeyError, Party, Refusal, Sealer, Verifier};
 use crate::wire_keys::KeyFile;
+
+/// Why a received datagram was refused, one counter each (ADR-0086
+/// section 2: per key and source, by reason).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum AuthReason {
+    /// Shorter than the envelope.
+    Short = 0,
+    /// `datagram_length` is not the datagram's length.
+    Length,
+    /// Another envelope version.
+    Version,
+    /// Nonzero flags.
+    Flags,
+    /// Another frame type.
+    FrameType,
+    /// Another profile.
+    Profile,
+    /// Another tag length.
+    TagLength,
+    /// Another domain.
+    Domain,
+    /// No key of its party epoch.
+    Epoch,
+    /// Another session or stream.
+    Binding,
+    /// An unknown `key_id`.
+    Key,
+    /// A tag that does not verify.
+    Tag,
+    /// A sequence already accepted.
+    Duplicate,
+    /// A sequence older than the window.
+    TooOld,
+    /// It opened, but its inner frames are not a domain 1 datagram of its
+    /// own binding: its sequence is not consumed.
+    Inner,
+    /// An envelope for no authenticated binding.
+    Unbound,
+}
+
+/// Reasons a datagram is refused for.
+pub const AUTH_REASONS: usize = AuthReason::Unbound as usize + 1;
+
+impl AuthReason {
+    /// The reason of `refusal`.
+    #[must_use]
+    pub fn of(refusal: Refusal) -> Self {
+        match refusal {
+            Refusal::Envelope(rejection) => match rejection {
+                Rejection::Short => Self::Short,
+                Rejection::Length => Self::Length,
+                Rejection::Version => Self::Version,
+                Rejection::Flags => Self::Flags,
+                Rejection::FrameType => Self::FrameType,
+                Rejection::Profile => Self::Profile,
+                Rejection::TagLength => Self::TagLength,
+                Rejection::Domain => Self::Domain,
+                Rejection::Epoch => Self::Epoch,
+                Rejection::Binding => Self::Binding,
+                Rejection::Key => Self::Key,
+                Rejection::Tag => Self::Tag,
+            },
+            Refusal::Replay(Replay::Duplicate) => Self::Duplicate,
+            Refusal::Replay(Replay::TooOld) => Self::TooOld,
+        }
+    }
+}
+
+/// Refusals by reason: fixed, saturating, allocation free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AuthRejections {
+    counts: [u64; AUTH_REASONS],
+}
+
+impl AuthRejections {
+    /// Counts one refusal for `reason`.
+    pub fn bump(&mut self, reason: AuthReason) {
+        if let Some(count) = self.counts.get_mut(reason as usize) {
+            *count = count.saturating_add(1);
+        }
+    }
+
+    /// The refusals for `reason`.
+    #[cfg(test)]
+    #[must_use]
+    pub fn get(&self, reason: AuthReason) -> u64 {
+        self.counts.get(reason as usize).copied().unwrap_or(0)
+    }
+
+    /// Every reason's count, by [`AuthReason`] value.
+    #[cfg(test)]
+    #[must_use]
+    pub fn counts(&self) -> [u64; AUTH_REASONS] {
+        self.counts
+    }
+}
 
 /// An authenticated image's keys: the sender's datagrams are opened in
 /// domain 1, its own controls sealed in domain 4.
@@ -27,15 +128,10 @@ use crate::wire_keys::KeyFile;
 pub(crate) struct ImageAuth {
     verifier: Verifier,
     sealer: SharedSealer,
+    /// Its binding's refusals: one key and one source, by reason.
+    pub(crate) rejections: AuthRejections,
     /// The wall clock in seconds, for the in-band epoch overlap.
     wall: fn() -> i64,
-}
-
-/// What the envelope of a datagram opened to: its inner frames' range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Inner {
-    pub(crate) start: usize,
-    pub(crate) len: usize,
 }
 
 impl ImageAuth {
@@ -71,6 +167,7 @@ impl ImageAuth {
         Ok(Self {
             verifier,
             sealer: SharedSealer::new(sealer),
+            rejections: AuthRejections::default(),
             wall: wall_seconds,
         })
     }
@@ -81,18 +178,29 @@ impl ImageAuth {
         self.wall = wall;
     }
 
-    /// Opens `datagram`: its fields, its tag, then its replay window, and
-    /// only then the inner frames' range. Allocates nothing.
+    /// The wall clock reading one datagram is checked and committed at.
+    pub(crate) fn now(&self) -> i64 {
+        (self.wall)()
+    }
+
+    /// Checks `datagram`'s fields, tag and replay window at `now`; changes
+    /// nothing. Allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// The [`Refusal`].
+    pub(crate) fn check(&self, datagram: &[u8], now: i64) -> Result<Checked, Refusal> {
+        self.verifier.check(datagram, now)
+    }
+
+    /// Records a checked datagram its caller accepts: its sequence, and any
+    /// in-band epoch move.
     ///
     /// # Errors
     ///
     /// The [`Refusal`]; nothing changes.
-    pub(crate) fn open(&mut self, datagram: &[u8]) -> Result<Inner, Refusal> {
-        let opened = self.verifier.open(datagram, (self.wall)())?;
-        Ok(Inner {
-            start: opened.start,
-            len: opened.frames,
-        })
+    pub(crate) fn commit(&mut self, checked: Checked, now: i64) -> Result<Opened, Refusal> {
+        self.verifier.commit(checked, now)
     }
 
     /// The sealer of the image's controls: shared, allocation free.

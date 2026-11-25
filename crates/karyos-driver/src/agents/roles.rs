@@ -275,8 +275,9 @@ pub struct ReceiverCounters {
     /// Envelopes for no authenticated binding: dropped before any key or
     /// state is touched, with no SOLICIT.
     pub auth_unbound: u64,
-    /// Bare DATA, heartbeats, PATH_HB, ERR or RTTM REPLY for a binding
-    /// whose image is authenticated (ADR-0086 section 2): dropped.
+    /// Bare DATA, heartbeats, PATH_HB, ERR, RTTM REPLY, SETUP ANNOUNCE or
+    /// SETUP ANSWER for an authenticated image (ADR-0086 section 2):
+    /// dropped.
     pub auth_bare: u64,
     /// Envelopes that opened but whose inner frames are not a domain 1
     /// datagram of their own binding: dropped.
@@ -926,6 +927,9 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     path_config: PathConfig,
     /// The path queues, allocated when the first later path is bound.
     path_intake: Option<Box<path_intake::PathIntake>>,
+    /// Refused envelopes no authenticated binding owns (unbound, or too
+    /// short to name one), by reason (ADR-0086 section 2).
+    auth_unattributed: AuthRejections,
     /// Each image's RTT probes' settings.
     rtt: RttConfig,
     /// A multicast image's NAK timing.
@@ -2150,6 +2154,7 @@ pub(super) fn roles<T: StreamTerms>(
             idle_timeout: config.idle_image_timeout,
             path_config: receiver_path_config(config),
             path_intake: None,
+            auth_unattributed: AuthRejections::default(),
             rtt: config.rtt,
             multicast: config.multicast,
             unicast_retry_slack: config.unicast_retry_slack,
@@ -2666,6 +2671,25 @@ impl<T: StreamTerms> ReceiverRole<T> {
         self.sessions.boot_id()
     }
 
+    /// Refused envelopes no authenticated binding owns, by reason.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn unattributed_auth_rejections(&self) -> AuthRejections {
+        self.auth_unattributed
+    }
+
+    /// The refusals of the authenticated image at `slot`, by reason;
+    /// `None` for a trusted or unknown image.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn auth_rejections(&self, slot: SlotRef) -> Option<AuthRejections> {
+        self.images
+            .iter()
+            .find(|image| image.slot == slot)
+            .and_then(|image| image.auth.as_deref())
+            .map(|auth| auth.rejections)
+    }
+
     /// The session table's counters.
     #[must_use]
     pub fn session_counters(&self) -> crate::sessions::receive::SessionCounters {
@@ -2761,6 +2785,12 @@ impl<T: StreamTerms> ReceiverRole<T> {
             work: 0,
         };
         intake.bytes_in(source, bytes);
+    }
+
+    /// Hands `item` to the sender agent's ring (tests).
+    #[cfg(test)]
+    pub(super) fn post_to_sender(&mut self, item: ControlItem) {
+        assert!(self.to_sender.try_post(item).is_ok(), "the ring has room");
     }
 
     /// Makes the image at `slot` authenticated (tests): its sender's
@@ -5354,6 +5384,16 @@ impl<T: StreamTerms> Intake<'_, T> {
         let now = self.now;
         match control {
             Control::SetupAnnounce(announce) => {
+                // A bare SETUP for an authenticated image is refused before
+                // any challenge is created or consumed: an unverified
+                // ANNOUNCE or ANSWER could otherwise bind a later path.
+                // Every further path of an authenticated image is refused
+                // until the SETUP proof (domain 5) is verified (slice 3b of
+                // karyos#648; ADR-0086 section 7a).
+                if self.names_authenticated(announce.alias, announce.identity) {
+                    self.role.count(|c| &mut c.auth_bare);
+                    return;
+                }
                 // §6.2 step 2: only a stream subscribed on this endpoint.
                 let Some(max_term_length) = self
                     .role
@@ -5406,6 +5446,16 @@ impl<T: StreamTerms> Intake<'_, T> {
                 }
             }
             Control::SetupAnswer(answer) => {
+                // A bare SETUP for an authenticated image is refused before
+                // any challenge is created or consumed: an unverified
+                // ANNOUNCE or ANSWER could otherwise bind a later path.
+                // Every further path of an authenticated image is refused
+                // until the SETUP proof (domain 5) is verified (slice 3b of
+                // karyos#648; ADR-0086 section 7a).
+                if self.names_authenticated(answer.alias, answer.identity) {
+                    self.role.count(|c| &mut c.auth_bare);
+                    return;
+                }
                 // A solicited answer brings its own term parameters: the
                 // subscription's term length bound applies here too (an
                 // answer to a challenge restates the announced ones).
@@ -5710,37 +5760,101 @@ impl<T: StreamTerms> Intake<'_, T> {
     /// the replay window, and only then are the inner frames classified,
     /// which must be a domain 1 datagram of that same binding.
     fn sealed(&mut self, source: SocketAddr, bytes: &[u8]) {
-        let bound = receive_auth::envelope_alias(bytes)
-            .and_then(|alias| Some((self.bound_image(source, alias)?, alias)));
-        let opened = bound.and_then(|(index, alias)| {
-            let auth = self.role.images.get_mut(index)?.auth.as_deref_mut()?;
-            Some((auth.open(bytes), alias))
-        });
-        let Some((opened, alias)) = opened else {
+        let Some(alias) = receive_auth::envelope_alias(bytes) else {
+            self.role.auth_unattributed.bump(AuthReason::Short);
             self.role.count(|c| &mut c.auth_unbound);
             return;
         };
-        let Ok(inner) = opened else {
-            self.role.count(|c| &mut c.auth_rejected);
+        let found = self.bound_image(source, alias).and_then(|index| {
+            let auth = self.role.images.get(index)?.auth.as_deref()?;
+            let now = auth.now();
+            Some((index, now, auth.check(bytes, now)))
+        });
+        let Some((index, now, checked)) = found else {
+            self.role.auth_unattributed.bump(AuthReason::Unbound);
+            self.role.count(|c| &mut c.auth_unbound);
             return;
         };
-        let Some(inner) = bytes
-            .get(inner.start..)
-            .and_then(|rest| rest.get(..inner.len))
-        else {
+        let checked = match checked {
+            Ok(checked) => checked,
+            Err(refusal) => {
+                self.reject(index, AuthReason::of(refusal));
+                self.role.count(|c| &mut c.auth_rejected);
+                return;
+            }
+        };
+        let opened = checked.opened();
+        let inner = bytes
+            .get(opened.start..)
+            .and_then(|rest| rest.get(..opened.frames));
+        // The inner class and alias are checked before the sequence is
+        // recorded or the epoch moves: a tagged datagram refused for its
+        // inner frames consumes nothing.
+        let accepted = match inner.map(classify) {
+            Some(Ok(Datagram::DataBatch(data) | Datagram::Heartbeat(data)))
+                if data.alias() == alias =>
+            {
+                Some(Ok(data.bytes()))
+            }
+            Some(Ok(Datagram::Control(control))) if sender_frame_alias(&control) == Some(alias) => {
+                Some(Err(control))
+            }
+            _ => None,
+        };
+        let Some(accepted) = accepted else {
+            self.reject(index, AuthReason::Inner);
             self.role.count(|c| &mut c.auth_inner_invalid);
             return;
         };
-        match classify(inner) {
-            Ok(Datagram::DataBatch(data) | Datagram::Heartbeat(data)) if data.alias() == alias => {
-                self.deliver(source, alias, data.bytes());
+        let committed = self
+            .role
+            .images
+            .get_mut(index)
+            .and_then(|image| image.auth.as_deref_mut())
+            .map(|auth| auth.commit(checked, now));
+        match committed {
+            Some(Ok(_)) => {}
+            Some(Err(refusal)) => {
+                self.reject(index, AuthReason::of(refusal));
+                self.role.count(|c| &mut c.auth_rejected);
+                return;
             }
-            Ok(Datagram::Control(control)) if sender_frame_alias(&control) == Some(alias) => {
+            None => {
+                self.role.auth_unattributed.bump(AuthReason::Unbound);
+                self.role.count(|c| &mut c.auth_unbound);
+                return;
+            }
+        }
+        match accepted {
+            Ok(data) => self.deliver(source, alias, data),
+            Err(control) => {
                 self.drain_own_queue();
                 self.control(source, control);
             }
-            _ => self.role.count(|c| &mut c.auth_inner_invalid),
         }
+    }
+
+    /// Counts a refusal by `reason` on the image at `index`, whose binding
+    /// is one key and one source.
+    fn reject(&mut self, index: usize, reason: AuthReason) {
+        if let Some(auth) = self
+            .role
+            .images
+            .get_mut(index)
+            .and_then(|image| image.auth.as_deref_mut())
+        {
+            auth.rejections.bump(reason);
+        }
+    }
+
+    /// Whether a bare SETUP ANNOUNCE or ANSWER names an authenticated
+    /// image: its identity, or its alias on this endpoint.
+    fn names_authenticated(&self, alias: Alias, identity: Identity) -> bool {
+        self.role.images.iter().any(|image| {
+            image.auth.is_some()
+                && (image.identity == identity
+                    || (image.key.endpoint == self.endpoint && image.key.alias == alias))
+        })
     }
 }
 
@@ -8906,9 +9020,9 @@ fn established<T: StreamTerms>(sessions: &SendSessions, outbound: &Outbound<T>) 
 }
 
 mod path_intake;
-mod receive_auth;
+pub(crate) mod receive_auth;
 
-use receive_auth::ImageAuth;
+use receive_auth::{AuthReason, AuthRejections, ImageAuth};
 
 /// The receiver's redundant path settings under `config`.
 pub(crate) fn receiver_path_config(config: &AgentConfig) -> PathConfig {
