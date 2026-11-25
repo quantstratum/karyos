@@ -56,6 +56,10 @@ name = "karyos-stat"
 path = "src/bin/karyos-stat.rs"
 
 [[bin]]
+name = "karyos-backup"
+path = "src/bin/karyos-backup.rs"
+
+[[bin]]
 name = "karyos-errors"
 path = "src/bin/karyos-errors.rs"
 
