@@ -2661,3 +2661,36 @@ fn a_dynamic_publication_holds_its_whole_destination_share_at_admission() {
         added.is_some()
     });
 }
+
+/// H8 finding 5 (guards-and-abort.md, Session abort, sender step 5): the
+/// end of an incarnation's SESSION_ABORT retires the publication through
+/// its removal, with no linger, until it is gone; a second report changes
+/// nothing.
+#[test]
+fn an_ended_abort_retires_its_publication() {
+    let mut driver = driver();
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    let handle = driver
+        .add_network_publication(aggregate(10, 1), &channel(destination))
+        .unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&handle) == Some(NetworkPublicationState::Active)
+    });
+    let net = driver.net.as_mut().unwrap();
+    assert!(net.abort_ended(handle.registration()));
+    assert_eq!(
+        driver.network_publication_state(&handle),
+        Some(NetworkPublicationState::Removing)
+    );
+    assert!(
+        !driver
+            .net
+            .as_mut()
+            .unwrap()
+            .abort_ended(handle.registration())
+    );
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&handle).is_none()
+    });
+}

@@ -2962,6 +2962,28 @@ impl<T: StreamTerms> Network<T> {
             .unwrap_or_default()
     }
 
+    /// Handles the sender's `SenderAbortEnded` for `registration` as an
+    /// event would (tests): returns whether it retired the publication.
+    #[cfg(test)]
+    pub(crate) fn abort_ended(&mut self, registration: u64) -> bool {
+        let retired = self
+            .publications
+            .iter_mut()
+            .find(|entry| entry.registration == registration)
+            .is_some_and(retire_aborted);
+        let mut stale = Stale {
+            queue: &mut self.stale_aliases,
+            overflows: &mut self.stale_overflows,
+        };
+        post_removals(
+            &self.links,
+            &mut self.publications,
+            &mut stale,
+            self.publication_linger,
+        );
+        retired
+    }
+
     pub(crate) fn publication_state(&self, registration: u64) -> Option<NetworkPublicationState> {
         if self
             .reincarnations
@@ -3594,6 +3616,19 @@ fn release(table: &mut [SendEndpoint], endpoint: EndpointId) {
     }
 }
 
+/// Retires an active publication whose incarnation's SESSION_ABORT ended:
+/// it is removed with no linger (its gate sends nothing more, no EOS is
+/// due), and its alias goes to quarantine with the removal. Returns
+/// whether it was active.
+fn retire_aborted(entry: &mut NetPublication) -> bool {
+    if entry.state != NetworkPublicationState::Active {
+        return false;
+    }
+    entry.state = NetworkPublicationState::Removing;
+    entry.linger = Some(0);
+    true
+}
+
 /// Posts `RemovePublication`, with the `linger`, for every publication
 /// being removed that is not posted yet, after its sender journals'
 /// closes; then `RemoveSenderSession` for every one whose linger is over,
@@ -3855,6 +3890,24 @@ fn publication_answer<T: StreamTerms>(
                 && entry.state == NetworkPublicationState::Removing
             {
                 entry.drained = true;
+            }
+        }
+        // An authenticated incarnation's SESSION_ABORT ended (acknowledged
+        // or interrupted): the incarnation is retired through its removal,
+        // with no linger since its gate sends nothing more, and its alias
+        // goes to quarantine as for any retired session (guards-and-abort.md,
+        // Session abort, sender step 5). A publication already being removed
+        // or reincarnated keeps that course.
+        AgentEvent::SenderAbortEnded {
+            endpoint,
+            alias,
+            registration,
+            interrupted: _,
+        } => {
+            if let Some(entry) = find(publications, endpoint, alias, registration)
+                .and_then(|index| publications.get_mut(index))
+            {
+                retire_aborted(entry);
             }
         }
         // A timed lane's publisher breached its ring: applied by the

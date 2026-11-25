@@ -480,6 +480,7 @@ impl Rig {
                         | crate::agents::AgentEvent::NetworkJournalOpened { .. }
                         | crate::agents::AgentEvent::NetworkJournalRefused { .. }
                         | crate::agents::AgentEvent::NetworkJournalClosed { .. }
+                        | crate::agents::AgentEvent::SenderAbortEnded { .. }
                 ) {
                     trace_events.push(event);
                 }
@@ -7579,7 +7580,8 @@ fn a_remote_session_abort_closes_the_image_and_is_acknowledged_in_domain_4() {
         alias(),
         karyos_protocol::network::authenticated::GUARD_CLOSED,
         11,
-        3
+        3,
+        rig.now
     ));
     for _ in 0..400 {
         rig.round(true);
@@ -7908,20 +7910,20 @@ fn an_unacknowledged_abort_is_resent_then_reported_interrupted() {
         rig.agents
             .sender
             .role
-            .request_abort(a, alias(), GUARD_CLOSED, 11, 3)
+            .request_abort(a, alias(), GUARD_CLOSED, 11, 3, rig.now)
     );
     assert!(
         rig.agents
             .sender
             .role
-            .request_abort(a, alias(), GUARD_CLOSED, 11, 3),
+            .request_abort(a, alias(), GUARD_CLOSED, 11, 3, rig.now),
         "the same, once"
     );
     assert!(
         !rig.agents
             .sender
             .role
-            .request_abort(a, alias(), GUARD_CLOSED, 11, 4),
+            .request_abort(a, alias(), GUARD_CLOSED, 11, 4, rig.now),
         "another epoch"
     );
     rig.round(true);
@@ -7990,7 +7992,7 @@ fn a_pending_abort_under_a_withdrawn_key_is_not_sent() {
         rig.agents
             .sender
             .role
-            .request_abort(a, alias(), GUARD_CLOSED, 11, 3)
+            .request_abort(a, alias(), GUARD_CLOSED, 11, 3, rig.now)
     );
     rig.agents
         .sender
@@ -8026,6 +8028,200 @@ fn a_raw_datagram_of_an_older_key_generation_is_not_sent() {
     let after = rig.agents.sender.role.counters();
     assert_eq!(after.raw_sent, before.raw_sent);
     assert!(after.seal_failures > before.seal_failures);
+}
+
+/// The `SenderAbortEnded` reports the rig saw: `interrupted` for each.
+fn abort_ends(rig: &Rig) -> Vec<bool> {
+    rig.trace_events
+        .iter()
+        .filter_map(|event| match event {
+            crate::agents::AgentEvent::SenderAbortEnded { interrupted, .. } => Some(*interrupted),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An authenticated rig whose publication is guarded locally by a guard
+/// word open at epoch 2, bound to guard 11 of authority 10, which the
+/// receiver admits; the receiver trusts authority 10 when `trusted`.
+fn guarded_abort_rig(trusted: bool) -> (Rig, std::sync::Arc<karyos_client::HeapWords>) {
+    use std::sync::Arc;
+
+    use crate::agents::roles::publish_auth::{AbortAuthority, PublicationAuth};
+    use crate::agents::roles::receive_auth::SubscriptionAuth;
+    use crate::authority::Ed25519Signer;
+    use crate::signed_control::Authority;
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::sync::Ordering;
+
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
+    let (mut rig, b) = Rig::new(Setup {
+        auth: true,
+        reliable: true,
+        identity: Some(identity_77(0)),
+        guard: Some(super::super::data::GuardSpec {
+            word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+            cell: Arc::new(AppliedEpoch::new()),
+            epoch: 2,
+            empty_since: None,
+            rate: None,
+            reserve: None,
+            policy: None,
+            frontier: Default::default(),
+        }),
+        ..Setup::default()
+    });
+    let (channel, pairwise) = auth_keys(77);
+    let a = rig.publisher;
+    rig.agents.receiver.role.authenticate_published(a, alias());
+    rig.agents.receiver.role.authenticate_subscription(
+        SubscriptionAuth::new(b, alias(), &channel, &pairwise, 77).unwrap(),
+    );
+    rig.agents.sender.role.authenticate_publication(
+        PublicationAuth::new(a, alias(), identity(), 2, &channel, &[&pairwise]).unwrap(),
+    );
+    let signer = Ed25519Signer::from_seed(&[9; 32]);
+    if trusted {
+        rig.agents.receiver.role.trust_authorities(
+            vec![Authority::of(10, signer.verifier(), 10, &[11], true)],
+            rig.now,
+        );
+        rig.agents.receiver.role.permit_abort(
+            b,
+            alias().stream_id,
+            crate::agents::roles::AbortScope {
+                authority_id: 10,
+                guard_id: 11,
+            },
+        );
+    }
+    rig.agents
+        .sender
+        .role
+        .set_abort_authority(a, alias(), AbortAuthority::new(signer, 10, 10));
+    rig.agents.sender.role.set_abort_guard(a, alias(), 11);
+    let _slot = established(&mut rig);
+    (rig, word)
+}
+
+/// Closes the local guard and appends, so the gate applies the close.
+fn close_guard(rig: &mut Rig, word: &karyos_client::HeapWords) {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    let _ = rig.log.as_mut().unwrap().publications[0]
+        .append(&[5; 100], AppendOptions::default())
+        .unwrap();
+}
+
+/// H8 finding 5, end to end: a local guard close of an authenticated
+/// guarded publication leads to its signed SESSION_ABORT (GUARD_CLOSED,
+/// guard 11, the applied epoch), the receiver's ACK completes it, and its
+/// end is reported once for the conductor to retire the incarnation.
+#[test]
+fn a_guard_close_aborts_the_session_and_its_ack_retires_it() {
+    let (mut rig, word) = guarded_abort_rig(true);
+    close_guard(&mut rig, &word);
+    for _ in 0..400 {
+        rig.round(true);
+        if !abort_ends(&rig).is_empty() {
+            break;
+        }
+    }
+    let sender = rig.agents.sender.role.counters();
+    let receiver = rig.agents.receiver.counters();
+    assert_eq!(
+        (
+            sender.aborts_sent,
+            sender.aborts_completed,
+            sender.aborts_interrupted
+        ),
+        (1, 1, 0),
+        "{sender:?}"
+    );
+    assert_eq!(receiver.images_closed_aborted, 1, "{receiver:?}");
+    let ack = rig.agents.sender.role.last_abort_ack().unwrap();
+    assert!(ack.guard_epoch >= 3, "the applied close epoch: {ack:?}");
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    assert_eq!(abort_ends(&rig), vec![false], "reported once");
+    assert_eq!(rig.agents.sender.role.pending_aborts(), 0);
+    assert_eq!(
+        rig.agents.sender.role.counters().aborts_sent,
+        1,
+        "requested once"
+    );
+}
+
+/// H8 finding 5, end to end: with no ACK (the receiver trusts no
+/// authority) the abort is resent, then reported interrupted at its
+/// deadline, once.
+#[test]
+fn a_guard_close_with_no_ack_is_reported_interrupted() {
+    let (mut rig, word) = guarded_abort_rig(false);
+    rig.agents.sender.role.set_abort_expiry(150 * MS);
+    close_guard(&mut rig, &word);
+    for _ in 0..300 {
+        rig.round(true);
+    }
+    let sender = rig.agents.sender.role.counters();
+    assert_eq!(
+        (
+            sender.aborts_sent,
+            sender.aborts_interrupted,
+            sender.aborts_completed
+        ),
+        (1, 1, 0),
+        "{sender:?}"
+    );
+    assert!(sender.aborts_resent >= 1, "{sender:?}");
+    assert_eq!(abort_ends(&rig), vec![true]);
+    assert_eq!(rig.agents.sender.role.pending_aborts(), 0);
+}
+
+/// H8 N2: an abort that never submits (its receiver's binding gone)
+/// backs off and still expires at the deadline set when it was requested.
+#[test]
+fn an_abort_that_never_submits_backs_off_and_expires() {
+    use crate::agents::roles::publish_auth::AbortAuthority;
+    use crate::authority::Ed25519Signer;
+    use karyos_protocol::network::authenticated::GUARD_CLOSED;
+
+    let (mut rig, _b, _channel) = authenticated_rig();
+    let a = rig.publisher;
+    rig.agents.sender.role.set_abort_authority(
+        a,
+        alias(),
+        AbortAuthority::new(Ed25519Signer::from_seed(&[9; 32]), 10, 10),
+    );
+    let _slot = established(&mut rig);
+    rig.agents.sender.role.forget_bindings(a, alias());
+    rig.agents.sender.role.set_abort_expiry(150 * MS);
+    assert!(
+        rig.agents
+            .sender
+            .role
+            .request_abort(a, alias(), GUARD_CLOSED, 11, 3, rig.now)
+    );
+    for _ in 0..200 {
+        rig.agents.sender.role.forget_bindings(a, alias());
+        rig.round(true);
+    }
+    let sender = rig.agents.sender.role.counters();
+    assert_eq!(
+        (sender.aborts_sent, sender.aborts_interrupted),
+        (0, 1),
+        "{sender:?}"
+    );
+    assert!(
+        (1..=8).contains(&sender.abort_send_failures),
+        "backed off, not every duty: {sender:?}"
+    );
+    assert_eq!(abort_ends(&rig), vec![true]);
+    assert_eq!(rig.agents.sender.role.pending_aborts(), 0);
 }
 
 /// Marks in memory, for a followed guard.
@@ -8239,17 +8435,20 @@ fn remotely_guarded_rig(
             lifetime_ms: 5_000,
             receivers: vec![(66, a_at)],
         }];
-        receiver.set_guard_authority(Some(
-            GuardAuthority::new(
-                10,
-                10,
-                Ed25519Signer::from_seed(&[9; 32]),
-                guards,
-                Box::new(MemoryMarks::default()),
-                0,
-            )
-            .unwrap(),
-        ));
+        receiver.set_guard_authority(
+            Some(
+                GuardAuthority::new(
+                    10,
+                    10,
+                    Ed25519Signer::from_seed(&[9; 32]),
+                    guards,
+                    Box::new(MemoryMarks::default()),
+                    0,
+                )
+                .unwrap(),
+            ),
+            &[b],
+        );
     }
     (rig, b_at, signer)
 }
@@ -8396,7 +8595,7 @@ fn a_remote_guard_that_lapses_aborts_its_incarnation() {
         )
     });
     assert!(send_one(&mut rig, 100) >= 1);
-    rig.agents.receiver.role.set_guard_authority(None);
+    rig.agents.receiver.role.set_guard_authority(None, &[]);
     rig.now += 6_000 * MS;
     rig.round(true);
     assert_eq!(
@@ -8675,4 +8874,44 @@ fn an_encrypted_publisher_and_receiver_establish_deliver_and_resynchronise() {
     }
     let sender = rig.agents.sender.role.enc_rejections(a, alias()).unwrap();
     assert_eq!(sender.total(), 0, "{sender:?}");
+}
+
+/// H8 N3: the guard authority answers a bare STATUS_CHALLENGE only on its
+/// control endpoints; one on another endpoint is refused before it is
+/// read, counted, and spends nothing.
+#[test]
+fn a_challenge_on_another_endpoint_is_refused_before_the_authority() {
+    use karyos_protocol::network::Receiver;
+    use karyos_protocol::network::authenticated::{AuthControl, StatusChallenge};
+
+    let authority = guard_word(2, true);
+    let (mut rig, _b_at, _signer) = remotely_guarded_rig(MemoryMarks::default(), Some(authority));
+    let a = rig.publisher;
+    let a_at = rig.endpoints.local_address(a).unwrap();
+    let mut bytes = vec![0u8; 256];
+    let length = AuthControl::Challenge(StatusChallenge {
+        authority_id: 10,
+        guard_id: 11,
+        receiver: Receiver {
+            receiver_boot_id: [1, 2],
+            receiver_id: 66,
+        },
+        nonce: [7, 8],
+    })
+    .encode(&mut bytes)
+    .unwrap();
+    bytes.truncate(length);
+    let before = rig.agents.receiver.counters();
+    // On A, which is not the authority's control endpoint.
+    inject_at_a(&mut rig, a_at, &bytes);
+    let after = rig.agents.receiver.counters();
+    assert_eq!(
+        after.guard_challenges_wrong_endpoint,
+        before.guard_challenges_wrong_endpoint + 1
+    );
+    assert_eq!(
+        (after.guard_statuses_sent, after.guard_challenges_refused),
+        (before.guard_statuses_sent, before.guard_challenges_refused),
+        "{after:?}"
+    );
 }

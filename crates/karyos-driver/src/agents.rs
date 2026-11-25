@@ -958,6 +958,22 @@ pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
         /// Its registration.
         registration: u64,
     },
+    /// Posted unsolicited, into a free slot and again each cycle until
+    /// posted: the SESSION_ABORT of the publication's incarnation ended,
+    /// acknowledged or, with `interrupted`, at its deadline
+    /// (guards-and-abort.md, Session abort, sender step 5). The conductor
+    /// retires the incarnation through its removal, which quarantines the
+    /// alias.
+    SenderAbortEnded {
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// Its alias.
+        alias: karyos_protocol::network::Alias,
+        /// Its registration.
+        registration: u64,
+        /// Whether no valid ACK arrived before the deadline.
+        interrupted: bool,
+    },
     /// The answer to [`AgentCommand::ChangeDestination`].
     DestinationChanged {
         /// The endpoint.
@@ -1859,6 +1875,8 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         // A drained publication's report; a full ring asks again next
         // cycle.
         role.report_drained(|event| events.try_post(event).is_ok());
+        // An ended abort's report, likewise.
+        role.report_aborts(|event| events.try_post(event).is_ok());
         // A schedule violation's report, likewise.
         role.report_violations(|event| events.try_post(event).is_ok());
         role.report_removals(|event| events.try_post(event).is_ok());

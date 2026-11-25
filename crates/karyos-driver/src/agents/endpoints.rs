@@ -801,6 +801,7 @@ impl<O: SocketOps> Endpoints<O> {
             | AgentEvent::PublicationRemoved { .. }
             | AgentEvent::PublicationDraining { .. }
             | AgentEvent::SenderSessionDrained { .. }
+            | AgentEvent::SenderAbortEnded { .. }
             | AgentEvent::ScheduleViolated { .. }
             | AgentEvent::DestinationRemoved { .. }
             | AgentEvent::PublicationLimit { .. }

@@ -315,6 +315,9 @@ pub struct ReceiverCounters {
     pub guard_statuses_sent: u64,
     /// STATUS_CHALLENGEs this authority refused (by reason on it).
     pub guard_challenges_refused: u64,
+    /// GUARD datagrams on an endpoint that is not one of the guard
+    /// authority's control endpoints: refused before they are read.
+    pub guard_challenges_wrong_endpoint: u64,
     /// Bare DATA, heartbeats, PATH_HB, ERR, RTTM REPLY, SETUP ANNOUNCE or
     /// SETUP ANSWER for an authenticated image (ADR-0086 section 2):
     /// dropped.
@@ -501,9 +504,17 @@ pub struct SenderCounters {
     pub aborts_resent: u64,
     /// Pending aborts completed by a valid ACK and retired.
     pub aborts_completed: u64,
-    /// Pending aborts past their expiry with no valid ACK: the session is
-    /// reported interrupted and the record retired.
+    /// Pending aborts past their deadline with no valid ACK: the session is
+    /// reported interrupted and its incarnation retired.
     pub aborts_interrupted: u64,
+    /// Abort attempts that submitted nothing: backed off like a resend.
+    pub abort_send_failures: u64,
+    /// Due abort attempts the duty's control budget deferred.
+    pub aborts_deferred: u64,
+    /// Applied guard closes whose abort could not be requested (no
+    /// identity, room or signature): the incarnation is not aborted
+    /// remotely and stays closed by its gate.
+    pub aborts_unrequested: u64,
     /// Verified ACKs that do not match the pending abort (epoch, lane
     /// count, or a position beyond what was submitted): dropped.
     pub abort_acks_invalid: u64,
@@ -1031,6 +1042,9 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     guard_marks: Option<Box<dyn MarkStore + Send>>,
     /// The guard authority this driver is, answering STATUS_CHALLENGEs.
     guard_authority: Option<Box<crate::guard_authority::GuardAuthority>>,
+    /// The control endpoints the guard authority answers on; a challenge
+    /// arriving on any other is refused before it is read.
+    guard_authority_endpoints: Vec<EndpointId>,
     /// Each image's RTT probes' settings.
     rtt: RttConfig,
     /// A multicast image's NAK timing.
@@ -2312,6 +2326,7 @@ pub(super) fn roles<T: StreamTerms>(
             remote_guards: Vec::new(),
             guard_marks: None,
             guard_authority: None,
+            guard_authority_endpoints: Vec::new(),
             rtt: config.rtt,
             multicast: config.multicast,
             unicast_retry_slack: config.unicast_retry_slack,
@@ -3132,8 +3147,10 @@ impl<T: StreamTerms> ReceiverRole<T> {
     pub(super) fn set_guard_authority(
         &mut self,
         authority: Option<crate::guard_authority::GuardAuthority>,
+        endpoints: &[EndpointId],
     ) {
         self.guard_authority = authority.map(Box::new);
+        self.guard_authority_endpoints = endpoints.to_vec();
     }
 
     /// The phase of the followed guard `guard_id` at `now` (tests).
@@ -6301,15 +6318,20 @@ struct PendingAbort {
     guard_epoch: u64,
     /// The signed datagram every send repeats.
     bytes: SealedBytes,
+    /// Set at the request: past it the abort is interrupted, sent or not.
+    deadline: u64,
     /// When it was first submitted; `None` until then.
     first: Option<u64>,
-    /// When the next send is due.
+    /// When the next attempt is due.
     next_at: u64,
-    /// The delay after the next send.
+    /// The delay after the next attempt, sent or failed.
     backoff: u64,
     /// The applied key generation its signature was checked under: on a
     /// change it is revalidated before the next send (H8 finding 4).
     generation: u64,
+    /// Ended, its report not posted yet: `Some(true)` interrupted,
+    /// `Some(false)` completed.
+    ended: Option<bool>,
 }
 
 /// The alias of a frame a sender authenticates in domain 1 that names an
@@ -6395,6 +6417,17 @@ impl<T: StreamTerms> Intake<'_, T> {
         use crate::guard_authority::ChallengeRefusal;
 
         let now = self.now;
+        if self.role.guard_authority.is_none() {
+            return false;
+        }
+        // Only the authority's own control endpoints answer (H8 N3).
+        if !self.role.guard_authority_endpoints.contains(&self.endpoint) {
+            if signed_control::is_gated(bytes) {
+                self.role.count(|c| &mut c.guard_challenges_wrong_endpoint);
+                return true;
+            }
+            return false;
+        }
         let Some(authority) = self.role.guard_authority.as_deref_mut() else {
             return false;
         };
@@ -6900,6 +6933,26 @@ impl<T: StreamTerms> SenderRole<T> {
         &self,
     ) -> Option<karyos_protocol::network::authenticated::AbortAck> {
         self.last_abort_ack
+    }
+
+    /// Binds the publication `alias` on `endpoint` to the guard
+    /// `guard_id` its aborts name (tests).
+    #[cfg(test)]
+    pub(super) fn set_abort_guard(&mut self, endpoint: EndpointId, alias: Alias, guard_id: u64) {
+        if let Some(auth) = self
+            .publication_auth_index(endpoint, alias)
+            .and_then(|index| self.publication_auth.get_mut(index))
+        {
+            auth.abort_guard = guard_id;
+        }
+    }
+
+    /// Drops the bindings of `alias` on `endpoint`, as if no receiver were
+    /// bound (tests).
+    #[cfg(test)]
+    pub(super) fn forget_bindings(&mut self, endpoint: EndpointId, alias: Alias) {
+        self.bindings
+            .retain(|binding| (binding.endpoint, binding.alias) != (endpoint, alias));
     }
 
     /// The incarnations in `Aborting` (tests).
@@ -7806,18 +7859,15 @@ impl<T: StreamTerms> SenderRole<T> {
     }
 
     /// Requests a SESSION_ABORT of the authenticated publication `alias` on
-    /// `endpoint`, for the close of `guard_id` (nonzero for GUARD_CLOSED)
-    /// at the applied `guard_epoch`, signed once by its abort authority and
-    /// sent to each of its bound receivers from the next duty on, resent
-    /// identically until acknowledged or expired (ADR-0086 domain 3;
-    /// design section 5 and G3). Returns whether it was taken: only for a
-    /// publication with an abort authority and an identity, a body that
-    /// encodes, and no abort of that incarnation already pending (a
-    /// repeated identical request is taken without a second record).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no authenticated channel opens yet")
-    )]
+    /// `endpoint` at `now`, for the close of `guard_id` (nonzero for
+    /// GUARD_CLOSED) at the applied `guard_epoch`, signed once by its abort
+    /// authority and sent to each of its bound receivers from the next duty
+    /// on, resent identically until acknowledged or its deadline, set now
+    /// (ADR-0086 domain 3; design section 5 and G3). Returns whether it was
+    /// taken: only for a publication with an abort authority and an
+    /// identity, a body that encodes, and no abort of that incarnation
+    /// already pending (a repeated identical request is taken without a
+    /// second record).
     pub(crate) fn request_abort(
         &mut self,
         endpoint: EndpointId,
@@ -7825,6 +7875,7 @@ impl<T: StreamTerms> SenderRole<T> {
         reason: u16,
         guard_id: u64,
         guard_epoch: u64,
+        now: u64,
     ) -> bool {
         use karyos_protocol::network::authenticated::SessionAbort;
 
@@ -7865,6 +7916,12 @@ impl<T: StreamTerms> SenderRole<T> {
             self.count(|c| &mut c.seal_failures);
             return false;
         };
+        if let Some(auth) = self
+            .publication_auth_index(endpoint, alias)
+            .and_then(|index| self.publication_auth.get_mut(index))
+        {
+            auth.aborted = Some(identity);
+        }
         self.aborts.push(PendingAbort {
             endpoint,
             alias,
@@ -7872,31 +7929,87 @@ impl<T: StreamTerms> SenderRole<T> {
             guard_id,
             guard_epoch,
             bytes,
+            deadline: now.saturating_add(self.abort_expiry),
             first: None,
-            next_at: 0,
+            next_at: now,
             backoff: ABORT_RESEND_INITIAL_NS,
             generation: self.key_generation.current(),
+            ended: None,
         });
         true
     }
 
+    /// Requests the abort of each authenticated, guarded publication whose
+    /// gate applied a guard close (guards-and-abort.md, Session abort,
+    /// sender step 3; H8 finding 5): GUARD_CLOSED, its bound guard and the
+    /// gate's applied epoch, once per incarnation.
+    fn abort_closed_guards(&mut self, now: u64) {
+        use crate::guard_gate::AbortCause;
+        use karyos_protocol::network::authenticated::GUARD_CLOSED;
+
+        for at in 0..self.publication_auth.len() {
+            let Some(auth) = self.publication_auth.get(at) else {
+                break;
+            };
+            let (endpoint, alias, guard_id) = (auth.endpoint, auth.alias, auth.abort_guard);
+            if auth.abort.is_none() || guard_id == 0 {
+                continue;
+            }
+            let identity = self.sessions.identity(endpoint, alias);
+            if identity.is_none() || auth.aborted == identity {
+                continue;
+            }
+            let epoch = self
+                .publications
+                .iter()
+                .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+                .and_then(|outbound| {
+                    let gate = outbound.guard_gate()?;
+                    (0..outbound.readers().len())
+                        .any(|lane| gate.abort_cause(lane) == Some(AbortCause::Guard))
+                        .then(|| gate.applied_epoch())
+                });
+            let Some(epoch) = epoch else {
+                continue;
+            };
+            if !self.request_abort(endpoint, alias, GUARD_CLOSED, guard_id, epoch, now) {
+                self.count(|c| &mut c.aborts_unrequested);
+                // Once per incarnation, refused or not: the deadline-free
+                // retry would spin on a refusal.
+                if let Some(auth) = self.publication_auth.get_mut(at) {
+                    auth.aborted = identity;
+                }
+            }
+        }
+    }
+
     /// Sends each pending SESSION_ABORT that is due at `now` to its
-    /// publication's bound receivers, identical bytes each time, and
-    /// retires those past their expiry as interrupted. A send not
-    /// submitted is retried at the next duty, never dropped.
-    fn send_aborts<O: SocketOps>(&mut self, halves: &mut [(EndpointId, Half<O>)], now: u64) {
-        let mut at = 0;
-        while let Some(pending) = self.aborts.get(at) {
-            if pending
-                .first
-                .is_some_and(|first| age_ns(now, first) >= self.abort_expiry)
-            {
-                self.aborts.swap_remove(at);
+    /// publication's bound receivers, identical bytes each time, at most
+    /// `allowance` attempts (the control budget's share); retires each
+    /// past its deadline as interrupted. An attempt that submits nothing
+    /// backs off like a resend. Returns the attempts made.
+    fn send_aborts<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        now: u64,
+        allowance: u32,
+    ) -> u32 {
+        let mut attempts = 0u32;
+        for at in 0..self.aborts.len() {
+            let Some(pending) = self.aborts.get(at) else {
+                break;
+            };
+            if pending.ended.is_some() {
+                continue;
+            }
+            if now >= pending.deadline {
+                if let Some(pending) = self.aborts.get_mut(at) {
+                    pending.ended = Some(true);
+                }
                 self.count(|c| &mut c.aborts_interrupted);
                 continue;
             }
             if now < pending.next_at {
-                at += 1;
                 continue;
             }
             // Signed before a key change: sent again only while its
@@ -7910,7 +8023,10 @@ impl<T: StreamTerms> SenderRole<T> {
                     .and_then(|index| self.publication_auth.get(index))
                     .is_some_and(|auth| auth.abort.is_some());
                 if !signs {
-                    self.aborts.swap_remove(at);
+                    // Reported interrupted, its incarnation retired.
+                    if let Some(pending) = self.aborts.get_mut(at) {
+                        pending.ended = Some(true);
+                    }
                     self.count(|c| &mut c.aborts_interrupted);
                     continue;
                 }
@@ -7921,6 +8037,12 @@ impl<T: StreamTerms> SenderRole<T> {
             let Some(pending) = self.aborts.get(at) else {
                 break;
             };
+            if attempts >= allowance {
+                // Deferred to the next duty, never dropped.
+                self.count(|c| &mut c.aborts_deferred);
+                continue;
+            }
+            attempts += 1;
             let (endpoint, alias, bytes, resend) = (
                 pending.endpoint,
                 pending.alias,
@@ -7953,24 +8075,57 @@ impl<T: StreamTerms> SenderRole<T> {
                 } else {
                     self.count(|c| &mut c.aborts_sent);
                 }
-                if let Some(pending) = self.aborts.get_mut(at) {
-                    pending.first.get_or_insert(now);
-                    pending.next_at = now.saturating_add(pending.backoff);
-                    pending.backoff = pending
-                        .backoff
-                        .checked_mul(2)
-                        .unwrap_or(ABORT_RESEND_MAX_NS)
-                        .min(ABORT_RESEND_MAX_NS);
-                }
+            } else {
+                self.count(|c| &mut c.abort_send_failures);
             }
-            at += 1;
+            if let Some(pending) = self.aborts.get_mut(at) {
+                if submitted && pending.first.is_none() {
+                    // The protocol schedule starts at the first send.
+                    pending.first = Some(now);
+                    pending.backoff = ABORT_RESEND_INITIAL_NS;
+                }
+                pending.next_at = now.saturating_add(pending.backoff);
+                pending.backoff = pending
+                    .backoff
+                    .checked_mul(2)
+                    .unwrap_or(ABORT_RESEND_MAX_NS)
+                    .min(ABORT_RESEND_MAX_NS);
+            }
+        }
+        attempts
+    }
+
+    /// Posts, through `post`, the end of each abort that completed or was
+    /// interrupted, once: the conductor retires its incarnation through the
+    /// session lifecycle, which quarantines its alias (network-sessions-
+    /// sender.md 3.4). One the ring refused is posted again next cycle.
+    pub(super) fn report_aborts<O: SocketOps>(
+        &mut self,
+        mut post: impl FnMut(AgentEvent<O, T>) -> bool,
+    ) {
+        let mut at = 0;
+        while let Some(pending) = self.aborts.get(at) {
+            let Some(interrupted) = pending.ended else {
+                at += 1;
+                continue;
+            };
+            let event = AgentEvent::SenderAbortEnded {
+                endpoint: pending.endpoint,
+                alias: pending.alias,
+                registration: pending.identity.registration_id,
+                interrupted,
+            };
+            if !post(event) {
+                return;
+            }
+            self.aborts.swap_remove(at);
         }
     }
 
     /// A verified SESSION_ABORT_ACK of `alias` on `endpoint`: valid only
     /// against its pending abort, with that epoch, the bound lane count,
     /// and each lane's range within what was submitted on the lane; a
-    /// valid one completes and retires the abort.
+    /// valid one completes the abort, whose end is then reported.
     fn abort_acked(
         &mut self,
         endpoint: EndpointId,
@@ -7979,6 +8134,7 @@ impl<T: StreamTerms> SenderRole<T> {
         let Some(at) = self.aborts.iter().position(|pending| {
             (pending.endpoint, pending.alias, pending.identity)
                 == (endpoint, ack.alias, ack.identity)
+                && pending.ended.is_none()
         }) else {
             self.count(|c| &mut c.abort_acks_unmatched);
             return;
@@ -8007,7 +8163,9 @@ impl<T: StreamTerms> SenderRole<T> {
             self.count(|c| &mut c.abort_acks_invalid);
             return;
         }
-        self.aborts.swap_remove(at);
+        if let Some(pending) = self.aborts.get_mut(at) {
+            pending.ended = Some(false);
+        }
         self.count(|c| &mut c.aborts_completed);
     }
 
@@ -8437,12 +8595,14 @@ impl<T: StreamTerms> SenderRole<T> {
             self.count(|c| &mut c.removed_unrecorded);
         }
         self.close_removed(halves, now);
-        self.send_aborts(halves, now);
+        self.abort_closed_guards(now);
+        // Abort sends are charged to the control budget (design G3).
+        let charged = self.send_aborts(halves, now, self.budget);
         self.naks_this_cycle = 0;
         // Bindings past their lifetime go even when nothing arrives.
         self.expire_bindings(now);
         let mut work = 0u32;
-        for _ in 0..self.budget {
+        for _ in 0..self.budget.saturating_sub(charged) {
             let Ok(Some(item)) = self.from_receiver.try_take() else {
                 break;
             };

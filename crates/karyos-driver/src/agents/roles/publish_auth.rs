@@ -78,6 +78,11 @@ pub(crate) struct PublicationAuth {
     pub(crate) rejections: AuthRejections,
     /// Its abort authority, when this driver may abort its sessions.
     pub(crate) abort: Option<AbortAuthority>,
+    /// The guard its aborts name, bound at admission; 0 for none, which
+    /// sends no abort on a close.
+    pub(crate) abort_guard: u64,
+    /// The incarnation whose abort was requested: once each.
+    pub(crate) aborted: Option<Identity>,
     /// The monotonic clock in nanoseconds, for the in-band epoch overlap
     /// (H8 finding 7: never the wall clock).
     clock: fn() -> u64,
@@ -261,6 +266,8 @@ impl PublicationAuth {
             receivers,
             rejections: AuthRejections::default(),
             abort: None,
+            abort_guard: 0,
+            aborted: None,
             clock: super::receive_auth::monotonic_ns,
         })
     }
