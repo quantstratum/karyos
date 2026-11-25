@@ -16,6 +16,9 @@ use super::*;
 use crate::disk::StdDisk;
 use crate::integrity::time_producer::{Event, EventClock};
 
+/// Records per segment under the test geometry.
+const PER_SEGMENT: usize = (TERM_RECORDS as usize) * (SEGMENT_TERMS as usize);
+
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "karyos-calibration-journal-{name}-{}",
@@ -40,9 +43,9 @@ fn key([low, high, journal, domain, epoch]: [u64; 5]) -> ClockKey {
 const A: [u64; 5] = [1, 0, 2, 3, 4];
 const B: [u64; 5] = [9, 0, 9, 9, 9];
 
-fn calibration(valid_from: u64, valid_to: u64) -> [u64; CALIBRATION_WORDS] {
+fn calibration_of(from: [u64; 5], valid_from: u64, valid_to: u64) -> [u64; CALIBRATION_WORDS] {
     Calibration {
-        from: key(A),
+        from: key(from),
         to: key(B),
         reference: valid_from,
         offset: 10,
@@ -54,6 +57,10 @@ fn calibration(valid_from: u64, valid_to: u64) -> [u64; CALIBRATION_WORDS] {
     }
     .encode()
     .unwrap()
+}
+
+fn calibration(valid_from: u64, valid_to: u64) -> [u64; CALIBRATION_WORDS] {
+    calibration_of(A, valid_from, valid_to)
 }
 
 /// A synthetic UTC reference record: no hardware here is UTC traceable.
@@ -77,19 +84,25 @@ fn reference(valid_from: u64, valid_to: u64) -> [u64; CALIBRATION_WORDS] {
 }
 
 /// A record of a type this build does not know (word 0's low byte 7).
-fn unknown() -> [u64; CALIBRATION_WORDS] {
-    let mut words = [0x5Au64; CALIBRATION_WORDS];
+fn unknown(fill: u64) -> [u64; CALIBRATION_WORDS] {
+    let mut words = [fill; CALIBRATION_WORDS];
     words[0] = 7;
     words
 }
 
-/// The store's index file of `dir`.
-fn file(dir: &Path, extension: &str) -> PathBuf {
-    std::fs::read_dir(dir)
+/// The store's files of `dir` with `extension`, in position order.
+fn files(dir: &Path, extension: &str) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())
-        .find(|path| path.extension().is_some_and(|found| found == extension))
-        .unwrap()
+        .filter(|path| path.extension().is_some_and(|found| found == extension))
+        .collect();
+    found.sort();
+    found
+}
+
+fn last_file(dir: &Path, extension: &str) -> PathBuf {
+    files(dir, extension).pop().unwrap()
 }
 
 fn append_bytes(path: &Path, bytes: &[u8]) {
@@ -97,6 +110,27 @@ fn append_bytes(path: &Path, bytes: &[u8]) {
     let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
     file.write_all(bytes).unwrap();
     file.sync_all().unwrap();
+}
+
+/// Writes `words` into the store and syncs it, without committing: a
+/// writer that crashed between the store's sync and the commit.
+fn uncommitted(dir: &Path, words: &[u64; CALIBRATION_WORDS]) {
+    let mut store = SegmentStore::recover(
+        StdDisk,
+        dir,
+        RECORDING,
+        geometry().unwrap(),
+        SyncPolicy::None,
+    )
+    .unwrap()
+    .store;
+    let mut bytes = Vec::new();
+    for word in words {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    let at = store.written();
+    store.append(at, &bytes).unwrap();
+    store.sync().unwrap();
 }
 
 /// What the agent's producer proves from a snapshot: the event at 1 of
@@ -123,31 +157,38 @@ fn records_round_trip_and_survive_a_reopen() {
     assert_eq!(
         read(StdDisk, &dir).unwrap(),
         Records {
+            generation: 0,
             records: Vec::new(),
             lossless: true
         }
     );
-    let written = [calibration(0, 100), reference(0, 1999), unknown()];
-    {
+    let written = [calibration(0, 100), reference(0, 1999), unknown(0x5A)];
+    let generation = {
         let mut journal = CalibrationJournal::open(StdDisk, &dir).unwrap();
-        for (index, words) in written.iter().enumerate() {
-            assert_eq!(
-                journal.append(words).unwrap(),
-                (index * RECORD_LENGTH) as u64
-            );
-        }
-    }
+        let outcomes = journal.append_batch(&written).unwrap();
+        assert_eq!(
+            outcomes,
+            [
+                Appended::At(0),
+                Appended::At(RECORD_LENGTH as u64),
+                Appended::At(2 * RECORD_LENGTH as u64)
+            ]
+        );
+        journal.durable().generation
+    };
+    assert_ne!(generation, 0);
     let read_back = read(StdDisk, &dir).unwrap();
     assert!(read_back.lossless);
+    assert_eq!(read_back.generation, generation);
     assert_eq!(read_back.records, written);
-    // The unknown type is kept on disk and skipped by the decoder.
     let (known, skipped) = ClockRecord::decode_all(&read_back.records).unwrap();
     assert_eq!((known.len(), skipped), (2, 1));
-    // A reopened writer appends after them.
+    // A reopened writer keeps the generation and appends after them.
     let mut journal = CalibrationJournal::open(StdDisk, &dir).unwrap();
+    assert_eq!(journal.durable().generation, generation);
     assert_eq!(
         journal.append(&calibration(1000, 2000)).unwrap(),
-        (3 * RECORD_LENGTH) as u64
+        Appended::At(3 * RECORD_LENGTH as u64)
     );
     drop(journal);
     assert_eq!(read(StdDisk, &dir).unwrap().records.len(), 4);
@@ -161,9 +202,113 @@ fn a_record_its_type_refuses_is_never_appended() {
     let mut bad = calibration(0, 100);
     // valid_from > valid_to.
     bad[16] = 200;
-    assert!(matches!(journal.append(&bad), Err(JournalError::Record(_))));
+    match journal.append_batch(&[calibration(0, 100), bad]) {
+        Err(JournalError::Refused(refused)) => {
+            assert_eq!(refused.len(), 1);
+            assert_eq!(refused[0].0, 1);
+            assert!(matches!(refused[0].1, Refusal::Record(_)));
+        }
+        other => panic!("{other:?}"),
+    }
     drop(journal);
     assert!(read(StdDisk, &dir).unwrap().records.is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// ADR-0098's completeness boundary: a `valid_from` not after the last
+/// of its type and clock is refused, and refuses the whole batch; other
+/// clocks and the other record type are ordered on their own.
+#[test]
+fn an_out_of_order_valid_from_is_refused() {
+    let dir = temp_dir("order");
+    let mut journal = CalibrationJournal::open(StdDisk, &dir).unwrap();
+    journal
+        .append_batch(&[calibration(1000, 2000), reference(2000, 3000)])
+        .unwrap();
+    match journal.append_batch(&[
+        calibration_of([5, 0, 5, 5, 5], 0, 100),
+        calibration(1000, 1500),
+        reference(0, 10),
+    ]) {
+        Err(JournalError::Refused(refused)) => assert_eq!(
+            refused,
+            [
+                (
+                    1,
+                    Refusal::OutOfOrder {
+                        valid_from: 1000,
+                        last: 1000
+                    }
+                ),
+                (
+                    2,
+                    Refusal::OutOfOrder {
+                        valid_from: 0,
+                        last: 2000
+                    }
+                )
+            ]
+        ),
+        other => panic!("{other:?}"),
+    }
+    // Inside one batch too.
+    assert!(matches!(
+        journal.append_batch(&[calibration(3000, 4000), calibration(2500, 2600)]),
+        Err(JournalError::Refused(_))
+    ));
+    assert_eq!(read(StdDisk, &dir).unwrap().records.len(), 2);
+    // Another clock, and a later time, are accepted.
+    journal
+        .append_batch(&[
+            calibration_of([5, 0, 5, 5, 5], 0, 100),
+            calibration(3000, 4000),
+        ])
+        .unwrap();
+    drop(journal);
+    // The order survives a reopen.
+    let mut journal = CalibrationJournal::open(StdDisk, &dir).unwrap();
+    assert!(matches!(
+        journal.append(&calibration(2999, 5000)),
+        Err(JournalError::Refused(_))
+    ));
+    drop(journal);
+    assert_eq!(read(StdDisk, &dir).unwrap().records.len(), 4);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A retried, partly applied batch never duplicates: a record identical
+/// to a stored one is skipped, reported already present.
+#[test]
+fn a_duplicate_is_skipped() {
+    let dir = temp_dir("duplicate");
+    let mut journal = CalibrationJournal::open(StdDisk, &dir).unwrap();
+    journal
+        .append_batch(&[calibration(0, 100), unknown(1)])
+        .unwrap();
+    drop(journal);
+    let mut journal = CalibrationJournal::open(StdDisk, &dir).unwrap();
+    assert_eq!(
+        journal
+            .append_batch(&[
+                calibration(0, 100),
+                unknown(1),
+                reference(0, 1999),
+                reference(0, 1999)
+            ])
+            .unwrap(),
+        [
+            Appended::AlreadyPresent,
+            Appended::AlreadyPresent,
+            Appended::At(2 * RECORD_LENGTH as u64),
+            Appended::AlreadyPresent
+        ]
+    );
+    assert_eq!(
+        journal.append(&reference(0, 1999)).unwrap(),
+        Appended::AlreadyPresent
+    );
+    drop(journal);
+    assert_eq!(read(StdDisk, &dir).unwrap().records.len(), 3);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -180,24 +325,21 @@ fn one_writer_at_a_time() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A torn tail (a record's data, or its index entry, cut short) is never
-/// read, by a reader while it is torn nor by the writer that recovers it;
-/// a record whose bytes no longer match its CRC is cut, never misread.
+/// A torn tail past the committed position is never read, by a reader
+/// nor by the writer that recovers it.
 #[test]
 fn a_torn_tail_is_ignored_until_complete() {
     let dir = temp_dir("torn");
     let mut journal = CalibrationJournal::open(StdDisk, &dir).unwrap();
-    journal.append(&calibration(0, 100)).unwrap();
-    journal.append(&reference(0, 1999)).unwrap();
+    journal
+        .append_batch(&[calibration(0, 100), reference(0, 1999)])
+        .unwrap();
     drop(journal);
-    // A crash part way through a third: half its data, and a partial
-    // index entry.
-    append_bytes(&file(&dir, "seg"), &[0xEE; RECORD_LENGTH / 2]);
-    append_bytes(&file(&dir, "idx"), &[0x11; 7]);
+    append_bytes(&last_file(&dir, "seg"), &[0xEE; RECORD_LENGTH / 2]);
+    append_bytes(&last_file(&dir, "idx"), &[0x11; 7]);
     let torn = read(StdDisk, &dir).unwrap();
     assert_eq!(torn.records, [calibration(0, 100), reference(0, 1999)]);
     assert!(torn.lossless);
-    // The next writer cuts the tail and appends whole records after it.
     let mut journal = CalibrationJournal::open(StdDisk, &dir).unwrap();
     journal.append(&calibration(1000, 2000)).unwrap();
     drop(journal);
@@ -209,39 +351,134 @@ fn a_torn_tail_is_ignored_until_complete() {
             calibration(1000, 2000)
         ]
     );
-    // The last record's bytes changed under its CRC: cut, not misread.
-    let data = file(&dir, "seg");
-    let file = std::fs::OpenOptions::new().write(true).open(&data).unwrap();
-    std::os::unix::fs::FileExt::write_all_at(&file, &[0xFF], (2 * RECORD_LENGTH + 40) as u64)
-        .unwrap();
-    drop(file);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A record the store holds but the committed position does not cover (a
+/// crash between the store's sync and the commit) is invisible, and the
+/// next writer cuts it.
+#[test]
+fn a_record_past_the_committed_position_is_unseen() {
+    let dir = temp_dir("past-durable");
+    let mut journal = CalibrationJournal::open(StdDisk, &dir).unwrap();
+    journal.append(&calibration(0, 100)).unwrap();
+    drop(journal);
+    uncommitted(&dir, &calibration(1000, 2000));
+    let records = read(StdDisk, &dir).unwrap();
+    assert_eq!(records.records, [calibration(0, 100)]);
+    assert!(records.lossless);
+    let mut journal = CalibrationJournal::open(StdDisk, &dir).unwrap();
+    // Cut: the same record is new again, at the same position.
+    assert_eq!(
+        journal.append(&calibration(1000, 2000)).unwrap(),
+        Appended::At(RECORD_LENGTH as u64)
+    );
+    drop(journal);
     assert_eq!(read(StdDisk, &dir).unwrap().records.len(), 2);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A committed record the store lost (its bytes no longer match their
+/// CRC, so verification cuts there) is a loss, never a shorter lossless
+/// journal; the writer refuses to repair it.
+#[test]
+fn interior_corruption_is_a_loss() {
+    let dir = temp_dir("interior");
+    let mut journal = CalibrationJournal::open(StdDisk, &dir).unwrap();
+    journal
+        .append_batch(&[
+            calibration(0, 100),
+            reference(0, 1999),
+            calibration(1000, 2000),
+        ])
+        .unwrap();
+    drop(journal);
+    let data = files(&dir, "seg").remove(0);
+    let file = std::fs::OpenOptions::new().write(true).open(&data).unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&file, &[0xFF], 40).unwrap();
+    drop(file);
+    let records = read(StdDisk, &dir).unwrap();
+    assert!(!records.lossless);
+    assert!(records.records.len() < 3);
+    let mut source = JournalSource::new(StdDisk, &dir);
+    assert!(!proves(&source.snapshot()));
+    assert!(matches!(
+        CalibrationJournal::open(StdDisk, &dir),
+        Err(JournalError::Damaged(_))
+    ));
+    // A committed position that does not decode is damage too.
+    std::fs::write(dir.join(DURABLE_FILE), [0u8; 20]).unwrap();
+    assert!(matches!(read(StdDisk, &dir), Err(JournalError::Damaged(_))));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Records never straddle a segment: a segment holds whole records, and
+/// a crash while the next segment's first record is written leaves every
+/// committed record readable.
+#[test]
+fn a_crash_at_a_segment_boundary_keeps_whole_records() {
+    let dir = temp_dir("boundary");
+    let mut journal = CalibrationJournal::open(StdDisk, &dir).unwrap();
+    let full: Vec<_> = (0..PER_SEGMENT as u64)
+        .map(|index| calibration(index * 10, index * 10 + 5))
+        .collect();
+    journal.append_batch(&full).unwrap();
+    drop(journal);
+    let segments = files(&dir, "seg");
+    assert_eq!(segments.len(), 1);
+    assert_eq!(
+        std::fs::metadata(&segments[0]).unwrap().len(),
+        (PER_SEGMENT * RECORD_LENGTH) as u64
+    );
+    // The next record starts the next segment; the crash tears it.
+    let next = calibration(PER_SEGMENT as u64 * 10, PER_SEGMENT as u64 * 10 + 5);
+    uncommitted(&dir, &next);
+    assert_eq!(files(&dir, "seg").len(), 2);
+    let second = last_file(&dir, "seg");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&second)
+        .unwrap();
+    file.set_len((RECORD_LENGTH / 2) as u64).unwrap();
+    drop(file);
+    let records = read(StdDisk, &dir).unwrap();
+    assert!(records.lossless);
+    assert_eq!(records.records, full);
+    let mut journal = CalibrationJournal::open(StdDisk, &dir).unwrap();
+    assert_eq!(
+        journal.append(&next).unwrap(),
+        Appended::At((PER_SEGMENT * RECORD_LENGTH) as u64)
+    );
+    drop(journal);
+    let records = read(StdDisk, &dir).unwrap();
+    assert_eq!(records.records.len(), PER_SEGMENT + 1);
+    assert_eq!(records.records.last(), Some(&next));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The agent's source reads the journal at each snapshot: records a
-/// producer appends while it runs are seen, and a snapshot proves
-/// coverage only once the producer's later records are durable.
+/// producer commits while it runs are seen, a snapshot proves coverage
+/// only once the producer's later records are committed, and another
+/// journal generation in the same path is a loss.
 #[test]
 fn a_source_sees_records_appended_while_it_reads() {
     let dir = temp_dir("tail");
     let mut source = JournalSource::new(StdDisk, &dir);
     assert!(!proves(&source.snapshot()));
     let mut journal = CalibrationJournal::open(StdDisk, &dir).unwrap();
-    journal.append(&calibration(0, 100)).unwrap();
-    journal.append(&reference(0, 1999)).unwrap();
-    // No completeness boundary yet: the producer has not published past.
+    journal
+        .append_batch(&[calibration(0, 100), reference(0, 1999)])
+        .unwrap();
     assert!(!proves(&source.snapshot()));
-    journal.append(&unknown()).unwrap();
-    journal.append(&calibration(1000, 2000)).unwrap();
+    journal
+        .append_batch(&[unknown(3), calibration(1000, 2000)])
+        .unwrap();
     assert!(!proves(&source.snapshot()));
     journal.append(&reference(2000, 3000)).unwrap();
     assert!(proves(&source.snapshot()));
 
-    // A writer appending on one thread while a reader reads on another:
-    // every read is a whole prefix of what was written.
     let writer = std::thread::spawn(move || {
-        for index in 0..200u64 {
+        for index in 0..60u64 {
             let at = 10_000 + index * 10;
             journal.append(&calibration(at, at + 5)).unwrap();
         }
@@ -250,6 +487,7 @@ fn a_source_sees_records_appended_while_it_reads() {
     loop {
         let finished = writer.is_finished();
         let records = read(StdDisk, &dir).unwrap();
+        assert!(records.lossless);
         assert!(records.records.len() >= seen);
         seen = records.records.len();
         for (index, words) in records.records.iter().enumerate().skip(5) {
@@ -257,11 +495,28 @@ fn a_source_sees_records_appended_while_it_reads() {
             assert_eq!(*words, calibration(at, at + 5));
         }
         if finished {
-            assert_eq!(seen, 205);
+            assert_eq!(seen, 65);
             break;
         }
     }
     writer.join().unwrap();
+    assert!(proves(&source.snapshot()));
     assert_eq!(source.failures(), 0);
+
+    // The directory replaced by another journal: a loss for this source.
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut other = CalibrationJournal::open(StdDisk, &dir).unwrap();
+    other
+        .append_batch(&[
+            calibration(0, 100),
+            reference(0, 1999),
+            calibration(1000, 2000),
+            reference(2000, 3000),
+        ])
+        .unwrap();
+    drop(other);
+    assert!(!proves(&source.snapshot()));
+    assert_eq!(source.failures(), 1);
     std::fs::remove_dir_all(&dir).unwrap();
 }

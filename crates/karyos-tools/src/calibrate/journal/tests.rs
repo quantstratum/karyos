@@ -75,7 +75,7 @@ fn records_given_as_words_or_on_standard_input_are_journalled() {
     let first = calibration(0, 100);
     let (status, out, err) = append(&dir, &printed(&first), "");
     assert_eq!((status, err.as_str()), (0, ""));
-    assert_eq!(out, "appended at 0\n");
+    assert_eq!(out, "record 0: appended at 0\n");
     // `calibrate phc`'s output: its evidence lines, then the record.
     let second = calibration(100, 200);
     let text = format!(
@@ -84,7 +84,7 @@ fn records_given_as_words_or_on_standard_input_are_journalled() {
     );
     let (status, out, err) = append(&dir, &[], &text);
     assert_eq!((status, err.as_str()), (0, ""));
-    assert_eq!(out, "appended at 144\n");
+    assert_eq!(out, "record 0: appended at 144\n");
     // Decimal words too, and an unknown type, kept for a newer reader.
     let mut unknown: Vec<String> = vec!["9".into()];
     unknown.extend(std::iter::repeat_n("0".to_owned(), 17));
@@ -100,28 +100,17 @@ fn records_given_as_words_or_on_standard_input_are_journalled() {
 #[test]
 fn a_bad_record_or_usage_appends_nothing() {
     let dir = temp_dir("refused");
-    let mut bad = calibration(0, 100);
-    // A calibration from a clock to itself.
-    let from = bad;
-    bad[6..11].copy_from_slice(&from[1..6]);
     let good = printed(&calibration(0, 100));
-    let both: Vec<String> = good.iter().cloned().chain(printed(&bad)).collect();
-    let (status, _, err) = append(&dir, &both, "");
-    assert_eq!(status, EXIT_ERROR);
-    assert!(err.contains("record 1"), "{err}");
+    // Errors of the input: nothing is made.
     let (status, _, err) = append(&dir, &good[..17], "");
     assert_eq!(status, EXIT_ERROR);
     assert!(err.contains("17 words"), "{err}");
     let (status, _, err) = append(&dir, &[], "nothing here\n");
     assert_eq!(status, EXIT_ERROR);
-    assert!(err.contains("0 words"), "{err}");
+    assert!(err.contains("no record line"), "{err}");
     let (status, _, err) = append(&dir, &["0xzz".into()], "");
     assert_eq!(status, EXIT_ERROR);
-    assert!(
-        err.contains("not a record word") || err.contains("words"),
-        "{err}"
-    );
-    // Nothing was made.
+    assert!(err.contains("words"), "{err}");
     assert!(!dir.exists());
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let status = run(
@@ -132,4 +121,96 @@ fn a_bad_record_or_usage_appends_nothing() {
     );
     assert_eq!(status, EXIT_ERROR);
     assert!(String::from_utf8(err).unwrap().contains("--journal"));
+
+    // A refused record refuses the batch: its good record is not appended.
+    let mut bad = calibration(100, 200);
+    let from = bad;
+    // A calibration from a clock to itself.
+    bad[6..11].copy_from_slice(&from[1..6]);
+    let both: Vec<String> = good.iter().cloned().chain(printed(&bad)).collect();
+    let (status, _, err) = append(&dir, &both, "");
+    assert_eq!(status, EXIT_ERROR);
+    assert!(err.contains("record 1:"), "{err}");
+    assert!(err.contains("nothing appended"), "{err}");
+    assert!(read(StdDisk, &dir).unwrap().records.is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Each `record` line is one record of exactly 18 words: a marker-only
+/// line, or a short one, is an error naming it, and words are never
+/// joined across lines.
+#[test]
+fn each_record_line_is_one_whole_record() {
+    let dir = temp_dir("lines");
+    let words = printed(&calibration(0, 100));
+    let marker = format!("record {}\nrecord\n", words.join(" "));
+    let (status, _, err) = append(&dir, &[], &marker);
+    assert_eq!(status, EXIT_ERROR);
+    assert!(err.contains("line 2: 0 words"), "{err}");
+    let split = format!(
+        "record {}\nrecord {}\n",
+        words[..9].join(" "),
+        words[9..].join(" ")
+    );
+    let (status, _, err) = append(&dir, &[], &split);
+    assert_eq!(status, EXIT_ERROR);
+    assert!(err.contains("line 1: 9 words"), "{err}");
+    let long = format!("record {} 0x0\n", words.join(" "));
+    let (status, _, err) = append(&dir, &[], &long);
+    assert_eq!(status, EXIT_ERROR);
+    assert!(err.contains("line 1: 19 words"), "{err}");
+    assert!(!dir.exists());
+    // Two whole lines are two records.
+    let two = format!(
+        "record {}\nrecord {}\n",
+        words.join(" "),
+        printed(&calibration(100, 200)).join(" ")
+    );
+    let (status, out, err) = append(&dir, &[], &two);
+    assert_eq!((status, err.as_str()), (0, ""));
+    assert_eq!(out, "record 0: appended at 0\nrecord 1: appended at 144\n");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A retried batch never duplicates, and an earlier `valid_from` than
+/// the journal's last of its clock is refused, per record.
+#[test]
+fn a_retry_is_already_present_and_an_earlier_record_is_refused() {
+    let dir = temp_dir("retry");
+    let first: Vec<String> = printed(&calibration(0, 100));
+    assert_eq!(append(&dir, &first, "").0, 0);
+    let batch: Vec<String> = first
+        .iter()
+        .cloned()
+        .chain(printed(&calibration(100, 200)))
+        .collect();
+    let (status, out, err) = append(&dir, &batch, "");
+    assert_eq!((status, err.as_str()), (0, ""));
+    assert_eq!(
+        out,
+        "record 0: already present\nrecord 1: appended at 144\n"
+    );
+    let (status, _, err) = append(&dir, &printed(&calibration(50, 60)), "");
+    assert_eq!(status, EXIT_ERROR);
+    assert!(
+        err.contains("record 0: valid_from 50 is not after 100"),
+        "{err}"
+    );
+    assert_eq!(read(StdDisk, &dir).unwrap().records.len(), 2);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Every directory the run makes has its parent synced, outermost first.
+#[test]
+fn new_directories_have_their_parents_synced() {
+    let root = temp_dir("parents");
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = root.join("a").join("b");
+    assert_eq!(
+        create_dir_durable(&dir).unwrap(),
+        [root.clone(), root.join("a")]
+    );
+    // Nothing new: nothing synced.
+    assert!(create_dir_durable(&dir).unwrap().is_empty());
+    std::fs::remove_dir_all(&root).unwrap();
 }

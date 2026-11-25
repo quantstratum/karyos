@@ -1505,12 +1505,38 @@ fn a_group_gets_time_evidence_from_the_calibration_journal_on_disk() {
     };
     append(&[calibration(0, 100), reference(0, 1999)]);
 
+    // karyosd's own path: its arguments parsed, then the source its start
+    // sets on the agent from them.
+    let parsed = match crate::args::parse(
+        [
+            "--dir",
+            "/run/k",
+            "--archive",
+            host.to_str().unwrap(),
+            "--archive-control",
+            "100,101",
+            "--archive-anchor-interval",
+            "3600s",
+            "--archive-calibration-journal",
+            calibrations.to_str().unwrap(),
+        ]
+        .iter()
+        .map(OsString::from),
+    )
+    .unwrap()
+    {
+        crate::args::Command::Run(options) => options.archive.unwrap(),
+        _ => panic!("expected options"),
+    };
+    assert_eq!(
+        parsed.calibration_journal.as_deref(),
+        Some(calibrations.as_path())
+    );
+    let daemon_source = crate::daemon_archive::configured_calibration_source(&parsed).unwrap();
     let config =
         AgentConfig::default().with_seal_interval(Some(std::time::Duration::from_millis(1)));
     let agent = ArchiveHandle::spawn(StdDisk, &host, config).unwrap();
-    agent
-        .set_calibration_source(crate::daemon_archive::calibration_source(&calibrations))
-        .unwrap();
+    agent.set_calibration_source(daemon_source).unwrap();
     let clock = EventClock {
         clock: [1, 0, 2, 3, 4],
         granularity: 1,
@@ -1586,16 +1612,30 @@ fn a_group_gets_time_evidence_from_the_calibration_journal_on_disk() {
     assert_eq!(err, "", "{out}");
     // Every event range is met through the journal's records. The group
     // journal's header, before the session's first event, carries no
-    // timestamp and has no entry, as for any group (karyos#1137), so the
-    // combined verdict stays no_evidence.
-    let met = out
+    // timestamp and has no entry, as for any group (karyos#1137): it is
+    // the one uncovered range, so the combined verdict stays no_evidence.
+    let first = entries.iter().map(|entry| entry.start).min().unwrap();
+    let ranges: Vec<&str> = out
         .lines()
         .filter(|line| line.starts_with(&format!("time recording {GROUP} [")))
-        .filter(|line| line.ends_with("clock 3:4 met"))
-        .count();
-    assert!(met >= 1, "{out}");
-    assert!(!out.contains("clock 3:4 no_evidence"), "{out}");
-    assert!(!out.contains("clock 3:4 not_met"), "{out}");
+        .collect();
+    assert!(!ranges.is_empty(), "{out}");
+    for line in &ranges {
+        if line.contains("uncovered") {
+            assert_eq!(
+                *line,
+                format!("time recording {GROUP} [0, {first}) uncovered no_evidence"),
+                "{out}"
+            );
+        } else {
+            assert!(line.ends_with("clock 3:4 met"), "{out}");
+        }
+    }
+    assert_eq!(
+        ranges.iter().filter(|line| line.ends_with(" met")).count(),
+        entries.len(),
+        "{out}"
+    );
     let (_, out, _) = time_run(&archive, &["--time-requirement", "50:1"]);
     assert!(out.contains("clock 3:4 not_met"), "{out}");
     assert!(out.ends_with("time verdict: not_met\n"), "{out}");
