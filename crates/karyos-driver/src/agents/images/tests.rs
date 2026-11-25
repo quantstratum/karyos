@@ -7422,7 +7422,7 @@ fn authenticated_rig() -> (Rig, EndpointId, crate::wire_keys::KeyFile) {
         SubscriptionAuth::new(b, alias(), &channel, &pairwise, 77).unwrap(),
     );
     rig.agents.sender.role.authenticate_publication(
-        PublicationAuth::new(a, alias(), identity(), 2, &channel, &[&[&pairwise]]).unwrap(),
+        PublicationAuth::new(a, alias(), identity(), 2, &channel, &[&pairwise]).unwrap(),
     );
     (rig, b, channel)
 }

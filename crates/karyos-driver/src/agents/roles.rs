@@ -479,6 +479,9 @@ pub struct SenderCounters {
     pub auth_unbound: u64,
     /// Session sealers installed at a binding.
     pub auth_sealers_installed: u64,
+    /// RSP_SETUPs of another receiver than an authenticated publication's
+    /// single one: refused, nothing bound or replaced.
+    pub auth_other_receiver: u64,
     /// SESSION_ABORTs signed and sent (one per bound receiver).
     pub aborts_sent: u64,
     /// SESSION_ABORT_ACKs verified in domain 4.
@@ -1914,8 +1917,6 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     due: Vec<(EndpointId, SetupAnnounce)>,
     /// The authenticated publications' keys (ADR-0086).
     publication_auth: Vec<PublicationAuth>,
-    /// The verified RSP_SETUP being answered.
-    establishing: Option<Establishing>,
     /// SESSION_ABORTs requested, sent at the next duty.
     aborts: Vec<RequestedAbort>,
     /// The last SESSION_ABORT_ACK verified (tests).
@@ -2114,7 +2115,6 @@ pub(super) fn roles<T: StreamTerms>(
             budget: u32::try_from(config.control_capacity).unwrap_or(u32::MAX),
             due: Vec::with_capacity(config.publications),
             publication_auth: Vec::new(),
-            establishing: None,
             aborts: Vec::with_capacity(config.publications),
             #[cfg(test)]
             last_abort_ack: None,
@@ -6485,6 +6485,29 @@ impl<T: StreamTerms> SenderRole<T> {
         self.publication_auth.push(auth);
     }
 
+    /// Verifies a sealed control as the duty does, returning its control
+    /// and establishment (tests).
+    #[cfg(test)]
+    pub(super) fn open_sealed_for(
+        &mut self,
+        endpoint: EndpointId,
+        bytes: &[u8],
+    ) -> Option<(Control, Option<Establishing>)> {
+        self.open_sealed(endpoint, bytes)
+    }
+
+    /// Installs the sealer of a verified establishment, as the answer
+    /// does (tests).
+    #[cfg(test)]
+    pub(super) fn establish_for(
+        &mut self,
+        endpoint: EndpointId,
+        answer: &Control,
+        establishing: Establishing,
+    ) {
+        self.establish(endpoint, answer, establishing);
+    }
+
     /// Gives the authenticated publication `alias` on `endpoint` an abort
     /// authority (tests).
     #[cfg(test)]
@@ -7534,7 +7557,11 @@ impl<T: StreamTerms> SenderRole<T> {
     /// Verifies an envelope for a local authenticated publication under
     /// its keys and returns its control; `None` when refused (counted by
     /// reason), with nothing else changed.
-    fn open_sealed(&mut self, endpoint: EndpointId, bytes: &[u8]) -> Option<Control> {
+    fn open_sealed(
+        &mut self,
+        endpoint: EndpointId,
+        bytes: &[u8],
+    ) -> Option<(Control, Option<Establishing>)> {
         let alias = receive_auth::envelope_alias(bytes);
         let index = alias.and_then(|alias| self.publication_auth_index(endpoint, alias));
         let (Some(alias), Some(index)) = (alias, index) else {
@@ -7557,10 +7584,9 @@ impl<T: StreamTerms> SenderRole<T> {
             .map(|auth| auth.open(bytes, identity, lane_count));
         match opened {
             Some(Ok(publish_auth::Opened::RspSetup(control, establishing))) => {
-                self.establishing = Some(establishing);
-                Some(control)
+                Some((control, Some(establishing)))
             }
-            Some(Ok(publish_auth::Opened::Receiver(control))) => Some(control),
+            Some(Ok(publish_auth::Opened::Receiver(control))) => Some((control, None)),
             Some(Ok(publish_auth::Opened::AbortAck(ack))) => {
                 self.count(|c| &mut c.abort_acks);
                 #[cfg(test)]
@@ -7570,7 +7596,14 @@ impl<T: StreamTerms> SenderRole<T> {
                 let _ = ack;
                 None
             }
-            Some(Err(_)) | None => {
+            Some(Err(reason)) => {
+                if reason == AuthReason::OtherReceiver {
+                    self.count(|c| &mut c.auth_other_receiver);
+                }
+                self.count(|c| &mut c.auth_rejected);
+                None
+            }
+            None => {
                 self.count(|c| &mut c.auth_rejected);
                 None
             }
@@ -7873,19 +7906,24 @@ impl<T: StreamTerms> SenderRole<T> {
             // An authenticated publication's receiver controls are verified
             // under its keys before anything decodes them; a bare one is
             // dropped (ADR-0086 section 2).
-            let item = match item {
+            // A verified RSP_SETUP's establishment travels with its own
+            // item, never in a field a later item could find.
+            let (item, establishing) = match item {
                 ControlItem::Sealed {
                     endpoint,
                     source,
                     bytes,
                     seen,
                 } => match self.open_sealed(endpoint, bytes.get()) {
-                    Some(control) => ControlItem::Incoming {
-                        endpoint,
-                        source,
-                        control,
-                        seen,
-                    },
+                    Some((control, establishing)) => (
+                        ControlItem::Incoming {
+                            endpoint,
+                            source,
+                            control,
+                            seen,
+                        },
+                        establishing,
+                    ),
                     None => continue,
                 },
                 ControlItem::Incoming {
@@ -7899,7 +7937,7 @@ impl<T: StreamTerms> SenderRole<T> {
                     self.count(|c| &mut c.auth_bare);
                     continue;
                 }
-                other => other,
+                other => (other, None),
             };
             match item {
                 // §7.3: an RSP_SETUP to the trigger's validated source,
@@ -8001,7 +8039,6 @@ impl<T: StreamTerms> SenderRole<T> {
                     control,
                     ..
                 } => {
-                    let establishing = self.establishing.take();
                     let authenticated = receiver_control_alias(&control)
                         .and_then(|alias| self.publication_auth_index(endpoint, alias));
                     // An authenticated publication answers only a verified

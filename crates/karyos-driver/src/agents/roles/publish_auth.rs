@@ -163,9 +163,15 @@ impl PublicationAuth {
     /// The authentication of the publication `alias` on `endpoint` of
     /// `identity` and `lane_count` lanes: `channel` is its channel signing
     /// key (domain 5 SETUP proof and the domain 1 sealer), `pairwise` the
-    /// key files of each receiver it may serve: one or two file epochs of
-    /// one key, the highest the current one. The boot id table holds every
-    /// receiver, allocated now.
+    /// key files of its one receiver: one or two file epochs of one key,
+    /// the highest the current one. The boot id table is allocated now.
+    ///
+    /// An authenticated publication is unicast with a single receiver:
+    /// [`crate::agents::data::Outbound::require_auth`] refuses fan-out,
+    /// dynamic and routed publications (ADR-0086 open point 6, ADR-0076
+    /// clause 4), and the publication has one domain 1 sealer, which a
+    /// second receiver's binding would replace. Per-destination sealers
+    /// come with karyos#649.
     ///
     /// # Errors
     ///
@@ -180,8 +186,9 @@ impl PublicationAuth {
         identity: Identity,
         lane_count: u8,
         channel: &KeyFile,
-        pairwise: &[&[&KeyFile]],
+        pairwise: &[&KeyFile],
     ) -> Result<Self, KeyError> {
+        let pairwise = [pairwise];
         let setup = Proof::new(
             ProofKind::Setup,
             alias,
@@ -309,11 +316,13 @@ impl PublicationAuth {
         identity: Identity,
         lane_count: u8,
     ) -> Result<Opened, AuthReason> {
+        // Any pairwise key but the single receiver's: another receiver,
+        // refused with its own reason, binding and replacing nothing.
         let index = self
             .receivers
             .iter()
             .position(|receiver| receiver.rsp.key_id() == key_id)
-            .ok_or(AuthReason::Key)?;
+            .ok_or(AuthReason::OtherReceiver)?;
         let receiver = self.receivers.get(index).ok_or(AuthReason::Key)?;
         let proved = receiver
             .rsp
@@ -323,9 +332,15 @@ impl PublicationAuth {
             .get(proved.opened.start..)
             .and_then(|rest| rest.get(..proved.opened.frames))
             .ok_or(AuthReason::Inner)?;
+        // The domain 6 key binds no publication identity (ADR-0086 section
+        // 4), so a CHALLENGE's identity is checked here, after its tag and
+        // before the boot id table: another incarnation's binds nothing. A
+        // SOLICIT carries none; a stale one is bounded by the publisher rule
+        // and the nonce, since the domain 1 key is salted with the
+        // establishment's boot id and nonce.
         let (control, challenge) = match classify(inner) {
             Ok(Datagram::Control(control @ Control::Challenge(challenge)))
-                if challenge.alias == self.alias =>
+                if challenge.alias == self.alias && challenge.identity == identity =>
             {
                 (control, challenge.challenge)
             }
@@ -362,6 +377,11 @@ impl PublicationAuth {
                 Err(AuthReason::Rebind)
             };
         }
+        // The binding is committed here, before the sender role answers:
+        // if the ANSWER then cannot be sent, the receiver's retry of the
+        // same boot id and nonce is `Bound` with that nonce, and the
+        // sender role installs the sealer then (`establish` installs one
+        // when none is installed), so nothing is lost or re-derived.
         match self.boots.decide(receiver_id, boot, &proved) {
             BootDecision::Bind => {}
             // The table's own bound boot id: the check above saw it.
@@ -521,7 +541,7 @@ mod tests {
 
     fn publication(files: &[&KeyFile]) -> PublicationAuth {
         let mut auth =
-            PublicationAuth::new(EndpointId(1), ALIAS, IDENTITY, 1, &channel(), &[files]).unwrap();
+            PublicationAuth::new(EndpointId(1), ALIAS, IDENTITY, 1, &channel(), files).unwrap();
         auth.set_wall(|| 1_795_000_000);
         auth
     }
@@ -637,6 +657,101 @@ mod tests {
             open(&mut auth, &challenge(&file, [2, 2], [7, 7])).unwrap_err(),
             AuthReason::Rebind
         );
+    }
+
+    /// The pairwise key of another receiver, 67.
+    fn other_receiver() -> KeyFile {
+        key(
+            "8-1.key",
+            "format=karyos-wire-key-v1\nkey_id=8\nfile_epoch=1\npurpose=pairwise\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=5555555555555555555555555555555555555555555555555555555555555555\nreceiver_id=67\npublisher_id=5\n",
+        )
+    }
+
+    /// A CHALLENGE of receiver 67 under its own pairwise key.
+    fn challenge_of_67(file: &KeyFile) -> Vec<u8> {
+        let proof = Proof::new(
+            ProofKind::RspSetup { receiver_id: 67 },
+            ALIAS,
+            Some(file),
+            [file],
+            file.file_epoch,
+        )
+        .unwrap();
+        let control = Control::Challenge(RspChallenge {
+            alias: ALIAS,
+            identity: IDENTITY,
+            challenge: ChallengeBlock {
+                receiver_boot_id: [5, 5],
+                nonce: [6, 6],
+            },
+        });
+        sealed(&control, |bytes, length| proof.seal(bytes, length).unwrap())
+    }
+
+    /// An authenticated publication serves a single receiver (ADR-0086
+    /// open point 6; per-destination sealers are karyos#649): a second
+    /// receiver's RSP_SETUP is refused with its own reason, binds nothing
+    /// and replaces nothing, and the first receiver's binding, and so its
+    /// session key, stays.
+    #[test]
+    fn a_second_receiver_is_refused_and_binds_nothing() {
+        let file = pairwise(1, '2');
+        let mut auth = publication(&[&file]);
+        let Ok(Opened::RspSetup(_, first)) = open(&mut auth, &challenge(&file, [1, 1], [9, 9]))
+        else {
+            panic!("the receiver binds");
+        };
+        assert_eq!(
+            open(&mut auth, &challenge_of_67(&other_receiver())).unwrap_err(),
+            AuthReason::OtherReceiver
+        );
+        assert_eq!(auth.rejections.get(AuthReason::OtherReceiver), 1);
+        // The first receiver's binding stands: its resend is the same
+        // establishment, its SMs open.
+        let Ok(Opened::RspSetup(_, again)) = open(&mut auth, &challenge(&file, [1, 1], [9, 9]))
+        else {
+            panic!("the bound receiver is answered");
+        };
+        assert_eq!((again.party, again.bind), (first.party, false));
+        let mut sealer = receiver_sealer(&file, [1, 1]);
+        assert!(matches!(
+            open(&mut auth, &sm(&mut sealer, &status([1, 1]))),
+            Ok(Opened::Receiver(_))
+        ));
+    }
+
+    /// ADR-0086 section 4: the domain 6 key binds no publication identity,
+    /// so a CHALLENGE of another incarnation is refused after its tag and
+    /// binds nothing; the right one then binds.
+    #[test]
+    fn a_challenge_of_another_incarnation_binds_nothing() {
+        let file = pairwise(1, '2');
+        let mut auth = publication(&[&file]);
+        let proof = Proof::new(
+            ProofKind::RspSetup { receiver_id: 66 },
+            ALIAS,
+            Some(&file),
+            [&file],
+            1,
+        )
+        .unwrap();
+        let stale = Control::Challenge(RspChallenge {
+            alias: ALIAS,
+            identity: Identity {
+                incarnation: 2,
+                ..IDENTITY
+            },
+            challenge: ChallengeBlock {
+                receiver_boot_id: [1, 1],
+                nonce: [9, 9],
+            },
+        });
+        let bytes = sealed(&stale, |bytes, length| proof.seal(bytes, length).unwrap());
+        assert_eq!(open(&mut auth, &bytes).unwrap_err(), AuthReason::Inner);
+        assert!(matches!(
+            open(&mut auth, &challenge(&file, [1, 1], [9, 9])),
+            Ok(Opened::RspSetup(_, establishing)) if establishing.bind
+        ));
     }
 
     /// ADR-0086 section 7: an RSP_SETUP that verifies only under the

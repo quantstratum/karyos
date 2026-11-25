@@ -70,6 +70,8 @@ pub enum AuthReason {
     PreviousEpoch,
     /// An RSP_SETUP of a new boot id with no room left to retire the old.
     Full,
+    /// An RSP_SETUP of another receiver than the publication's single one.
+    OtherReceiver,
     /// An envelope for no authenticated binding.
     Unbound,
 }

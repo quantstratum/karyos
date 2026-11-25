@@ -7514,7 +7514,7 @@ fn sender_controls_of_an_authenticated_publication_go_sealed_in_domain_1() {
     path.require_auth().unwrap();
     sender.publications.push(path);
     let auth =
-        PublicationAuth::new(EndpointId(1), alias(), identity(), 1, &channel, &[&[&pair]]).unwrap();
+        PublicationAuth::new(EndpointId(1), alias(), identity(), 1, &channel, &[&pair]).unwrap();
     let party = Party::Sender {
         identity: identity(),
         lane_count: 1,
@@ -7600,4 +7600,98 @@ fn a_bare_sm_for_an_authenticated_publication_never_reaches_the_sender() {
         Some(ControlItem::Sealed { .. })
     ));
     assert!(sender.take_control().is_none());
+}
+
+/// ADR-0086 section 7: the binding is committed when the RSP_SETUP
+/// verifies, before the answer. When that answer cannot be sent, the
+/// receiver's retry of the same boot id and nonce installs the session
+/// sealer; another receiver's RSP_SETUP is refused with its own reason and
+/// counted, and replaces nothing.
+#[test]
+fn an_unsent_answer_is_recovered_by_the_receivers_retry() {
+    use karyos_protocol::network::{RspChallenge, SetupAnswer};
+
+    use super::publish_auth::PublicationAuth;
+    use crate::wire_auth::{ENVELOPE_LEN, Proof, ProofKind};
+
+    let (mut sender, _role) = receiver_with(AgentConfig::default());
+    let key = |name: &str, text: String| crate::wire_keys::parse(name, text.as_bytes()).unwrap();
+    let channel = key(
+        "3-1.key",
+        "format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=1\npurpose=channel\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=1111111111111111111111111111111111111111111111111111111111111111\nchannel_id=7\nstream_id=6\n".to_owned(),
+    );
+    let pairwise = |id: u32, receiver: u64, fill: char| {
+        let secret: String = core::iter::repeat_n(fill, 64).collect();
+        key(
+            &format!("{id}-1.key"),
+            format!(
+                "format=karyos-wire-key-v1\nkey_id={id}\nfile_epoch=1\npurpose=pairwise\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret={secret}\nreceiver_id={receiver}\npublisher_id=5\n"
+            ),
+        )
+    };
+    let ours = pairwise(9, 66, '2');
+    let theirs = pairwise(8, 67, '5');
+    let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let (mut path, _log) = outbound(EndpointId(1), destination);
+    path.require_auth().unwrap();
+    sender.publications.push(path);
+    sender.sessions.add(publication(EndpointId(1))).unwrap();
+    sender.authenticate_publication(
+        PublicationAuth::new(EndpointId(1), alias(), identity(), 1, &channel, &[&ours]).unwrap(),
+    );
+    let challenge = |file: &crate::wire_keys::KeyFile, receiver_id: u64| {
+        let proof = Proof::new(
+            ProofKind::RspSetup { receiver_id },
+            alias(),
+            Some(file),
+            [file],
+            1,
+        )
+        .unwrap();
+        let control = Control::Challenge(RspChallenge {
+            alias: alias(),
+            identity: identity(),
+            challenge: ChallengeBlock {
+                receiver_boot_id: [7, 8],
+                nonce: [9, 9],
+            },
+        });
+        let mut bytes = vec![0u8; karyos_protocol::network::MAX_CONTROL_LENGTH + ENVELOPE_LEN];
+        let length = control.encode(&mut bytes).unwrap();
+        let length = proof.seal(&mut bytes, length).unwrap();
+        bytes.truncate(length);
+        bytes
+    };
+    let first = challenge(&ours, 66);
+    let (_, Some(binding)) = sender.open_sealed_for(EndpointId(1), &first).unwrap() else {
+        panic!("an establishment");
+    };
+    assert!(binding.bind);
+    // Its answer is never sent: no sealer.
+    assert_eq!(sender.publications[0].sealer_party(), None);
+    // Another receiver meanwhile: refused, counted, nothing replaced.
+    assert!(
+        sender
+            .open_sealed_for(EndpointId(1), &challenge(&theirs, 67))
+            .is_none()
+    );
+    assert_eq!(sender.counters().auth_other_receiver, 1);
+    // The receiver retries: the same establishment, now installed.
+    let (_, Some(retry)) = sender.open_sealed_for(EndpointId(1), &first).unwrap() else {
+        panic!("an establishment");
+    };
+    assert_eq!((retry.party, retry.bind), (binding.party, false));
+    let answer = Control::SetupAnswer(SetupAnswer {
+        alias: alias(),
+        identity: identity(),
+        term: publication(EndpointId(1)).term,
+        challenge: ChallengeBlock {
+            receiver_boot_id: [7, 8],
+            nonce: [9, 9],
+        },
+        joins: Lanes::new(&[0]).unwrap(),
+    });
+    sender.establish_for(EndpointId(1), &answer, retry);
+    assert_eq!(sender.publications[0].sealer_party(), Some(binding.party));
+    assert_eq!(sender.counters().auth_sealers_installed, 1);
 }
