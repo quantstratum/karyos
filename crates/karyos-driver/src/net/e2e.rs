@@ -52,6 +52,16 @@ fn driver(threading: ThreadingMode) -> EmbeddedDriver {
     driver_with(threading, AgentConfig::default())
 }
 
+/// A driver whose endpoints a test resets: its IPv4 loopback data
+/// endpoints bind ports outside the ephemeral range
+/// ([`crate::net::Network::pin_data_ports`]), so another test's bind to
+/// port 0 never takes the port a reset closes and binds again.
+fn resettable(threading: ThreadingMode) -> EmbeddedDriver {
+    let mut driver = driver(threading);
+    driver.net.as_mut().unwrap().pin_data_ports();
+    driver
+}
+
 /// A driver whose silent images retire within 100 ms.
 fn fast_driver(threading: ThreadingMode) -> EmbeddedDriver {
     driver_with(threading, fast_agents())
@@ -934,7 +944,10 @@ fn a_steady_network_cycle_allocates_nothing() {
 /// subscriber gets every message exactly once, in order.
 #[test]
 fn an_endpoint_reset_loses_nothing_on_a_reliable_channel() {
-    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (mut a, mut b) = (
+        resettable(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+    );
     let (publication, image) = connected(&mut a, &mut b, true, 10);
     let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
     let mut lane = a
@@ -993,7 +1006,10 @@ fn an_endpoint_reset_loses_nothing_on_a_reliable_channel() {
 /// (SPEC.md §4, "Sender position").
 #[test]
 fn an_endpoint_reset_loses_nothing_with_a_required_receiver() {
-    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (mut a, mut b) = (
+        resettable(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+    );
     let (publication, image) = connected_required(&mut a, &mut b, 10);
     let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
     let mut lane = a
@@ -3134,7 +3150,7 @@ fn optional_receiver_closes(
         etf: None,
     };
     let (mut a, mut b, mut c) = (
-        driver(ThreadingMode::Shared),
+        resettable(ThreadingMode::Shared),
         driver(ThreadingMode::Shared),
         driver(ThreadingMode::Shared),
     );
@@ -3776,7 +3792,10 @@ fn a_slow_optional_receiver_under_min_is_bounded_and_repaired() {
 /// flows.
 #[test]
 fn a_tail_lost_at_a_reset_with_an_idle_publisher_is_recovered() {
-    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (mut a, mut b) = (
+        resettable(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+    );
     let (publication, image) = connected(&mut a, &mut b, true, 10);
     let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
     let mut lane = a
@@ -3833,7 +3852,10 @@ fn a_tail_lost_at_a_reset_with_an_idle_publisher_is_recovered() {
 /// whole, then the messages after it, in order.
 #[test]
 fn a_fragmented_message_straddling_a_reset_is_read_once_and_whole() {
-    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (mut a, mut b) = (
+        resettable(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+    );
     let (publication, image) = connected(&mut a, &mut b, true, 10);
     let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
     let mut lane = a

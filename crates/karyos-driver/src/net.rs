@@ -945,6 +945,10 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     /// validation).
     #[cfg(test)]
     fail_control_endpoint: bool,
+    /// Tests: IPv4 loopback data endpoints on port 0 bind a port outside
+    /// the ephemeral range instead ([`Self::pin_data_ports`]).
+    #[cfg(test)]
+    pin_data_ports: bool,
     /// Whether the backend isolates redundant path sockets.
     paths_isolated: bool,
     /// Channels with `paths` refused because they cannot be isolated.
@@ -1097,6 +1101,8 @@ impl<T: StreamTerms> Network<T> {
             control_endpoint: config.control_endpoint,
             #[cfg(test)]
             fail_control_endpoint: false,
+            #[cfg(test)]
+            pin_data_ports: false,
             paths_isolated: <OsSocket as karyos_io::sockets::ops::SocketOps>::isolates_paths(),
             paths_refused: 0,
             path_failures: 0,
@@ -1403,7 +1409,12 @@ impl<T: StreamTerms> Network<T> {
         if self.endpoints.retiring_at(bind) {
             return Err((DriverError::NetworkBusy, None));
         }
-        let mut config = SocketsConfig::new(bind);
+        // The entry stays keyed by `bind`, so it is shared as before.
+        #[cfg(test)]
+        let local = self.pinned_bind(bind, multicast, purpose);
+        #[cfg(not(test))]
+        let local = bind;
+        let mut config = SocketsConfig::new(local);
         config.multicast = multicast;
         config.etf_route = matches!(purpose, EndpointPurpose::Etf { .. });
         config.tx_slots = self.endpoint_tables.tx_slots;
@@ -2141,6 +2152,42 @@ impl<T: StreamTerms> Network<T> {
         held.into_iter()
             .flatten()
             .filter_map(|endpoint| self.endpoints.local_address(endpoint))
+    }
+
+    /// Tests: the address a new endpoint for `bind` binds: a port of
+    /// [`crate::test_ports`] for an IPv4 loopback data endpoint on port 0
+    /// once [`Self::pin_data_ports`] was called, `bind` otherwise.
+    #[cfg(test)]
+    fn pinned_bind(
+        &self,
+        bind: SocketAddr,
+        multicast: Option<MulticastConfig>,
+        purpose: EndpointPurpose,
+    ) -> SocketAddr {
+        let pinned = self.pin_data_ports
+            && purpose == EndpointPurpose::Data
+            && multicast.is_none()
+            && bind.port() == 0
+            && bind.ip() == IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        if pinned {
+            SocketAddr::new(bind.ip(), crate::test_ports::test_port())
+        } else {
+            bind
+        }
+    }
+
+    /// Tests: every later IPv4 loopback data endpoint on port 0 binds a
+    /// port outside the ephemeral range ([`crate::test_ports`]), for the
+    /// tests that reset a publisher's endpoint. A reset closes the socket
+    /// and binds the same port again (`Endpoints::reset`, which keeps the
+    /// port so receivers' bindings stay valid). An ephemeral port is free
+    /// in between, and on a busy host another test's bind to port 0 can
+    /// take it: the reopen fails with `EADDRINUSE` and the endpoint fails
+    /// for good, so the test waits out its deadline. No bind to port 0
+    /// takes a port of the test range.
+    #[cfg(test)]
+    pub(crate) fn pin_data_ports(&mut self) {
+        self.pin_data_ports = true;
     }
 
     /// Tests: makes every later control endpoint creation fail (its e2e
