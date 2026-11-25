@@ -102,6 +102,13 @@ impl SenderAuth {
         match self {
             Self::Off => Some(frames),
             Self::Pending | Self::EncPending => None,
+            // Nothing authenticated is sealed while the VM generation
+            // fence is held (H8 R3-6).
+            Self::Sealing(_) | Self::Encrypting(_)
+                if crate::wire_enc::vm_generation::quiesced() =>
+            {
+                None
+            }
             Self::Sealing(sealer) => sealer.seal(datagram, frames).ok(),
             Self::Encrypting(sealer) => sealer.seal(datagram, frames).ok(),
         }
@@ -410,5 +417,55 @@ impl<T: StreamTerms> Outbound<T> {
     #[must_use]
     pub fn authenticated(&self) -> bool {
         !matches!(self.auth, SenderAuth::Off)
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+
+    use karyos_protocol::network::{Alias, Identity};
+
+    use super::SenderAuth;
+    use crate::wire_auth::{ENVELOPE_LEN, Party, Sealer};
+    use crate::wire_enc::VmGenerationWatch;
+    use crate::wire_enc::vm_generation::{self, InjectedSignal};
+
+    /// H8 R3-6, the fence alone: an installed DATA sealer seals nothing
+    /// while the VM generation fence is held, and seals again once it is
+    /// released. No key view is involved at this point.
+    #[test]
+    fn a_held_fence_seals_no_data() {
+        let channel = crate::wire_keys::parse(
+            "3-1.key",
+            b"format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=1\npurpose=channel\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=1111111111111111111111111111111111111111111111111111111111111111\nchannel_id=7\nstream_id=6\n",
+        )
+        .unwrap();
+        let alias = Alias {
+            session_id: 5,
+            stream_id: 6,
+        };
+        let party = Party::Sender {
+            identity: Identity {
+                driver_id: [1, 2],
+                registration_id: 3,
+                incarnation: 1,
+            },
+            lane_count: 1,
+            receiver_boot_id: [4, 4],
+            nonce: [5, 5],
+        };
+        let mut auth = SenderAuth::Sealing(Box::new(Sealer::new(&channel, party, alias).unwrap()));
+        let mut datagram = [0u8; 64 + ENVELOPE_LEN];
+        assert!(!vm_generation::quiesced());
+        assert!(auth.seal(&mut datagram, 64).is_some(), "seals before");
+        // A role that never redraws keeps the fence held.
+        vm_generation::register();
+        let (signal, injector) = InjectedSignal::new();
+        let mut watch = VmGenerationWatch::new(Box::new(signal));
+        injector.change();
+        assert_eq!(watch.poll(0), 1);
+        assert!(vm_generation::quiesced());
+        assert!(auth.seal(&mut datagram, 64).is_none(), "nothing sealed");
     }
 }

@@ -315,6 +315,9 @@ pub struct ReceiverCounters {
     pub guard_statuses_sent: u64,
     /// STATUS_CHALLENGEs this authority refused (by reason on it).
     pub guard_challenges_refused: u64,
+    /// Authenticated datagrams dropped unread while the VM generation fence
+    /// was held.
+    pub auth_fenced: u64,
     /// GUARD datagrams on an endpoint that is not one of the guard
     /// authority's control endpoints: refused before they are read.
     pub guard_challenges_wrong_endpoint: u64,
@@ -520,6 +523,14 @@ pub struct SenderCounters {
     pub abort_send_failures: u64,
     /// Due abort attempts the duty's control budget deferred.
     pub aborts_deferred: u64,
+    /// SETUP ANNOUNCEs or ANSWERs of an authenticated publication not sent:
+    /// the fence held, admission pending, or its incarnation aborting.
+    pub setup_blocked: u64,
+    /// RSP_SETUPs refused before they were read, for the same reasons.
+    pub establishment_refused: u64,
+    /// Sealed or signed controls not submitted while the VM generation
+    /// fence was held.
+    pub fenced: u64,
     /// Applied guard closes whose abort could not be requested (no
     /// identity, room or signature): the incarnation is not aborted
     /// remotely and stays closed by its gate.
@@ -6417,8 +6428,15 @@ impl<T: StreamTerms> Intake<'_, T> {
             self.role.count(|c| &mut c.auth_rejected);
             return;
         }
-        // The encrypted class first (ADR-0114 section 9).
+        // The encrypted class first (ADR-0114 section 9), which fences its
+        // own envelopes.
         if self.encrypted_in(source, bytes) {
+            return;
+        }
+        // No authenticated datagram is read while the VM generation fence
+        // is held (H8 R3-6).
+        if receive_auth::is_envelope(bytes) && crate::wire_enc::vm_generation::quiesced() {
+            self.role.count(|c| &mut c.auth_fenced);
             return;
         }
         if receive_auth::is_envelope(bytes) {
@@ -7056,6 +7074,13 @@ impl<T: StreamTerms> SenderRole<T> {
     pub(super) fn forget_bindings(&mut self, endpoint: EndpointId, alias: Alias) {
         self.bindings
             .retain(|binding| (binding.endpoint, binding.alias) != (endpoint, alias));
+    }
+
+    /// Whether the sender's key view admits it now (tests).
+    #[cfg(test)]
+    pub(super) fn key_view_admits(&self) -> bool {
+        self.key_generation
+            .admits_now(crate::wire_auth::Side::Sender)
     }
 
     /// The incarnations in `Aborting` (tests).
@@ -8149,9 +8174,7 @@ impl<T: StreamTerms> SenderRole<T> {
                 break;
             };
             let (endpoint, alias, guard_id) = (auth.endpoint, auth.alias, auth.abort_guard);
-            if auth.abort.is_none() || guard_id == 0 {
-                continue;
-            }
+            let signs = auth.abort.is_some() && guard_id != 0;
             let identity = self.sessions.identity(endpoint, alias);
             if identity.is_none() || auth.aborted == identity {
                 continue;
@@ -8169,15 +8192,73 @@ impl<T: StreamTerms> SenderRole<T> {
             let Some(epoch) = epoch else {
                 continue;
             };
-            if !self.request_abort(endpoint, alias, GUARD_CLOSED, guard_id, epoch, now) {
-                self.count(|c| &mut c.aborts_unrequested);
-                // Once per incarnation, refused or not: the deadline-free
-                // retry would spin on a refusal.
-                if let Some(auth) = self.publication_auth.get_mut(at) {
-                    auth.aborted = identity;
-                }
+            if signs && self.request_abort(endpoint, alias, GUARD_CLOSED, guard_id, epoch, now) {
+                continue;
             }
+            // No signed abort can originate here (no signer, a withdrawn
+            // key, or signing failed): the close is a terminal interruption
+            // at once, reported for retirement like an expired abort (H8
+            // R3-3; guards-and-abort.md, Session abort, sender step 5).
+            let Some(identity) = identity else {
+                continue;
+            };
+            if self.aborts.len() >= self.aborts.capacity() {
+                // Retried next duty: nothing is marked handled.
+                continue;
+            }
+            let Some(bytes) = SealedBytes::copy(&[]) else {
+                continue;
+            };
+            self.aborts.push(PendingAbort {
+                endpoint,
+                alias,
+                identity,
+                guard_id,
+                guard_epoch: epoch,
+                bytes,
+                deadline: now,
+                first: None,
+                next_at: now,
+                backoff: ABORT_RESEND_INITIAL_NS,
+                generation: self.key_generation.current(),
+                ended: Some(true),
+            });
+            if let Some(auth) = self.publication_auth.get_mut(at) {
+                auth.aborted = Some(identity);
+            }
+            self.count(|c| &mut c.aborts_unrequested);
+            self.count(|c| &mut c.aborts_interrupted);
         }
+    }
+
+    /// Whether the authenticated publication `alias` on `endpoint` may not
+    /// establish now: while the VM generation fence is held, while it is
+    /// admission-pending (its remote guard has not opened), and once its
+    /// incarnation is aborting or terminal (H8 R3-4, R3-6, R3-7). A
+    /// SETUP it would send is not sent, and an RSP_SETUP binds nothing.
+    fn establishment_blocked(&self, endpoint: EndpointId, alias: Alias) -> bool {
+        if crate::wire_enc::vm_generation::quiesced() {
+            return true;
+        }
+        let pending = self
+            .publications
+            .iter()
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+            .is_none_or(|outbound| outbound.admission_pending());
+        if pending {
+            return true;
+        }
+        let Some(identity) = self.sessions.identity(endpoint, alias) else {
+            return true;
+        };
+        let aborted = self
+            .publication_auth_index(endpoint, alias)
+            .and_then(|index| self.publication_auth.get(index))
+            .is_some_and(|auth| auth.aborted == Some(identity));
+        aborted
+            || self.aborts.iter().any(|pending| {
+                (pending.endpoint, pending.alias, pending.identity) == (endpoint, alias, identity)
+            })
     }
 
     /// Sends each pending SESSION_ABORT that is due at `now` to its
@@ -8384,6 +8465,12 @@ impl<T: StreamTerms> SenderRole<T> {
             self.count(|c| &mut c.seal_failures);
             return Sent::NotSubmitted;
         }
+        // Raw bytes are signed or sealed: none is submitted while the VM
+        // generation fence is held (H8 R3-6).
+        if crate::wire_enc::vm_generation::quiesced() {
+            self.count(|c| &mut c.fenced);
+            return Sent::NotSubmitted;
+        }
         let tx = halves.iter_mut().find_map(|(held, half)| match half {
             Half::Tx(tx) if *held == endpoint => Some(tx),
             _ => None,
@@ -8503,6 +8590,15 @@ impl<T: StreamTerms> SenderRole<T> {
             self.count(|c| &mut c.auth_unbound);
             return None;
         };
+        // An RSP_SETUP (domain 6) is refused before it is read when the
+        // publication may not establish: nothing is bound or consumed.
+        if bytes.get(10).copied()
+            == Some(karyos_protocol::protection::hmac_sha256::Domain::RspSetup as u8)
+            && self.establishment_blocked(endpoint, alias)
+        {
+            self.count(|c| &mut c.establishment_refused);
+            return None;
+        }
         let opened = self
             .publication_auth
             .get_mut(index)
@@ -8577,6 +8673,15 @@ impl<T: StreamTerms> SenderRole<T> {
         control: &Control,
         index: usize,
     ) -> Sent {
+        let alias = match control {
+            Control::SetupAnnounce(announce) => Some(announce.alias),
+            Control::SetupAnswer(answer) => Some(answer.alias),
+            _ => None,
+        };
+        if alias.is_none_or(|alias| self.establishment_blocked(endpoint, alias)) {
+            self.count(|c| &mut c.setup_blocked);
+            return Sent::NotSubmitted;
+        }
         // Moved out and back: allocates nothing.
         let mut auths = std::mem::take(&mut self.publication_auth);
         let sent = match auths.get_mut(index) {
@@ -8732,6 +8837,12 @@ impl<T: StreamTerms> SenderRole<T> {
         };
         slot.endpoint = Some(endpoint);
         let sealed = seal.is_some();
+        // Nothing authenticated is submitted while the VM generation fence
+        // is held (H8 R3-6).
+        if sealed && crate::wire_enc::vm_generation::quiesced() {
+            self.count(|c| &mut c.fenced);
+            return Sent::NotSubmitted;
+        }
         let result = match (mode, seal) {
             (Mode::Now, Some(seal)) => slot
                 .routes

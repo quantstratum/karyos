@@ -8044,7 +8044,10 @@ fn abort_ends(rig: &Rig) -> Vec<bool> {
 /// An authenticated rig whose publication is guarded locally by a guard
 /// word open at epoch 2, bound to guard 11 of authority 10, which the
 /// receiver admits; the receiver trusts authority 10 when `trusted`.
-fn guarded_abort_rig(trusted: bool) -> (Rig, std::sync::Arc<karyos_client::HeapWords>) {
+fn guarded_abort_rig(
+    trusted: bool,
+    signs: bool,
+) -> (Rig, std::sync::Arc<karyos_client::HeapWords>) {
     use std::sync::Arc;
 
     use crate::agents::roles::publish_auth::{AbortAuthority, PublicationAuth};
@@ -8097,10 +8100,12 @@ fn guarded_abort_rig(trusted: bool) -> (Rig, std::sync::Arc<karyos_client::HeapW
             },
         );
     }
-    rig.agents
-        .sender
-        .role
-        .set_abort_authority(a, alias(), AbortAuthority::new(signer, 10, 10));
+    if signs {
+        rig.agents
+            .sender
+            .role
+            .set_abort_authority(a, alias(), AbortAuthority::new(signer, 10, 10));
+    }
     rig.agents.sender.role.set_abort_guard(a, alias(), 11);
     let _slot = established(&mut rig);
     (rig, word)
@@ -8122,7 +8127,7 @@ fn close_guard(rig: &mut Rig, word: &karyos_client::HeapWords) {
 /// end is reported once for the conductor to retire the incarnation.
 #[test]
 fn a_guard_close_aborts_the_session_and_its_ack_retires_it() {
-    let (mut rig, word) = guarded_abort_rig(true);
+    let (mut rig, word) = guarded_abort_rig(true, true);
     close_guard(&mut rig, &word);
     for _ in 0..400 {
         rig.round(true);
@@ -8161,7 +8166,7 @@ fn a_guard_close_aborts_the_session_and_its_ack_retires_it() {
 /// deadline, once.
 #[test]
 fn a_guard_close_with_no_ack_is_reported_interrupted() {
-    let (mut rig, word) = guarded_abort_rig(false);
+    let (mut rig, word) = guarded_abort_rig(false, true);
     rig.agents.sender.role.set_abort_expiry(150 * MS);
     close_guard(&mut rig, &word);
     for _ in 0..300 {
@@ -9445,3 +9450,265 @@ fn a_generation_change_reestablishes_the_authenticated_class_and_refuses_what_ca
 
 /// The H8 invariants of the authenticated class (karyos#648).
 mod invariants;
+
+/// A valid RSP_SETUP CHALLENGE of the rig's publication from receiver 77
+/// under `boot`, sealed under its pairwise RSP_SETUP proof (domain 6).
+fn valid_challenge(boot: [u64; 2], nonce: [u64; 2]) -> Vec<u8> {
+    use karyos_protocol::network::{ChallengeBlock, Control, RspChallenge};
+
+    use crate::wire_auth::{ENVELOPE_LEN, Proof, ProofKind};
+
+    let (_, pairwise) = auth_keys(77);
+    let proof = Proof::new(
+        ProofKind::RspSetup { receiver_id: 77 },
+        alias(),
+        Some(&pairwise),
+        [&pairwise],
+        pairwise.file_epoch,
+    )
+    .unwrap();
+    let control = Control::Challenge(RspChallenge {
+        alias: alias(),
+        identity: identity(),
+        challenge: ChallengeBlock {
+            receiver_boot_id: boot,
+            nonce,
+        },
+    });
+    let mut bytes = vec![0u8; karyos_protocol::network::MAX_CONTROL_LENGTH + ENVELOPE_LEN];
+    let length = control.encode(&mut bytes).unwrap();
+    let length = proof.seal(&mut bytes, length).unwrap();
+    bytes.truncate(length);
+    bytes
+}
+
+/// H8 R3-3: a guard close of an authenticated publication with no abort
+/// signer (a remote authority's publication, or a withdrawn key) records a
+/// terminal interruption at once, reported for retirement, and the
+/// incarnation establishes nothing more.
+#[test]
+fn a_close_with_no_abort_signer_is_a_terminal_interruption() {
+    let (mut rig, word) = guarded_abort_rig(true, false);
+    close_guard(&mut rig, &word);
+    for _ in 0..50 {
+        rig.round(true);
+    }
+    let sender = rig.agents.sender.role.counters();
+    assert_eq!(
+        (
+            sender.aborts_sent,
+            sender.aborts_interrupted,
+            sender.aborts_unrequested
+        ),
+        (0, 1, 1),
+        "{sender:?}"
+    );
+    assert_eq!(
+        abort_ends(&rig),
+        vec![true],
+        "reported once, for retirement"
+    );
+    assert_eq!(rig.agents.sender.role.pending_aborts(), 0);
+    // A fresh challenge of the incarnation binds nothing.
+    let a = rig.publisher;
+    let before = rig.agents.sender.role.counters().establishment_refused;
+    assert!(
+        rig.agents
+            .sender
+            .role
+            .open_sealed_for(a, &valid_challenge([5, 5], [6, 6]))
+            .is_none()
+    );
+    assert_eq!(
+        rig.agents.sender.role.counters().establishment_refused,
+        before + 1
+    );
+}
+
+/// H8 R3-7: while the incarnation's abort is pending (here the receiver
+/// never acknowledges, as after a receiver-only restart that lost the
+/// applied abort), a fresh establishment of the same incarnation under a
+/// new receiver boot id is refused before anything binds.
+#[test]
+fn an_aborting_incarnation_refuses_a_fresh_establishment() {
+    let (mut rig, word) = guarded_abort_rig(false, true);
+    close_guard(&mut rig, &word);
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    assert_eq!(rig.agents.sender.role.pending_aborts(), 1, "aborting");
+    let established = rig.agents.sender.role.session_counters().established;
+    let a = rig.publisher;
+    assert!(
+        rig.agents
+            .sender
+            .role
+            .open_sealed_for(a, &valid_challenge([5, 5], [6, 6]))
+            .is_none()
+    );
+    let sender = rig.agents.sender.role.counters();
+    assert_eq!(sender.establishment_refused, 1, "{sender:?}");
+    assert_eq!(
+        rig.agents.sender.role.session_counters().established,
+        established
+    );
+}
+
+/// H8 R3-4: an authenticated publication still admission-pending on its
+/// remote guard sends no SETUP, and a valid CHALLENGE creates no binding,
+/// response or image.
+#[test]
+fn an_admission_pending_publication_does_not_establish() {
+    use std::sync::Arc;
+
+    use crate::agents::roles::publish_auth::PublicationAuth;
+    use crate::agents::roles::receive_auth::SubscriptionAuth;
+    use karyos_sys::applied_epoch::AppliedEpoch;
+
+    let mirror = guard_word(1, false);
+    let (mut rig, b) = Rig::new(Setup {
+        auth: true,
+        reliable: true,
+        identity: Some(identity_77(0)),
+        remote_guard: Some(super::super::data::GuardSpec {
+            word: Arc::clone(&mirror) as Arc<dyn karyos_client::SharedWords>,
+            cell: Arc::new(AppliedEpoch::new()),
+            epoch: 0,
+            empty_since: None,
+            rate: None,
+            reserve: None,
+            policy: None,
+            frontier: Default::default(),
+        }),
+        ..Setup::default()
+    });
+    let (channel, pairwise) = auth_keys(77);
+    let a = rig.publisher;
+    rig.agents.receiver.role.authenticate_published(a, alias());
+    rig.agents.receiver.role.authenticate_subscription(
+        SubscriptionAuth::new(b, alias(), &channel, &pairwise, 77).unwrap(),
+    );
+    rig.agents.sender.role.authenticate_publication(
+        PublicationAuth::new(a, alias(), identity(), 2, &channel, &[&pairwise]).unwrap(),
+    );
+    for _ in 0..300 {
+        rig.round(true);
+    }
+    assert!(
+        rig.agents
+            .sender
+            .role
+            .outbound(0)
+            .unwrap()
+            .admission_pending()
+    );
+    let sender = rig.agents.sender.role.counters();
+    assert!(sender.setup_blocked > 0, "no ANNOUNCE went out: {sender:?}");
+    assert_eq!(rig.agents.receiver.role.posted_challenges().len(), 0);
+    let established = rig.agents.sender.role.session_counters().established;
+    assert!(
+        rig.agents
+            .sender
+            .role
+            .open_sealed_for(a, &valid_challenge([5, 5], [6, 6]))
+            .is_none(),
+        "a valid challenge binds nothing"
+    );
+    assert_eq!(rig.agents.sender.role.counters().establishment_refused, 1);
+    assert_eq!(
+        rig.agents.sender.role.session_counters().established,
+        established
+    );
+    assert!(
+        rig.events
+            .iter()
+            .all(|event| !matches!(event, ImageEvent::Installed { .. })),
+        "no image"
+    );
+}
+
+/// H8 R3-6: with the VM generation fence held (the successor refused),
+/// nothing authenticated is submitted: no SETUP under the retained
+/// bootstrap proof, no queued signed or sealed control from before the
+/// change, and no DATA.
+#[test]
+fn a_held_fence_submits_nothing_authenticated() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    use crate::agents::control::{ControlItem, SealedBytes};
+    use crate::wire_enc::VmGenerationWatch;
+    use crate::wire_enc::vm_generation::{self, InjectedSignal, MAX_SUCCESSORS};
+
+    let (mut rig, _b, _channel) = authenticated_rig();
+    let _slot = established(&mut rig);
+    let a = rig.publisher;
+    // The change, seen by another watch of the process, and a table full
+    // for its generation before the sender's duty.
+    let (signal, injector) = InjectedSignal::new();
+    let mut watch = VmGenerationWatch::new(Box::new(signal));
+    injector.change();
+    assert_eq!(watch.poll(0), 1);
+    let generation = vm_generation::generation();
+    for id in 1..=u64::try_from(MAX_SUCCESSORS).unwrap() {
+        assert!(vm_generation::successor([id, 0xFEED], generation).is_some());
+    }
+    // Queued before the sender's duty sees the change.
+    rig.agents.receiver.role.post_to_sender(ControlItem::Raw {
+        endpoint: a,
+        destination: "127.0.0.1:9".parse().unwrap(),
+        bytes: SealedBytes::copy(&[1, 2, 3]).unwrap(),
+        generation: 0,
+    });
+    let before = rig.agents.sender.role.counters();
+    let committed = rig.agents.receiver.counters().data_committed;
+    for i in 0..10u8 {
+        let _ =
+            rig.log.as_mut().unwrap().publications[0].append(&[i; 100], AppendOptions::default());
+    }
+    for _ in 0..500 {
+        rig.round(true);
+    }
+    assert!(vm_generation::quiesced(), "the fence stays held");
+    let after = rig.agents.sender.role.counters();
+    assert_eq!(
+        (after.sent, after.raw_sent),
+        (before.sent, before.raw_sent),
+        "{after:?}"
+    );
+    assert_eq!(rig.agents.receiver.counters().data_committed, committed);
+}
+
+/// H8 R3-6, the fence alone for SETUP: with the key view fresh and applied
+/// (so its own fence admits) and the VM generation fence held with the
+/// successor refused, a publication not yet established submits no SETUP
+/// under its retained bootstrap proof.
+#[test]
+fn a_held_fence_submits_no_setup_under_an_admitting_key_view() {
+    use crate::wire_enc::VmGenerationWatch;
+    use crate::wire_enc::vm_generation::{self, InjectedSignal, MAX_SUCCESSORS};
+
+    let (mut rig, _b, _channel) = authenticated_rig();
+    // A role that never redraws keeps the fence held.
+    vm_generation::register();
+    let (signal, injector) = InjectedSignal::new();
+    let mut watch = VmGenerationWatch::new(Box::new(signal));
+    injector.change();
+    assert_eq!(watch.poll(0), 1);
+    let generation = vm_generation::generation();
+    for id in 1..=u64::try_from(MAX_SUCCESSORS).unwrap() {
+        assert!(vm_generation::successor([id, 0xFEED], generation).is_some());
+    }
+    let before = rig.agents.sender.role.counters();
+    for _ in 0..300 {
+        rig.round(true);
+    }
+    assert!(vm_generation::quiesced(), "the fence stays held");
+    assert!(
+        rig.agents.sender.role.key_view_admits(),
+        "the key view fence admits"
+    );
+    let after = rig.agents.sender.role.counters();
+    assert_eq!(after.sent, before.sent, "no SETUP submitted: {after:?}");
+    assert!(after.setup_blocked + after.fenced > 0, "{after:?}");
+    assert_eq!(rig.agents.receiver.role.posted_challenges().len(), 0);
+}
