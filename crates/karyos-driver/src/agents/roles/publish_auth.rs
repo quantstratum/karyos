@@ -1123,3 +1123,7 @@ mod tests {
         ));
     }
 }
+
+/// The H8 invariants of the publication key holders (karyos#648).
+#[cfg(test)]
+mod invariants_tests;

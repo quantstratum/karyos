@@ -9442,3 +9442,6 @@ fn a_generation_change_reestablishes_the_authenticated_class_and_refuses_what_ca
     let a = rig.publisher;
     assert!(rig.agents.sender.role.open_sealed_for(a, &bytes).is_none());
 }
+
+/// The H8 invariants of the authenticated class (karyos#648).
+mod invariants;

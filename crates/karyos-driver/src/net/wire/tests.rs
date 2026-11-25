@@ -1106,3 +1106,6 @@ fn a_backward_wall_step_does_not_delay_a_revocation() {
         roles(&subscriber)
     );
 }
+
+/// The H8 invariants of the authenticated class (karyos#648).
+mod invariants;

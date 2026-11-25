@@ -7786,3 +7786,6 @@ fn an_unsent_answer_is_recovered_by_the_receivers_retry() {
     assert_eq!(sender.publications[0].sealer_party(), Some(binding.party));
     assert_eq!(sender.counters().auth_sealers_installed, 1);
 }
+
+/// The H8 invariants of the authenticated class (karyos#648).
+mod invariants;
