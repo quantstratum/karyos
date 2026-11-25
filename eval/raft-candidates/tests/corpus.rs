@@ -186,8 +186,7 @@ fn run<C: ConsensusCore>(
     out: &mut impl std::io::Write,
     traces: &Path,
 ) -> Summary {
-    run_corpus_with_traces::<C>(core, Evidence::C5Version2, workloads, range, out, traces)
-        .unwrap()
+    run_corpus_with_traces::<C>(core, Evidence::C5Version2, workloads, range, out, traces).unwrap()
 }
 
 /// A core's build by name.
@@ -247,7 +246,9 @@ fn the_c5_version_2_corpus_over_every_core() {
             out.display()
         );
         for (workload, case, seed) in &summary.failed {
-            println!("  failed: {workload} {case} seed {seed} (its line carries the minimised run)");
+            println!(
+                "  failed: {workload} {case} seed {seed} (its line carries the minimised run)"
+            );
         }
         for ((workload, fault), [before, during, after]) in &summary.coverage {
             println!(
