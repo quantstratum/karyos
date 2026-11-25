@@ -49,7 +49,10 @@ fn events(
     count: usize,
 ) -> Vec<(AgentKind, u64)> {
     let mut seen = Vec::new();
-    for _ in 0..100_000 {
+    // A time limit, not 100 000 yields, which a loaded host ran through
+    // before the agent threads were scheduled (karyos#1067).
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         if let Some(agents) = agents.as_mut() {
             agents.do_work(0).unwrap();
         }
@@ -66,7 +69,9 @@ fn events(
 
 /// Waits until `runner` reports `kind` failed.
 fn wait_failed(runner: &AgentRunner<S>, kind: AgentKind) {
-    for _ in 0..10_000 {
+    // A time limit, not 10 000 sleeps of 1 ms (karyos#1067).
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         if runner.failed().contains(&kind) {
             return;
         }
