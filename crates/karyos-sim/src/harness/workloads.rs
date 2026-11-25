@@ -791,6 +791,9 @@ pub struct Outcome {
     /// Each fault the run applied, in order, and where it fell against the
     /// run's leader commits (C5's per-fault coverage; karyos#691).
     pub faults: Vec<FaultPhase>,
+    /// The server each client still waiting at the end sends to, in
+    /// client order.
+    pub waiting_on: Vec<NodeId>,
 }
 
 /// Where a fault fell against a run's leader commits (quantstratum-docs:
@@ -1006,6 +1009,9 @@ fn per_server(survives: Survives, id: NodeId) -> Survives {
 ///
 /// [`RunError`] when the run cannot be set up or stepped.
 pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError> {
+    // Every node of the run, and every restart of one, draws its election
+    // timeouts from the run's seed and its id (`core::run_seed`).
+    let _seed = super::core::RunSeed::set(seed);
     if let Some(limits) = case.limits {
         // The largest entry the case writes: a client's append, framed.
         let command = super::node::Command {
@@ -1137,7 +1143,8 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             .ok_or(RunError::Count)?;
         #[cfg_attr(not(feature = "test-hooks"), allow(unused_mut))]
         let mut client = ClientNode::new(id, leader, script(case, index), Rc::clone(&recorder))
-            .with_retry_after(case.retry_after);
+            .with_retry_after(case.retry_after)
+            .with_servers(servers);
         #[cfg(feature = "test-hooks")]
         if case.faults.corrupt_reads.contains(&index) {
             client = client.corrupting_reads();
@@ -1452,6 +1459,12 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         sim.run_for(steps).map_err(RunError::Sim)?;
     }
 
+    let waiting_on: Vec<NodeId> = clients
+        .iter()
+        .filter_map(|id| sim.node(*id).and_then(Member::client))
+        .filter(|client| !client.done())
+        .map(ClientNode::server)
+        .collect();
     let waiting = clients
         .iter()
         .filter(|id| {
@@ -1531,6 +1544,7 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         deduplicated,
         promoted,
         faults: phases(&recorded.observations, &marks),
+        waiting_on,
     })
 }
 
@@ -1713,6 +1727,7 @@ pub fn outcome(
         promoted: false,
         // A process run of W1 applies no fault.
         faults: Vec::new(),
+        waiting_on: Vec::new(),
     })
 }
 
@@ -1760,6 +1775,20 @@ pub fn pass(case: &Case, outcome: &Outcome) -> Result<Option<Liveness>, Failed> 
     let gap = match (outcome.liveness, case.progress) {
         (Ok(()), _) => None,
         (Err(gap), Progress::MayStop) => Some(gap),
+        // Every waiting client sends to a server whose flushes failed,
+        // which answers nothing from then on: as for a leader crashed and
+        // not restarted, the run's bound ends before a client's second
+        // silent retry moves it on, so the stall is a gap, not a failure
+        // (karyos#691). One waiting client on a healthy server fails.
+        (Err(gap @ Liveness::Stalled { .. }), Progress::Expected)
+            if !outcome.waiting_on.is_empty()
+                && outcome
+                    .waiting_on
+                    .iter()
+                    .all(|server| case.failing_flushes.contains(server)) =>
+        {
+            Some(gap)
+        }
         (Err(gap), Progress::Expected) => return Err(Failed::Liveness(gap)),
     };
     if let Some(to) = case.handover {

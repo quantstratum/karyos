@@ -561,7 +561,8 @@ impl Custom {
         // A batch never larger than the entries a follower may have in
         // flight.
         let batch = limits.map_or(BATCH, |limits| BATCH.min(limits.in_flight_entries));
-        // Seeded by the node: the same run reproduces the same timeouts.
+        // Seeded by the run and the node: the same run reproduces the same
+        // timeouts, and another seed draws others (`core::run_seed`).
         let config = Config::new(
             core_id(id),
             &voters,
@@ -569,7 +570,7 @@ impl Custom {
             ELECTION_MAX,
             HEARTBEAT,
             batch,
-            u64::from(id),
+            super::core::node_seed(super::core::run_seed(), u64::from(id)),
         )
         .map_err(|_| Unsupported)?;
         let config = match limits {

@@ -2554,7 +2554,12 @@ pub const RETRY_AFTER: u64 = 400;
 /// A scripted client: it sends its next request to its server once the
 /// last one was answered, and sends an unanswered one again (the same
 /// sequence number) when it is refused or after its retry delay, so the
-/// service's deduplication answers a command applied twice.
+/// service's deduplication answers a command applied twice. Its first
+/// retry goes to the server it last used; when that one stays silent for
+/// a second retry delay, and the client knows the servers
+/// ([`ClientNode::with_servers`]), the retry goes to the next server,
+/// which answers or redirects it: a server that stopped answering (a
+/// failed flush, a crash) never holds a client forever (karyos#691).
 #[derive(Debug, Clone)]
 pub struct ClientNode {
     id: NodeId,
@@ -2566,6 +2571,11 @@ pub struct ClientNode {
     retry_after: u64,
     /// The open request was refused: send it again now.
     refused: bool,
+    /// Servers `0..servers`, to move to the next on silence; 0 when the
+    /// client keeps its server.
+    servers: NodeId,
+    /// Retries sent to the current server with no message back from it.
+    silent: u32,
     recorder: Shared,
     /// The highest generation it has seen, 0 before the first answer.
     generation: u64,
@@ -2587,6 +2597,8 @@ impl ClientNode {
             open: None,
             retry_after: RETRY_AFTER,
             refused: false,
+            servers: 0,
+            silent: 0,
             recorder,
             generation: 0,
             #[cfg(feature = "test-hooks")]
@@ -2616,6 +2628,20 @@ impl ClientNode {
         self
     }
 
+    /// The servers are `0..servers`: a retry its server leaves unanswered
+    /// for two retry delays goes to the next.
+    #[must_use]
+    pub fn with_servers(mut self, servers: NodeId) -> Self {
+        self.servers = servers;
+        self
+    }
+
+    /// The server its requests go to.
+    #[must_use]
+    pub fn server(&self) -> NodeId {
+        self.server
+    }
+
     /// Whether every request of its script was answered.
     #[must_use]
     pub fn done(&self) -> bool {
@@ -2630,6 +2656,15 @@ impl<M> Node<Wire<M>> for ClientNode {
                 .checked_sub(*sent)
                 .is_some_and(|waited| waited >= self.retry_after);
             if self.refused || due {
+                if due && !self.refused {
+                    // A second retry delay with nothing from this server:
+                    // the next one answers or redirects.
+                    self.silent = self.silent.saturating_add(1);
+                    if self.silent >= 2 && self.servers > 1 {
+                        self.server = self.server.wrapping_add(1) % self.servers;
+                        self.silent = 0;
+                    }
+                }
                 self.refused = false;
                 *sent = now;
                 out.push((self.server, Wire::Request(command.clone())));
@@ -2662,6 +2697,8 @@ impl<M> Node<Wire<M>> for ClientNode {
     }
 
     fn deliver(&mut self, _from: NodeId, message: Wire<M>, _now: u64, _out: &mut Outbox<Wire<M>>) {
+        // Anything from a server counts as an answer: it is not silent.
+        self.silent = 0;
         let open = self.open.as_ref().map(|(command, _)| command.sequence);
         match message {
             Wire::Response { generation, .. } if generation < self.generation => {

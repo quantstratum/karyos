@@ -883,10 +883,15 @@ impl<const PRE_VOTE: bool, const BATCH: u64> fmt::Debug for OpenRaftCore<PRE_VOT
     }
 }
 
-/// The node's executor seed: fixed per node, so a run is a function of
-/// the harness's seed and calls.
+/// The node's executor seed, which also seeds OpenRaft's election
+/// timeout draws (`RT::thread_rng`): from the run's seed and the node's
+/// id (`harness::core::run_seed`), so a run is a function of the
+/// harness's seed and calls, and each seed draws other timeouts.
 fn seed_of(id: NodeId) -> u64 {
-    crate::executor::splitmix64(u64::from(id) ^ 0x0000_43C5)
+    crate::executor::splitmix64(
+        karyos_sim::harness::core::node_seed(karyos_sim::harness::core::run_seed(), u64::from(id))
+            ^ 0x0000_43C5,
+    )
 }
 
 impl<const PRE_VOTE: bool, const BATCH: u64> OpenRaftCore<PRE_VOTE, BATCH> {
@@ -1337,6 +1342,30 @@ impl<const PRE_VOTE: bool, const BATCH: u64> crate::process::Wire
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each run seed seeds each node's executor, and so OpenRaft's
+    /// election timeout draws, differently; outside a run the seed is
+    /// the node's alone, as before.
+    #[test]
+    fn the_run_seed_reseeds_each_node() {
+        let base: Vec<u64> = (0..5_u32).map(seed_of).collect();
+        assert_eq!(
+            base,
+            (0..5_u32)
+                .map(|id| crate::executor::splitmix64(u64::from(id) ^ 0x0000_43C5))
+                .collect::<Vec<_>>()
+        );
+        let one: Vec<u64> = {
+            let _seed = karyos_sim::harness::core::RunSeed::set(1);
+            (0..5_u32).map(seed_of).collect()
+        };
+        let two: Vec<u64> = {
+            let _seed = karyos_sim::harness::core::RunSeed::set(2);
+            (0..5_u32).map(seed_of).collect()
+        };
+        assert_ne!(one, base);
+        assert_ne!(one, two);
+    }
 
     fn append_rpc(term: u64, prev: Option<(u64, u64)>, entries: &[(u64, &[u8])]) -> Request {
         Request::Append(Arc::new(AppendEntriesRequest {

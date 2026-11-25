@@ -61,19 +61,40 @@ fn w3_safety_holds_and_only_the_unrestarted_crash_is_a_gap<C: ConsensusCore>() {
 }
 
 /// W4: every cut keeps safety; a single failed flush recovers, and the
-/// repeated failed flushes (a lost durable majority) are a gap with no
-/// leader, as with the reference.
+/// repeated failed flushes (a lost durable majority) are a gap: no
+/// leader, or a leader that cannot commit (a server whose flushes failed
+/// may still lead). A single failed flush is a gap only when every
+/// waiting client sits on the failed server, which answers nothing: the
+/// run ends before a client's second silent retry (karyos#691).
 fn w4_passes_and_a_lost_majority_is_a_gap<C: ConsensusCore>() {
     for seed in SEEDS {
         for case in W4::skeleton(seed).cases() {
             let outcome = workloads::run::<C>(&case, seed).unwrap();
             let result = workloads::pass(&case, &outcome);
             if case.name.contains("FailedFlushes") {
-                assert_eq!(
-                    result,
-                    Ok(Some(Liveness::NoLeader)),
+                assert!(
+                    matches!(
+                        result,
+                        Ok(Some(Liveness::NoLeader | Liveness::Stalled { .. }))
+                    ),
+                    "{} seed {seed}: {result:?}",
+                    case.name
+                );
+            } else if let Ok(Some(gap)) = result {
+                assert!(
+                    matches!(gap, Liveness::Stalled { .. }),
                     "{} seed {seed}",
                     case.name
+                );
+                assert!(
+                    !outcome.waiting_on.is_empty()
+                        && outcome
+                            .waiting_on
+                            .iter()
+                            .all(|server| case.failing_flushes.contains(server)),
+                    "{} seed {seed}: {:?}",
+                    case.name,
+                    outcome.waiting_on
                 );
             } else {
                 assert_eq!(result, Ok(None), "{} seed {seed}", case.name);
@@ -155,9 +176,12 @@ fn w2<C: ConsensusCore>(short: &[&str], metered: bool) {
             continue;
         }
         let result = workloads::pass(case, &outcome);
+        // A paused follower that did not fall far enough behind is a typed
+        // `NotBehind`, reported and never a pass; with the run's seeded
+        // timing it may fall behind and pass instead (karyos#691).
         if short.iter().any(|name| case.name.contains(name)) {
             assert!(
-                matches!(result, Err(Failed::NotBehind { .. })),
+                matches!(result, Err(Failed::NotBehind { .. }) | Ok(None)),
                 "{}: {result:?}",
                 case.name
             );
