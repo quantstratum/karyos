@@ -104,7 +104,7 @@ impl Daemon {
                 return status;
             }
             assert!(
-                start.elapsed() < Duration::from_secs(20),
+                start.elapsed() < Duration::from_secs(40),
                 "karyosd did not exit"
             );
             std::thread::sleep(Duration::from_millis(5));
@@ -1294,20 +1294,15 @@ fn karyosd_records_its_trace_journal_with_time_evidence() {
     let text = log(&log_path);
     assert!(text.contains("trace mirror published"), "{text}");
 
-    // The operator's anchors cover the last heads, once signed: the daemon
-    // runs again, without the trace recording, until they are.
-    let second = root.join("second.log");
-    let mut daemon = Daemon::start(&dir, &archive, &signing, &second);
-    let start = Instant::now();
-    while !(last_head(&archive).1 && last_head(&entries_dir(&archive)).1) {
+    // The clean shutdown waited for the last heads' signatures: the
+    // operator's anchors cover them, with no second run.
+    for journal_dir in [archive.clone(), entries_dir(&archive)] {
         assert!(
-            start.elapsed() < Duration::from_secs(60),
-            "{}",
-            log(&second)
+            last_head(&journal_dir).1,
+            "{} is not signed",
+            journal_dir.display()
         );
-        std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(daemon.stop().success());
     for (journal_dir, store) in [
         (archive.clone(), &anchors),
         (entries_dir(&archive), &time_anchors),

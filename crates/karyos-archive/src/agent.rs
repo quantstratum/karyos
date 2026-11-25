@@ -149,9 +149,23 @@ pub struct AgentConfig {
     ///
     /// [`Retention::purge`]: crate::integrity::retention::Retention::purge
     pub retention_policy: Option<crate::integrity::retention::RetentionPolicy>,
+    /// How long a clean shutdown waits, at most, for the signer to sign
+    /// the last head of the integrity journal and of the time evidence
+    /// entries' journal, so the final range gets its evidence. Past it the
+    /// agent stops with those heads pending, reported untrusted by verify
+    /// until a later run signs them. Zero waits for nothing.
+    pub shutdown_signing_wait: Duration,
 }
 
 impl AgentConfig {
+    /// This configuration with `shutdown_signing_wait` set.
+    #[must_use]
+    #[inline]
+    pub const fn with_shutdown_signing_wait(mut self, wait: Duration) -> Self {
+        self.shutdown_signing_wait = wait;
+        self
+    }
+
     /// This configuration with `retention_policy` set (karyos#1093).
     #[must_use]
     #[inline]
@@ -202,6 +216,7 @@ impl Default for AgentConfig {
             seal_interval: None,
             copy_location: None,
             retention_policy: None,
+            shutdown_signing_wait: Duration::ZERO,
         }
     }
 }
@@ -2966,6 +2981,19 @@ impl<D: Disk + Clone> Signing<D> {
         Ok(())
     }
 
+    /// Whether signed heads cover every record of `journal`; false when it
+    /// cannot be read.
+    fn signed_through(&mut self, journal: &mut IntegrityJournal<D>) -> bool {
+        if !self.refresh(journal) {
+            return false;
+        }
+        let sealed = u64::try_from(self.records.len())
+            .ok()
+            .and_then(|len| self.base.checked_add(len))
+            .unwrap_or(u64::MAX);
+        self.signing.covered() >= sealed
+    }
+
     /// Drops the records signed heads cover from the cache (karyos#1095),
     /// keeping the last record, whose head a poll offers.
     fn trim(&mut self) {
@@ -3964,11 +3992,51 @@ where
                 }
                 // The stops' catalog records are chained before the reply.
                 let _ = self.integrity_duty(now);
+                // The last heads signed, within a bound, so the final
+                // ranges get their evidence.
+                self.sign_last_heads(now);
                 let _ = reply.send(first);
                 return true;
             }
         }
         false
+    }
+
+    /// Runs the signing duties until every signing journal's last head is
+    /// signed, or until `shutdown_signing_wait` is over: a clean shutdown
+    /// leaves no final range without its signature when the signer
+    /// answers. The duties' clock advances from `now` by the real time
+    /// waited, so their polling interval holds.
+    fn sign_last_heads(&mut self, now: u64) {
+        let wait = self.config.shutdown_signing_wait;
+        let started = std::time::Instant::now();
+        loop {
+            if self.last_heads_signed() || started.elapsed() >= wait {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            let waited = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let _ = self.integrity_duty(now.saturating_add(waited));
+        }
+    }
+
+    /// Whether the integrity journal's and the entries' journal's last
+    /// records are covered by signed heads; true without signing.
+    fn last_heads_signed(&mut self) -> bool {
+        let Some(integrity) = self.integrity.as_mut() else {
+            return true;
+        };
+        let journal = integrity
+            .signing
+            .as_mut()
+            .is_none_or(|signing| signing.signed_through(&mut integrity.journal));
+        let entries = integrity.evidence.as_mut().is_none_or(|evidence| {
+            evidence
+                .signing
+                .as_mut()
+                .is_none_or(|signing| signing.signed_through(evidence.store.journal_mut()))
+        });
+        journal && entries
     }
 
     /// Drains what the group's ring still holds into its journal, then

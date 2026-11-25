@@ -65,6 +65,10 @@ pub const AUDIT: &str = "karyos::archive::audit";
 /// its boot recordings and their stop.
 pub const DAEMON_REQUESTER: u64 = 0xFFFF_FFFF << 32;
 
+/// How long a clean shutdown waits, at most, for the signer to sign the
+/// last heads (the integrity journal's and the time evidence entries').
+pub const SHUTDOWN_SIGNING_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Concurrent handles on the request stream at once.
 pub const REQUEST_PUBLISHERS: u8 = 8;
 
@@ -660,7 +664,10 @@ impl DaemonArchive {
         let config = AgentConfig::default()
             .with_seal_interval(Some(options.seal_interval))
             .with_copy_location(options.copy_location)
-            .with_retention_policy(options.retention);
+            .with_retention_policy(options.retention)
+            // A clean shutdown waits for the last heads' signatures, so
+            // the final range gets its evidence.
+            .with_shutdown_signing_wait(SHUTDOWN_SIGNING_WAIT);
         let agent = match &options.signer {
             None => ArchiveHandle::spawn(StdDisk, &options.dir, config),
             Some(signer) => ArchiveHandle::spawn_signing(
