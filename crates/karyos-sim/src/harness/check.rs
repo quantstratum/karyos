@@ -928,6 +928,8 @@ fn server_of(observation: &Observation) -> Option<NodeId> {
         | Observation::Compacted { node, .. }
         | Observation::Installed { node, .. }
         | Observation::SnapshotRefused { node, .. }
+        | Observation::SnapshotPiece { node, .. }
+        | Observation::SnapshotPieceLost { node, .. }
         | Observation::Unsupported { node, .. }
         | Observation::Transfer { node, .. }
         | Observation::Deduplicated { node, .. }
@@ -940,7 +942,8 @@ fn server_of(observation: &Observation) -> Option<NodeId> {
         | Observation::PromotionRefused { .. }
         | Observation::Expired { .. }
         | Observation::Healed
-        | Observation::Triggered { .. } => None,
+        | Observation::Triggered { .. }
+        | Observation::Leading { .. } => None,
     }
 }
 

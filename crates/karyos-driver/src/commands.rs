@@ -2953,7 +2953,7 @@ fn conflation_bytes(writer: &karyos_sys::conflation::ConflationWriter) -> Option
 /// other command (the callers only reach it for subscriptions).
 /// Takes the awaiting cell of `parent` on `stream` (ADR-0100), if one is
 /// waiting with `role`.
-fn take_awaiting<T: StreamTerms>(
+pub(crate) fn take_awaiting<T: StreamTerms>(
     stream: &mut crate::embedded::Stream<T>,
     parent: u64,
     role: Role,

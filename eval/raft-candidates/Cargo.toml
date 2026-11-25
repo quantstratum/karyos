@@ -18,7 +18,11 @@ repository = "https://github.com/quantstratum/karyos"
 publish = false
 
 [dependencies]
-karyos-sim = { path = "../../crates/karyos-sim" }
+# The allocation probe (harness::probe) and the counting allocator it
+# needs: the real-process node measures its own declared path (C5 v2,
+# "Processes"; karyos#691). This crate is never shipped.
+karyos-sim = { path = "../../crates/karyos-sim", features = ["alloc-probe"] }
+karyos-sys = { path = "../../crates/karyos-sys", features = ["alloc-count"] }
 karyos-cluster = { path = "../../crates/karyos-cluster" }
 # StdDisk: C4's log on real files for the real-process runs.
 karyos-archive = { path = "../../crates/karyos-archive" }

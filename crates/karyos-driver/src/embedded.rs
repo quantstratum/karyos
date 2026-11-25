@@ -732,6 +732,15 @@ fn charge_of(mtu: u32) -> Option<u64> {
 /// Source of driver identities within the process.
 static NEXT_DRIVER: AtomicU64 = AtomicU64::new(1);
 
+/// The parent ids of embedded awaiting entries (ADR-0100) carry this bit,
+/// which no registration a client is given has, so an embedded entry's
+/// cell is never taken by a client's `AddImageSubscriptionOf` nor a
+/// client's by an embedded attach.
+pub(crate) const EMBEDDED_AWAITING_PARENT: u64 = 1 << 63;
+
+/// The client an embedded awaiting entry names: none admitted.
+pub(crate) const EMBEDDED_AWAITING_CLIENT: u64 = u64::MAX;
+
 /// One awaiting cell of a network image lane (ADR-0100).
 #[derive(Debug)]
 pub(crate) struct StreamAwaiting {
@@ -1343,6 +1352,18 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     /// The network subscriptions in `net_owned`, as the image table needs
     /// them to register awaiting cells (ADR-0100); kept in step with it.
     pub(crate) awaiting_entries: Vec<crate::agents::images::AwaitingEntry>,
+    /// The awaiting entries of in-process network subscriptions of the
+    /// embedded API (ADR-0100 decisions 1 and 2: every local network
+    /// subscription of an in-process client of the driver's build), each
+    /// with the subscription it awaits for, merged into `awaiting_entries`
+    /// by `refresh_awaiting`.
+    pub(crate) embedded_awaiting: Vec<(
+        crate::net::NetworkSubscription,
+        crate::agents::images::AwaitingEntry,
+    )>,
+    /// The next parent id of an embedded awaiting entry, below
+    /// [`EMBEDDED_AWAITING_PARENT`].
+    pub(crate) next_embedded_parent: u64,
     /// The parent an `AddImageSubscriptionOf` named (ADR-0100), handed
     /// from its validation to the issuing paths of the same command, which
     /// adopt that parent's awaiting cell; cleared at each command.
@@ -1793,6 +1814,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 crate::net::client::owned_capacity(&network, config.max_clients).unwrap_or(0)
             })),
             awaiting_entries: Vec::new(),
+            embedded_awaiting: Vec::new(),
+            next_embedded_parent: 0,
             attach_of: None,
             pending_join_loss: None,
             adopted_start: false,
@@ -4389,6 +4412,67 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let stream = self.active_stream(stream)?;
         stream.issuing()?;
         let inner = stream.conductor.subscribe(role)?;
+        let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
+        let (link, base) = stream.join(MemberKind::Subscriber {
+            role,
+            cell: inner.cell(),
+        });
+        let subscription =
+            ClientSubscription::with_lease(inner, lease).with_generation(link, base)?;
+        self.update_stream_gauges();
+        Ok(subscription)
+    }
+
+    /// Subscribes, as `role`, to an image of `subscription` from the
+    /// image's join (ADR-0100 decisions 3 and 4): the in-process twin of
+    /// `AddImageSubscriptionOf`. The reader adopts, in place, the awaiting
+    /// cell the image table registered at the join when it built `lane`'s
+    /// image, so it reads what the image received before this call. The
+    /// subscription must await its images
+    /// ([`EmbeddedDriver::await_network_images`]); the role is the one it
+    /// awaits with. An optional or observer cell the floor passed is moved
+    /// up to the floor first (decision 6).
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::NoAwaitingCell`] when `subscription` does not await
+    /// its images, or its cell on `lane` is gone: taken already, or a
+    /// required cell past `image_join_deadline` (decision 5). The caller
+    /// can then join at the head with [`EmbeddedDriver::subscribe`], which
+    /// may skip what the image retains (decision 6). As
+    /// [`EmbeddedDriver::subscribe`] otherwise.
+    pub fn subscribe_image_of(
+        &mut self,
+        subscription: crate::net::NetworkSubscription,
+        lane: StreamHandle,
+    ) -> Result<ClientSubscription<T>, DriverError> {
+        let entry = self
+            .embedded_awaiting
+            .iter()
+            .find(|(awaiting, _)| *awaiting == subscription)
+            .map(|(_, entry)| *entry)
+            .ok_or(DriverError::NoAwaitingCell)?;
+        let clock = (self.clock.now(), self.awaiting_deadline());
+        let stream = self.active_stream(lane)?;
+        stream.issuing()?;
+        let role = entry.role;
+        let cell = crate::commands::take_awaiting(stream, entry.parent, role, clock)
+            .ok_or(DriverError::NoAwaitingCell)?;
+        if matches!(role, Role::Optional | Role::Observer) {
+            let _ = stream.conductor.raise_to_floor(&cell);
+        }
+        let inner = match karyos_sys::log_buffer::Subscription::adopt(
+            Arc::clone(&stream.buffer),
+            cell.cell(),
+            role,
+            cell.export(),
+        ) {
+            Ok(inner) => inner,
+            Err(error) => {
+                let _ = stream.conductor.end_subscriber(cell.cell(), cell.export());
+                return Err(error.into());
+            }
+        };
         let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
         let (link, base) = stream.join(MemberKind::Subscriber {
             role,

@@ -23,6 +23,7 @@
 //! - [`variant`]: which build of a candidate ran, baseline or patched,
 //!   with its patch record.
 
+pub mod custom_wire;
 pub mod executor;
 pub mod openraft_core;
 pub mod openraft_wire;

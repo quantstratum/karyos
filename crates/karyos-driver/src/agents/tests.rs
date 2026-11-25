@@ -42,14 +42,17 @@ fn start(mode: ThreadingMode, agents: NetworkAgents<S>, config: AgentConfig) -> 
 }
 
 /// Collects `count` events from `link`, driving `agents` when they run on
-/// this thread, within a bounded number of tries.
+/// this thread, for 30 s at most.
 fn events(
     link: &AgentLink<S>,
     agents: &mut Option<NetworkAgents<S>>,
     count: usize,
 ) -> Vec<(AgentKind, u64)> {
     let mut seen = Vec::new();
-    for _ in 0..100_000 {
+    // A time limit, not 100 000 yields, which a loaded host ran through
+    // before the agent threads were scheduled (karyos#1067).
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         if let Some(agents) = agents.as_mut() {
             agents.do_work(0).unwrap();
         }
@@ -66,7 +69,9 @@ fn events(
 
 /// Waits until `runner` reports `kind` failed.
 fn wait_failed(runner: &AgentRunner<S>, kind: AgentKind) {
-    for _ in 0..10_000 {
+    // A time limit, not 10 000 sleeps of 1 ms (karyos#1067).
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         if runner.failed().contains(&kind) {
             return;
         }
@@ -318,7 +323,13 @@ fn a_command_needs_its_reply_slot() {
 fn every_threading_mode_serves_stops_and_returns_the_agents() {
     let mut replies = Vec::new();
     for mode in MODES {
-        let config = AgentConfig::default();
+        // A stop budget a loaded host cannot exhaust: the test checks that
+        // every mode stops and hands its agents back, not how fast
+        // (karyos#1067, #1268 review).
+        let config = AgentConfig {
+            stop_timeout: Duration::from_secs(30),
+            ..AgentConfig::default()
+        };
         let (agents, links) = new_agents(config);
         let (mut local, runner) = if mode == ThreadingMode::Shared {
             (Some(agents), None)
@@ -404,20 +415,25 @@ fn a_stuck_agent_is_returned_late() {
     };
     let (agents, links) = new_agents(config);
     let runner = start(ThreadingMode::Dedicated, agents, config);
-    let flag = Arc::new(AtomicBool::new(true));
+    let gate = Arc::new(AtomicU8::new(crate::agents::BLOCK_ARMED));
     links
         .sender
         .commands
-        .try_post(AgentCommand::Block(Arc::clone(&flag)))
+        .try_post(AgentCommand::Block(Arc::clone(&gate)))
         .unwrap();
-    std::thread::sleep(Duration::from_millis(20));
+    // Blocked for certain before the stop, not after a 20 ms guess.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while gate.load(Ordering::Acquire) != crate::agents::BLOCK_ENTERED {
+        assert!(std::time::Instant::now() < deadline, "never blocked");
+        std::thread::yield_now();
+    }
     let mut stopped = runner.stop();
     assert!(stopped.receiver.is_some());
     assert!(stopped.sender.is_none());
     assert_eq!(stopped.late.len(), 1);
     let late = stopped.late.pop().unwrap();
     assert_eq!(late.kinds(), [AgentKind::Sender]);
-    flag.store(false, Ordering::Release);
+    gate.store(crate::agents::BLOCK_RELEASED, Ordering::Release);
     let joined = late.join();
     assert!(joined.sender.unwrap().is_stopped());
 }

@@ -902,6 +902,7 @@ fn ipc_driver(dir: &std::path::Path) -> EmbeddedDriver<karyos_sys::term_bytes::S
             max_regions_per_fetch: 4,
             max_fetch_bytes: 1 << 30,
             max_tools: crate::admission::DEFAULT_MAX_TOOLS,
+            client_send_buffer: None,
         },
         Box::new(crate::clock::SystemClock::new()),
     )

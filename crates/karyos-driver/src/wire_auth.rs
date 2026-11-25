@@ -35,6 +35,9 @@ use zeroize::Zeroizing;
 
 use crate::wire_keys::{Context, KEY_LEN, KeyFile, Material, Purpose, Scope};
 
+/// Bytes the envelope adds to a datagram: the 32-byte header and the
+/// 16-byte tag (ADR-0086 section 5, `E`).
+pub const ENVELOPE_LEN: usize = HEADER_LEN + karyos_protocol::protection::hmac_sha256::TAG_LEN;
 /// The HMAC-SHA-256 usage limit: tags per key (manifest 4.3).
 pub const TAG_CAP: u64 = 1 << 48;
 /// Where a sender moves to the next in-band key epoch: 75% of
@@ -88,6 +91,25 @@ pub enum Refusal {
     Envelope(Rejection),
     /// The replay window of the key that verified it (section 6).
     Replay(Replay),
+}
+
+/// A datagram [`Verifier::check`] passed and nothing has yet recorded:
+/// [`Verifier::commit`] records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub struct Checked {
+    opened: Opened,
+    index: usize,
+    file_epoch: u32,
+    party_epoch: u8,
+    advance: bool,
+}
+
+impl Checked {
+    /// What the envelope opened to.
+    pub fn opened(&self) -> Opened {
+        self.opened
+    }
 }
 
 /// The party a domain 1 or 4 key is derived for (ADR-0086 section 4).
@@ -277,10 +299,35 @@ impl Sealer {
         })
     }
 
+    /// The domain this sealer tags in: 1 for a sender, 4 for a receiver.
+    #[must_use]
+    pub fn domain(&self) -> Domain {
+        self.party.domain()
+    }
+
+    /// The party, and so the establishment, its key was derived for.
+    #[must_use]
+    pub fn party(&self) -> Party {
+        self.party
+    }
+
     /// The in-band key epoch the next datagram carries.
     #[must_use]
     pub fn party_epoch(&self) -> u8 {
         self.party_epoch
+    }
+
+    /// Whether [`Sealer::seal`] can seal one more datagram: false once the
+    /// usage limit is reached with no in-band epoch left. A sender asks
+    /// before it reads anything it would then have to drop.
+    #[must_use]
+    pub fn can_seal(&self) -> bool {
+        let seq = self.profile.next_seq();
+        if seq >= ROTATE_AT {
+            self.party_epoch < u8::MAX
+        } else {
+            seq < TAG_CAP
+        }
     }
 
     /// Seals the first `frames` bytes of `datagram` with a fresh envelope
@@ -507,39 +554,82 @@ impl Verifier {
     ///
     /// The [`Refusal`]; nothing changes.
     pub fn open(&mut self, datagram: &[u8], now: i64) -> Result<Opened, Refusal> {
+        let checked = self.check(datagram, now)?;
+        self.commit(checked, now)
+    }
+
+    /// The first half of [`Verifier::open`]: the fields, the tag and the
+    /// replay window are checked, and nothing changes, so a caller can
+    /// still refuse the datagram for its inner frames without consuming
+    /// its sequence or moving its epoch. Allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// The [`Refusal`]; nothing changes.
+    pub fn check(&self, datagram: &[u8], now: i64) -> Result<Checked, Refusal> {
         let (party_epoch, key_id) =
             header_selectors(datagram).ok_or(Refusal::Envelope(Rejection::Short))?;
         if key_id != self.key_id {
             return Err(Refusal::Envelope(Rejection::Key));
         }
         let mut first = Refusal::Envelope(Rejection::Epoch);
-        for index in 0..MAX_FILE_EPOCHS {
-            let Some(keys) = self.epochs.get_mut(index).and_then(Option::as_mut) else {
+        for (index, keys) in self.epochs.iter().enumerate() {
+            let Some(keys) = keys else {
                 continue;
             };
-            let (opened, advanced) = match keys.find(party_epoch, datagram, now) {
-                Some(Ok(found)) => found,
-                Some(Err(refusal)) => {
-                    if first == Refusal::Envelope(Rejection::Epoch) {
-                        first = refusal;
-                    }
-                    continue;
+            match keys.find(party_epoch, datagram, now) {
+                Some(Ok((opened, advance))) => {
+                    return Ok(Checked {
+                        opened,
+                        index,
+                        file_epoch: keys.file_epoch,
+                        party_epoch,
+                        advance,
+                    });
                 }
-                None => continue,
-            };
-            if advanced {
-                let next_epoch = party_epoch.checked_add(1);
-                let secret = Zeroizing::new(*keys.secret);
-                let file_epoch = keys.file_epoch;
-                let upcoming =
-                    next_epoch.map(|epoch| self.slot_for(&secret, key_id, file_epoch, epoch));
-                if let Some(keys) = self.epochs.get_mut(index).and_then(Option::as_mut) {
-                    keys.advance(upcoming, now);
+                Some(Err(refusal)) if first == Refusal::Envelope(Rejection::Epoch) => {
+                    first = refusal;
                 }
+                Some(Err(_)) | None => {}
             }
-            return Ok(opened);
         }
         Err(first)
+    }
+
+    /// The second half of [`Verifier::open`], for a datagram
+    /// [`Verifier::check`] passed and the caller accepts: its sequence is
+    /// recorded in the window of the key that verified it, and a datagram
+    /// under the next in-band epoch makes that epoch current.
+    ///
+    /// # Errors
+    ///
+    /// The [`Refusal`] when the keys changed since the check (a refresh, or
+    /// the same sequence committed meanwhile); nothing changes.
+    pub fn commit(&mut self, checked: Checked, now: i64) -> Result<Opened, Refusal> {
+        let key_id = self.key_id;
+        let keys = self
+            .epochs
+            .get_mut(checked.index)
+            .and_then(Option::as_mut)
+            .filter(|keys| keys.file_epoch == checked.file_epoch)
+            .ok_or(Refusal::Envelope(Rejection::Epoch))?;
+        let slot = keys
+            .slot_mut(checked.party_epoch, now)
+            .ok_or(Refusal::Envelope(Rejection::Epoch))?;
+        slot.window
+            .accept(checked.opened.seq)
+            .map_err(Refusal::Replay)?;
+        if checked.advance {
+            let next_epoch = checked.party_epoch.checked_add(1);
+            let secret = Zeroizing::new(*keys.secret);
+            let file_epoch = keys.file_epoch;
+            let upcoming =
+                next_epoch.map(|epoch| self.slot_for(&secret, key_id, file_epoch, epoch));
+            if let Some(keys) = self.epochs.get_mut(checked.index).and_then(Option::as_mut) {
+                keys.advance(upcoming, now);
+            }
+        }
+        Ok(checked.opened)
     }
 }
 
@@ -548,7 +638,7 @@ impl EpochKeys {
     /// epoch has one: the tag, then the window. Returns whether it was the
     /// next epoch, which the caller then makes current.
     fn find(
-        &mut self,
+        &self,
         party_epoch: u8,
         datagram: &[u8],
         now: i64,
@@ -559,15 +649,34 @@ impl EpochKeys {
             .as_ref()
             .is_some_and(|slot| slot.party_epoch == party_epoch);
         let slot = if self.current.party_epoch == party_epoch {
-            &mut self.current
+            &self.current
         } else if is_next {
-            self.next.as_mut()?
+            self.next.as_ref()?
         } else {
             self.previous
-                .as_mut()
+                .as_ref()
                 .filter(|slot| previous_open && slot.party_epoch == party_epoch)?
         };
         Some(slot.check(datagram).map(|opened| (opened, is_next)))
+    }
+
+    /// The slot of `party_epoch` that [`EpochKeys::find`] would pick at
+    /// `now`, to commit to.
+    fn slot_mut(&mut self, party_epoch: u8, now: i64) -> Option<&mut Slot> {
+        let previous_open = now < self.previous_until;
+        if self.current.party_epoch == party_epoch {
+            Some(&mut self.current)
+        } else if self
+            .next
+            .as_ref()
+            .is_some_and(|slot| slot.party_epoch == party_epoch)
+        {
+            self.next.as_mut()
+        } else {
+            self.previous
+                .as_mut()
+                .filter(|slot| previous_open && slot.party_epoch == party_epoch)
+        }
     }
 
     fn advance(&mut self, upcoming: Option<Slot>, now: i64) {
@@ -581,12 +690,12 @@ impl EpochKeys {
 }
 
 impl Slot {
-    fn check(&mut self, datagram: &[u8]) -> Result<Opened, Refusal> {
+    fn check(&self, datagram: &[u8]) -> Result<Opened, Refusal> {
         let opened = self
             .profile
             .open_envelope(datagram)
             .map_err(Refusal::Envelope)?;
-        self.window.accept(opened.seq).map_err(Refusal::Replay)?;
+        self.window.check(opened.seq).map_err(Refusal::Replay)?;
         Ok(opened)
     }
 }
@@ -596,6 +705,7 @@ impl Slot {
 /// challenge transcript (ADR-0086 sections 6 and 7), and `envelope_seq` is
 /// a per-start counter.
 pub struct Proof {
+    kind: ProofKind,
     key_id: u32,
     /// The current file epoch of the key, from the durable lineage: only a
     /// proof under it may bind.
@@ -710,6 +820,7 @@ impl Proof {
         current: u32,
     ) -> Result<Self, KeyError> {
         let mut proof = Self {
+            kind,
             key_id: 0,
             current,
             signing: None,
@@ -737,6 +848,12 @@ impl Proof {
             return Err(KeyError::NoKey);
         }
         Ok(proof)
+    }
+
+    /// The domain this proof tags in: 5 for SETUP, 6 for RSP_SETUP.
+    #[must_use]
+    pub fn domain(&self) -> Domain {
+        self.kind.domain()
     }
 
     /// Seals the first `frames` bytes of `datagram` under the signing key.

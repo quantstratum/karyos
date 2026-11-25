@@ -333,6 +333,7 @@ pub fn ipc_config(admission: &AdmissionOptions) -> IpcConfig {
         max_regions_per_fetch: admission.max_regions_per_fetch,
         max_fetch_bytes: admission.max_fetch_bytes,
         max_tools: admission.max_tools,
+        client_send_buffer: None,
     }
 }
 
@@ -810,6 +811,7 @@ mod tests {
             copy_location: None,
             retention: None,
             time_evidence: false,
+            calibration_journal: None,
             replications: Vec::new(),
             replicas: Vec::new(),
             trusted_network: false,
@@ -855,6 +857,7 @@ mod tests {
             copy_location: None,
             retention: None,
             time_evidence: false,
+            calibration_journal: None,
             replications: Vec::new(),
             replicas: Vec::new(),
             trusted_network: false,

@@ -234,6 +234,26 @@ impl<O: BufferOwner> FrameReader<O> {
         &self.subscription
     }
 
+    /// Whether the reader holds a terminal end, which every later serve
+    /// answers again without a loan, for the tests (karyos#1067).
+    #[cfg(test)]
+    pub(crate) fn has_ended(&self) -> bool {
+        matches!(self.state, State::Ended(_))
+    }
+
+    /// A serve between messages that found nothing to serve and ends with
+    /// its seal check, taken as [`FrameReader::serve_frame`] takes it, for
+    /// the tests of a revocation that lands during a serve (karyos#1067).
+    #[cfg(test)]
+    pub(crate) fn serve_at_seal(&mut self) -> Result<FrameStep, SysError> {
+        let step = SubscriptionContext {
+            buffer: &self.subscription.buffer,
+            cursor: &mut self.subscription.cursor,
+        }
+        .pending();
+        self.settle(Ok((State::Idle, step)))
+    }
+
     /// Whether a complete message awaits [`FrameReader::take`].
     #[must_use]
     pub fn ready(&self) -> bool {
@@ -263,12 +283,23 @@ impl<O: BufferOwner> FrameReader<O> {
             cursor: &mut self.subscription.cursor,
         };
         let served = context.serve(assembly, &mut self.assembly);
+        self.settle(served)
+    }
+
+    /// Takes a serve's outcome as the reader's state and returns its step.
+    fn settle(
+        &mut self,
+        served: Result<(State, FrameStep), SysError>,
+    ) -> Result<FrameStep, SysError> {
         let (state, step) = match served {
-            // Closed is terminal like Revoked: later calls answer it again
-            // without a loan, whatever happens to the slot after the seal.
-            Ok((_, FrameStep::Ended(end @ FrameEnd::Closed { .. }))) => {
-                (State::Ended(Ok(end)), Ok(FrameStep::Ended(end)))
-            }
+            // Closed and Revoked are terminal, however they were found (a
+            // revocation is also found at the seal, karyos#1067): later
+            // calls answer them again without a loan, whatever happens to
+            // the slot after.
+            Ok((
+                _,
+                FrameStep::Ended(end @ (FrameEnd::Closed { .. } | FrameEnd::Revoked { .. })),
+            )) => (State::Ended(Ok(end)), Ok(FrameStep::Ended(end))),
             Ok((state, step)) => (state, Ok(step)),
             Err(error) => (State::Ended(Err(error)), Err(error)),
         };
@@ -597,6 +628,23 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
     fn pending(&self) -> FrameStep {
         match decode_seal(self.buffer.seal().load(Ordering::Acquire)) {
             SealWord::Positioned(position) if self.cursor.position >= position => {
+                // A reader revoked meanwhile is revoked, not closed, as in
+                // `Subscription::poll` (karyos#1067). Where the revocation
+                // itself seals (`abort`), the flag is stored before the
+                // seal swap and the positioning keeps that order, so the
+                // seal observed above makes it visible. A revocation that
+                // does not seal (another policy, or a buffer sealed before)
+                // may set the flag after this load: then it is seen on the
+                // next attempt, as every revocation is.
+                if self
+                    .buffer
+                    .cell(self.cursor.cell)
+                    .is_ok_and(|cell| cell.revoked.load(Ordering::SeqCst) != 0)
+                {
+                    return FrameStep::Ended(FrameEnd::Revoked {
+                        position: self.cursor.position,
+                    });
+                }
                 // The Acquire load above observed the seal: the reason
                 // stored before its swap is visible.
                 let reason = SealReason::from_code(seal_reason(self.buffer.seal_reason_word()));

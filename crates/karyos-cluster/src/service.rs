@@ -86,6 +86,10 @@ use karyos_codec::{CodecError, Decoder, ENVELOPE_LENGTH, Encoder, Template, VAR_
 use crate::dedup::{
     ConfigError, DedupConfig, Outcome, RegisterError, Registered, Request, SessionTable,
 };
+use crate::guards::{
+    GUARD_SCHEMA_ID, GuardBounds, GuardEffect, GuardEntry, GuardOutcome, GuardStop, GuardTable,
+    SectionError,
+};
 use crate::log::Entry;
 
 /// Schema 2, the Cluster's log entries.
@@ -224,18 +228,20 @@ impl SessionBounds {
     }
 }
 
-/// A decoded entry: the service's (schema 2) or the core's (schema 5).
+/// A decoded entry: the service's (schema 2), the core's (schema 5) or a
+/// guard entry (schema 6, [`crate::guards`]).
 enum Decoded<'a> {
     Service(Envelope<'a>),
     Bounds(SessionBounds),
+    Guard(GuardEntry),
 }
 
 impl<'a> Decoded<'a> {
     fn of(bytes: &'a [u8]) -> Result<Self, CodecError> {
-        if karyos_codec::Envelope::read(bytes)?.schema_id == CORE_SCHEMA_ID {
-            Ok(Self::Bounds(SessionBounds::decode(bytes)?))
-        } else {
-            Ok(Self::Service(Envelope::decode(bytes)?))
+        match karyos_codec::Envelope::read(bytes)?.schema_id {
+            CORE_SCHEMA_ID => Ok(Self::Bounds(SessionBounds::decode(bytes)?)),
+            GUARD_SCHEMA_ID => Ok(Self::Guard(GuardEntry::decode(bytes)?)),
+            _ => Ok(Self::Service(Envelope::decode(bytes)?)),
         }
     }
 }
@@ -624,6 +630,11 @@ pub struct ContainerConfig {
     /// later one, so it stays behind until it restarts with a budget that
     /// holds the bounds.
     pub session_budget: u64,
+    /// The guard table's bounds ([`crate::guards`]): **the same on every
+    /// replica**. The log's first `GuardBounds` entry is checked against
+    /// them, and a replica configured otherwise stops at it with
+    /// [`ApplyError::Guard`].
+    pub guards: GuardBounds,
 }
 
 /// The timers of [`ContainerConfig::default`].
@@ -636,6 +647,7 @@ impl Default for ContainerConfig {
             dedup: DedupConfig::default(),
             timers: DEFAULT_TIMERS,
             session_budget: crate::dedup::DEFAULT_BUDGET,
+            guards: GuardBounds::default(),
         }
     }
 }
@@ -653,6 +665,13 @@ impl ContainerConfig {
     #[must_use]
     pub fn with_session_budget(mut self, budget: u64) -> Self {
         self.session_budget = budget;
+        self
+    }
+
+    /// With the guard table bounded by `guards`: the same on every replica.
+    #[must_use]
+    pub fn with_guards(mut self, guards: GuardBounds) -> Self {
+        self.guards = guards;
         self
     }
 
@@ -689,6 +708,21 @@ pub enum Applied<'a> {
     },
     /// The service took a configuration change.
     Configured,
+    /// A guard entry ([`crate::guards`]): its outcome, and every change it
+    /// made, in the order the host hands them to its driver.
+    Guard {
+        /// The entry's own outcome.
+        outcome: GuardOutcome,
+        /// The operator operation it carries (`Close`, `Reopen`), for
+        /// correlation even when it changed nothing.
+        operation: Option<u64>,
+        /// The entry's log index.
+        index: u64,
+        /// The log time it applied at.
+        log_time: u64,
+        /// Its effects: a lapse's first, then its own, then the lease's.
+        effects: &'a [GuardEffect],
+    },
 }
 
 /// An entry the container cannot apply. It stops: no later entry may be
@@ -705,10 +739,15 @@ pub enum ApplyError {
         /// The last applied.
         last: Option<u64>,
     },
-    /// Its payload is neither a schema 2 message nor a core's own entry
-    /// of schema 5: a safety stop (see [`ServiceContainer::apply`]).
-    #[error("not a schema 2 or schema 5 message: {0}")]
+    /// Its payload is neither a schema 2 message, a core's own entry of
+    /// schema 5 nor a guard entry of schema 6 version 1: a safety stop
+    /// (see [`ServiceContainer::apply`]).
+    #[error("not a schema 2, 5 or 6 message: {0}")]
     Envelope(CodecError),
+    /// A guard entry the guard table cannot apply, its bounds differing
+    /// from this replica's among them: a safety stop.
+    #[error(transparent)]
+    Guard(GuardStop),
     /// A `SessionBounds` entry differs from the bounds of a table that
     /// has applied a registration: a safety stop, never a rebuild under
     /// live sessions (karyos#927).
@@ -742,6 +781,11 @@ pub struct ServiceContainer<S> {
     bounds_logged: bool,
     /// [`ContainerConfig::session_budget`], for bounds a log entry carries.
     session_budget: u64,
+    /// The guard table.
+    guards: GuardTable,
+    /// When this node last proposed a renewal while leading; local, not
+    /// replicated.
+    renewed_at: Option<u64>,
 }
 
 impl<S: ClusteredService> ServiceContainer<S> {
@@ -764,6 +808,8 @@ impl<S: ClusteredService> ServiceContainer<S> {
             fresh: true,
             bounds_logged: false,
             session_budget: config.session_budget,
+            guards: GuardTable::new(config.guards),
+            renewed_at: None,
         })
     }
 
@@ -789,6 +835,80 @@ impl<S: ClusteredService> ServiceContainer<S> {
     #[must_use]
     pub fn bounds_logged(&self) -> bool {
         self.bounds_logged
+    }
+
+    /// The guard table.
+    #[must_use]
+    pub fn guards(&self) -> &GuardTable {
+        &self.guards
+    }
+
+    /// Proposes the guard table's bounds while the log carries none: `true`
+    /// if it proposed. A leader does this as it does
+    /// [`ServiceContainer::propose_bounds`].
+    ///
+    /// # Errors
+    ///
+    /// [`NotLeader`] when the core does not lead.
+    pub fn propose_guard_bounds<P: Propose>(&self, core: &mut P) -> Result<bool, NotLeader> {
+        if self.guards.bounds_logged() {
+            return Ok(false);
+        }
+        let Ok(payload) = GuardEntry::Bounds(self.guards.bounds()).to_vec() else {
+            return Ok(false);
+        };
+        core.propose(payload)?;
+        Ok(true)
+    }
+
+    /// Proposes a lease renewal issued at `now` when one is due: `true` if
+    /// it proposed. The host calls this at every tick with the core's
+    /// clock, the one it stamps entries' event times with, so a renewal's
+    /// `issued` is its entry's event time; the container proposes on the
+    /// first call after the node starts to lead, then every
+    /// [`GuardBounds::renew_every`]. A node that does not lead forgets its
+    /// last renewal, so it renews at once when it leads again.
+    ///
+    /// # Errors
+    ///
+    /// [`NotLeader`] when the core does not lead. A `now` of 0 proposes
+    /// nothing.
+    pub fn propose_renew<P: Propose>(&mut self, core: &mut P, now: u64) -> Result<bool, NotLeader> {
+        if !core.leads() {
+            self.renewed_at = None;
+            return Err(NotLeader::new(None));
+        }
+        let every = self.guards.bounds().renew_every;
+        if self
+            .renewed_at
+            .is_some_and(|at| now.saturating_sub(at) < every)
+        {
+            return Ok(false);
+        }
+        let Ok(payload) = (GuardEntry::Renew { issued: now }).to_vec() else {
+            return Ok(false);
+        };
+        core.propose(payload)
+            .inspect_err(|_| self.renewed_at = None)?;
+        self.renewed_at = Some(now);
+        Ok(true)
+    }
+
+    /// Replaces the guard table with a snapshot section's (of `version`), for a snapshot
+    /// at `index` whose log time is `log_time`: validated whole first.
+    ///
+    /// # Errors
+    ///
+    /// [`SectionError`]: the table is unchanged.
+    pub fn restore_guards(
+        &mut self,
+        version: u64,
+        section: &[u8],
+        index: u64,
+        log_time: u64,
+    ) -> Result<(), SectionError> {
+        self.guards = GuardTable::restore(version, section, self.guards.bounds(), index, log_time)?;
+        Ok(())
     }
 
     /// Proposes the table's bounds as a `SessionBounds` entry through
@@ -881,6 +1001,7 @@ impl<S: ClusteredService> ServiceContainer<S> {
             match Decoded::of(&entry.payload).map_err(ApplyError::Envelope)? {
                 Decoded::Service(envelope) => Some(envelope),
                 Decoded::Bounds(bounds) => return self.apply_bounds(entry, bounds),
+                Decoded::Guard(guard) => return self.apply_guard(entry, guard),
             }
         };
         self.applied = Some(entry.index);
@@ -933,6 +1054,31 @@ impl<S: ClusteredService> ServiceContainer<S> {
     /// bounds deliver nothing; a fresh table is rebuilt from different
     /// ones, keeping its log time; a table that has applied a registration
     /// stops. A later one delivers nothing, whatever it carries.
+    /// A guard entry: the table applies it at the log time once the
+    /// entry's event time is observed. A stop applies nothing.
+    fn apply_guard(&mut self, entry: &Entry, guard: GuardEntry) -> Result<Applied<'_>, ApplyError> {
+        let log_time = self.sessions.log_time().max(entry.event_time);
+        let outcome = self
+            .guards
+            .apply(guard, entry.index, log_time)
+            .map_err(ApplyError::Guard)?;
+        self.applied = Some(entry.index);
+        self.sessions.observe(entry.event_time);
+        let operation = match guard {
+            GuardEntry::Close { operation, .. } | GuardEntry::Reopen { operation, .. } => {
+                Some(operation)
+            }
+            _ => None,
+        };
+        Ok(Applied::Guard {
+            outcome,
+            operation,
+            index: entry.index,
+            log_time,
+            effects: self.guards.effects(),
+        })
+    }
+
     fn apply_bounds(
         &mut self,
         entry: &Entry,

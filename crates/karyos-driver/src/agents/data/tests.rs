@@ -1373,6 +1373,332 @@ fn reset_with_a_held_window(extra: u64) {
     }
 }
 
+/// A channel key file and the unicast sender party of one establishment.
+fn sender_key() -> (crate::wire_keys::KeyFile, crate::wire_auth::Party) {
+    let text = "format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=1\npurpose=channel\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=1111111111111111111111111111111111111111111111111111111111111111\nchannel_id=7\nstream_id=6\n";
+    let file = crate::wire_keys::parse("3-1.key", text.as_bytes()).unwrap();
+    let party = crate::wire_auth::Party::Sender {
+        identity: karyos_protocol::network::Identity {
+            driver_id: [1, 2],
+            registration_id: 1,
+            incarnation: 1,
+        },
+        lane_count: 1,
+        receiver_boot_id: [3, 4],
+        nonce: [5, 6],
+    };
+    (file, party)
+}
+
+type Recorded = Arc<Mutex<Vec<Vec<u8>>>>;
+
+/// A scripted endpoint recording what it sends, and a one-lane outbound
+/// path with 3000 bytes, an aborted claim and 200 bytes committed.
+fn recorded_path() -> (
+    karyos_io::sockets::endpoint::SocketsTx<ScriptedSocket>,
+    Recorded,
+    Box<super::Outbound>,
+    super::testing::TestLog,
+) {
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let seen: Recorded = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    observer.set_send_hook(Box::new(move |_, datagrams| {
+        for datagram in datagrams {
+            record.lock().unwrap().push(datagram.to_vec());
+        }
+    }));
+    for _ in 0..64 {
+        observer.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let local = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let endpoint = SocketsEndpoint::open(&local, InstanceId::FIRST, socket).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    // The log is sized for the inner budget, the channel's 1408 less the
+    // envelope; the path sends datagrams up to the whole 1408.
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 9,
+        mtu: 1360,
+    };
+    let destination = SocketAddr::from(([127, 0, 0, 1], 41_000));
+    let (path, mut log) =
+        super::testing::outbound_wire(EndpointId(1), AUTH_ALIAS, destination, term, 1408, false);
+    let publication = &mut log.publications[0];
+    let _ = publication
+        .append(&[1u8; 3000], AppendOptions::default())
+        .unwrap();
+    let ClaimOutcome::Claimed(claim) = publication
+        .try_claim(100, AppendOptions::default())
+        .unwrap()
+    else {
+        panic!("not claimed");
+    };
+    claim.abort();
+    let _ = publication
+        .append(&[2u8; 200], AppendOptions::default())
+        .unwrap();
+    (tx, seen, path, log)
+}
+
+const AUTH_ALIAS: Alias = Alias {
+    session_id: 5,
+    stream_id: 6,
+};
+
+const AUTH_BUDGET: Budget = Budget {
+    work: 64,
+    bytes: 1 << 20,
+};
+
+/// An authenticated publication seals every DATA datagram and record: each
+/// opens under the session's key, once, and holds exactly the trusted
+/// path's inner frames, at most the inner MTU, in a datagram at most the
+/// envelope larger (ADR-0086 sections 2, 5 and 6).
+#[test]
+fn an_authenticated_publication_seals_every_datagram() {
+    use crate::wire_auth::{ENVELOPE_LEN, Sealer, Verifier};
+    let (mut tx, seen, mut path, _log) = recorded_path();
+    let (file, party) = sender_key();
+    path.require_auth().unwrap();
+    path.install_sealer(Sealer::new(&file, party, AUTH_ALIAS).unwrap())
+        .unwrap();
+    for _ in 0..4 {
+        let _ = path.serve(&mut tx, AUTH_BUDGET, None, 0).unwrap();
+    }
+    let mut verifier = Verifier::new([&file], party, AUTH_ALIAS).unwrap();
+    let seen = seen.lock().unwrap();
+    assert!(seen.len() >= 4, "{} datagrams", seen.len());
+    let mut seqs = Vec::new();
+    for bytes in seen.iter() {
+        assert!(bytes.len() <= 1408);
+        // Never bare on the wire.
+        assert!(!matches!(classify(bytes), Ok(Datagram::DataBatch(_))));
+        let opened = verifier.open(bytes, 0).unwrap();
+        seqs.push(opened.seq);
+        let inner = &bytes[opened.start..opened.start + opened.frames];
+        assert!(inner.len() <= 1408 - ENVELOPE_LEN);
+        let Ok(Datagram::DataBatch(data)) = classify(inner) else {
+            panic!("not a DATA datagram inside: {:?}", classify(inner));
+        };
+        assert_eq!(data.alias(), AUTH_ALIAS);
+        assert!(verifier.open(bytes, 0).is_err(), "a replay opened");
+    }
+    // One fresh sequence per transmission, in order.
+    assert!(
+        seqs.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "{seqs:?}"
+    );
+    assert_eq!(path.counters().records, 1);
+    assert_eq!(path.counters().seal_failures, 0);
+}
+
+/// Until the establishment installs its key an authenticated publication
+/// sends nothing, not even a heartbeat, and reads nothing it would drop;
+/// once keyed it sends from where it stopped.
+#[test]
+fn an_authenticated_publication_sends_nothing_without_its_key() {
+    use crate::wire_auth::{Sealer, Verifier};
+    let (mut tx, seen, mut path, _log) = recorded_path();
+    path.require_auth().unwrap();
+    for _ in 0..4 {
+        let _ = path.serve(&mut tx, AUTH_BUDGET, None, 0).unwrap();
+    }
+    assert_eq!(path.serve_heartbeats(&mut tx, 1_000, 10), Some(0));
+    assert_eq!(path.serve_heartbeats(&mut tx, 2_000, 10), Some(0));
+    assert!(seen.lock().unwrap().is_empty());
+    assert!(path.counters().seal_waits > 0);
+    assert_eq!(path.readers()[0].sent_position(), 0);
+    let (file, party) = sender_key();
+    path.install_sealer(Sealer::new(&file, party, AUTH_ALIAS).unwrap())
+        .unwrap();
+    for _ in 0..4 {
+        let _ = path.serve(&mut tx, AUTH_BUDGET, None, 0).unwrap();
+    }
+    let mut verifier = Verifier::new([&file], party, AUTH_ALIAS).unwrap();
+    let seen = seen.lock().unwrap();
+    assert!(seen.len() >= 4);
+    // The first datagram starts at the log's first frame.
+    let opened = verifier.open(&seen[0], 0).unwrap();
+    let Ok(Datagram::DataBatch(data)) = classify(&seen[0][opened.start..][..opened.frames]) else {
+        panic!("not DATA");
+    };
+    assert_eq!(data.alias(), AUTH_ALIAS);
+    assert!(path.readers()[0].sent_position() > 0);
+}
+
+/// An idle authenticated lane's heartbeat is sealed like its DATA.
+#[test]
+fn an_authenticated_heartbeat_is_sealed() {
+    use crate::wire_auth::{Sealer, Verifier};
+    let (mut tx, seen, mut path, _log) = recorded_path();
+    let (file, party) = sender_key();
+    path.require_auth().unwrap();
+    path.install_sealer(Sealer::new(&file, party, AUTH_ALIAS).unwrap())
+        .unwrap();
+    for _ in 0..4 {
+        let _ = path.serve(&mut tx, AUTH_BUDGET, None, 0).unwrap();
+    }
+    // Idle since 0: one heartbeat at each idle interval.
+    assert_eq!(path.serve_heartbeats(&mut tx, 1_000, 10), Some(1));
+    assert_eq!(path.serve_heartbeats(&mut tx, 2_000, 10), Some(1));
+    let seen = seen.lock().unwrap();
+    // Every datagram opens in sequence order, and the
+    // heartbeats are the two header-only DATA frames behind the envelope.
+    let mut verifier = Verifier::new([&file], party, AUTH_ALIAS).unwrap();
+    let mut heartbeats = 0;
+    for bytes in seen.iter() {
+        let opened = verifier.open(bytes, 0).unwrap();
+        if let Ok(Datagram::Heartbeat(_)) = classify(&bytes[opened.start..][..opened.frames]) {
+            assert_eq!(opened.frames, 32);
+            heartbeats += 1;
+        }
+    }
+    assert_eq!(heartbeats, 2);
+}
+
+/// Authentication is unicast single-path only: a publication that has
+/// several destinations refuses it, and an authenticated one refuses
+/// destinations; a sealer needs an authenticated publication.
+#[test]
+fn only_a_unicast_publication_is_authenticated() {
+    use crate::wire_auth::Sealer;
+    let (_tx, _seen, mut path, _log) = recorded_path();
+    let (file, party) = sender_key();
+    assert_eq!(
+        path.install_sealer(Sealer::new(&file, party, AUTH_ALIAS).unwrap()),
+        Err(super::AuthUnsupported::NotAuthenticated)
+    );
+    path.require_auth().unwrap();
+    let destinations = [
+        SocketAddr::from(([127, 0, 0, 1], 41_001)),
+        SocketAddr::from(([127, 0, 0, 1], 41_002)),
+    ];
+    assert!(
+        path.set_destinations(4, &destinations, &[], Some(true))
+            .is_err()
+    );
+    let (_tx, _seen, mut fanned, _log) = recorded_path();
+    fanned
+        .set_destinations(4, &destinations, &[], Some(true))
+        .unwrap();
+    assert_eq!(
+        fanned.require_auth(),
+        Err(super::AuthUnsupported::NotUnicast)
+    );
+}
+
+/// Authentication is set before any traffic: a publication that already
+/// staged or sent bare datagrams refuses it, so nothing bare can still
+/// leave from its queue. A second sealer of the same establishment is
+/// refused, keeping the sequence; a re-establishment's replaces it.
+#[test]
+fn authentication_starts_before_traffic_and_each_establishment_keys_once() {
+    use crate::wire_auth::{Party, Sealer, Verifier};
+    let (mut tx, seen, mut path, _log) = recorded_path();
+    let _ = path.serve(&mut tx, AUTH_BUDGET, None, 0).unwrap();
+    assert!(!seen.lock().unwrap().is_empty());
+    assert_eq!(path.require_auth(), Err(super::AuthUnsupported::Started));
+    assert!(!path.authenticated());
+
+    let (mut tx, seen, mut path, _log) = recorded_path();
+    let (file, party) = sender_key();
+    path.require_auth().unwrap();
+    path.install_sealer(Sealer::new(&file, party, AUTH_ALIAS).unwrap())
+        .unwrap();
+    let _ = path.serve(&mut tx, AUTH_BUDGET, None, 0).unwrap();
+    assert_eq!(
+        path.install_sealer(Sealer::new(&file, party, AUTH_ALIAS).unwrap()),
+        Err(super::AuthUnsupported::SameEstablishment)
+    );
+    // A receiver-side sealer is never a publication's.
+    let pair = crate::wire_keys::parse(
+        "9-1.key",
+        b"format=karyos-wire-key-v1\nkey_id=9\nfile_epoch=1\npurpose=pairwise\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=2222222222222222222222222222222222222222222222222222222222222222\nreceiver_id=66\npublisher_id=5\n",
+    )
+    .unwrap();
+    let receiver = Party::Receiver {
+        identity: karyos_protocol::network::Identity {
+            driver_id: [1, 2],
+            registration_id: 1,
+            incarnation: 1,
+        },
+        receiver_boot_id: [3, 4],
+        receiver_id: 66,
+    };
+    assert!(
+        path.install_sealer(Sealer::new(&pair, receiver, AUTH_ALIAS).unwrap())
+            .is_err()
+    );
+    // The sequence went on under the one key: every datagram opens in
+    // order.
+    let mut verifier = Verifier::new([&file], party, AUTH_ALIAS).unwrap();
+    for _ in 0..4 {
+        let _ = path.serve(&mut tx, AUTH_BUDGET, None, 0).unwrap();
+    }
+    let sent = seen.lock().unwrap().clone();
+    assert!(sent.len() >= 3);
+    for bytes in &sent {
+        verifier.open(bytes, 0).unwrap();
+    }
+    // A re-establishment (a new receiver boot id) keys anew.
+    let Party::Sender {
+        identity,
+        lane_count,
+        nonce,
+        ..
+    } = party
+    else {
+        unreachable!()
+    };
+    let again = Party::Sender {
+        identity,
+        lane_count,
+        receiver_boot_id: [9, 9],
+        nonce,
+    };
+    path.install_sealer(Sealer::new(&file, again, AUTH_ALIAS).unwrap())
+        .unwrap();
+}
+
+/// An authenticated EOS is the trusted EOS sealed.
+#[test]
+fn an_authenticated_eos_is_the_bare_one_sealed() {
+    use crate::wire_auth::{Sealer, Verifier};
+    let (mut bare_tx, bare_seen, mut bare, _bare_log) = recorded_path();
+    let (mut tx, seen, mut path, _log) = recorded_path();
+    let (file, party) = sender_key();
+    path.require_auth().unwrap();
+    path.install_sealer(Sealer::new(&file, party, AUTH_ALIAS).unwrap())
+        .unwrap();
+    // Open the queues, then send an EOS at the same position on both.
+    let _ = bare.serve(&mut bare_tx, AUTH_BUDGET, None, 0).unwrap();
+    let _ = path.serve(&mut tx, AUTH_BUDGET, None, 0).unwrap();
+    let bare_before = bare_seen.lock().unwrap().len();
+    let before = seen.lock().unwrap().len();
+    assert!(bare.write_heartbeat(&mut bare_tx, 0, 4096, true));
+    assert!(path.write_heartbeat(&mut tx, 0, 4096, true));
+    let bare_eos = bare_seen.lock().unwrap()[bare_before..]
+        .last()
+        .unwrap()
+        .clone();
+    let seen = seen.lock().unwrap();
+    let mut verifier = Verifier::new([&file], party, AUTH_ALIAS).unwrap();
+    for bytes in &seen[..before] {
+        let _ = verifier.open(bytes, 0);
+    }
+    let sealed = seen[before..].last().unwrap();
+    let opened = verifier.open(sealed, 0).unwrap();
+    assert_eq!(
+        &sealed[opened.start..][..opened.frames],
+        bare_eos.as_slice()
+    );
+}
+
 /// ADR-0109 (#625): on the `etf` route a timed head is eligible its lane's
 /// declared advance before its time, and goes on the etf socket with its
 /// time converted to `CLOCK_TAI` by the cycle's offset, `CLOCK_TAI` less

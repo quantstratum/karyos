@@ -89,6 +89,11 @@ pub enum DriverError {
     /// The driver has no network configured (`DriverConfig::network`).
     #[error("no network is configured")]
     NetworkUnavailable,
+    /// An attach from an image's join found no awaiting cell to adopt
+    /// (ADR-0100): its subscription does not await its images, or its cell
+    /// was taken or expired. A join at the head is the fallback.
+    #[error("no awaiting cell for an attach at the image's join")]
+    NoAwaitingCell,
     /// The channel uses a feature this driver does not wire yet (multi
     /// destination, redundant paths, an interface name), or `fc=tagged:0`
     /// on a publication: a tagged group is never 0.

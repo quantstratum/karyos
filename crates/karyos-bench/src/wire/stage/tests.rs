@@ -173,42 +173,32 @@ fn a_receiver_done_with_every_message_never_stops_the_sender() {
 #[test]
 fn the_synthetic_profile_adds_its_spin_to_each_stage() {
     use crate::wire::profile::Profile;
-    // Load-tolerant (ACS 16456): the two profiles run interleaved, a few
-    // rounds each, and each stage is compared by its fastest sample over
-    // every round. Load only adds time, so a minimum is the least
-    // disturbed figure; Synthetic spins at least 500 ns in seal and in
-    // open, which the fastest path cannot skip, while a busy spin keeps
-    // the core clocked up and makes the rest of the stage faster (ACS
-    // 15453), so the bounds only show the spin is there and is not
-    // runaway. Without the spin both minima are the same path.
-    let fastest = |values: &[u32]| values.iter().copied().min().map_or(u64::MAX, u64::from);
-    let stages = |configuration: &str| {
-        let samples = run(
-            stage_run(Shape::W1, StageLoad::Closed, 500, 50),
-            &Profile::of(configuration).unwrap(),
-        )
-        .unwrap();
-        (
-            fastest(&samples.send),
-            fastest(&samples.receivers[0].receive),
-        )
-    };
-    let (mut trusted, mut synthetic) = ((u64::MAX, u64::MAX), (u64::MAX, u64::MAX));
-    for _ in 0..4 {
-        let round = stages("trusted");
-        trusted = (trusted.0.min(round.0), trusted.1.min(round.1));
-        let round = stages("synthetic-500");
-        synthetic = (synthetic.0.min(round.0), synthetic.1.min(round.1));
-    }
-    for (stage, trusted, synthetic) in [
-        ("send", trusted.0, synthetic.0),
-        ("receive", trusted.1, synthetic.1),
+    // karyos#1067: a lower bound only, which load cannot break. Synthetic
+    // busy-waits on the monotonic clock until its spin has elapsed, so a
+    // spin never lasts less than `SPIN`, however loaded the host; load only
+    // makes it longer. A send sample spans the seal (from `begin` before it
+    // to `committed` after it), and a receive sample spans the last
+    // datagram's open (from the message's first callback to `decided`
+    // after it), both on the same clock: every sample of the synthetic run
+    // is at least `SPIN`. An earlier form compared the trusted and the
+    // synthetic minima and bounded the difference from above, which load
+    // broke on loaded hosts. The spin is 50 us, far above a stage's own
+    // cost, so a profile that skipped it would show.
+    const SPIN: u64 = 50_000;
+    let samples = run(
+        stage_run(Shape::W1, StageLoad::Closed, 200, 20),
+        &Profile::of(&format!("synthetic-{SPIN}")).unwrap(),
+    )
+    .unwrap();
+    for (stage, values) in [
+        ("send", &samples.send),
+        ("receive", &samples.receivers[0].receive),
     ] {
-        // A synthetic minimum below the trusted one adds nothing.
-        let added = synthetic.checked_sub(trusted);
+        assert!(!values.is_empty(), "{stage}: no samples");
+        let fastest = values.iter().copied().map(u64::from).min().unwrap();
         assert!(
-            added.is_some_and(|added| (125..20_000).contains(&added)),
-            "{stage}: trusted {trusted} ns, synthetic {synthetic} ns (fastest samples)"
+            fastest >= SPIN,
+            "{stage}: fastest sample {fastest} ns, below the {SPIN} ns spin"
         );
     }
 }

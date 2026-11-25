@@ -658,9 +658,22 @@ fn range_end(start: u64, length: usize) -> Result<u64, IntegrityError> {
         .ok_or(IntegrityError::Overflow)
 }
 
-/// Takes the single-writer lock on a journal or ledger `file`.
+/// How long taking a journal's or a ledger's single-writer lock keeps
+/// trying while the lock is held (karyos#1067, #663): see
+/// [`karyos_sys::spawn_window`]. A spawned child holds a closed journal's
+/// `flock` until its exec; a lock still held after this window is another
+/// writer's, refused with [`IntegrityError::Locked`] as before. The
+/// single-writer guarantee is unchanged: only how long a refusal takes.
+pub use karyos_sys::spawn_window::LOCK_SPAWN_WINDOW;
+
+/// Takes the single-writer lock on a journal or ledger `file`, trying again
+/// within [`LOCK_SPAWN_WINDOW`] while it is held.
 pub(super) fn lock<D: Disk>(disk: &mut D, file: &D::File) -> Result<(), IntegrityError> {
-    disk.lock(file).map_err(|error| {
+    karyos_sys::spawn_window::retry_held(
+        || disk.lock(file),
+        |error| error.kind() == io::ErrorKind::WouldBlock,
+    )
+    .map_err(|error| {
         if error.kind() == io::ErrorKind::WouldBlock {
             IntegrityError::Locked
         } else {

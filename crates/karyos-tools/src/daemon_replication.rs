@@ -69,6 +69,25 @@ pub const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// request starts again.
 pub const RECONNECT_SETTLE: Duration = Duration::from_secs(1);
 
+/// How long the source keeps watching its forward publication after a
+/// request finished (caught up on demand, or ended), so that a replica
+/// that missed the request's start, left and came back gets it again
+/// (ADR-0102 decision 7: the source sees the receiver gone, then back, and
+/// asks again from its start). A replica leaves at most its late-join
+/// grace after it followed the incarnation and comes back after its rejoin
+/// pause; the source then needs its reconnect settle. The watch is twice
+/// that sum; then the forward publication is closed, so a finished
+/// request never keeps it alive for good (karyos#1067).
+pub const FINISHED_WATCH: Duration = crate::daemon_replica::LATE_JOIN_GRACE
+    .saturating_add(crate::daemon_replica::REJOIN_PAUSE)
+    .saturating_add(RECONNECT_SETTLE)
+    .saturating_mul(2);
+
+/// How often the source probes the replica's connection while it watches
+/// a finished request: a quarter of the settle, so a connection back is
+/// seen to hold for [`RECONNECT_SETTLE`] within one more probe.
+const FINISHED_PROBE: Duration = Duration::from_millis(250);
+
 /// The high 32 bits of the correlation ids of the daemon's replication
 /// requests: distinct from its boot recordings'.
 pub const REPLICATION_REQUESTER: u64 = 0xFFFF_FFFE << 32;
@@ -137,8 +156,81 @@ enum Phase {
     /// A stop was decided: nothing more is forwarded; the next request
     /// waits for the agent to drop this one, then for `at`.
     Stopping { at: Instant },
-    /// Done for good: caught up on demand, ended, or an interior gap.
+    /// The request finished (caught up on demand, or ended): its final
+    /// status is offered again every [`FINISHED_PROBE`] as a probe of the
+    /// replica's connection, for [`FINISHED_WATCH`]; a replica lost and
+    /// back for [`RECONNECT_SETTLE`] is asked again from the start
+    /// (ADR-0102 decision 7, karyos#1067).
+    Finished,
+    /// Done for good: a finished request watched to its end, or an
+    /// interior gap.
     Ended,
+}
+
+/// What a finished request's watch decides at one step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Watched {
+    /// Keep watching.
+    Keep,
+    /// The replica was lost and is back for [`RECONNECT_SETTLE`]: ask
+    /// again from the start.
+    AskAgain,
+    /// The watch ran its time: close the forward publication.
+    Expired,
+}
+
+/// The watch of a finished request's replica connection (see
+/// [`Phase::Finished`]), apart from the publication so it is testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FinishedWatch {
+    until: Instant,
+    probe_at: Instant,
+    lost: bool,
+    back_since: Option<Instant>,
+}
+
+impl FinishedWatch {
+    fn new(now: Instant) -> Self {
+        Self {
+            until: now.checked_add(FINISHED_WATCH).unwrap_or(now),
+            probe_at: now,
+            lost: false,
+            back_since: None,
+        }
+    }
+
+    /// Whether a probe is due at `now`.
+    fn due(&self, now: Instant) -> bool {
+        now >= self.probe_at && now < self.until
+    }
+
+    /// One step at `now`, with the probe's outcome if one was offered:
+    /// `Some(true)` when the replica took it, `Some(false)` when there was
+    /// no receiver, `None` for no probe or a refusal that says nothing.
+    fn step(&mut self, probed: Option<bool>, now: Instant) -> Watched {
+        if now >= self.until {
+            return Watched::Expired;
+        }
+        if let Some(connected) = probed {
+            self.probe_at = now.checked_add(FINISHED_PROBE).unwrap_or(now);
+            if connected {
+                if self.lost && self.back_since.is_none() {
+                    self.back_since = Some(now);
+                }
+            } else {
+                self.lost = true;
+                self.back_since = None;
+            }
+        }
+        if self.lost
+            && self
+                .back_since
+                .is_some_and(|since| now.saturating_duration_since(since) >= RECONNECT_SETTLE)
+        {
+            return Watched::AskAgain;
+        }
+        Watched::Keep
+    }
 }
 
 /// A stream that takes a message or refuses it for now.
@@ -314,6 +406,10 @@ struct Replication {
     /// The agent's answer to "is the stopped request still active".
     confirming: Option<Posted<bool>>,
     buf: Vec<u8>,
+    /// The finished request's final status, offered again as a probe, and
+    /// its watch (see [`Phase::Finished`]).
+    ending: Held,
+    finished: Option<FinishedWatch>,
 }
 
 /// Every replication of a source daemon.
@@ -446,6 +542,8 @@ impl Replications {
                 streamed: false,
                 confirming: None,
                 buf: vec![0; MAX_MESSAGE],
+                ending: Held::new(),
+                finished: None,
             });
         }
         Ok(replications)
@@ -675,6 +773,7 @@ impl Replication {
         }
         match self.phase {
             Phase::Ended => {}
+            Phase::Finished => worked |= self.watch_finished(driver, now),
             Phase::Idle { at } => {
                 if now >= at && self.pending.is_none() {
                     worked = true;
@@ -1026,6 +1125,58 @@ impl Replication {
         }
     }
 
+    /// Watches a finished request (see [`Phase::Finished`]): probes the
+    /// replica's connection with the request's final status, asks again
+    /// from the start once a lost replica is back for [`RECONNECT_SETTLE`]
+    /// (ADR-0102 decision 7), and closes the forward publication once
+    /// [`FINISHED_WATCH`] passed.
+    fn watch_finished(&mut self, driver: &mut EmbeddedDriver<SharedTerms>, now: Instant) -> bool {
+        let Some(mut watch) = self.finished else {
+            self.phase = Phase::Ended;
+            return true;
+        };
+        let mut probed = None;
+        if watch.due(now)
+            && let Some((_, publication)) = self.forward.as_mut()
+            && let Some(message) = self
+                .ending
+                .length
+                .and_then(|length| self.ending.buf.get(..length))
+        {
+            probed = match publication.offer_message(message) {
+                OfferOutcome::Accepted { .. } => Some(true),
+                OfferOutcome::NotConnected => Some(false),
+                _ => None,
+            };
+        }
+        let watched = watch.step(probed, now);
+        self.finished = Some(watch);
+        match watched {
+            Watched::Keep => probed.is_some(),
+            Watched::AskAgain => {
+                tracing::info!(
+                    recording_id = self.option.recording_id,
+                    "replica connection back after the request finished: replication asked \
+                     again from the start (ADR-0102 decision 7)"
+                );
+                self.finished = None;
+                self.ending.clear();
+                self.stop(now);
+                true
+            }
+            Watched::Expired => {
+                self.finished = None;
+                self.ending.clear();
+                if let Some((aggregate, publication)) = self.forward.take() {
+                    drop(publication);
+                    let _ = driver.remove_aggregate(&aggregate);
+                }
+                self.phase = Phase::Ended;
+                true
+            }
+        }
+    }
+
     /// What a forwarded message of the current request changes: an end, a
     /// restart after an interruption, or a refusal.
     fn observe(
@@ -1106,7 +1257,18 @@ impl Replication {
             }
             State::CaughtUp | State::Ended => {
                 tracing::info!(recording_id, state = ?status.state, "replication done");
-                Some(Phase::Ended)
+                // Watched, not ended at once: a replica that missed the
+                // request's start may still come back for it (ADR-0102
+                // decision 7, karyos#1067).
+                // The final status, encoded again for the probes.
+                self.ending.clear();
+                if let Ok(length) =
+                    ReplicationMessage::ReplicationStatus(*status).encode(&mut self.ending.buf)
+                {
+                    self.ending.length = Some(length);
+                }
+                self.finished = Some(FinishedWatch::new(now));
+                Some(Phase::Finished)
             }
             State::Stopped => Some(Phase::Idle { at: now }),
             _ => None,
@@ -1120,6 +1282,75 @@ mod tests {
 
     use super::*;
     use karyos_archive::replication::Mode;
+
+    /// karyos#1067: a finished request with no loss is never asked again
+    /// (no request loop), and its watch ends after [`FINISHED_WATCH`],
+    /// which then closes the forward publication.
+    #[test]
+    fn a_finished_request_with_no_loss_is_not_asked_again_and_its_watch_ends() {
+        let start = Instant::now();
+        let mut watch = FinishedWatch::new(start);
+        let mut now = start;
+        while now < start + FINISHED_WATCH {
+            if watch.due(now) {
+                assert_eq!(watch.step(Some(true), now), Watched::Keep, "at {now:?}");
+            } else {
+                assert_eq!(watch.step(None, now), Watched::Keep);
+            }
+            now += FINISHED_PROBE / 2;
+        }
+        assert!(!watch.due(now), "a probe after the watch");
+        assert_eq!(watch.step(None, now), Watched::Expired);
+    }
+
+    /// karyos#1067, on demand: a replica that joined the finished request's
+    /// incarnation late leaves at its grace, so the source's probes find no
+    /// receiver; it comes back after its rejoin pause, and once its
+    /// connection held for the settle the request is asked again from the
+    /// start (ADR-0102 decision 7): within the watch, which covers the
+    /// replica's grace, pause and the settle.
+    #[test]
+    fn an_on_demand_replica_that_left_and_came_back_is_asked_again_from_the_start() {
+        use crate::daemon_replica::{LATE_JOIN_GRACE, REJOIN_PAUSE};
+        assert!(FINISHED_WATCH > LATE_JOIN_GRACE + REJOIN_PAUSE + RECONNECT_SETTLE);
+        let start = Instant::now();
+        let mut watch = FinishedWatch::new(start);
+        // Connected while the late replica waits out its grace.
+        let left = start + LATE_JOIN_GRACE;
+        let back = left + REJOIN_PAUSE;
+        let mut now = start;
+        let mut asked = None;
+        while now < start + FINISHED_WATCH && asked.is_none() {
+            let connected = !(left..back).contains(&now);
+            let probed = watch.due(now).then_some(connected);
+            match watch.step(probed, now) {
+                Watched::Keep => {}
+                Watched::AskAgain => asked = Some(now),
+                Watched::Expired => panic!("expired before the replica came back"),
+            }
+            now += FINISHED_PROBE / 2;
+        }
+        let asked = asked.expect("never asked again");
+        assert!(asked >= back + RECONNECT_SETTLE, "asked before the settle");
+        assert!(asked < back + RECONNECT_SETTLE + FINISHED_PROBE * 2);
+    }
+
+    /// The asking again is the reconnect path of a streaming request: the
+    /// same stop, whose next request starts at the recording's current
+    /// start. A loss alone, never back, is not asked again: the watch ends.
+    #[test]
+    fn a_replica_lost_for_good_after_the_end_is_not_asked_again() {
+        let start = Instant::now();
+        let mut watch = FinishedWatch::new(start);
+        assert_eq!(watch.step(Some(false), start), Watched::Keep);
+        let mut now = start;
+        while now < start + FINISHED_WATCH {
+            let probed = watch.due(now).then_some(false);
+            assert_eq!(watch.step(probed, now), Watched::Keep);
+            now += FINISHED_PROBE;
+        }
+        assert_eq!(watch.step(None, now), Watched::Expired);
+    }
 
     #[test]
     fn a_correlation_id_is_read_from_either_schema() {

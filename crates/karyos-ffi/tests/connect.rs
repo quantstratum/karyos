@@ -174,6 +174,7 @@ fn a_driver_admits_the_client_until_it_is_closed() {
         max_regions_per_fetch: 4,
         max_fetch_bytes: 1 << 30,
         max_tools: 1,
+        client_send_buffer: None,
     };
     let mut driver: EmbeddedDriver<SharedTerms> = EmbeddedDriver::with_ipc(
         DriverConfig::default(),
@@ -239,6 +240,7 @@ fn a_remote_client_reads_a_conflated_view_until_its_close() {
         max_regions_per_fetch: 4,
         max_fetch_bytes: 1 << 30,
         max_tools: 1,
+        client_send_buffer: None,
     };
     let mut driver: EmbeddedDriver<SharedTerms> = EmbeddedDriver::with_ipc(
         DriverConfig::default(),
