@@ -26,9 +26,32 @@
 //!   still in the window gets its retained reply ([`Outcome::Retained`]);
 //!   one below the window, acknowledged by the client, gets
 //!   [`Outcome::Duplicate`] without one; one past a full window is refused
-//!   ([`Outcome::WindowFull`]). Sequences are applied in order: a request
-//!   past the next sequence is refused ([`Outcome::OutOfOrder`]), so a
-//!   request lost before the log is retried before its successors apply.
+//!   ([`Outcome::WindowFull`]).
+//! - **The exact identity** (R-CORE-6, karyos#750; decision X5). A request
+//!   is `(client, epoch, sequence)`, and its sequence is an identity
+//!   component, not a counter: a client's sequences rise with holes (a
+//!   FIX gateway's administrative messages use sequence numbers and are
+//!   never submitted), so a sequence past the next one applies, and the
+//!   ones it skips are holes. A hole inside the window applies when it
+//!   arrives, once, as a request lost before the log and retried after
+//!   its successors does; the window spans `[base, base + window)` of
+//!   sequences, holes included. Below the window a request is
+//!   acknowledged ([`Outcome::Duplicate`]) and never runs.
+//! - **Payload mismatch.** Each applied request keeps a digest of its
+//!   command (its length and CRC-32C). A retry of an identity whose
+//!   digest differs is [`Outcome::PayloadMismatch`]: neither run nor
+//!   answered as a duplicate. CRC-32C detects a client's mistake, not an
+//!   attacker who forges a colliding payload.
+//! - **Retained outcomes.** A retry inside the window gets the reply the
+//!   first apply wrote ([`Outcome::Retained`]) without the service being
+//!   called, so a retry of an accepted request returns its outcome even
+//!   when the same request would now be refused: admission is evaluated
+//!   once, at the first apply.
+//! - **No fresh epoch on an unknown outcome.** The table never opens a
+//!   session by itself: a request of an epoch whose session is gone is
+//!   [`Outcome::SessionExpired`], for good, and a new epoch is had only by
+//!   the client's explicit registration, a decision it takes knowing it
+//!   may resubmit what already ran.
 //! - **Replies.** The command runs once, in [`SessionTable::request`]'s
 //!   `apply`, which writes its reply straight into the session's slot: one
 //!   copy, no allocation. A reply that does not fit is recorded as such:
@@ -58,8 +81,8 @@
 //!
 //! | Profile | Sessions | Replies | Bytes per reply | TTL | Reserved per replica |
 //! | --- | --- | --- | --- | --- | --- |
-//! | [`DedupConfig::default`] | 64 | 64 | 8 KiB | 60 s | 33,590,272 B (32 MiB and 35 KiB of metadata) |
-//! | [`DedupConfig::large`] | 1024 | 64 | 8 KiB | 60 s | 537,444,352 B (512 MiB and 560 KiB of metadata) |
+//! | [`DedupConfig::default`] | 64 | 64 | 8 KiB | 60 s | 33,623,040 B (32 MiB and 67 KiB of metadata) |
+//! | [`DedupConfig::large`] | 1024 | 64 | 8 KiB | 60 s | 537,968,640 B (512 MiB and 1,072 KiB of metadata) |
 //!
 //!   A cluster reserves this on every replica: three replicas of the
 //!   large profile reserve over 1.5 GiB. Every number here is
@@ -88,7 +111,7 @@
 //! | last registration: 1 and its index, or 0 and 0 | 1, 8 |
 //! | live sessions | 4 |
 //! | per session: slot, client, epoch, activity, base, next | 4, 8 × 5 |
-//! | per retained sequence from base to next: 1 and its length and bytes, or 2 for a reply too large | 1, 4, length |
+//! | per sequence from base to next: 0 for a hole; 1, its length, bytes and command digest; or 2 and the digest of a reply too large | 1, 4, length, 8 |
 //!
 //! Decoding checks every bound: a slot past the table, a window past
 //! [`DedupConfig::window`], a reply past [`DedupConfig::response_bytes`],
@@ -102,8 +125,10 @@ mod tests;
 /// The sessions section's version.
 pub const SESSIONS_VERSION: u64 = 1;
 const SESSIONS_MAGIC: [u8; 4] = *b"KRDT";
-/// The encoding's own version, inside the section.
-const ENCODING_VERSION: u32 = 1;
+/// The encoding's own version, inside the section: 2 since karyos#750
+/// (holes and command digests); version 1 still decodes, its replies with
+/// no digest.
+const ENCODING_VERSION: u32 = 2;
 
 /// A sessions section that does not decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -331,13 +356,13 @@ pub enum Outcome<'a> {
     /// closed, or was never opened. The client registers again, under a
     /// new epoch; it must not assume the request was deduplicated.
     SessionExpired,
-    /// The window holds [`DedupConfig::window`] unacknowledged replies.
+    /// The sequence is at or past the window's end, `base +`
+    /// [`DedupConfig::window`]: the client has not acknowledged enough
+    /// replies (holes count).
     WindowFull,
-    /// The sequence is past the next one the session expects.
-    OutOfOrder {
-        /// The sequence the session expects.
-        expected: u64,
-    },
+    /// The identity applied before with another command: a client's bug
+    /// or an attack. Neither run nor answered as a duplicate.
+    PayloadMismatch,
 }
 
 /// One session slot.
@@ -354,13 +379,33 @@ struct Session {
     next: u64,
 }
 
-/// One retained reply's length, or a reply that did not fit.
+/// One sequence of a session's window: a hole, or an applied request's
+/// reply length (or a reply that did not fit) and its command's digest
+/// ([`digest`]; 0 for one decoded from a version 1 section, which kept
+/// none, and is not checked).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Stored {
     #[default]
     Empty,
-    Reply(u32),
-    TooLarge,
+    Reply(u32, u64),
+    TooLarge(u64),
+}
+
+impl Stored {
+    fn digest(self) -> Option<u64> {
+        match self {
+            Self::Empty => None,
+            Self::Reply(_, digest) | Self::TooLarge(digest) => Some(digest),
+        }
+    }
+}
+
+/// A command's digest: its length and CRC-32C, never 0.
+#[must_use]
+pub fn digest(command: &[u8]) -> u64 {
+    let length = u64::try_from(command.len()).unwrap_or(u64::MAX) & 0xffff_ffff;
+    let crc = u64::from(karyos_archive::crc32c::crc32c(command));
+    ((length << 32) | crc).max(1)
 }
 
 /// The replicated session table.
@@ -513,6 +558,16 @@ impl SessionTable {
                 next: 0,
             };
         }
+        // The new session's window starts empty: a slot's earlier session
+        // leaves nothing a sequence of this one could read as applied.
+        let window = usize::try_from(self.config.window).unwrap_or(0);
+        if let Some(start) = slot.checked_mul(window)
+            && let Some(entries) = start
+                .checked_add(window)
+                .and_then(|end| self.stored.get_mut(start..end))
+        {
+            entries.fill(Stored::Empty);
+        }
         Ok(Registered {
             epoch: index,
             config: self.config,
@@ -539,15 +594,23 @@ impl SessionTable {
         true
     }
 
-    /// Applies `request`, in an entry of event time `event_time`. A new
-    /// request runs `apply` once, which writes its reply into the buffer it
-    /// is given ([`DedupConfig::response_bytes`] long) and returns the
-    /// reply's length, or `None` for a reply that does not fit; any other
-    /// outcome leaves `apply` uncalled.
-    pub fn request<F>(&mut self, request: Request, event_time: u64, apply: F) -> Outcome<'_>
+    /// Applies `request` carrying `command`, in an entry of event time
+    /// `event_time`. A new identity (a sequence never applied inside the
+    /// window, a hole included) runs `apply` once, which writes its reply
+    /// into the buffer it is given ([`DedupConfig::response_bytes`] long)
+    /// and returns the reply's length, or `None` for a reply that does not
+    /// fit; any other outcome leaves `apply` uncalled.
+    pub fn request<F>(
+        &mut self,
+        request: Request,
+        command: &[u8],
+        event_time: u64,
+        apply: F,
+    ) -> Outcome<'_>
     where
         F: FnOnce(&mut [u8]) -> Option<usize>,
     {
+        let digest = digest(command);
         self.advance(event_time);
         let Some(slot) = self.find(request.client, request.epoch) else {
             return Outcome::SessionExpired;
@@ -560,32 +623,54 @@ impl SessionTable {
         session.activity = now;
         // The client has seen every reply below its lowest unanswered. The
         // base never goes back: a late duplicate carries an older one.
+        let old_base = session.base;
         session.base = request
             .lowest_unanswered
             .max(session.base)
             .min(session.next);
         let (base, next) = (session.base, session.next);
+        // The slots the base passed are free for the sequences a window
+        // later: holes and acknowledged replies alike.
+        let mut freed = old_base;
+        while freed < base && freed < old_base.saturating_add(window) {
+            if let Some(index) = self.stored_index(slot, freed)
+                && let Some(entry) = self.stored.get_mut(index)
+            {
+                *entry = Stored::Empty;
+            }
+            freed = freed.saturating_add(1);
+        }
         if request.sequence < base {
             return Outcome::Duplicate;
         }
-        if request.sequence < next {
-            return match self.slot(slot, request.sequence) {
-                Some((Stored::Reply(length), at)) => self
-                    .reply(at, length)
-                    .map_or(Outcome::Duplicate, Outcome::Retained),
-                Some((Stored::TooLarge, _)) => Outcome::ReplyTooLarge,
-                _ => Outcome::Duplicate,
-            };
-        }
-        if request.sequence > next {
-            return Outcome::OutOfOrder { expected: next };
-        }
-        if next.checked_sub(base).is_none_or(|held| held >= window) {
+        if request
+            .sequence
+            .checked_sub(base)
+            .is_none_or(|ahead| ahead >= window)
+        {
             return Outcome::WindowFull;
         }
-        let Some(after) = next.checked_add(1) else {
+        match self.slot(slot, request.sequence) {
+            Some((stored, _))
+                if stored
+                    .digest()
+                    .is_some_and(|held| held != 0 && held != digest) =>
+            {
+                return Outcome::PayloadMismatch;
+            }
+            Some((Stored::Reply(length, _), at)) => {
+                return self
+                    .reply(at, length)
+                    .map_or(Outcome::Duplicate, Outcome::Retained);
+            }
+            Some((Stored::TooLarge(_), _)) => return Outcome::ReplyTooLarge,
+            Some((Stored::Empty, _)) => {}
+            None => return Outcome::SessionExpired,
+        }
+        let Some(after) = request.sequence.checked_add(1) else {
             return Outcome::WindowFull;
         };
+        let after = after.max(next);
         let Some((_, at)) = self.slot(slot, request.sequence) else {
             return Outcome::SessionExpired;
         };
@@ -598,8 +683,10 @@ impl SessionTable {
         };
         let written = apply(buffer);
         let stored = match written.filter(|length| *length <= bytes) {
-            Some(length) => u32::try_from(length).map_or(Stored::TooLarge, Stored::Reply),
-            None => Stored::TooLarge,
+            Some(length) => u32::try_from(length).map_or(Stored::TooLarge(digest), |length| {
+                Stored::Reply(length, digest)
+            }),
+            None => Stored::TooLarge(digest),
         };
         if let Some(session) = self.sessions.get_mut(slot) {
             session.next = after;
@@ -610,7 +697,7 @@ impl SessionTable {
             *entry = stored;
         }
         match stored {
-            Stored::Reply(length) => self
+            Stored::Reply(length, _) => self
                 .reply(at, length)
                 .map_or(Outcome::ReplyTooLarge, Outcome::Applied),
             _ => Outcome::ReplyTooLarge,
@@ -653,22 +740,20 @@ impl SessionTable {
             let mut sequence = session.base;
             while sequence < session.next {
                 match self.slot(slot, sequence) {
-                    Some((Stored::Reply(length), at)) => {
+                    Some((Stored::Reply(length, digest), at)) => {
                         let reply = self.reply(at, length);
                         debug_assert!(reply.is_some(), "a retained reply is within its slot");
                         out.push(1);
                         out.extend_from_slice(&length.to_le_bytes());
                         out.extend_from_slice(reply.unwrap_or_default());
+                        out.extend_from_slice(&digest.to_le_bytes());
                     }
-                    stored => {
-                        // Every sequence in the window holds a reply or a
-                        // reply too large.
-                        debug_assert!(
-                            matches!(stored, Some((Stored::TooLarge, _))),
-                            "{stored:?} in a window"
-                        );
+                    Some((Stored::TooLarge(digest), _)) => {
                         out.push(2);
+                        out.extend_from_slice(&digest.to_le_bytes());
                     }
+                    // A hole: never applied.
+                    _ => out.push(0),
                 }
                 let Some(after) = sequence.checked_add(1) else {
                     break;
@@ -689,11 +774,15 @@ impl SessionTable {
     /// its bounds.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut input = Input(bytes);
-        if input.array::<4>()? != SESSIONS_MAGIC
-            || u32::from_le_bytes(input.array()?) != ENCODING_VERSION
-        {
+        if input.array::<4>()? != SESSIONS_MAGIC {
             return Err(DecodeError::Format);
         }
+        let encoding = u32::from_le_bytes(input.array()?);
+        if !(1..=ENCODING_VERSION).contains(&encoding) {
+            return Err(DecodeError::Format);
+        }
+        // Version 1 kept no holes and no digests.
+        let digests = encoding >= 2;
         let config = DedupConfig {
             sessions: u32::from_le_bytes(input.array()?),
             window: u32::from_le_bytes(input.array()?),
@@ -744,7 +833,15 @@ impl SessionTable {
                 let (_, at) = table.slot(index, sequence).ok_or(broken)?;
                 let entry = table.stored_index(index, sequence).ok_or(broken)?;
                 let [kind] = input.array::<1>()?;
+                let digest = |input: &mut Input<'_>| -> Result<u64, DecodeError> {
+                    if digests {
+                        Ok(u64::from_le_bytes(input.array()?))
+                    } else {
+                        Ok(0)
+                    }
+                };
                 let value = match kind {
+                    0 if digests => Stored::Empty,
                     1 => {
                         let length = u32::from_le_bytes(input.array()?);
                         let size = usize::try_from(length).map_err(|_| broken)?;
@@ -758,9 +855,9 @@ impl SessionTable {
                             .get_mut(at..end)
                             .ok_or(broken)?
                             .copy_from_slice(bytes);
-                        Stored::Reply(length)
+                        Stored::Reply(length, digest(&mut input)?)
                     }
-                    2 => Stored::TooLarge,
+                    2 => Stored::TooLarge(digest(&mut input)?),
                     _ => return Err(DecodeError::Format),
                 };
                 *table.stored.get_mut(entry).ok_or(broken)? = value;

@@ -1062,7 +1062,7 @@ impl<S: ClusteredService> ServiceContainer<S> {
             }
             Envelope::Request { request, command } => {
                 let mut context = Context::of(entry, sessions, timers);
-                let outcome = sessions.request(request, entry.event_time, |reply| {
+                let outcome = sessions.request(request, command, entry.event_time, |reply| {
                     service.on_command(&mut context, request.client, command, reply)
                 });
                 Applied::Answered { request, outcome }

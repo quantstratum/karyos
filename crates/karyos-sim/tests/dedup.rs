@@ -123,7 +123,7 @@ impl Replica {
             *counter += add;
             return Answer::Value(*counter);
         };
-        let outcome = table.request(request, time, |buffer| {
+        let outcome = table.request(request, &add.to_le_bytes(), time, |buffer| {
             *counter += add;
             buffer.get_mut(..8)?.copy_from_slice(&counter.to_le_bytes());
             Some(8)
