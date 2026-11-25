@@ -1019,6 +1019,9 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// the file epoch the last key application found for it (H8 finding
     /// 4): [`ReceiverRole::apply_keys`] rebuilds the trusted list from them.
     authority_keys: Vec<(u32, Option<u32>)>,
+    /// The applied key generation, shared with the sender role (H8
+    /// finding 4).
+    key_generation: Arc<crate::wire_auth::KeyGeneration>,
     /// The remote abort each authenticated subscription admits, by
     /// endpoint and stream: copied to each image at admission.
     abort_scopes: Vec<(EndpointId, i32, AbortScope)>,
@@ -1962,6 +1965,10 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     due: Vec<(EndpointId, SetupAnnounce)>,
     /// The authenticated publications' keys (ADR-0086).
     publication_auth: Vec<PublicationAuth>,
+    /// The applied key generation, shared with the receiver role: a
+    /// prepared datagram made under an older one is dropped unsent (H8
+    /// finding 4).
+    key_generation: Arc<crate::wire_auth::KeyGeneration>,
     /// The encrypted publications' keys (ADR-0114).
     enc: publish_enc::SenderEnc,
     /// The incarnations in `Aborting`, sent and resent at each duty.
@@ -2156,8 +2163,10 @@ pub(super) fn roles<T: StreamTerms>(
             ),
         })
         .collect();
+    let key_generation = Arc::new(crate::wire_auth::KeyGeneration::default());
     Ok((
         SenderRole {
+            key_generation: Arc::clone(&key_generation),
             sessions: send,
             from_receiver,
             publications: Vec::with_capacity(config.publications),
@@ -2230,6 +2239,7 @@ pub(super) fn roles<T: StreamTerms>(
             nak_log: Vec::new(),
         },
         ReceiverRole {
+            key_generation,
             #[cfg(test)]
             drop_data: Vec::new(),
             #[cfg(test)]
@@ -2950,6 +2960,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
 
         if let Some(intake) = self.signed.as_deref_mut() {
             intake.new_cycle();
+            // Expired cache entries go, with their sealers (H8 finding 8).
+            intake.prune(now);
         }
         if let Some(authority) = self.guard_authority.as_deref_mut() {
             authority.new_cycle();
@@ -2985,6 +2997,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 endpoint,
                 destination,
                 bytes: raw,
+                generation: self.key_generation.current(),
             }) {
                 Ok(()) => self.count(|c| &mut c.guard_challenges),
                 Err(_) => self.count(|c| &mut c.ring_full_raw),
@@ -3052,8 +3065,15 @@ impl<T: StreamTerms> ReceiverRole<T> {
     /// exists yet: no authenticated channel can open, and the reload timer
     /// is wired with that enablement.
     pub fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        // A changed set moves the generation: every prepared send made
+        // under the previous one is dropped at submission.
+        self.key_generation.observe(keys);
         for auth in &mut self.subscription_auth {
             auth.apply_keys(keys);
+        }
+        // The guard authority's own signer.
+        if let Some(authority) = self.guard_authority.as_deref_mut() {
+            authority.apply_keys(keys);
         }
         for image in &mut self.images {
             if let Some(auth) = image.auth.as_deref_mut() {
@@ -3071,6 +3091,11 @@ impl<T: StreamTerms> ReceiverRole<T> {
             && let Some(authorities) = receive_auth::authorities_for(keys, &mut self.authority_keys)
         {
             signed.replace_authorities(authorities);
+        }
+        // The cached SESSION_ABORT_ACK resends, of images retired since
+        // included (H8 finding 8).
+        if let Some(signed) = self.signed.as_deref_mut() {
+            signed.for_each_cached(|resend| resend.sealer.apply_keys(keys));
         }
     }
 
@@ -5640,7 +5665,9 @@ impl<T: StreamTerms> Intake<'_, T> {
                     auth.stream_id == alias.stream_id
                         && (auth.endpoint == self.endpoint || auth.endpoint == endpoint)
                 })
-                .map(|auth| auth.rsp_sealer(alias))
+                // Bound to the key generation: a queued copy of the proof
+                // seals nothing once the keys change (H8 finding 4).
+                .map(|auth| auth.rsp_sealer(alias).bound_to(&self.role.key_generation))
         });
         let seal = match seal {
             Some(seal) => Some(seal),
@@ -6280,6 +6307,9 @@ struct PendingAbort {
     next_at: u64,
     /// The delay after the next send.
     backoff: u64,
+    /// The applied key generation its signature was checked under: on a
+    /// change it is revalidated before the next send (H8 finding 4).
+    generation: u64,
 }
 
 /// The alias of a frame a sender authenticates in domain 1 that names an
@@ -6384,6 +6414,7 @@ impl<T: StreamTerms> Intake<'_, T> {
             endpoint: self.endpoint,
             destination: answer.destination,
             bytes: raw,
+            generation: self.role.key_generation.current(),
         }) {
             self.role.count(|c| &mut c.guard_statuses_sent);
         }
@@ -6669,6 +6700,7 @@ impl<T: StreamTerms> Intake<'_, T> {
             endpoint: resend.endpoint,
             destination: resend.destination,
             bytes: raw,
+            generation: self.role.key_generation.current(),
         })
     }
 
@@ -7843,6 +7875,7 @@ impl<T: StreamTerms> SenderRole<T> {
             first: None,
             next_at: 0,
             backoff: ABORT_RESEND_INITIAL_NS,
+            generation: self.key_generation.current(),
         });
         true
     }
@@ -7866,6 +7899,28 @@ impl<T: StreamTerms> SenderRole<T> {
                 at += 1;
                 continue;
             }
+            // Signed before a key change: sent again only while its
+            // publication still holds its abort authority, whose key the
+            // key application drops once withdrawn (H8 finding 4).
+            let generation = self.key_generation.current();
+            if pending.generation != generation {
+                let (endpoint, alias) = (pending.endpoint, pending.alias);
+                let signs = self
+                    .publication_auth_index(endpoint, alias)
+                    .and_then(|index| self.publication_auth.get(index))
+                    .is_some_and(|auth| auth.abort.is_some());
+                if !signs {
+                    self.aborts.swap_remove(at);
+                    self.count(|c| &mut c.aborts_interrupted);
+                    continue;
+                }
+                if let Some(pending) = self.aborts.get_mut(at) {
+                    pending.generation = generation;
+                }
+            }
+            let Some(pending) = self.aborts.get(at) else {
+                break;
+            };
             let (endpoint, alias, bytes, resend) = (
                 pending.endpoint,
                 pending.alias,
@@ -8018,6 +8073,7 @@ impl<T: StreamTerms> SenderRole<T> {
     /// exists yet: no authenticated channel can open, and the reload timer
     /// is wired with that enablement.
     pub fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        self.key_generation.observe(keys);
         self.enc.apply_keys(keys);
         for auth in &mut self.publication_auth {
             auth.apply_keys(keys);
@@ -8561,7 +8617,14 @@ impl<T: StreamTerms> SenderRole<T> {
                     endpoint,
                     destination,
                     bytes,
+                    generation,
                 } => {
+                    // Signed or sealed under keys since changed: dropped
+                    // unsent (H8 finding 4).
+                    if generation != self.key_generation.current() {
+                        self.count(|c| &mut c.seal_failures);
+                        continue;
+                    }
                     let _ = self.send_raw(halves, endpoint, destination, bytes.get());
                 }
             }

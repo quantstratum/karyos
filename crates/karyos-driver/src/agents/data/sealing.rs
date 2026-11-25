@@ -213,17 +213,15 @@ impl<T: StreamTerms> Outbound<T> {
     /// still verifies through the overlap, re-keyed to the new signing
     /// file under the same establishment (no re-establishment; the new key
     /// starts its own sequence); otherwise (revoked, expired, no longer
-    /// verifying, or the store disabled) dropped, which erases it, and the
-    /// publication sends nothing until a new establishment keys it again.
+    /// verifying, or the store disabled) withdrawn, its key erased in
+    /// place. A withdrawn one stays installed as a tombstone (H8 N1): it
+    /// seals nothing, does not come back if its file does, and a sealer of
+    /// the same establishment (party) is refused, so no sequence restarts
+    /// under its key; only a new establishment, with new key derivation
+    /// inputs, replaces it.
     pub(crate) fn follow_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
         match &mut self.auth {
-            SenderAuth::Sealing(sealer) => {
-                sealer.follow(keys);
-                if !sealer.can_seal() {
-                    // Dropping the box erases the key.
-                    self.auth = SenderAuth::Pending;
-                }
-            }
+            SenderAuth::Sealing(sealer) => sealer.follow(keys),
             // An encrypted publication's domain 1 sealer: withdrawn, its
             // key erased in place, once its key epoch is revoked or
             // expired. It stays installed as a tombstone: it seals nothing,

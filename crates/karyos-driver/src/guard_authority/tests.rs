@@ -332,3 +332,20 @@ fn unreadable_committed_state_disables_signing() {
     );
     assert_eq!(authority.answered, 0);
 }
+
+/// H8 finding 4: the guard authority takes part in key application: once
+/// its key no longer signs (revoked, expired, or the store disabled) it
+/// signs no STATUS again, and its signer is overwritten.
+#[test]
+fn a_withdrawn_authority_key_signs_no_status() {
+    let mut authority = authority(vec![guard(11, &[(66, at(1))])]);
+    assert!(authority.answer(&challenge(11, 66, 1), at(1), 0).is_ok());
+    authority.apply_keys(&crate::wire_auth::FixedKeys::default());
+    assert!(!authority.signing());
+    assert_eq!(
+        authority
+            .answer(&challenge(11, 66, 2), at(1), 0)
+            .unwrap_err(),
+        ChallengeRefusal::Uncommitted
+    );
+}

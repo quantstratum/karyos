@@ -546,6 +546,24 @@ impl<R: Clone> SignedIntake<R> {
         self.cache.forget(drop);
     }
 
+    /// Runs `apply` on every cached resend, terminal ones included (an
+    /// image retired since): key withdrawal reaches their sealers (H8
+    /// finding 8).
+    pub fn for_each_cached(&mut self, mut apply: impl FnMut(&mut R)) {
+        for entry in &mut self.cache.entries {
+            apply(&mut entry.resend);
+        }
+    }
+
+    /// Drops every cache entry past its deadline at `now`, and with it the
+    /// sealer it holds (H8 finding 8). Allocates nothing.
+    pub fn prune(&mut self, now: u64) {
+        self.cache.entries.retain(|entry| now < entry.expires);
+        if self.cache.next >= self.cache.entries.len() {
+            self.cache.next = 0;
+        }
+    }
+
     /// The digest cache entries held (tests).
     #[cfg(test)]
     #[must_use]

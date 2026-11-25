@@ -255,6 +255,10 @@ pub enum ControlItem {
         destination: SocketAddr,
         /// The datagram.
         bytes: SealedBytes,
+        /// The applied key generation it was signed or sealed under: the
+        /// sender drops it unsent once the generation has moved (H8
+        /// finding 4).
+        generation: u64,
     },
     /// `control` arrived on `endpoint` from `source`, for a local
     /// publication.
@@ -507,6 +511,10 @@ pub struct SharedSealer {
     /// Set once the key is withdrawn: no holder seals again, whatever the
     /// shared sealer can erase itself (H8 finding 4).
     withdrawn: Arc<core::sync::atomic::AtomicBool>,
+    /// The key generation it was made under, for a copy that must not
+    /// outlive a key change (a queued RSP_SETUP proof): it seals nothing
+    /// once the generation has moved (H8 finding 4).
+    generation: Option<(Arc<crate::wire_auth::KeyGeneration>, u64)>,
 }
 
 impl core::fmt::Debug for SharedSealer {
@@ -526,6 +534,7 @@ impl SharedSealer {
             sealer: Arc::new(Mutex::new(sealer)),
             domain,
             withdrawn: Arc::default(),
+            generation: None,
         }
     }
 
@@ -537,6 +546,7 @@ impl SharedSealer {
             sealer: Arc::new(Mutex::new(seal)),
             domain,
             withdrawn: Arc::default(),
+            generation: None,
         }
     }
 
@@ -549,7 +559,18 @@ impl SharedSealer {
             sealer: Arc::new(Mutex::new(proof)),
             domain,
             withdrawn: Arc::default(),
+            generation: None,
         }
+    }
+}
+
+impl SharedSealer {
+    /// Binds it to the current key `generation`: once that moves, it
+    /// seals nothing (H8 finding 4).
+    #[must_use]
+    pub fn bound_to(mut self, generation: &Arc<crate::wire_auth::KeyGeneration>) -> Self {
+        self.generation = Some((Arc::clone(generation), generation.current()));
+        self
     }
 }
 
@@ -560,6 +581,13 @@ impl ControlSeal for SharedSealer {
 
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
         if self.withdrawn.load(core::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        if self
+            .generation
+            .as_ref()
+            .is_some_and(|(generation, made)| generation.current() != *made)
+        {
             return None;
         }
         self.sealer.lock().ok()?.seal_control(buffer, frames)

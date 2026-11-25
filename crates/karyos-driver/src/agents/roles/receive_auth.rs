@@ -373,7 +373,8 @@ impl ImageAuth {
     pub(crate) fn apply_keys(&mut self, keys: &dyn KeySet) {
         use crate::wire_auth::{KeyMove, key_move};
 
-        self.verifier.apply(keys);
+        // A live verifier: a dropped file epoch never returns (H8 N1).
+        self.verifier.apply_live(keys);
         self.verifier.tick(self.now());
         if self.withdrawn {
             return;
@@ -611,5 +612,39 @@ mod tests {
         assert_eq!(changed.map(|list| list.len()), Some(0));
         assert_eq!(applied, vec![(10, None)]);
         assert!(authorities_for(&FixedKeys::default(), &mut applied).is_none());
+    }
+
+    /// H8 finding 4: a queued copy of the RSP_SETUP proof is bound to the
+    /// applied key generation: it seals while the keys stay as they were,
+    /// and nothing once they change.
+    #[test]
+    fn a_queued_rsp_proof_seals_nothing_after_a_key_change() {
+        use std::sync::Arc;
+
+        use super::SubscriptionAuth;
+        use crate::wire_auth::KeyGeneration;
+
+        let auth = SubscriptionAuth::new(
+            crate::agents::EndpointId(1),
+            ALIAS,
+            &channel(1),
+            &pairwise(1),
+            66,
+        )
+        .unwrap();
+        let generation = Arc::new(KeyGeneration::default());
+        let same = || FixedKeys {
+            files: vec![channel(1), pairwise(1)],
+        };
+        generation.observe(&same());
+        let mut queued = auth.rsp_sealer(ALIAS).bound_to(&generation);
+        let mut buffer = [0u8; 8 + ENVELOPE_LEN];
+        assert!(queued.seal_control(&mut buffer, 8).is_some());
+        assert!(!generation.observe(&same()), "unchanged");
+        assert!(queued.seal_control(&mut buffer, 8).is_some());
+        assert!(generation.observe(&FixedKeys {
+            files: vec![channel(1)],
+        }));
+        assert!(queued.seal_control(&mut buffer, 8).is_none());
     }
 }

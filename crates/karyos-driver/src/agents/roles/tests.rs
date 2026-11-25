@@ -7624,13 +7624,25 @@ fn a_reload_without_the_channel_key_stops_an_authenticated_publication() {
     sender.apply_keys(&FixedKeys {
         files: vec![parse("9-1.key", pair_text)],
     });
-    assert_eq!(sender.publications[0].sealer_party(), None);
+    // Withdrawn, and kept as a tombstone (H8 N1): it seals nothing.
+    assert_eq!(sender.publications[0].sealer_party(), Some(party));
     assert!(!sender.send_sender_control_for(&mut halves, EndpointId(1), destination, &heartbeat));
     assert_eq!(sender.counters().seal_failures, 1);
     assert!(sender.publication_auth[0].sealer(party).is_err());
-    // The key back: a new establishment installs a sealer and it sends.
+    // The key back: the same establishment stays withdrawn, its sealer
+    // never reinstalled (H8 N1); a new establishment installs one and it
+    // sends.
     sender.apply_keys(&both());
-    let sealer = sender.publication_auth[0].sealer(party).unwrap();
+    assert!(!sender.send_sender_control_for(&mut halves, EndpointId(1), destination, &heartbeat));
+    let same = sender.publication_auth[0].sealer(party).unwrap();
+    assert!(sender.publications[0].install_sealer(same).is_err());
+    let fresh = Party::Sender {
+        identity: identity(),
+        lane_count: 1,
+        receiver_boot_id: [7, 8],
+        nonce: [5, 5],
+    };
+    let sealer = sender.publication_auth[0].sealer(fresh).unwrap();
     sender.publications[0].install_sealer(sealer).unwrap();
     assert!(sender.send_sender_control_for(&mut halves, EndpointId(1), destination, &heartbeat));
 }

@@ -365,3 +365,22 @@ fn the_digest_cache_is_scoped_and_bounded() {
         Ok(Received::Fresh(_))
     ));
 }
+
+/// H8 finding 8: key application reaches every cached resend, a terminal
+/// one included, and an entry past its deadline is pruned with its
+/// resend (and so its sealer).
+#[test]
+fn the_cache_follows_key_application_and_prunes_expired_entries() {
+    let mut intake = SignedIntake::<u8>::new(vec![authority(true)], 0);
+    intake.applied(1, source(), [1; 32], 7, 0);
+    let mut seen = 0;
+    intake.for_each_cached(|resend| {
+        seen += 1;
+        *resend = 0;
+    });
+    assert_eq!((seen, intake.cached()), (1, 1));
+    intake.prune(1);
+    assert_eq!(intake.cached(), 1, "within its retention");
+    intake.prune(u64::MAX);
+    assert_eq!(intake.cached(), 0, "pruned past its deadline");
+}

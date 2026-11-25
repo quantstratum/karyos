@@ -294,7 +294,9 @@ impl PublicationAuth {
             receiver.rsp.apply(keys);
             receiver.prototype.apply(keys);
             if let Some(bound) = receiver.bound.as_mut() {
-                bound.verifier.apply(keys);
+                // A live verifier: a dropped file epoch never returns (H8
+                // N1).
+                bound.verifier.apply_live(keys);
                 bound.verifier.tick(now);
             }
             if let Some(lowest) = keys
@@ -1045,5 +1047,74 @@ mod tests {
         ));
         let mut old_receiver = receiver_sealer(&p1, [1, 1]);
         assert!(open(&mut auth, &sm(&mut old_receiver, &status([1, 1]))).is_err());
+    }
+
+    /// H8 N1: a recoverable store failure (every key withdrawn, then the
+    /// same files back) never resets replay state under an unchanged
+    /// traffic key. The live verifiers keep the dropped file epochs as
+    /// tombstones, so old DATA and old SMs stay refused, and the withdrawn
+    /// sealers stay withdrawn; traffic resumes only after a fresh
+    /// establishment.
+    #[test]
+    fn a_restored_key_set_does_not_reopen_replay() {
+        use crate::agents::control::ControlSeal;
+        use crate::agents::roles::receive_auth::ImageAuth;
+        use crate::wire_auth::FixedKeys;
+
+        let c1 = channel_epoch(1, '1');
+        let p1 = pairwise(1, '2');
+        let all = || FixedKeys {
+            files: vec![channel_epoch(1, '1'), pairwise(1, '2')],
+        };
+        let mut auth =
+            PublicationAuth::new(EndpointId(1), ALIAS, IDENTITY, 1, &c1, &[&p1]).unwrap();
+        auth.set_clock(|| 1_000);
+        let Ok(Opened::RspSetup(_, establishing)) =
+            open(&mut auth, &challenge(&p1, [1, 1], [9, 9]))
+        else {
+            panic!("the receiver binds");
+        };
+        let mut session = auth.sealer(establishing.party).unwrap();
+        let receiver = Party::Receiver {
+            identity: IDENTITY,
+            receiver_boot_id: [1, 1],
+            receiver_id: 66,
+        };
+        let mut image = ImageAuth::new([&c1], &p1, establishing.party, receiver, ALIAS).unwrap();
+        image.set_clock(|| 1_000);
+        let mut image_sealer = image.sealer();
+        let mut data_bytes = vec![0u8; 8 + ENVELOPE_LEN];
+        let length = session.seal(&mut data_bytes, 8).unwrap();
+        data_bytes.truncate(length);
+        let old_data = data_bytes;
+        let old_sm = sealed(&status([1, 1]), |bytes, length| {
+            image_sealer.seal_control(bytes, length).unwrap()
+        });
+        let checked = image.check(&old_data, 1_000).unwrap();
+        assert!(image.commit(checked, 1_000).is_ok());
+        assert!(matches!(open(&mut auth, &old_sm), Ok(Opened::Receiver(_))));
+        // The store fails (every key withdrawn), then reloads the same files.
+        for keys in [FixedKeys::default(), all()] {
+            auth.apply_keys(&keys);
+            image.apply_keys(&keys);
+            session.follow(&keys);
+        }
+        // Old DATA and old SMs stay refused: no empty window came back.
+        assert!(image.check(&old_data, 1_000).is_err());
+        assert!(open(&mut auth, &old_sm).is_err());
+        // The sealers stay withdrawn under the restored key.
+        let mut bytes = vec![0u8; 8 + ENVELOPE_LEN];
+        assert!(session.seal(&mut bytes, 8).is_err());
+        assert!(image.withdrawn());
+        // A fresh establishment (a new boot id) binds and works again.
+        assert!(matches!(
+            open(&mut auth, &challenge(&p1, [2, 2], [8, 8])),
+            Ok(Opened::RspSetup(_, fresh)) if fresh.bind
+        ));
+        let mut fresh = receiver_sealer(&p1, [2, 2]);
+        assert!(matches!(
+            open(&mut auth, &sm(&mut fresh, &status([2, 2]))),
+            Ok(Opened::Receiver(_))
+        ));
     }
 }

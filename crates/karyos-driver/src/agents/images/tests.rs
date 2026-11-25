@@ -7969,6 +7969,65 @@ fn an_unacknowledged_abort_is_resent_then_reported_interrupted() {
     assert_eq!(rig.agents.sender.role.pending_aborts(), 0);
 }
 
+/// H8 finding 4: a pending SESSION_ABORT signed before a key change is
+/// revalidated before its next send: its publication's abort authority
+/// was dropped with the key, so it is retired as interrupted, never sent.
+#[test]
+fn a_pending_abort_under_a_withdrawn_key_is_not_sent() {
+    use crate::agents::roles::publish_auth::AbortAuthority;
+    use crate::authority::Ed25519Signer;
+    use karyos_protocol::network::authenticated::GUARD_CLOSED;
+
+    let (mut rig, _b, _channel) = authenticated_rig();
+    let a = rig.publisher;
+    rig.agents.sender.role.set_abort_authority(
+        a,
+        alias(),
+        AbortAuthority::new(Ed25519Signer::from_seed(&[9; 32]), 10, 10),
+    );
+    let _slot = established(&mut rig);
+    assert!(
+        rig.agents
+            .sender
+            .role
+            .request_abort(a, alias(), GUARD_CLOSED, 11, 3)
+    );
+    rig.agents
+        .sender
+        .role
+        .apply_keys(&crate::wire_auth::FixedKeys::default());
+    rig.round(true);
+    let sender = rig.agents.sender.role.counters();
+    assert_eq!((sender.aborts_sent, sender.aborts_interrupted), (0, 1));
+    assert_eq!(rig.agents.sender.role.pending_aborts(), 0);
+}
+
+/// H8 finding 4: a prepared datagram (a signed STATUS, a sealed ACK, a
+/// guard challenge) queued under an older key generation is dropped at
+/// submission, never sent.
+#[test]
+fn a_raw_datagram_of_an_older_key_generation_is_not_sent() {
+    use crate::agents::control::{ControlItem, SealedBytes};
+
+    let (mut rig, _b) = Rig::new(Setup::default());
+    let a = rig.publisher;
+    rig.agents
+        .sender
+        .role
+        .apply_keys(&crate::wire_auth::FixedKeys::default());
+    let before = rig.agents.sender.role.counters();
+    rig.agents.receiver.role.post_to_sender(ControlItem::Raw {
+        endpoint: a,
+        destination: "10.0.0.9:5000".parse().unwrap(),
+        bytes: SealedBytes::copy(&[1, 2, 3]).unwrap(),
+        generation: 0,
+    });
+    rig.round(true);
+    let after = rig.agents.sender.role.counters();
+    assert_eq!(after.raw_sent, before.raw_sent);
+    assert!(after.seal_failures > before.seal_failures);
+}
+
 /// Marks in memory, for a followed guard.
 #[derive(Debug, Default)]
 struct MemoryMarks(std::collections::HashMap<u64, u64>);

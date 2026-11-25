@@ -386,6 +386,11 @@ impl Sealer {
     /// epoch 0 and sequence 0, when the key rotated to a newer file epoch
     /// and its own still verifies (the overlap); withdrawn otherwise.
     pub fn follow(&mut self, keys: &dyn KeySet) {
+        // A withdrawn sealer is a tombstone: it never comes back, even if
+        // its file does (H8 N1).
+        if self.withdrawn {
+            return;
+        }
         match key_move(self.key_ref(), keys) {
             KeyMove::Keep => {}
             KeyMove::Rekey(file) => match self.rekeyed(file) {
@@ -525,6 +530,10 @@ pub struct Verifier {
     alias: Alias,
     key_id: u32,
     epochs: [Option<EpochKeys>; MAX_FILE_EPOCHS],
+    /// The highest file epoch a live verifier ever dropped (H8 N1): it
+    /// never verifies again, so a file withdrawn and then restored cannot
+    /// return with an empty replay window.
+    dropped: Option<u32>,
 }
 
 impl core::fmt::Debug for Verifier {
@@ -561,6 +570,7 @@ impl Verifier {
             alias,
             key_id: 0,
             epochs: [None, None],
+            dropped: None,
         };
         verifier.refresh(files)?;
         if verifier.epochs.iter().flatten().next().is_none() {
@@ -640,6 +650,7 @@ impl Verifier {
             alias,
             key_id: self.key_id,
             epochs: [None, None],
+            dropped: None,
         };
         let mut epochs: [Option<EpochKeys>; MAX_FILE_EPOCHS] = [None, None];
         for (slot, keys) in epochs.iter_mut().zip(&self.epochs) {
@@ -675,6 +686,37 @@ impl Verifier {
         let files = keys.verifying(self.key_id);
         if self.refresh(files.iter().flatten().copied()).is_err() {
             self.epochs = [None, None];
+        }
+    }
+
+    /// Applies the key store's current key set to a live verifier, one
+    /// whose windows hold traffic (an image's, a bound receiver's), as
+    /// [`Verifier::apply`] does, but a file epoch once dropped is a
+    /// tombstone (H8 N1): if the same file returns (a store disabled and
+    /// then reloaded, a revocation undone) it is not re-admitted, because
+    /// its window would restart empty under an unchanged traffic key and
+    /// replay old datagrams. Traffic under it resumes only after a fresh
+    /// establishment, with new key derivation inputs.
+    pub fn apply_live(&mut self, keys: &dyn KeySet) {
+        let held = self
+            .epochs
+            .each_ref()
+            .map(|keys| keys.as_ref().map(|k| k.file_epoch));
+        let dropped = self.dropped;
+        let files = keys
+            .verifying(self.key_id)
+            .map(|file| file.filter(|file| dropped.is_none_or(|floor| file.file_epoch > floor)));
+        if self.refresh(files.iter().flatten().copied()).is_err() {
+            self.epochs = [None, None];
+        }
+        let kept = self
+            .epochs
+            .each_ref()
+            .map(|keys| keys.as_ref().map(|k| k.file_epoch));
+        for epoch in held.iter().flatten() {
+            if !kept.contains(&Some(*epoch)) {
+                self.dropped = Some(self.dropped.map_or(*epoch, |floor| floor.max(*epoch)));
+            }
         }
     }
 
@@ -910,6 +952,58 @@ pub trait KeySet {
     fn verifying(&self, key_id: u32) -> [Option<&KeyFile>; MAX_FILE_EPOCHS];
     /// The current file epoch of `key_id` from the durable lineage.
     fn current_epoch(&self, key_id: u32) -> Option<u32>;
+    /// A digest of the whole set (every file, whether it signs and
+    /// whether it verifies): it changes whenever the set does, so the
+    /// roles bump their [`KeyGeneration`] and drop prepared traffic made
+    /// under the previous set (H8 finding 4).
+    fn fingerprint(&self) -> u64;
+}
+
+/// FNV-1a over `words`, from `hash`.
+fn fnv(mut hash: u64, words: &[u64]) -> u64 {
+    for word in words {
+        for byte in word.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// The applied key generation shared by a driver's roles (H8 finding 4):
+/// bumped whenever an applied key set differs from the last one. Every
+/// prepared send (a queued proof, a signed or sealed datagram, a pending
+/// abort) records the generation it was made under and is dropped, or
+/// revalidated, at submission once the generation has moved.
+#[derive(Debug, Default)]
+pub struct KeyGeneration {
+    generation: core::sync::atomic::AtomicU64,
+    fingerprint: core::sync::atomic::AtomicU64,
+}
+
+impl KeyGeneration {
+    /// The current generation.
+    #[must_use]
+    pub fn current(&self) -> u64 {
+        self.generation.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Records the key set `keys` was applied; bumps the generation when
+    /// it differs from the last one. Returns whether it did.
+    pub fn observe(&self, keys: &dyn KeySet) -> bool {
+        let fingerprint = keys.fingerprint();
+        let last = self
+            .fingerprint
+            .swap(fingerprint, core::sync::atomic::Ordering::AcqRel);
+        if last == fingerprint {
+            return false;
+        }
+        self.generation
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        true
+    }
 }
 
 /// What a live sealer under the file `(key_id, file_epoch)` does with a
@@ -988,6 +1082,30 @@ impl<K: crate::wire_keys::store::Files, S: crate::wire_keys::store::Files> KeySe
             .get(&key_id)
             .map(|lineage| lineage.highest)
     }
+
+    fn fingerprint(&self) -> u64 {
+        let mut hash = fnv(FNV_OFFSET, &[u64::from(self.store.is_disabled())]);
+        for file in self.store.loaded() {
+            let signs = self
+                .signing(file.key_id)
+                .is_some_and(|signing| signing.file_epoch == file.file_epoch);
+            let verifies = self
+                .verifying(file.key_id)
+                .iter()
+                .flatten()
+                .any(|held| held.file_epoch == file.file_epoch);
+            hash = fnv(
+                hash,
+                &[
+                    u64::from(file.key_id),
+                    u64::from(file.file_epoch),
+                    u64::from(signs),
+                    u64::from(verifies),
+                ],
+            );
+        }
+        hash
+    }
 }
 
 /// A fixed key set (tests): `files` as loaded, the highest epoch of a
@@ -1020,6 +1138,14 @@ impl KeySet for FixedKeys {
 
     fn current_epoch(&self, key_id: u32) -> Option<u32> {
         self.signing(key_id).map(|file| file.file_epoch)
+    }
+
+    fn fingerprint(&self) -> u64 {
+        let mut hash = FNV_OFFSET;
+        for file in &self.files {
+            hash = fnv(hash, &[u64::from(file.key_id), u64::from(file.file_epoch)]);
+        }
+        hash
     }
 }
 

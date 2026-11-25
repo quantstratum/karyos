@@ -223,6 +223,20 @@ impl GuardAuthority {
         })
     }
 
+    /// Applies the key store's current key set (H8 finding 4): once its
+    /// `key_id` no longer has a signing file (revoked, expired, or the
+    /// store disabled) the signer is overwritten and signing stops for
+    /// good; STATUS challenges are then refused as
+    /// [`ChallengeRefusal::Uncommitted`]. A restored key does not bring it
+    /// back: a new authority must be configured.
+    pub fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        if keys.signing(self.key_id).is_none() {
+            self.signing = false;
+            // The old signing key is dropped, and erased, here.
+            self.signer = Ed25519Signer::from_seed(&[0; crate::authority::KEY_LEN]);
+        }
+    }
+
     /// A new duty cycle.
     pub fn new_cycle(&mut self) {
         self.cycle_left = STATUS_PER_CYCLE;
