@@ -203,7 +203,7 @@ pub enum CapabilityState {
 
 /// The capability names of API v1, a closed list: a later agent may add
 /// names, and a client ignores the ones it does not know.
-pub const CAPABILITIES: [&str; 17] = [
+pub const CAPABILITIES: [&str; 18] = [
     "view",
     "guard-close",
     "guard-reopen",
@@ -221,6 +221,7 @@ pub const CAPABILITIES: [&str; 17] = [
     "clocks",
     "rate-limits",
     "cluster-command",
+    "journal-history",
 ];
 
 /// The byte bound of a `trace-buckets` reply (R-CORE-23). A reply holds
@@ -326,6 +327,11 @@ pub struct JournalView {
     /// Whether a purge intent is outstanding: every further purge is
     /// refused until it is reconciled.
     pub purge_pending: bool,
+    /// The journal's recording and durable end when the view was taken
+    /// (R-CORE-14; karyos#725): a reader that follows the history from
+    /// here misses no record written after the view and sees none written
+    /// before it again. `None` while the journal is unavailable.
+    pub head: Option<crate::journal::HistoryCursor>,
 }
 
 /// An unknown interval in the journal: operations may have taken effect

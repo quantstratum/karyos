@@ -285,7 +285,124 @@ fn journal_view(out: &mut Out<'_>, journal: &JournalView) {
             });
         });
         fields.key("purge_pending").bool(journal.purge_pending);
+        // The handoff to the history (R-CORE-14; karyos#725).
+        fields.key("head").option(journal.head, |out, head| {
+            out.object(|fields| {
+                fields.number("recording", head.recording);
+                fields.number("position", head.position);
+            });
+        });
     });
+}
+
+/// A page of the journal's history (R-CORE-14; karyos#725):
+/// `{"recording":R,"floor":F,"head":H,"records":[...],"next":N,
+/// "unknown_intervals":[P...]}`, each record `{"position":P,"next":N,
+/// "kind":K, ...}` with its fields, an unknown interval's with its
+/// `"gap_reason"`, and a frame that is no record `{"position":P,
+/// "next":N,"kind":"undecodable"}`.
+#[must_use]
+pub fn journal_history(page: &crate::journal::HistoryPage) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields.number("recording", page.recording);
+        fields.number("floor", page.floor);
+        fields.number("head", page.head);
+        fields.key("records").array(&page.records, |out, record| {
+            history_record(out, record);
+        });
+        fields.number("next", page.next);
+        fields
+            .key("unknown_intervals")
+            .array(&page.unknown_intervals(), |out, position| {
+                out.number(position);
+            });
+    });
+    text
+}
+
+fn history_record(out: &mut Out<'_>, record: &crate::journal::HistoryRecord) {
+    use crate::journal::{GapReason, Kind};
+
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    out.object(|fields| {
+        fields.number("position", record.position);
+        fields.number("next", record.next);
+        let Some(body) = record.record.as_ref() else {
+            fields.string("kind", "undecodable");
+            return;
+        };
+        fields.string("kind", body.kind.name());
+        fields.number("time", body.time);
+        if body.kind == Kind::UnknownInterval {
+            fields.string("gap_reason", GapReason::from_code(body.code).name());
+        }
+        fields.number("guard", body.guard);
+        fields.number("expected", body.expected);
+        fields.number("operation", body.operation);
+        fields.number("operator", body.operator);
+        fields.number("parameters", body.parameters);
+        fields.number("code", body.code);
+        fields.number("word", body.word);
+        fields.string("reason", &text(&body.reason));
+        fields.number("relay", body.relay);
+        for (key, value) in [
+            ("target", &body.target),
+            ("boot", &body.boot),
+            ("command", &body.command),
+            ("evidence", &body.evidence),
+        ] {
+            if !value.is_empty() {
+                fields.string(key, &text(value));
+            }
+        }
+        if !body.bytes.is_empty() {
+            fields.string("bytes", &hex(&body.bytes));
+        }
+        if body.instance != 0 {
+            fields.string("instance", &format!("{:032x}", body.instance));
+        }
+    });
+}
+
+/// A refused history read (R-CORE-14; karyos#725), typed:
+/// `{"error":TEXT,"refusal":NAME}` with the recording and floor of a
+/// cursor of another recording or below the floor, the durable end of
+/// one past it, and the position of one that is not a record.
+#[must_use]
+pub fn history_refusal(refusal: crate::journal::HistoryRefusal) -> String {
+    use crate::journal::HistoryRefusal;
+
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        let message = match refusal {
+            HistoryRefusal::NotConfigured => "no journal",
+            HistoryRefusal::Unavailable => "journal unavailable",
+            HistoryRefusal::RecordingChanged { .. } => "recording changed",
+            HistoryRefusal::BelowFloor { .. } => "below floor",
+            HistoryRefusal::Ahead { .. } => "cursor ahead",
+            HistoryRefusal::NotARecord { .. } => "not a record",
+            _ => "journal corrupt",
+        };
+        fields.string("error", message);
+        fields.string("refusal", refusal.name());
+        match refusal {
+            HistoryRefusal::RecordingChanged { recording, floor }
+            | HistoryRefusal::BelowFloor { recording, floor } => {
+                fields.number("recording", recording);
+                fields.number("floor", floor);
+            }
+            HistoryRefusal::Ahead { recording, head } => {
+                fields.number("recording", recording);
+                fields.number("head", head);
+            }
+            HistoryRefusal::NotARecord { position } | HistoryRefusal::Corrupt { position } => {
+                fields.number("position", position);
+            }
+            _ => {}
+        }
+    });
+    text
 }
 
 /// `bytes` as lowercase hex.

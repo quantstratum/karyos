@@ -52,10 +52,15 @@
 //!   through the Archive library's engine over this directory
 //!   ([`retention`]); [`Integrity::purged`] lists each purged prefix with
 //!   its purge evidence.
+//! - **History** (R-CORE-14; karyos#725). [`Journal::history`] serves
+//!   the durable records in pages, with a cursor a reader keeps across
+//!   restarts, the retention floor, unknown intervals in place and a
+//!   sequence a reader checks for gaps ([`history`]).
 //! - **Encoding.** Sealing changed nothing in a record's layout
 //!   ([`JournalRecord::encode`]): a journal written before it decodes as it
 //!   did, and is sealed from its start at its next durable append.
 
+pub mod history;
 pub mod retention;
 #[cfg(test)]
 mod tests;
@@ -75,6 +80,9 @@ use karyos_archive::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
 use karyos_sys::frame::{FRAME_ALIGNMENT, FrameType, HEADER_LENGTH, Lane, Word0};
 
 use crate::retention::RangeOutcome;
+pub use history::{
+    HISTORY_DEFAULT, HISTORY_MAX, HistoryCursor, HistoryPage, HistoryRecord, HistoryRefusal,
+};
 pub use retention::{JournalPolicy, JournalRetention, JournalTrust, Purged};
 
 /// The journal recording's channel.
@@ -236,6 +244,39 @@ impl Kind {
             Self::ApprovalGranted => 24,
             Self::ApprovalWithdrawn => 25,
             Self::ApprovalExpired => 26,
+        }
+    }
+
+    /// Its name in the journal's history (R-CORE-14; karyos#725).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::CloseRequest => "close_request",
+            Self::CloseOutcome => "close_outcome",
+            Self::ReopenRequest => "reopen_request",
+            Self::ReopenOutcome => "reopen_outcome",
+            Self::UnknownInterval => "unknown_interval",
+            Self::GapAcknowledged => "gap_acknowledged",
+            Self::AgentStopped => "agent_stopped",
+            Self::AgentStarted => "agent_started",
+            Self::HoldRequest => "hold_request",
+            Self::HoldOutcome => "hold_outcome",
+            Self::ReleaseRequest => "release_request",
+            Self::ReleaseOutcome => "release_outcome",
+            Self::PurgeRequest => "purge_request",
+            Self::PurgeOutcome => "purge_outcome",
+            Self::VerifyRequest => "verify_request",
+            Self::VerifyOutcome => "verify_outcome",
+            Self::RateRequest => "rate_request",
+            Self::RateOutcome => "rate_outcome",
+            Self::Submitted => "submitted",
+            Self::ClusterRequest => "cluster_request",
+            Self::ClusterOutcome => "cluster_outcome",
+            Self::ClusterRefused => "cluster_refused",
+            Self::ApprovalRequested => "approval_requested",
+            Self::ApprovalGranted => "approval_granted",
+            Self::ApprovalWithdrawn => "approval_withdrawn",
+            Self::ApprovalExpired => "approval_expired",
         }
     }
 
@@ -575,6 +616,18 @@ impl GapReason {
             Self::UncleanStop => 3,
             Self::JournalReplaced => 4,
             Self::JournalUnavailableAtStart => 5,
+        }
+    }
+
+    /// Its name, as the view and the history show it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::RequestWithoutOutcome => "request_without_outcome",
+            Self::TornTail => "torn_tail",
+            Self::UncleanStop => "unclean_stop",
+            Self::JournalReplaced => "journal_replaced",
+            Self::JournalUnavailableAtStart => "journal_unavailable_at_start",
         }
     }
 

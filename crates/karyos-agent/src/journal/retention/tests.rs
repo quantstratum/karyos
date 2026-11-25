@@ -1132,3 +1132,30 @@ fn a_close_time_later_than_the_clock_is_not_expired() {
     );
     cleanup(&[&dir, &copy]);
 }
+
+/// R-CORE-14 (karyos#725): after a purge, a history cursor below the new
+/// retention floor is refused with the floor, never answered with an
+/// empty page, and a read without a cursor starts at the floor.
+#[test]
+fn a_history_cursor_below_the_floor_is_refused_with_it() {
+    use crate::journal::{HistoryCursor, HistoryRefusal};
+
+    let (mut journal, dir, copy) = filled("history-floor", Some(expired()));
+    let first = journal.history(None, 1).unwrap();
+    assert_eq!(first.floor, 0);
+    let old = HistoryCursor::new(first.recording, first.records[0].next);
+    assert_eq!(
+        journal.purge_journal(1, SEG, authorised(), 2),
+        RetentionReply::Done { evidenced: true }
+    );
+    assert_eq!(
+        journal.history(Some(old), 1),
+        Err(HistoryRefusal::BelowFloor {
+            recording: first.recording,
+            floor: SEG
+        })
+    );
+    let page = journal.history(None, 1).unwrap();
+    assert_eq!((page.floor, page.records[0].position), (SEG, SEG));
+    cleanup(&[&dir, &copy]);
+}
