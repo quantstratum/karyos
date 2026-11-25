@@ -62,6 +62,7 @@ use crate::repair::jobs::{Domain, JobKey, JobRef, Jobs, JobsConfig, JobsError, J
 use crate::repair::scheduler::{
     Head, RepairBudget, RepairRead, RepairReadError, RepairSubmit, Scheduler, Submit,
 };
+use crate::wire_auth::{ENVELOPE_LEN, Sealer};
 
 /// The repair settings of the sender agent (RC-11, RC-12; provisional and
 /// configurable).
@@ -247,6 +248,8 @@ impl RepairCounts {
 #[derive(Debug)]
 struct Scratch {
     bytes: Vec<u8>,
+    /// Its length already leaves room for an envelope.
+    reserved: bool,
     /// Lane, position and length of the staged head.
     staged: Option<(u8, u64, usize)>,
 }
@@ -321,6 +324,7 @@ impl RepairPath {
             scheduler: Scheduler::new(drr),
             scratch: RefCell::new(Scratch {
                 bytes: vec![0; mtu],
+                reserved: false,
                 staged: None,
             }),
             queues: [None; MAX_ROUTES],
@@ -572,7 +576,21 @@ impl RepairPath {
         budget: &mut RepairBudget,
         now: u64,
     ) -> Report {
-        self.serve_routes(&mut [Some(tx)], readers, limits, budget, now)
+        self.serve_routes(&mut [Some(tx)], readers, limits, budget, now, None)
+    }
+
+    /// Leaves room for an envelope of `envelope` bytes in every repair
+    /// datagram: reads stop that much short of the MTU, so a sealed repair
+    /// stays within it (ADR-0086 section 5). Allocates nothing; once is
+    /// enough.
+    pub(crate) fn reserve_envelope(&mut self, envelope: usize) {
+        if let Ok(mut scratch) = self.scratch.try_borrow_mut()
+            && !scratch.reserved
+        {
+            let inner = scratch.bytes.len().saturating_sub(envelope);
+            scratch.bytes.truncate(inner);
+            scratch.reserved = true;
+        }
     }
 
     /// [`RepairPath::serve`] over the live routes of a routed publication
@@ -581,7 +599,10 @@ impl RepairPath {
     /// datagram is read once and submitted on every one of them, debited
     /// once, at its first submission; a route that cannot take it skips
     /// it, counted, and its receivers ask again by NAK. The job completes
-    /// once every live route has submitted or skipped each datagram.
+    /// once every live route has submitted or skipped each datagram. An
+    /// authenticated publication passes its `seal`: each copy is sealed in
+    /// its own TX frame, under a fresh envelope sequence (ADR-0086 section
+    /// 6), never on the shared read.
     pub fn serve_routes<O: SocketOps, T: StreamTerms>(
         &mut self,
         routes: &mut [Option<&mut SocketsTx<O>>],
@@ -589,6 +610,7 @@ impl RepairPath {
         (sent_high, closed): (&[u64], &[bool]),
         budget: &mut RepairBudget,
         now: u64,
+        seal: Option<&mut Sealer>,
     ) -> Report {
         let mut read = ReadView {
             readers,
@@ -599,6 +621,7 @@ impl RepairPath {
         };
         let mut submit = SubmitView {
             routes,
+            seal,
             queues: self.queues,
             route_counts: &mut self.route_counts,
             scratch: &self.scratch,
@@ -744,6 +767,8 @@ impl<T: StreamTerms> RepairRead for ReadView<'_, T> {
 struct SubmitView<'a, 'b, O: SocketOps> {
     /// The live routes' TX halves, by route.
     routes: &'a mut [Option<&'b mut SocketsTx<O>>],
+    /// An authenticated publication's sealer.
+    seal: Option<&'a mut Sealer>,
     queues: [Option<TxQueueId>; MAX_ROUTES],
     route_counts: &'a mut [RouteRepairCounts; MAX_ROUTES],
     scratch: &'a RefCell<Scratch>,
@@ -799,17 +824,24 @@ fn cancel<O: SocketOps>(
     }
 }
 
-/// Copies `bytes` into `queue` on `tx` and submits it: one route's
-/// submission of a repair datagram.
+/// Copies `bytes` into `queue` on `tx`, sealed under `seal` when the
+/// publication is authenticated, and submits it: one route's submission of
+/// a repair datagram.
 fn submit_on<O: SocketOps>(
     tx: &mut SocketsTx<O>,
     queue: TxQueueId,
     bytes: &[u8],
+    seal: Option<&mut Sealer>,
     report: &mut TxReport,
     counts: &mut RepairCounts,
 ) -> Submit {
-    let len = bytes.len();
-    let mut frame = match tx.claim_tx(queue, len) {
+    let frames = bytes.len();
+    // A sealer at its usage limit sends nothing; the job keeps its cursor.
+    if seal.as_deref().is_some_and(|seal| !seal.can_seal()) {
+        return Submit::NotSubmitted;
+    }
+    let envelope = if seal.is_some() { ENVELOPE_LEN } else { 0 };
+    let mut frame = match tx.claim_tx(queue, frames + envelope) {
         Ok(frame) => frame,
         Err(
             ClaimError::QueueFull { .. }
@@ -818,10 +850,17 @@ fn submit_on<O: SocketOps>(
         ) => return Submit::NoRoom,
         Err(_) => return Submit::Broken,
     };
-    let Some(target) = frame.bytes_mut().get_mut(..len) else {
+    let Some(target) = frame.bytes_mut().get_mut(..frames) else {
         return Submit::Broken;
     };
     target.copy_from_slice(bytes);
+    let len = match seal {
+        Some(seal) => match seal.seal(frame.bytes_mut(), frames) {
+            Ok(len) => len,
+            Err(_) => return Submit::NotSubmitted,
+        },
+        None => frames,
+    };
     if frame
         .commit(Commit {
             len,
@@ -920,7 +959,14 @@ impl<O: SocketOps> RepairSubmit for SubmitView<'_, '_, O> {
                 }
                 continue;
             };
-            let outcome = submit_on(tx, queue, bytes, self.report, self.counts);
+            let outcome = submit_on(
+                tx,
+                queue,
+                bytes,
+                self.seal.as_deref_mut(),
+                self.report,
+                self.counts,
+            );
             if let Some(counts) = self.route_counts.get_mut(index) {
                 match outcome {
                     Submit::Submitted => counts.bump(|c| &mut c.submitted),

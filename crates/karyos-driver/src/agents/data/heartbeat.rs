@@ -185,16 +185,24 @@ impl<T: StreamTerms> Outbound<T> {
                 target.copy_from_slice(field);
             }
         }
-        let Ok(mut frame) = tx.claim_tx(queue, header) else {
+        // An authenticated lane's heartbeat is sealed like its DATA, under
+        // a fresh envelope sequence; without a session key none leaves.
+        if !self.auth.ready() {
+            return false;
+        }
+        let Ok(mut frame) = tx.claim_tx(queue, header + self.auth.envelope()) else {
             return false;
         };
         let Some(target) = frame.bytes_mut().get_mut(..header) else {
             return false;
         };
         target.copy_from_slice(&bytes);
+        let Some(len) = self.auth.seal(frame.bytes_mut(), header) else {
+            return false;
+        };
         if frame
             .commit(Commit {
-                len: header,
+                len,
                 token: SenderToken::new(0),
                 options: TxOptions::none(),
             })
