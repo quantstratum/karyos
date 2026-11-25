@@ -398,6 +398,15 @@ pub enum SnapshotError {
         /// Its id.
         id: u64,
     },
+    /// A section of a kind this build does not know: written by a newer
+    /// version, told apart from damage. The snapshot is not used.
+    #[error("snapshot {id} has a section of unknown kind {code}")]
+    UnknownSection {
+        /// Its id.
+        id: u64,
+        /// The kind's code.
+        code: u32,
+    },
     /// An earlier failure: reopen the store.
     #[error("the snapshot store failed; reopen it")]
     Failed,
@@ -841,10 +850,33 @@ impl<D: Disk> PendingSnapshot<D> {
         version: u64,
         length: u64,
     ) -> Result<(), SnapshotError> {
+        self.open_coded(header_of(kind, version, length), length)
+    }
+
+    /// A section of kind `code`, which need not be one this build knows
+    /// (tests: a newer writer's section).
+    #[cfg(test)]
+    fn section_of_code(
+        &mut self,
+        code: u32,
+        version: u64,
+        length: u64,
+    ) -> Result<(), SnapshotError> {
+        let mut header = header_of(SectionKind::Service, version, length);
+        if let Some(kind) = header.get_mut(4..8) {
+            kind.copy_from_slice(&code.to_le_bytes());
+        }
+        self.open_coded(header, length)
+    }
+
+    fn open_coded(
+        &mut self,
+        header: [u8; SECTION_HEADER],
+        length: u64,
+    ) -> Result<(), SnapshotError> {
         if self.broken || self.left > 0 {
             return Err(SnapshotError::Incomplete);
         }
-        let header = header_of(kind, version, length);
         let store = self.store.as_mut().ok_or(SnapshotError::Incomplete)?;
         self.digest.update(&header);
         self.at = store.append(self.at, &header)?;
@@ -1023,7 +1055,9 @@ impl<D: Disk> SnapshotReader<D> {
         if *magic != SECTION_MAGIC {
             return Err(damaged());
         }
-        let kind = SectionKind::from_code(u32::from_le_bytes(*kind)).ok_or_else(damaged)?;
+        let code = u32::from_le_bytes(*kind);
+        let kind = SectionKind::from_code(code)
+            .ok_or(SnapshotError::UnknownSection { id: self.id, code })?;
         let length = u64::from_le_bytes(*length);
         let end = self
             .at

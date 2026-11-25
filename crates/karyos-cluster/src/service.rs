@@ -76,10 +76,16 @@
 //! before, and a bounds entry that later differs from them stops the
 //! container as above.
 
+mod compose;
 #[cfg(test)]
 mod golden;
 #[cfg(test)]
 mod tests;
+
+pub use compose::{
+    ComposeError, ComposedSnapshot, MAX_SERVICE_PARTS, PART_METADATA, RestoreError, RestoreRefused,
+    SESSIONS_SECTION_VERSION, ServicePart, ServiceSnapshot, SnapshotFull, TIMERS_VERSION,
+};
 
 use karyos_codec::{CodecError, Decoder, ENVELOPE_LENGTH, Encoder, Template, VAR_HEADER_LENGTH};
 
@@ -502,6 +508,35 @@ pub trait ClusteredService {
 
     /// A configuration change has been applied.
     fn on_configuration(&mut self, context: &mut Context<'_>, configuration: &[u8]);
+
+    /// Writes the service's state after the last applied entry into
+    /// `parts`, as one or more parts (R-CORE-9; the contract is
+    /// [`ServiceContainer::snapshot`]'s). It is called between two applies,
+    /// never during one, so every part is from the same log position. The
+    /// default writes none: a service with no state of its own.
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotFull`] from `parts`: the snapshot is not taken.
+    fn snapshot(&self, parts: &mut ServiceSnapshot) -> Result<(), SnapshotFull> {
+        let _ = parts;
+        Ok(())
+    }
+
+    /// Replaces the service's state with the `parts` a snapshot holds, in
+    /// the order they were written: all of them, or, on refusal, none
+    /// (the state must stay as it was). The default accepts no part.
+    ///
+    /// # Errors
+    ///
+    /// [`RestoreRefused`]: an unknown part id, a version newer than the
+    /// service reads, a missing or malformed part.
+    fn restore(&mut self, parts: &[ServicePart<'_>]) -> Result<(), RestoreRefused> {
+        match parts.first() {
+            Some(part) => Err(RestoreRefused::UnknownPart { id: part.id }),
+            None => Ok(()),
+        }
+    }
 }
 
 /// The scheduled timers: ids and deadlines, sorted by id, never more
