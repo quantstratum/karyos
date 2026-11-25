@@ -28,10 +28,13 @@
 //! - A **record** names the facts generation in force when it was read; a
 //!   reader that holds no facts message of that generation before the
 //!   record knows nothing about its clock.
-//! - A **loss** names records the mirror's ring overwrote before they were
-//!   read: by journal and journal sequence when a gap in a journal's
-//!   sequences shows them, or with journal 0 by ring sequence when the
-//!   ring's boundary does.
+//! - A **loss** names records lost before they were read, by journal and
+//!   journal sequence: a gap in a journal's sequences, or the records of a
+//!   journal the mirror's ring overwrote after its last one read (its
+//!   table entry still names its last mirrored record). Only when the
+//!   overwritten records belong to journals whose table entries were
+//!   recycled before they were read does a loss name journal 0, with the
+//!   overwritten ring sequences: then nothing left names their journal.
 //!
 //! - A **requirement** is the operator's time requirement for the clocks
 //!   of one domain (`karyosd --archive-time-requirement`), published right
@@ -116,8 +119,9 @@ pub struct StreamRecord {
 /// Records lost before they were read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamLoss {
-    /// The journal; 0 for ring records whose journal is unknown, named by
-    /// ring sequence.
+    /// The journal; 0 for ring records whose journal no longer exists in
+    /// the table (its entry recycled before the records were read), named
+    /// by ring sequence.
     pub journal: u64,
     /// The first lost sequence.
     pub first: u64,
