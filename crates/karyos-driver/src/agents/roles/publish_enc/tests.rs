@@ -421,3 +421,136 @@ fn the_sender_role_opens_an_envelope_only_under_its_publication_keys() {
             .is_none()
     );
 }
+
+/// ADR-0114 section 10 at the send role. The first duty after the signal
+/// drops the publication's keys and binding and gives it the fresh
+/// `driver_id` the fence's table holds for the old one. While the fence is
+/// held it opens nothing (an RSP_SETUP and a NAK sealed before the change
+/// included, counted `enc_vm_generation`) and seals no SETUP, so none goes
+/// bare. Once released, its domain 5 keys are made under the new identity,
+/// and a receiver under a new boot id binds it again: nothing of the old
+/// binding, retired boot ids and tombstones included, blocks it, and the
+/// old identity's controls never verify again.
+#[test]
+fn a_vm_generation_change_redraws_the_publication_and_it_binds_again() {
+    use crate::wire_enc::vm_generation;
+
+    let (mut sender, _): (super::super::SenderRole, super::super::ReceiverRole) =
+        super::super::roles(&crate::agents::AgentConfig::default()).unwrap();
+    sender.enc.publish(publication());
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    let Ok(EncOpened::RspSetup(_, establishing)) =
+        open(&mut sender.enc.publications[0], &receiver.challenge())
+    else {
+        panic!()
+    };
+    let (mut naks, _) = receiver.data_keys();
+    let nak = seal_control(&mut naks, &receiver.nak());
+    let later = receiver.challenge();
+    let (signal, injector) = vm_generation::InjectedSignal::new();
+    sender.enc.watch(VmGenerationWatch::new(Box::new(signal)));
+    // A second role, the receiver's, holds the fence until it redraws.
+    vm_generation::register();
+    sender.on_generation_change(0);
+    assert_eq!(sender.enc_identity(EndpointId(1), ALIAS), Some(IDENTITY));
+
+    injector.change();
+    sender.on_generation_change(vm_generation::POLL_INTERVAL_NS);
+    assert_eq!(sender.enc_generation(), 1);
+    let fresh = sender.enc_identity(EndpointId(1), ALIAS).unwrap();
+    assert_eq!(
+        Some(fresh.driver_id),
+        vm_generation::successor(IDENTITY.driver_id, 1),
+        "the id the embedded driver takes too"
+    );
+    assert_eq!(
+        (fresh.registration_id, fresh.incarnation),
+        (IDENTITY.registration_id, IDENTITY.incarnation)
+    );
+    let publication = &mut sender.enc.publications[0];
+    assert!(publication.bound_receiver().is_none());
+    assert!(publication.setup.is_none() && publication.bootstrap.is_none());
+    let mut bytes = [0_u8; MAX_SEALED];
+    assert_eq!(publication.seal_announce(&mut bytes, 32), None);
+    assert_eq!(open(publication, &nak), Err(EncRejection::VmGeneration));
+    assert_eq!(open(publication, &later), Err(EncRejection::VmGeneration));
+    assert_eq!(
+        publication
+            .channel
+            .rejections
+            .get(EncRejection::VmGeneration),
+        2
+    );
+
+    // The receiver's role redraws: the fence releases and the next duty
+    // keys the publication under its new identity.
+    vm_generation::redrawn(1);
+    sender.on_generation_change(2 * vm_generation::POLL_INTERVAL_NS);
+    let publication = &mut sender.enc.publications[0];
+    assert!(publication.seal_announce(&mut bytes, 32).is_some());
+    let session = publication.data_sealer(&establishing).unwrap();
+    assert_eq!(session.context().publication, publication_of(&fresh));
+    assert_ne!(session.context().publication, publication_of(&IDENTITY));
+    // The old identity's controls select keys that no longer exist.
+    assert!(open(publication, &later).is_err());
+    assert!(open(publication, &nak).is_err());
+    // A receiver under a new boot id challenges the new identity and binds.
+    let mut again = fresh_peer(6, fresh);
+    let Ok(EncOpened::RspSetup(_, rebound)) = open(publication, &again.challenge()) else {
+        panic!()
+    };
+    assert!(rebound.bind);
+    assert_eq!(publication.bound_receiver(), Some(again.receiver));
+}
+
+/// A receiver start that challenges the publication under `identity`.
+fn fresh_peer(boot: u64, identity: Identity) -> FreshPeer {
+    let receiver = ReceiverIdentity {
+        receiver_boot_id: id128([boot, boot]),
+        receiver_id: 66,
+    };
+    let files = PairwiseFiles::new(&[&pairwise(0x22)]).unwrap();
+    let rsp = EncSealer::new(
+        &keys(),
+        Some(&files),
+        KeyContext {
+            domain: Domain::RspSetup,
+            key_epoch: 1,
+            party_epoch: 0,
+            session_id: ALIAS.session_id,
+            stream_id: ALIAS.stream_id,
+            publication: publication_of(&identity),
+            receiver: Some(receiver),
+            salt: Salt::Empty,
+        },
+        clock,
+    )
+    .unwrap();
+    FreshPeer {
+        boot,
+        identity,
+        receiver,
+        rsp,
+    }
+}
+
+struct FreshPeer {
+    boot: u64,
+    identity: Identity,
+    receiver: ReceiverIdentity,
+    rsp: EncSealer,
+}
+
+impl FreshPeer {
+    fn challenge(&mut self) -> Vec<u8> {
+        let control = Control::Challenge(RspChallenge {
+            alias: ALIAS,
+            identity: self.identity,
+            challenge: ChallengeBlock {
+                receiver_boot_id: [self.boot, self.boot],
+                nonce: [self.boot + 200, self.boot + 200],
+            },
+        });
+        seal_control(&mut self.rsp, &control)
+    }
+}

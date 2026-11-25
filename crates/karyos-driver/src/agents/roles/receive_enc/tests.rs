@@ -631,3 +631,93 @@ fn a_withdrawn_rsp_sealer_is_never_rebuilt() {
     }
     assert_eq!(role.enc.subscriptions[0].rsp.len(), 1, "no rebuild");
 }
+
+/// A receive role whose VM generation signal the test changes.
+fn watched(
+    role: &mut super::super::ReceiverRole,
+) -> crate::wire_enc::vm_generation::SignalInjector {
+    let (signal, injector) = crate::wire_enc::vm_generation::InjectedSignal::new();
+    role.enc.watch(VmGenerationWatch::new(Box::new(signal)));
+    injector
+}
+
+fn session_end() -> super::super::SessionEnd {
+    session_rings(std::num::NonZeroUsize::new(4).unwrap()).0
+}
+
+const AFTER: u64 = crate::wire_enc::vm_generation::POLL_INTERVAL_NS;
+
+/// ADR-0114 section 10 at the receive role: until the signal changes
+/// nothing closes; the first duty after it drops every image's domain 1
+/// keys, every pending answer, target, domain 6 sealer and scratch slot,
+/// draws a fresh `receiver_boot_id` and reports the role redrawn, which
+/// releases the fence. The subscription stays encrypted.
+#[test]
+fn a_vm_generation_change_closes_every_image_and_redraws_the_boot_id() {
+    let mut role = bound();
+    let sessions = session_end();
+    role.enc
+        .targets
+        .push((EndpointId(1), ALIAS, publication_of(&IDENTITY)));
+    role.enc
+        .answers
+        .push((EndpointId(1), ALIAS, enc_answer(2, 0, NONCE)));
+    let injector = watched(&mut role);
+    let old = role.boot_id();
+    role.on_generation_change(&sessions, 0);
+    assert_eq!(role.enc_generation(), 0);
+    assert_eq!(role.enc_images(), 1);
+    injector.change();
+    role.on_generation_change(&sessions, AFTER);
+    assert_eq!(role.enc_generation(), 1);
+    assert_eq!(role.enc_images(), 0);
+    assert!(role.enc.answers.is_empty() && role.enc.targets.is_empty());
+    let subscription = &role.enc.subscriptions[0];
+    assert!(subscription.rsp.is_empty() && subscription.bootstrap.is_none());
+    assert_ne!(role.boot_id(), old);
+    assert_ne!(role.boot_id(), [0, 0]);
+    assert!(!crate::wire_enc::quiesced(), "the only role redrew");
+    // No resynchronisation can move a binding that no longer exists.
+    assert_eq!(
+        role.enc
+            .resync(0, &enc_answer(2, 3, NONCE), 2, true, BOOT, 1_500),
+        Err(EncRejection::ResyncRefused)
+    );
+}
+
+/// While the fence is held (another role has not redrawn), an envelope
+/// is dropped and counted (`enc_vm_generation`) before anything opens it,
+/// and the stream still refuses a bare SETUP: closing never downgrades it.
+#[test]
+fn while_the_fence_is_held_every_envelope_is_dropped_and_counted() {
+    let mut rig = rig();
+    let sessions = session_end();
+    let mut sealer = setup_sealer(0x11);
+    let announce_sealed = sealed(&mut sealer, &announce());
+    let injector = watched(&mut rig.role);
+    crate::wire_enc::vm_generation::register();
+    injector.change();
+    rig.role.on_generation_change(&sessions, AFTER);
+    assert!(crate::wire_enc::quiesced());
+    rig.inject(&announce_sealed);
+    assert_eq!(rig.rejections().get(EncRejection::VmGeneration), 1);
+    assert_eq!(rig.rejections().total(), 1, "refused for that reason only");
+    rig.inject(&encoded(&announce()));
+    assert_eq!(rig.rejections().get(EncRejection::PlaintextSetup), 1);
+}
+
+/// Where the platform gives no signal, a role's encrypted images stay
+/// until the deployment rule ends the process: no timer closes them.
+#[test]
+fn without_a_signal_no_image_closes() {
+    let mut role = bound();
+    let sessions = session_end();
+    let old = role.boot_id();
+    role.enc.watch(VmGenerationWatch::platform());
+    for now in [0, 1_000_000_000, 3_600_000_000_000] {
+        role.on_generation_change(&sessions, now);
+    }
+    assert_eq!(role.enc_generation(), 0);
+    assert_eq!(role.enc_images(), 1);
+    assert_eq!(role.boot_id(), old);
+}

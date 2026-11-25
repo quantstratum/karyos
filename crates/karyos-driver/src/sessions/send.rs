@@ -253,6 +253,13 @@ impl SendSessions {
             .map(|session| session.publication.identity)
     }
 
+    /// The publication `alias` on `endpoint`, read only.
+    #[must_use]
+    pub fn publication(&self, endpoint: EndpointId, alias: Alias) -> Option<Publication> {
+        self.find(endpoint, alias)
+            .map(|session| session.publication)
+    }
+
     /// Whether the publication received its first SM.
     #[must_use]
     pub fn is_established(&self, endpoint: EndpointId, alias: Alias) -> bool {

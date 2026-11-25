@@ -353,6 +353,16 @@ impl<T: StreamTerms> Outbound<T> {
         Ok(())
     }
 
+    /// Drops the session's encrypted sealer, which erases its key and
+    /// sequence (ADR-0114 section 10 step 2): the publication stays
+    /// encrypted and sends nothing until another is installed. Nothing
+    /// changes for a publication of another class.
+    pub(crate) fn retire_enc_sealer(&mut self) {
+        if matches!(self.auth, SenderAuth::Encrypting(_)) {
+            self.auth = SenderAuth::EncPending;
+        }
+    }
+
     /// Whether the publication is authenticated.
     #[must_use]
     pub fn authenticated(&self) -> bool {

@@ -341,6 +341,18 @@ impl RepairPath {
         })
     }
 
+    /// Takes the publication's fresh incarnation identity, which its
+    /// later ERRs carry (ADR-0114 section 10 step 3).
+    pub(crate) fn set_identity(&mut self, identity: Identity) {
+        self.identity = identity;
+    }
+
+    /// The incarnation identity its ERRs carry (tests).
+    #[cfg(test)]
+    pub(crate) fn identity(&self) -> Identity {
+        self.identity
+    }
+
     /// How far below the sent position its lanes stay repairable
     /// ([`RepairConfig::retransmit_window`]).
     #[must_use]

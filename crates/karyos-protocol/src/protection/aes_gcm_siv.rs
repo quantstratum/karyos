@@ -569,6 +569,11 @@ pub enum EncRejection {
     /// `enc_before_join`: verified, but before a join point or already
     /// delivered. Raised by the driver.
     BeforeJoin,
+    /// `enc_vm_generation`: refused because the platform signalled a
+    /// virtual machine generation change; every encrypted incarnation is
+    /// closed and no key is derived again until the driver runs under
+    /// fresh identities (ADR-0114 section 10). Raised by the driver.
+    VmGeneration,
 }
 
 impl From<Replay> for EncRejection {
@@ -603,9 +608,10 @@ impl From<EncRejection> for Rejection {
             | EncRejection::TooOld
             | EncRejection::BeforeJoin
             | EncRejection::ResyncRefused => Self::Binding,
-            EncRejection::Party | EncRejection::RetiredBoot | EncRejection::RetiredParty => {
-                Self::Key
-            }
+            EncRejection::Party
+            | EncRejection::RetiredBoot
+            | EncRejection::RetiredParty
+            | EncRejection::VmGeneration => Self::Key,
             EncRejection::Tag
             | EncRejection::Pairwise
             | EncRejection::InnerRejected

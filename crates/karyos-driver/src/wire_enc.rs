@@ -22,7 +22,9 @@
 //!   derivation from its header (section 4, the bootstrap rule);
 //! - [`OpenRate`] and [`EncRejections`]: the fixed per channel accounting
 //!   of section 6 and the counter of every rejection reason (sections 8
-//!   and 9).
+//!   and 9);
+//! - [`vm_generation`]: the VM generation change of section 10, after
+//!   which no key is derived, no datagram sealed and none opened.
 //!
 //! The receive order is section 8's exactly: fixed fields, epochs,
 //! sequence cap and open rate, key age, key selection, replay precheck,
@@ -44,6 +46,10 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::wire_keys::{Class, KEY_LEN, KeyFile, Material, Purpose, Scope};
+
+pub mod vm_generation;
+
+pub use vm_generation::{VmGenerationWatch, quiesced};
 
 /// Nanoseconds in a second: the open rate interval.
 pub(crate) const SECOND_NS: u64 = 1_000_000_000;
@@ -79,7 +85,7 @@ pub const PAIRWISE_FILES: usize = 4;
 pub(crate) const RETIRED_BOOTS: usize = 8;
 
 /// The reasons [`EncRejections`] counts, one per [`EncRejection`].
-pub const ENC_REASONS: usize = 30;
+pub const ENC_REASONS: usize = 31;
 
 /// The counter index of `reason`. Exhaustive: a new reason does not
 /// compile until it has its own counter.
@@ -116,6 +122,7 @@ pub const fn reason_index(reason: EncRejection) -> usize {
         EncRejection::RetiredParty => 27,
         EncRejection::ResyncRefused => 28,
         EncRejection::BeforeJoin => 29,
+        EncRejection::VmGeneration => 30,
     }
 }
 
@@ -244,6 +251,10 @@ pub enum EncKeyError {
     /// The derivation context is refused.
     #[error(transparent)]
     Context(#[from] ContextError),
+    /// A VM generation change was seen: no key is derived again in this
+    /// process (section 10).
+    #[error("no key is derived after a VM generation change")]
+    VmGeneration,
 }
 
 /// One secret of a `profile_id=16` file and its file epoch.
@@ -555,6 +566,9 @@ fn derive(
     pairwise: Option<&PairwiseFiles>,
     context: KeyContext,
 ) -> Result<AesGcmSiv, EncKeyError> {
+    if quiesced() {
+        return Err(EncKeyError::VmGeneration);
+    }
     let ikm = keys.ikm(context.key_epoch).ok_or(EncKeyError::NoKey)?;
     match (context.domain.is_receiver(), context.receiver, pairwise) {
         (true, Some(receiver), Some(files)) => {
@@ -578,6 +592,9 @@ fn derive_into(
     context: KeyContext,
     slot: &mut AesGcmSiv,
 ) -> Result<(), EncKeyError> {
+    if quiesced() {
+        return Err(EncKeyError::VmGeneration);
+    }
     let ikm = keys.ikm(context.key_epoch).ok_or(EncKeyError::NoKey)?;
     match (context.domain.is_receiver(), context.receiver, pairwise) {
         (true, Some(receiver), Some(files)) => {
@@ -789,6 +806,10 @@ pub enum EncSendError {
     /// The key was withdrawn by a key reload (H8 finding 4).
     #[error("the key was withdrawn")]
     Withdrawn,
+    /// A VM generation change was seen: nothing is sealed again in this
+    /// process (section 10).
+    #[error("nothing is sealed after a VM generation change")]
+    VmGeneration,
 }
 
 /// One encrypting party in one domain (section 5): its key, rolled to the
@@ -808,6 +829,9 @@ pub struct EncSealer {
     /// Withdrawn by a key reload (H8 finding 4): checked first by every
     /// seal, roll and re-key, so it never seals again.
     withdrawn: bool,
+    /// The VM generation it was made in: it seals nothing in a later one
+    /// (section 10).
+    generation: u64,
 }
 
 impl core::fmt::Debug for EncSealer {
@@ -842,6 +866,7 @@ impl EncSealer {
             clock,
             erase: erase_context(&context)?,
             withdrawn: false,
+            generation: vm_generation::generation(),
         })
     }
 
@@ -970,6 +995,9 @@ impl EncSealer {
     ///
     /// [`EncSendError`]; nothing is written.
     pub fn seal(&mut self, datagram: &mut [u8], frames: usize) -> Result<usize, EncSendError> {
+        if self.generation != vm_generation::generation() {
+            return Err(EncSendError::VmGeneration);
+        }
         if self.withdrawn {
             return Err(EncSendError::Withdrawn);
         }
@@ -1086,6 +1114,9 @@ pub struct EncOpener {
     /// Withdrawn by a key reload (H8 finding 4): checked first by every
     /// open, resynchronisation and re-key, so it never opens again.
     withdrawn: bool,
+    /// The VM generation it was made in: it opens nothing in a later one
+    /// (section 10).
+    generation: u64,
 }
 
 impl core::fmt::Debug for EncOpener {
@@ -1133,6 +1164,7 @@ impl EncOpener {
             spare: Some(spare),
             erase: erase_context(&context)?,
             withdrawn: false,
+            generation: vm_generation::generation(),
         })
     }
 
@@ -1289,6 +1321,9 @@ impl EncOpener {
         now_ns: u64,
         inner: impl FnOnce(&[u8]) -> Result<(), EncRejection>,
     ) -> Result<Accepted, EncRejection> {
+        if self.generation != vm_generation::generation() {
+            return Err(EncRejection::VmGeneration);
+        }
         if self.withdrawn {
             zeroize::Zeroize::zeroize(out);
             return Err(EncRejection::Epoch);
@@ -1347,6 +1382,9 @@ impl EncOpener {
         party_epoch: u16,
         now_ns: u64,
     ) -> Result<(), EncRejection> {
+        if self.generation != vm_generation::generation() {
+            return Err(EncRejection::VmGeneration);
+        }
         if self.withdrawn {
             return Err(EncRejection::ResyncRefused);
         }
@@ -1459,6 +1497,9 @@ pub fn open_bootstrap_in(
     now_ns: u64,
     inner: impl FnOnce(&Header, &[u8]) -> Result<(), EncRejection>,
 ) -> Result<Bootstrap, EncRejection> {
+    if quiesced() {
+        return Err(EncRejection::VmGeneration);
+    }
     let header = header(datagram)?;
     if !header.domain.is_bootstrap() {
         return Err(EncRejection::Domain);

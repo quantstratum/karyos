@@ -617,6 +617,16 @@ impl ReceiveSessions {
         self.boot_id
     }
 
+    /// Replaces the boot id after a VM generation change (ADR-0114
+    /// section 10 step 3): every later CHALLENGE and SOLICIT names
+    /// `boot_id`, so an answer to an earlier one no longer matches. A zero
+    /// id is refused, as at creation.
+    pub(crate) fn set_boot_id(&mut self, boot_id: [u64; 2]) {
+        if boot_id != [0, 0] {
+            self.boot_id = boot_id;
+        }
+    }
+
     /// Whether `slot` still names an active image (the admission recheck).
     #[must_use]
     pub fn is_active(&self, slot: SlotRef) -> bool {

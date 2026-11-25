@@ -4726,6 +4726,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
         now: u64,
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Receiver);
+        self.on_generation_change(sessions, now);
         self.guard_rounds(now);
         // A lost path stops being charged in its image's statistics from
         // the terms it was lost in (RP-6). The term is the contiguous
@@ -8658,6 +8659,7 @@ impl<T: StreamTerms> SenderRole<T> {
         halves: &mut [(EndpointId, Half<O>)],
         now: u64,
     ) -> Result<u32, AgentError> {
+        self.on_generation_change(now);
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         self.cycle = self.cycle.checked_add(1).ok_or(overflow.clone())?;
         self.prune(halves);

@@ -158,6 +158,7 @@ fn every_rejection_reason_has_its_own_counter() {
         R::RetiredParty,
         R::ResyncRefused,
         R::BeforeJoin,
+        R::VmGeneration,
     ];
     assert_eq!(all.len(), ENC_REASONS);
     let mut seen = [false; ENC_REASONS];

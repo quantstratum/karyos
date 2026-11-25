@@ -1077,6 +1077,14 @@ impl<T: StreamTerms> Outbound<T> {
         self.repair.as_deref()
     }
 
+    /// Gives its repair path the publication's fresh identity (ADR-0114
+    /// section 10 step 3).
+    pub(crate) fn set_repair_identity(&mut self, identity: Identity) {
+        if let Some(repair) = self.repair.as_deref_mut() {
+            repair.set_identity(identity);
+        }
+    }
+
     /// Admits `nak` from a receiver bound to this publication, whose state
     /// on the lane is `requester`, at `now`. A publication with no repair
     /// path drops it.

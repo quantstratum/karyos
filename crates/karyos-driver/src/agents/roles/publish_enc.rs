@@ -30,9 +30,10 @@ use super::publish_auth::{Establishing, receiver_control_alias};
 use super::{Half, Mode, SenderRole, Sent};
 use crate::agents::EndpointId;
 use crate::embedded::StreamTerms;
+use crate::wire_enc::vm_generation;
 use crate::wire_enc::{
     ChannelKeys, EncChannel, EncKeyError, EncOpener, EncRejections, EncSealer, PairwiseFiles,
-    RetiredBoots, header, id128, open_bootstrap_in, publication_of,
+    RetiredBoots, VmGenerationWatch, header, id128, open_bootstrap_in, publication_of, quiesced,
 };
 use crate::wire_keys::KeyFile;
 use karyos_io::sockets::ops::SocketOps;
@@ -78,8 +79,9 @@ pub(crate) struct PublicationEnc {
     keys: ChannelKeys,
     pairwise: PairwiseFiles,
     /// Domain 5: SETUP ANNOUNCE and ENC ANSWER, one key and counter for
-    /// the publication's life under its `key_epoch`.
-    setup: EncSealer,
+    /// the publication's life under its `key_epoch`; `None` once a VM
+    /// generation change closed the publication (section 10).
+    setup: Option<EncSealer>,
     bound: Option<Bound>,
     retired: RetiredBoots,
     /// The channel's rate counters and rejections by reason.
@@ -114,37 +116,67 @@ impl PublicationEnc {
     ) -> Result<Self, EncKeyError> {
         let keys = ChannelKeys::new(channel)?;
         let pairwise = PairwiseFiles::new(pairwise)?;
-        let publication = publication_of(&identity);
-        let setup = EncSealer::new(
-            &keys,
-            None,
-            KeyContext {
-                domain: Domain::Setup,
-                key_epoch: keys.current_epoch(),
-                party_epoch: 0,
-                session_id: alias.session_id,
-                stream_id: alias.stream_id,
-                publication,
-                receiver: None,
-                salt: Salt::Empty,
-            },
-            clock,
-        )?;
-        let bootstrap = EncSealer::new(&keys, None, *setup.context(), clock)?.into_key();
-        Ok(Self {
+        let mut made = Self {
             endpoint,
             alias,
             identity,
-            publication,
+            publication: publication_of(&identity),
             keys,
             pairwise,
-            setup,
+            setup: None,
             bound: None,
             retired: RetiredBoots::default(),
             channel: EncChannel::default(),
             clock,
-            bootstrap: Some(bootstrap),
-        })
+            bootstrap: None,
+        };
+        made.rekey()?;
+        Ok(made)
+    }
+
+    /// Makes the domain 5 sealer and the domain 6 scratch slot under the
+    /// publication's identity, at construction and after a VM generation
+    /// change (section 10 step 4).
+    ///
+    /// # Errors
+    ///
+    /// [`EncKeyError`]; nothing changes.
+    fn rekey(&mut self) -> Result<(), EncKeyError> {
+        let setup = EncSealer::new(
+            &self.keys,
+            None,
+            KeyContext {
+                domain: Domain::Setup,
+                key_epoch: self.keys.current_epoch(),
+                party_epoch: 0,
+                session_id: self.alias.session_id,
+                stream_id: self.alias.stream_id,
+                publication: self.publication,
+                receiver: None,
+                salt: Salt::Empty,
+            },
+            self.clock,
+        )?;
+        let bootstrap = EncSealer::new(&self.keys, None, *setup.context(), self.clock)?.into_key();
+        self.setup = Some(setup);
+        self.bootstrap = Some(bootstrap);
+        Ok(())
+    }
+
+    /// Takes `identity`, the fresh incarnation identity of section 10 step
+    /// 3: the publication's keys stay dropped until [`Self::rekey`], and
+    /// its retired boot ids, which named the old identity, go.
+    fn reidentify(&mut self, identity: Identity) {
+        self.close();
+        self.identity = identity;
+        self.publication = publication_of(&identity);
+        self.retired = RetiredBoots::default();
+    }
+
+    /// The publication's incarnation identity (tests).
+    #[cfg(test)]
+    pub(crate) fn identity(&self) -> Identity {
+        self.identity
     }
 
     /// Applies the key store's current key set (H8 finding 4): the files
@@ -156,7 +188,9 @@ impl PublicationEnc {
     pub(crate) fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
         self.keys.retain(keys);
         self.pairwise.retain(keys);
-        self.setup.apply_keys(keys);
+        if let Some(setup) = &mut self.setup {
+            setup.apply_keys(keys);
+        }
         if let Some(bound) = self.bound.as_mut() {
             bound.opener.apply_keys(keys);
         }
@@ -186,6 +220,10 @@ impl PublicationEnc {
         datagram: &[u8],
         out: &mut [u8; MAX_PLAINTEXT],
     ) -> Result<EncOpened, EncRejection> {
+        // Section 10: nothing is opened after a VM generation change.
+        if quiesced() {
+            return Err(EncRejection::VmGeneration);
+        }
         let head = header(datagram)?;
         if (head.session_id, head.stream_id) != (self.alias.session_id, self.alias.stream_id) {
             return Err(EncRejection::Binding);
@@ -391,13 +429,23 @@ impl PublicationEnc {
             party_epoch,
         };
         let length = enc.encode(out).ok()?;
-        self.setup.seal(out, length).ok()
+        self.setup.as_mut()?.seal(out, length).ok()
     }
 
     /// Seals an encoded SETUP ANNOUNCE (the first `frames` bytes of `out`)
     /// in domain 5.
     pub(crate) fn seal_announce(&mut self, out: &mut [u8], frames: usize) -> Option<usize> {
-        self.setup.seal(out, frames).ok()
+        self.setup.as_mut()?.seal(out, frames).ok()
+    }
+
+    /// Section 10 step 2: drops every derived key and sequence of the
+    /// publication, which erases them: its domain 5 sealer, its binding's
+    /// domain 4 keys and its scratch slot. The entry and its key files
+    /// stay, so that it sends nothing bare and opens nothing.
+    fn close(&mut self) {
+        self.setup = None;
+        self.bound = None;
+        self.bootstrap = None;
     }
 
     /// The bound receiver (tests).
@@ -413,6 +461,11 @@ pub(crate) struct SenderEnc {
     publications: Vec<PublicationEnc>,
     /// Envelopes for no encrypted publication, by reason.
     pub(crate) unattributed: EncRejections,
+    /// The VM generation signal, read once the role has an encrypted
+    /// publication (section 10).
+    watch: Option<VmGenerationWatch>,
+    /// The VM generation the role last redrew its identities for.
+    seen: u64,
 }
 
 impl SenderEnc {
@@ -422,6 +475,16 @@ impl SenderEnc {
         for publication in &mut self.publications {
             publication.apply_keys(keys);
         }
+    }
+
+    /// Reads the signal with `watch`, the platform's or a test's, and
+    /// registers the role with the fence from the current generation on.
+    pub(crate) fn watch(&mut self, watch: VmGenerationWatch) {
+        if self.watch.is_none() {
+            vm_generation::register();
+            self.seen = vm_generation::generation();
+        }
+        self.watch = Some(watch);
     }
 
     /// Makes the publication `publication` names encrypted (tests); its
@@ -445,6 +508,118 @@ impl SenderEnc {
 }
 
 impl<T: StreamTerms> SenderRole<T> {
+    /// Section 10 on the send side, once per duty at `now`, while the role
+    /// has an encrypted publication: reads the VM generation signal and,
+    /// on a change seen by this role or any other:
+    ///
+    /// 1. the fence already stops every key made before the change;
+    /// 2. every publication's keys are dropped and every session sealer is
+    ///    taken out of its `Outbound`, which erases them;
+    /// 3. each publication takes a fresh `driver_id`, the one the fence's
+    ///    table gives the embedded driver too, in its SETUP side and in its
+    ///    repair path's ERRs, and is no longer established;
+    /// 4. once every role has redrawn and the fence releases, its domain 5
+    ///    keys are made under the new identity, it announces, and the
+    ///    fresh challenge of each receiver binds it again.
+    ///
+    /// When no fresh `driver_id` can be drawn nothing is redrawn, the
+    /// fence stays held and the next duty tries again (fail closed).
+    pub(super) fn on_generation_change(&mut self, now: u64) {
+        if self.enc.publications.is_empty() {
+            return;
+        }
+        if self.enc.watch.is_none() {
+            self.enc.watch(VmGenerationWatch::platform());
+        }
+        let Some(watch) = self.enc.watch.as_mut() else {
+            return;
+        };
+        let current = watch.poll(now);
+        if current != self.enc.seen {
+            // Step 2 at once, whether or not step 3 can be done: when no
+            // fresh `driver_id` is given (no random word, a full table, or a
+            // role too far behind), the role stays closed and unredrawn, so
+            // the fence stays held and nothing runs under the old identity.
+            for publication in &mut self.enc.publications {
+                publication.close();
+            }
+            for outbound in &mut self.publications {
+                outbound.retire_enc_sealer();
+            }
+            if self.redraw(current) {
+                // impl-e: the authenticated class's redraw goes here
+                // (ADR-0086 section 7 under a fresh `driver_id`).
+                self.enc.seen = current;
+                vm_generation::redrawn(current);
+            }
+        }
+        // Step 4, only under the identity of the current generation.
+        if current == self.enc.seen && !vm_generation::quiesced() {
+            for publication in &mut self.enc.publications {
+                if publication.setup.is_none() {
+                    let _ = publication.rekey();
+                }
+            }
+        }
+    }
+
+    /// Step 3 for `current`; `false` when a fresh `driver_id` could not be
+    /// drawn, with nothing redrawn.
+    fn redraw(&mut self, current: u64) -> bool {
+        let first = self.enc.seen.saturating_add(1);
+        // Every new identity first, so that a failed draw redraws nothing.
+        for publication in &self.enc.publications {
+            let mut driver = publication.identity.driver_id;
+            for generation in first..=current {
+                match vm_generation::successor(driver, generation) {
+                    Some(next) => driver = next,
+                    None => return false,
+                }
+            }
+        }
+        for publication in &mut self.enc.publications {
+            let mut identity = publication.identity;
+            for generation in first..=current {
+                if let Some(next) = vm_generation::successor(identity.driver_id, generation) {
+                    identity.driver_id = next;
+                }
+            }
+            let (endpoint, alias) = (publication.endpoint, publication.alias);
+            publication.reidentify(identity);
+            if let Some(held) = self.sessions.publication(endpoint, alias) {
+                let _ = self.sessions.remove(endpoint, alias);
+                let _ = self
+                    .sessions
+                    .add(crate::sessions::send::Publication { identity, ..held });
+            }
+            if let Some(outbound) = self
+                .publications
+                .iter_mut()
+                .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+            {
+                outbound.set_repair_identity(identity);
+            }
+        }
+        true
+    }
+
+    /// The VM generation the role last redrew for (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_generation(&self) -> u64 {
+        self.enc.seen
+    }
+
+    /// The incarnation identity of the encrypted publication `alias` on
+    /// `endpoint` (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_identity(&self, endpoint: EndpointId, alias: Alias) -> Option<Identity> {
+        self.enc
+            .publications
+            .iter()
+            .find(|publication| publication.endpoint == endpoint && publication.alias == alias)
+            .map(PublicationEnc::identity)
+    }
+
     /// Makes the publication `publication` names encrypted (tests); its
     /// `Outbound` must be made encrypted too, before any traffic.
     #[cfg(test)]

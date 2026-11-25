@@ -29,6 +29,13 @@
 //! points are ignored and the unicast salt stays. Any other answer for a
 //! bound identity is dropped and counted (`enc_resync_refused`).
 //!
+//! VM generation change (section 10): once the signal is seen, every
+//! image's domain 1 keys, every pending answer and every domain 6 sealer
+//! are dropped and each image's domain 4 sealer is replaced by one that
+//! refuses; the subscriptions stay, so their streams keep refusing bare
+//! frames, and every envelope is dropped and counted
+//! (`enc_vm_generation`).
+//!
 //! An outer `0x21` on a stream that is not
 //! encrypted is dropped and counted (`enc_unexpected`). Nothing makes a
 //! subscription encrypted yet: the class is still refused at parse.
@@ -46,13 +53,15 @@ use karyos_protocol::protection::aes_gcm_siv::{
 use karyos_protocol::protection::hmac_sha256::Domain as ControlDomain;
 
 use super::super::control::{ControlItem, ControlSeal, SealedBytes, SharedSealer};
-use super::{BindingKey, Intake, ReceiverRole, SlotRef, sender_frame_alias};
+use super::{BindingKey, Intake, ReceiverRole, SessionEnd, SlotRef, sender_frame_alias};
 use crate::agents::EndpointId;
 use crate::embedded::StreamTerms;
 use crate::sessions::NonceSource;
+use crate::wire_enc::vm_generation;
 use crate::wire_enc::{
     ChannelKeys, EncChannel, EncKeyError, EncOpener, EncRejections, EncSealer, PairwiseFiles,
-    check_resync, header, id128, is_envelope, monotonic_ns, open_bootstrap_in, publication_of,
+    VmGenerationWatch, check_resync, header, id128, is_envelope, monotonic_ns, open_bootstrap_in,
+    publication_of, quiesced,
 };
 use crate::wire_keys::KeyFile;
 
@@ -255,6 +264,11 @@ pub(crate) struct ReceiverEnc {
     /// Refusals no encrypted subscription owns, by reason:
     /// `enc_unexpected` on a trusted or authenticated stream among them.
     pub(crate) unattributed: EncRejections,
+    /// The VM generation signal, read once the role has an encrypted
+    /// incarnation (section 10).
+    watch: Option<VmGenerationWatch>,
+    /// The VM generation the role last redrew its identity for.
+    seen: u64,
 }
 
 impl ReceiverEnc {
@@ -373,6 +387,31 @@ impl ReceiverEnc {
     fn published(&self, endpoint: EndpointId, alias: Alias) -> bool {
         self.published.contains(&(endpoint, alias))
     }
+
+    /// Reads the signal with `watch`, the platform's or a test's, and
+    /// registers the role with the fence from the current generation on.
+    pub(crate) fn watch(&mut self, watch: VmGenerationWatch) {
+        if self.watch.is_none() {
+            vm_generation::register();
+            self.seen = vm_generation::generation();
+        }
+        self.watch = Some(watch);
+    }
+
+    /// Section 10 step 2: drops every derived key and sequence, which
+    /// erases them: the images' domain 1 openers, the answers not yet
+    /// installed, the targets and every domain 6 sealer and scratch slot.
+    /// The subscriptions and their key files stay, so that their streams
+    /// keep refusing bare frames and re-establish under the fresh identity.
+    fn close(&mut self) {
+        self.images.clear();
+        self.answers.clear();
+        self.targets.clear();
+        for subscription in &mut self.subscriptions {
+            subscription.rsp.clear();
+            subscription.bootstrap = None;
+        }
+    }
 }
 
 /// The alias a bare frame or an authenticated envelope names: both put
@@ -454,6 +493,13 @@ impl<T: StreamTerms> Intake<'_, T> {
             self.role.enc.unattributed.bump(EncRejection::Short);
             return;
         };
+        // Section 10: while a VM generation change is not released nothing
+        // is opened, and nothing goes to the sender to be opened either.
+        if quiesced() {
+            let index = self.role.enc.subscription(endpoint, alias.stream_id);
+            self.enc_reject(index, EncRejection::VmGeneration);
+            return;
+        }
         if self.role.enc.published(endpoint, alias) {
             match SealedBytes::copy(bytes) {
                 Some(sealed) => {
@@ -782,6 +828,86 @@ impl ReceiverEnc {
 }
 
 impl<T: StreamTerms> ReceiverRole<T> {
+    /// Section 10 on the receive side, once per duty at `now`, while the
+    /// role has an encrypted incarnation: reads the VM generation signal
+    /// and, on a change seen by this role or any other, closes them and
+    /// redraws the role's identity:
+    ///
+    /// 1. the fence already stops every key made before the change;
+    /// 2. every encrypted image is retired (its binding goes at once, its
+    ///    identity is quarantined) and every derived key, sequence and
+    ///    pending answer is dropped, which erases them; any other image's
+    ///    domain 4 sealer is replaced by one that refuses;
+    /// 3. a fresh `receiver_boot_id` is drawn;
+    /// 4. once every role has redrawn, the fence releases and the next
+    ///    SETUP of each publication is challenged afresh under the new boot
+    ///    id, so the incarnations re-establish.
+    ///
+    /// When no random word can be drawn the fence stays held and the next
+    /// duty tries again (fail closed).
+    pub(super) fn on_generation_change(&mut self, sessions: &SessionEnd<T>, now: u64) {
+        if self.enc.subscriptions.is_empty() && self.enc.published.is_empty() {
+            return;
+        }
+        if self.enc.watch.is_none() {
+            self.enc.watch(VmGenerationWatch::platform());
+        }
+        let Some(watch) = self.enc.watch.as_mut() else {
+            return;
+        };
+        let current = watch.poll(now);
+        if current == self.enc.seen {
+            return;
+        }
+        // Step 2.
+        while let Some(image) = self.enc.images.pop() {
+            if let Some(index) = self.images.iter().position(|held| held.slot == image.slot) {
+                let installed = self.images.swap_remove(index);
+                self.retire(sessions, installed, false, now);
+            }
+        }
+        self.enc.close();
+        // A clone of an image's sealer already in a queued control keeps
+        // its key until that control drains; its generation refuses every
+        // seal through it, so nothing it holds is used after the change.
+        for image in &mut self.images {
+            if image.enc_seal.is_some() {
+                image.enc_seal = Some(SharedSealer::of(Refuse(ControlDomain::ReceiverToPublisher)));
+            }
+        }
+        // Step 3.
+        let old = self.sessions.boot_id();
+        let mut boot = [0_u64; 2];
+        while boot == [0, 0] || boot == old {
+            if karyos_sys::random::fill_u64s(&mut boot).is_err() {
+                return;
+            }
+        }
+        self.sessions.set_boot_id(boot);
+        // impl-e: the authenticated class's redraw goes here (ADR-0086
+        // section 7 under a fresh `receiver_boot_id`).
+        self.enc.seen = current;
+        vm_generation::redrawn(current);
+    }
+
+    /// Reads the signal with `watch` instead of the platform's (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_watch(&mut self, watch: VmGenerationWatch) {
+        self.enc.watch(watch);
+    }
+
+    /// The VM generation the role last redrew for (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_generation(&self) -> u64 {
+        self.enc.seen
+    }
+
+    /// The number of encrypted images holding keys (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_images(&self) -> usize {
+        self.enc.images.len()
+    }
+
     /// The keys of an image an encrypted subscription installs (the
     /// install hook): its domain 1 opener at the epoch pair of the verified
     /// ENC ANSWER that set it up, salted with the completed challenge, and

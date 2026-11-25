@@ -9086,3 +9086,216 @@ fn a_queued_terminal_ack_is_not_sent_after_its_key_is_withdrawn() {
     }
     assert_eq!(rig.agents.sender.role.counters().abort_acks, 0);
 }
+
+/// ADR-0114 section 10 end to end on unicast: after an established
+/// encrypted session delivers, a VM generation change closes both sides
+/// and re-establishes the channel. The receiver draws a new boot id, the
+/// publication takes the new `driver_id` (in its SETUP side and in its
+/// repair path's ERRs), the receiver challenges it afresh under the new
+/// boot id, a new image is installed, and data flows again under the new
+/// keys. Nothing is refused for its tag, trailer or class: the class
+/// stops and starts again, it never falls back.
+#[test]
+fn a_vm_generation_change_re_establishes_an_encrypted_session() {
+    use karyos_protocol::network::Control;
+    use karyos_protocol::protection::aes_gcm_siv::EncRejection;
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    use crate::wire_enc::VmGenerationWatch;
+    use crate::wire_enc::vm_generation::{self, InjectedSignal};
+
+    let (mut rig, b) = encrypted_rig();
+    let a = rig.publisher;
+    let slot = established(&mut rig);
+    let (signal, injector) = InjectedSignal::new();
+    rig.agents
+        .receiver
+        .role
+        .enc_watch(VmGenerationWatch::new(Box::new(signal)));
+    let deliver =
+        |rig: &mut Rig,
+         subscriber: &mut karyos_sys::log_buffer::Subscription<std::sync::Arc<LogBuffer>>,
+         messages: &[Vec<u8>]| {
+            for message in messages {
+                let _ = rig.log.as_mut().unwrap().publications[0]
+                    .append(message, AppendOptions::default())
+                    .unwrap();
+            }
+            let mut delivered = Vec::new();
+            for _ in 0..3000 {
+                rig.round(true);
+                while let Some(message) = poll_message(subscriber) {
+                    delivered.push(message);
+                }
+                if delivered.len() == messages.len() {
+                    break;
+                }
+            }
+            delivered
+        };
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let first: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i; 120]).collect();
+    assert_eq!(deliver(&mut rig, &mut subscriber, &first), first);
+    let old_boot = rig.agents.receiver.role.boot_id();
+    let old = rig.agents.sender.role.enc_identity(a, alias()).unwrap();
+    let challenges = rig.agents.receiver.role.posted_challenges().len();
+
+    injector.change();
+    rig.until(true, |rig| {
+        rig.agents.sender.role.session_counters().established == 2
+            && rig.events.iter().any(
+                |event| matches!(event, ImageEvent::Installed { slot: new, .. } if *new != slot),
+            )
+    });
+    assert_eq!(vm_generation::generation(), 1);
+    assert!(!vm_generation::quiesced(), "both roles redrew");
+    let boot = rig.agents.receiver.role.boot_id();
+    assert_ne!(boot, old_boot, "a new receiver_boot_id");
+    let fresh = rig.agents.sender.role.enc_identity(a, alias()).unwrap();
+    assert_ne!(fresh.driver_id, old.driver_id, "a new driver_id");
+    assert_eq!(
+        Some(fresh.driver_id),
+        vm_generation::successor(old.driver_id, 1)
+    );
+    assert_eq!(
+        rig.agents
+            .sender
+            .role
+            .outbound_mut(0)
+            .unwrap()
+            .repair()
+            .unwrap()
+            .identity(),
+        fresh,
+        "its ERRs carry the new identity"
+    );
+    let fresh_challenge = rig.agents.receiver.role.posted_challenges()[challenges..]
+        .iter()
+        .any(|(_, control)| {
+            matches!(control, Control::Challenge(challenge)
+                if challenge.identity == fresh && challenge.challenge.receiver_boot_id == boot)
+        });
+    assert!(fresh_challenge, "a fresh challenge under the new boot id");
+    let Some(ImageEvent::Installed { slot: new, .. }) = rig
+        .events
+        .iter()
+        .rev()
+        .find(|event| matches!(event, ImageEvent::Installed { slot: new, .. } if *new != slot))
+        .copied()
+    else {
+        panic!("{:?}", rig.events);
+    };
+    assert!(
+        rig.agents.receiver.role.enc_epochs(slot).is_none(),
+        "old keys gone"
+    );
+    assert!(rig.agents.receiver.role.enc_epochs(new).is_some());
+    let (_conductor, mut subscriber) = image_subscriber(&rig, new, 0, Role::Optional);
+    let second: Vec<Vec<u8>> = (5..10u8).map(|i| vec![i; 120]).collect();
+    assert_eq!(
+        deliver(&mut rig, &mut subscriber, &second),
+        second,
+        "data flows again"
+    );
+    let receiver = rig
+        .agents
+        .receiver
+        .role
+        .enc_rejections(b, alias().stream_id)
+        .unwrap();
+    for reason in [
+        EncRejection::Tag,
+        EncRejection::Pairwise,
+        EncRejection::MixedClass,
+        EncRejection::BareFrame,
+        EncRejection::PlaintextSetup,
+    ] {
+        assert_eq!(receiver.get(reason), 0, "{reason:?}: {receiver:?}");
+    }
+    let sender = rig.agents.sender.role.enc_rejections(a, alias()).unwrap();
+    assert_eq!(sender.get(EncRejection::Tag), 0, "{sender:?}");
+}
+
+/// ADR-0114 section 10, fail closed: when the successor table refuses the
+/// sender's fresh `driver_id` (here it is full for the generation), the
+/// sender closes but does not redraw, so the fence stays held. Over many
+/// duties nothing encrypted is sealed or opened, nothing is delivered, no
+/// receiver is challenged or bound again, and the publication keeps its old
+/// identity without announcing under it: every ANNOUNCE it attempts fails
+/// to seal and is never sent bare.
+#[test]
+fn a_refused_successor_keeps_the_driver_stopped() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    use crate::wire_enc::VmGenerationWatch;
+    use crate::wire_enc::vm_generation::{self, InjectedSignal, MAX_SUCCESSORS};
+
+    let (mut rig, _b) = encrypted_rig();
+    let a = rig.publisher;
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let old = rig.agents.sender.role.enc_identity(a, alias()).unwrap();
+    let challenges = rig.agents.receiver.role.posted_challenges().len();
+    let established_before = rig.agents.sender.role.session_counters().established;
+    let installed_before = rig.events.len();
+    // The change, seen by another watch of the process, and a table full
+    // for its generation before the sender's duty.
+    let (signal, injector) = InjectedSignal::new();
+    let mut watch = VmGenerationWatch::new(Box::new(signal));
+    injector.change();
+    assert_eq!(watch.poll(0), 1);
+    for id in 1..=u64::try_from(MAX_SUCCESSORS).unwrap() {
+        assert!(vm_generation::successor([id, 0xFEED], 1).is_some());
+    }
+    for i in 0..20u8 {
+        let _ =
+            rig.log.as_mut().unwrap().publications[0].append(&[i; 100], AppendOptions::default());
+    }
+    for _ in 0..2000 {
+        rig.round(true);
+        assert_eq!(poll_message(&mut subscriber), None, "nothing delivered");
+    }
+    assert!(vm_generation::quiesced(), "the fence stays held");
+    assert_eq!(rig.agents.sender.role.enc_generation(), 0, "never redrawn");
+    assert_eq!(
+        rig.agents.sender.role.enc_identity(a, alias()),
+        Some(old),
+        "no fresh identity, and the old one is not used"
+    );
+    assert_eq!(
+        rig.agents
+            .sender
+            .role
+            .outbound_mut(0)
+            .unwrap()
+            .enc_party_epoch(),
+        None,
+        "no session sealer"
+    );
+    assert_eq!(
+        rig.agents.sender.role.session_counters().established,
+        established_before,
+        "never bound again"
+    );
+    assert_eq!(
+        rig.agents.receiver.role.posted_challenges().len(),
+        challenges,
+        "no SETUP reached the receiver, so it challenged nothing"
+    );
+    assert!(
+        rig.events[installed_before..]
+            .iter()
+            .all(|event| !matches!(event, ImageEvent::Installed { .. })),
+        "{:?}",
+        rig.events
+    );
+    assert_eq!(
+        rig.agents.receiver.role.enc_epochs(slot),
+        None,
+        "old keys gone"
+    );
+    assert!(
+        rig.agents.sender.role.counters().seal_failures > 0,
+        "each ANNOUNCE under the old identity failed to seal: none went out"
+    );
+}
