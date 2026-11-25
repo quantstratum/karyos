@@ -1302,7 +1302,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     let now = karyos_sys::host_clock::host_monotonic_ns();
                     outbound.set_timed(&policies, counters, now)?;
                     if let Some(etf) = etf {
-                        outbound.set_etf(etf);
+                        let advance = policies.first().map_or(0, |policy| policy.advance);
+                        outbound.set_etf(etf, advance);
                     }
                 }
                 // Its counters' cells (M2b), dropped with the outbound if

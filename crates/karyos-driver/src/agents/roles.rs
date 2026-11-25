@@ -6005,6 +6005,39 @@ impl<T: StreamTerms> SenderRole<T> {
         }
     }
 
+    /// Posts, through `post` (which says whether it was posted), each late
+    /// drop report of a publication on the `etf` route (ADR-0109 point 7);
+    /// one the ring refused is posted again next cycle. A publication with
+    /// no session identity reports nothing yet.
+    pub(super) fn report_etf_late<O: SocketOps>(
+        &mut self,
+        mut post: impl FnMut(AgentEvent<O, T>) -> bool,
+    ) {
+        for outbound in &mut self.publications {
+            let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
+            let Some(identity) = self.sessions.identity(endpoint, alias) else {
+                continue;
+            };
+            let mut refused = false;
+            outbound.post_etf_late(|report| {
+                let Ok(lane) = u8::try_from(report.lane) else {
+                    return true;
+                };
+                refused = !post(AgentEvent::EtfLateDropReport {
+                    endpoint,
+                    alias,
+                    registration: identity.registration_id,
+                    lane,
+                    txtime: report.txtime,
+                });
+                !refused
+            });
+            if refused {
+                return;
+            }
+        }
+    }
+
     /// Stops the publication `alias` on `endpoint`: its SETUP side, its
     /// bindings and its data path, which goes back to the conductor.
     fn remove<O: SocketOps>(
