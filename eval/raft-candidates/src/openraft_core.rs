@@ -95,21 +95,27 @@ pub const VARIANT: Variant = Variant::Baseline;
 /// Polls one core call pumps at most: the work budget of a call.
 pub const PUMP_BUDGET: usize = 4096;
 
-/// Milliseconds (harness ticks) between heartbeats.
-pub const HEARTBEAT_MS: u64 = 2;
+/// Milliseconds (harness ticks) between heartbeats: one harness step is
+/// one OpenRaft millisecond (C5 v2 manifest, Timing).
+pub const HEARTBEAT_MS: u64 = 5;
 
-/// The election timeout's range, in milliseconds (harness ticks).
-pub const ELECTION_MS: (u64, u64) = (10, 20);
+/// The election timeout's range, in milliseconds (harness ticks),
+/// `[15, 30)` (C5 v2 manifest, Timing). OpenRaft draws it again at every
+/// reset with `RT::thread_rng()`, which this adapter's runtime seeds from
+/// the node's executor (`executor::SimRuntime::thread_rng`), so the draw
+/// is the manifest's, from a seeded source.
+pub const ELECTION_MS: (u64, u64) = (15, 30);
 
 /// The retry delays after a failed RPC, on the harness's clock. OpenRaft's
-/// default, 200 ms then up to 1 s, is 100 heartbeats here, which on a lossy
+/// default, 200 ms then up to 1 s, is 40 heartbeats here, which on a lossy
 /// link stalls a follower for most of a run; raft-rs retries at its next
-/// heartbeat. The adapter scales it to its own heartbeat instead: an
-/// adapter setting, the same for every workload, not a workload parameter.
-pub const BACKOFF: &str = "2ms, 4ms, 8ms ..20ms";
+/// heartbeat. The adapter scales it to its own heartbeat instead, from
+/// one heartbeat up to the longest election timeout: an adapter setting,
+/// the same for every workload, not a workload parameter.
+pub const BACKOFF: &str = "5ms, 10ms, 20ms ..30ms";
 
 /// The shortest an RPC waits for its answer: OpenRaft's replication asks
-/// for its heartbeat interval, 2 ticks, which is shorter than a reply's
+/// for its heartbeat interval, 5 ticks, which is shorter than a reply's
 /// round trip on the workloads' slower links; this is the election
 /// timeout's upper bound instead. An adapter setting, the same for every
 /// workload.

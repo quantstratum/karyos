@@ -26,12 +26,17 @@
 //! it as it does after a loss. The log-read limit is then the measured
 //! bytes the harness charges, not the mirror's.
 //!
-//! **Determinism.** raft-rs draws each election timeout with
-//! `rand::thread_rng()` from `[min_election_tick, max_election_tick)`.
-//! The adapter sets `max = min + 1`, so the draw has one value and the
-//! run is reproducible from its seed; to keep elections from splitting,
-//! each node's timeout is staggered by its position in the voter set
-//! ([`election_ticks`]), so no two voters share one.
+//! **Timing and determinism** (C5 v2 manifest, Timing: heartbeat 5
+//! ticks, election timeouts in `[15, 30)` ticks from a seeded source).
+//! One harness step is one raft-rs tick. raft-rs draws each election
+//! timeout with `rand::thread_rng()` from `[min_election_tick,
+//! max_election_tick)`, a source the adapter cannot seed, so it takes the
+//! manifest's fallback: the adapter sets `max = min + 1`, so the draw has
+//! one value and the run is reproducible from its seed, and gives each
+//! server a fixed value in `[15, 30)`, spread evenly by its position in
+//! the voter set ([`election_ticks`]), no two equal. The report names
+//! that as this adapter's deviation from the frozen timing; raft-rs keeps
+//! the value at every reset.
 //!
 //! **Pre-vote** (SPEC.md §9, "pre-vote") is raft-rs's own `pre_vote`, on
 //! in [`RaftRs`] and off only in [`RaftRsNoPreVote`], the negative
@@ -74,11 +79,16 @@ use crate::variant::Variant;
 /// The build of `raft` this adapter runs: the admitted release, unpatched.
 pub const VARIANT: Variant = Variant::Baseline;
 
-/// Ticks between a leader's heartbeats: one harness step is one tick.
-pub const HEARTBEAT_TICKS: usize = 2;
+/// Ticks between a leader's heartbeats: one harness step is one tick
+/// (C5 v2 manifest, Timing).
+pub const HEARTBEAT_TICKS: usize = 5;
 
-/// The shortest election timeout, in ticks.
-pub const ELECTION_TICKS: usize = 10;
+/// The shortest election timeout, in ticks (C5 v2 manifest, Timing).
+pub const ELECTION_TICKS: usize = 15;
+
+/// One past the longest election timeout, in ticks: timeouts are in
+/// `ELECTION_TICKS..ELECTION_END` (C5 v2 manifest, Timing).
+pub const ELECTION_END: usize = 30;
 
 /// Ticks one [`ConsensusCore::tick`] call runs at most: a clock that
 /// jumps never makes a single call unbounded.
@@ -152,15 +162,20 @@ pub fn append_ack(message: &eraftpb::Message) -> Option<(u64, u64)> {
 }
 
 /// Node `id`'s election timeout among `voters`, `[min, max)` in ticks:
-/// one value, so raft-rs's `thread_rng` draw is deterministic, staggered
-/// by the node's position among the voters (and itself) in id order, so
-/// no two voters share a timeout and elections do not split forever,
-/// whatever the ids (karyos#956 review).
+/// one value, so raft-rs's `thread_rng` draw is deterministic, in
+/// `ELECTION_TICKS..ELECTION_END`, spread evenly by the node's position
+/// among the voters (and itself) in id order, so no two of up to 15
+/// voters share a timeout and elections do not split forever, whatever
+/// the ids (karyos#956 review). Past 15 voters, positions share the last
+/// value; the comparison runs 3 and 5.
 #[must_use]
 pub fn election_ticks(id: NodeId, voters: &[NodeId]) -> (usize, usize) {
     let position = voters.iter().filter(|&&voter| voter < id).count();
-    let stagger = position.saturating_mul(3);
-    let min = ELECTION_TICKS.saturating_add(stagger);
+    let span = ELECTION_END - ELECTION_TICKS;
+    let step = (span / voters.len().max(1)).max(1);
+    let min = ELECTION_TICKS
+        .saturating_add(position.saturating_mul(step))
+        .min(ELECTION_END - 1);
     (min, min.saturating_add(1))
 }
 
@@ -806,6 +821,7 @@ mod tests {
         for &id in &voters {
             let (min, max) = election_ticks(id, &voters);
             assert!(min >= ELECTION_TICKS);
+            assert!(max <= ELECTION_END, "{id}: {min}..{max}");
             assert_eq!(max, min + 1);
         }
     }
@@ -814,7 +830,8 @@ mod tests {
     /// a timeout, or synchronized voters split every election.
     #[test]
     fn no_two_voters_share_an_election_timeout() {
-        for voters in [vec![0, 3, 6], vec![1, 4, 7, 10, 13], vec![0, 1, 2]] {
+        let fifteen: Vec<NodeId> = (0..15).collect();
+        for voters in [vec![0, 3, 6], vec![1, 4, 7, 10, 13], vec![0, 1, 2], fifteen] {
             let ticks: BTreeSet<(usize, usize)> = voters
                 .iter()
                 .map(|&id| election_ticks(id, &voters))
