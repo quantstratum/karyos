@@ -950,3 +950,126 @@ fn test_container_bounds_over_its_budget_stop_it() {
     ));
     assert_eq!(container.applied(), None);
 }
+
+fn guard_entry(index: u64, event_time: u64, guard: crate::guards::GuardEntry) -> Entry {
+    Entry {
+        index,
+        term: 1,
+        event_time,
+        payload: guard.to_vec().unwrap(),
+    }
+}
+
+/// Guard entries go to the guard table, not the service, and come back
+/// with their ordered effects; the service sees none of them.
+#[test]
+fn test_container_guard_entries_go_to_the_guard_table_with_their_effects() {
+    use crate::guards::{GuardEffect, GuardEntry, GuardOutcome, Lease};
+    let mut container = container();
+    let bounds = container.guards().bounds();
+    assert!(matches!(
+        container.apply(&guard_entry(1, 1, GuardEntry::Bounds(bounds))),
+        Ok(Applied::Guard {
+            outcome: GuardOutcome::Bounds,
+            effects: []
+        })
+    ));
+    assert!(matches!(
+        container.apply(&guard_entry(
+            2,
+            2,
+            GuardEntry::Define {
+                guard: 9,
+                policy: 1
+            }
+        )),
+        Ok(Applied::Guard {
+            outcome: GuardOutcome::Accepted,
+            effects: [GuardEffect::Guard { .. }]
+        })
+    ));
+    assert!(matches!(
+        container.apply(&guard_entry(3, 10, GuardEntry::Renew { issued: 10 })),
+        Ok(Applied::Guard {
+            outcome: GuardOutcome::Accepted,
+            effects: [GuardEffect::Lease {
+                lease: Lease::Active { .. },
+                ..
+            }]
+        })
+    ));
+    let reopen = GuardEntry::Reopen {
+        guard: 9,
+        fence: 1,
+        operation: 1,
+        requester: 2,
+        reason: 3,
+    };
+    assert!(matches!(
+        container.apply(&guard_entry(4, 11, reopen)),
+        Ok(Applied::Guard {
+            outcome: GuardOutcome::Accepted,
+            ..
+        })
+    ));
+    assert!(container.guards().guard(9).unwrap().open());
+    assert_eq!(container.applied(), Some(4));
+    assert!(
+        container.service().seen.is_empty(),
+        "the service saw a guard entry"
+    );
+}
+
+/// A replica whose guard bounds, its durability profile included, differ
+/// from the logged ones stops at that entry, with nothing applied; an
+/// unreadable guard entry stops every replica at the same index.
+#[test]
+fn test_container_other_guard_bounds_or_an_unreadable_guard_entry_stop() {
+    use crate::guards::{GuardBounds, GuardEntry, GuardStop, Profile};
+    let volatile = GuardBounds::new(64, 2_000_000_000, 500_000_000, Profile::Volatile).unwrap();
+    let mut container = container();
+    assert!(matches!(
+        container.apply(&guard_entry(1, 1, GuardEntry::Bounds(volatile))),
+        Err(ApplyError::Guard(GuardStop::BoundsDiffer { .. }))
+    ));
+    assert_eq!(container.applied(), None);
+    let mut bad = guard_entry(1, 1, GuardEntry::Renew { issued: 1 });
+    // Version 2 of schema 6: unsupported.
+    bad.payload[4] = 2;
+    assert!(matches!(
+        container.apply(&bad),
+        Err(ApplyError::Envelope(_))
+    ));
+    assert_eq!(container.applied(), None);
+}
+
+/// A restored guard section replaces the table; an invalid one leaves it.
+#[test]
+fn test_container_a_guard_section_restores_or_is_refused_whole() {
+    use crate::guards::GuardEntry;
+    let mut source = container();
+    let bounds = source.guards().bounds();
+    source
+        .apply(&guard_entry(1, 1, GuardEntry::Bounds(bounds)))
+        .unwrap();
+    source
+        .apply(&guard_entry(
+            2,
+            2,
+            GuardEntry::Define {
+                guard: 9,
+                policy: 1,
+            },
+        ))
+        .unwrap();
+    let section = source.guards().section();
+    let mut replica = container();
+    assert!(
+        replica
+            .restore_guards(&section[..section.len() - 1], 2, 2)
+            .is_err()
+    );
+    assert!(replica.guards().guards().is_empty());
+    replica.restore_guards(&section, 2, 2).unwrap();
+    assert_eq!(replica.guards().guards(), source.guards().guards());
+}
