@@ -178,5 +178,20 @@ fn a_section_of_an_unknown_kind_is_told_apart_from_damage() {
         matches!(read, Err(SnapshotError::UnknownSection { code: 99, .. })),
         "{read:?}"
     );
+    // Codex review of #1270 (P2): the kind is classified only once the
+    // whole snapshot's digest holds; a digest that fails is damage.
+    let wrong = SnapshotInfo {
+        digest: info.digest ^ 1,
+        ..info
+    };
+    assert!(matches!(
+        store.read(&wrong),
+        Err(SnapshotError::Damaged { .. })
+    ));
+    // A reopened store reports it apart from damage, and does not use it.
+    let opened = SnapshotStore::open(StdDisk, &dir, geometry, SnapshotConfig::default()).unwrap();
+    assert_eq!(opened.unknown, vec![info]);
+    assert!(opened.damaged.is_empty());
+    assert!(opened.store.snapshots().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }

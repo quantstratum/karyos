@@ -450,3 +450,105 @@ fn a_part_round_trips_through_its_section_version() {
     );
     assert_eq!(ServicePart::of_section(1 << 48, b""), None);
 }
+
+fn raw(index: u64, event_time: u64, payload: Vec<u8>) -> Entry {
+    Entry {
+        index,
+        term: 1,
+        event_time,
+        payload,
+    }
+}
+
+/// Codex review of #1270 (P1): a snapshot taken before the log's guard
+/// bounds applied has no guards section and restores a fresh guard table,
+/// not the target's guards of another position.
+#[test]
+fn a_snapshot_without_guards_restores_a_fresh_guard_table() {
+    use crate::guards::GuardEntry;
+
+    let mut source = ServiceContainer::new(Sequencer::new(), config()).unwrap();
+    apply_range(&mut source, 1, 6);
+    let mut parts = ServiceSnapshot::new(4096, 8);
+    let sections = reads(&source.snapshot(&mut parts).unwrap());
+    assert!(
+        sections
+            .iter()
+            .all(|section| section.kind != SectionKind::Guards)
+    );
+    let mut target = ServiceContainer::new(Sequencer::new(), config()).unwrap();
+    let bounds = target.guards().bounds();
+    target
+        .apply(&raw(1, 1, GuardEntry::Bounds(bounds).to_vec().unwrap()))
+        .unwrap();
+    assert!(target.guards().bounds_logged());
+    target.restore(6, &sections).unwrap();
+    assert!(!target.guards().bounds_logged(), "the snapshot's guards");
+    assert!(target.guards().guards().is_empty());
+}
+
+/// Codex review of #1270 (P1): the session bootstrap state is restored
+/// from the snapshot: one taken before the log's session bounds applied
+/// leaves a restored leader proposing them, and one taken after does not.
+#[test]
+fn the_session_bootstrap_state_travels_in_the_snapshot() {
+    use crate::service::SessionBounds;
+
+    let mut before = ServiceContainer::new(Sequencer::new(), config()).unwrap();
+    // A leader's empty entry: applied, no bounds yet.
+    before.apply(&raw(1, 1, Vec::new())).unwrap();
+    let mut parts = ServiceSnapshot::new(4096, 8);
+    let sections = reads(&before.snapshot(&mut parts).unwrap());
+    let mut restored = ServiceContainer::new(Sequencer::new(), config()).unwrap();
+    restored.restore(1, &sections).unwrap();
+    assert!(!restored.bounds_logged(), "the bounds are still to propose");
+    let mut after = ServiceContainer::new(Sequencer::new(), config()).unwrap();
+    let bounds = SessionBounds::new(after.sessions().config());
+    after.apply(&raw(1, 1, bounds.to_vec().unwrap())).unwrap();
+    let sections = reads(&after.snapshot(&mut parts).unwrap());
+    let mut restored = ServiceContainer::new(Sequencer::new(), config()).unwrap();
+    restored.restore(1, &sections).unwrap();
+    assert!(restored.bounds_logged());
+}
+
+/// Codex review of #1270 (P1, P2): bounds the log carried, which a fresh
+/// replica adopted, restore into a replica configured otherwise, as the
+/// log's entry would; within the container's session budget, refused
+/// before anything is allocated.
+#[test]
+fn logged_session_bounds_restore_within_the_budget() {
+    use crate::service::SessionBounds;
+
+    // Larger than the configured table, so a budget can hold one and not
+    // the other.
+    let logged = DedupConfig::default()
+        .with_sessions(8)
+        .with_window(8)
+        .with_response_bytes(16)
+        .with_ttl(1_000_000);
+    let mut source = ServiceContainer::new(Sequencer::new(), config()).unwrap();
+    source
+        .apply(&raw(1, 1, SessionBounds::new(logged).to_vec().unwrap()))
+        .unwrap();
+    assert_eq!(source.sessions().config(), logged);
+    let mut parts = ServiceSnapshot::new(4096, 8);
+    let sections = reads(&source.snapshot(&mut parts).unwrap());
+    let mut target = ServiceContainer::new(Sequencer::new(), config()).unwrap();
+    target.restore(1, &sections).unwrap();
+    assert_eq!(target.sessions().config(), logged);
+    let asked = logged.reserved_bytes().unwrap();
+    let mut tight =
+        ServiceContainer::new(Sequencer::new(), config().with_session_budget(asked - 1));
+    // A container whose own table fits the tight budget.
+    if let Ok(tight) = tight.as_mut() {
+        assert!(matches!(
+            tight.restore(1, &sections),
+            Err(RestoreError::Sessions(crate::dedup::DecodeError::Config(
+                crate::dedup::ConfigError::OverBudget { .. }
+            )))
+        ));
+        assert_eq!(tight.applied(), None);
+    } else {
+        panic!("the tight container does not hold its own table");
+    }
+}

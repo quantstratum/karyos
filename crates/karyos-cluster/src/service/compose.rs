@@ -26,7 +26,16 @@
 //!   service its parts ([`ClusteredService::restore`]), and only when the
 //!   service accepts them replaces its own tables. A service must leave
 //!   its state unchanged when it refuses, so a refused restore changes
-//!   nothing.
+//!   nothing. Every container table is replaced from the snapshot's one
+//!   position: a snapshot taken before the log's guard bounds applied has
+//!   no guards section, and restores a fresh guard table; the session
+//!   bootstrap state (whether the log's session bounds have applied, and
+//!   whether a registration has) travels in the timers section, so a
+//!   restored leader still proposes the bounds a snapshot was taken
+//!   before. A snapshot whose logged session bounds differ from the
+//!   container's configured ones restores them, as the log's bounds entry
+//!   would, within the container's session budget; bounds the log never
+//!   carried must match.
 //! - **Versions.** A part carries its own id and version. A service meets
 //!   a part id it does not know, or a version newer than it reads, with a
 //!   typed refusal ([`RestoreRefused`]), never a guess; the snapshot is
@@ -56,8 +65,12 @@ pub const MAX_SERVICE_PARTS: usize = 64;
 /// slot (id, version, offset, length) and its section header.
 pub const PART_METADATA: u64 = 24 + crate::snapshot::SECTION_HEADER as u64;
 
-/// The version of the timers section.
+/// The version of the timers section: the container's session bootstrap
+/// flags (bit 0: the log's session bounds applied; bit 1: no registration
+/// applied yet), then the timers.
 pub const TIMERS_VERSION: u64 = 1;
+const BOUNDS_LOGGED: u8 = 1;
+const FRESH: u8 = 2;
 /// The version of the sessions section ([`SessionTable::encode`]).
 pub const SESSIONS_SECTION_VERSION: u64 = 1;
 
@@ -247,6 +260,7 @@ pub struct ComposedSnapshot<'a> {
     /// The log time at that index.
     pub log_time: u64,
     sessions: Vec<u8>,
+    /// The bootstrap flags and the timers.
     timers: Vec<u8>,
     guards: Option<Vec<u8>>,
     service: &'a ServiceSnapshot,
@@ -396,7 +410,18 @@ impl<S: ClusteredService> ServiceContainer<S> {
             index,
             log_time: self.sessions.log_time(),
             sessions: self.sessions.encode(),
-            timers: self.timers.encode(),
+            timers: {
+                let mut flags = 0;
+                if self.bounds_logged {
+                    flags |= BOUNDS_LOGGED;
+                }
+                if self.fresh {
+                    flags |= FRESH;
+                }
+                let mut out = vec![flags];
+                out.extend(self.timers.encode());
+                out
+            },
             guards: self.guards.section(),
             service: parts,
         })
@@ -450,10 +475,6 @@ impl<S: ClusteredService> ServiceContainer<S> {
                 version: sessions.version,
             });
         }
-        let table = SessionTable::decode(&sessions.bytes)?;
-        if table.config() != self.sessions.config() {
-            return Err(RestoreError::SessionBounds);
-        }
         let timers = timers.ok_or(RestoreError::Missing(SectionKind::Timers))?;
         if timers.version != TIMERS_VERSION {
             return Err(RestoreError::Version {
@@ -461,29 +482,40 @@ impl<S: ClusteredService> ServiceContainer<S> {
                 version: timers.version,
             });
         }
-        let timers =
-            Timers::decode(&timers.bytes, self.timers.bound).ok_or(RestoreError::Timers)?;
+        let (&flags, rest) = timers.bytes.split_first().ok_or(RestoreError::Timers)?;
+        if flags & !(BOUNDS_LOGGED | FRESH) != 0 {
+            return Err(RestoreError::Timers);
+        }
+        let (bounds_logged, fresh) = (flags & BOUNDS_LOGGED != 0, flags & FRESH != 0);
+        let timers = Timers::decode(rest, self.timers.bound).ok_or(RestoreError::Timers)?;
+        // Within this container's session budget, checked before the
+        // table is allocated; logged bounds restore as the log's entry
+        // would, unlogged ones must be this container's.
+        let table = SessionTable::decode_within(&sessions.bytes, self.session_budget)?;
+        if table.config() != self.sessions.config() && !bounds_logged {
+            return Err(RestoreError::SessionBounds);
+        }
+        // Every table from the snapshot's position: no guards section is
+        // a fresh guard table, the log's guard bounds not applied yet.
         let guards = match guards {
-            Some(section) => Some(GuardTable::restore(
+            Some(section) => GuardTable::restore(
                 section.version,
                 &section.bytes,
                 self.guards.bounds(),
                 index,
                 table.log_time(),
-            )?),
-            None => None,
+            )?,
+            None => GuardTable::new(self.guards.bounds()),
         };
         // Every container section holds: the service's parts last, so a
         // refusal leaves everything as it was.
         self.service.restore(&parts)?;
         self.sessions = table;
         self.timers = timers;
-        if let Some(guards) = guards {
-            self.guards = guards;
-        }
+        self.guards = guards;
         self.applied = Some(index);
-        self.fresh = false;
-        self.bounds_logged = true;
+        self.fresh = fresh;
+        self.bounds_logged = bounds_logged;
         Ok(())
     }
 }
