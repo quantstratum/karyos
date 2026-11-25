@@ -861,8 +861,15 @@ fn time_archive(name: &str, journal_id: u64) -> Archive {
     store.append(&met).unwrap();
     store.append(&missing).unwrap();
     drop(store);
+    sign_time_evidence(&archive, &entries, journal_id);
+    archive
+}
 
-    let mut journal = open_journal(&entries);
+/// Signs and anchors the head of the time evidence journal in `entries` as
+/// journal `journal_id`, the operator's, and writes the trust file naming
+/// it `time-journal 1`.
+fn sign_time_evidence(archive: &Archive, entries: &Path, journal_id: u64) {
+    let mut journal = open_journal(entries);
     let authority = TestKey::from_seed([1; 32]);
     let mut signer = TestKey::from_seed([9; 32]);
     let mut entry = RegistryEntry {
@@ -881,7 +888,7 @@ fn time_archive(name: &str, journal_id: u64) -> Archive {
         archive_id: ARCHIVE,
         authorities: vec![authority.public()],
     };
-    let mut keys = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &entries, KEYS_FILE).unwrap();
+    let mut keys = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, entries, KEYS_FILE).unwrap();
     KeyRegistry::new(trust)
         .append(&entry, &mut journal, &mut keys)
         .unwrap();
@@ -899,7 +906,7 @@ fn time_archive(name: &str, journal_id: u64) -> Archive {
         custody: Custody::NoSeparation,
         signature: signer.sign(&head).unwrap(),
     };
-    let mut heads = Ledger::<_, SIGNED_HEAD_LENGTH>::open(StdDisk, &entries, HEADS_FILE).unwrap();
+    let mut heads = Ledger::<_, SIGNED_HEAD_LENGTH>::open(StdDisk, entries, HEADS_FILE).unwrap();
     heads.append(signed.encode()).unwrap();
     let mut anchors = LedgerAnchorStore::open(StdDisk, &archive.anchors(), OPERATOR).unwrap();
     publish_due(
@@ -919,7 +926,6 @@ fn time_archive(name: &str, journal_id: u64) -> Archive {
         ),
     )
     .unwrap();
-    archive
 }
 
 fn time_run(archive: &Archive, extra: &[&str]) -> (u8, String, String) {
@@ -1396,4 +1402,202 @@ fn time_evidence_is_checked_against_its_directorys_seals() {
 /// The first entry of `dir`'s store.
 fn time_evidence_first(dir: &std::path::Path) -> karyos_archive::integrity::time_evidence::Entry {
     karyos_archive::integrity::time_evidence::read_sealed(StdDisk, dir).unwrap()[0]
+}
+
+/// karyos#1137's last acceptance point: a group recorded by a running
+/// Archive agent, whose calibration source is the one `karyosd
+/// --archive-calibration-journal` gives it, gets time evidence entries
+/// from the records `karyos-tools calibrate append` writes to the journal
+/// on disk, including records appended after the group's events, while
+/// the agent waits for them; `verify --time-requirement` then reports a
+/// verdict. The UTC reference records are synthetic: no hardware here is
+/// UTC traceable, and nothing here claims UTC.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_group_gets_time_evidence_from_the_calibration_journal_on_disk() {
+    use karyos_archive::agent::{
+        AgentConfig, ArchiveHandle, GroupTimeEvidence, NewGroup, StartGroup,
+    };
+    use karyos_archive::group::capture::CaptureConfig;
+    use karyos_archive::group::journal::JournalConfig;
+    use karyos_archive::group::record::{
+        Capture, EndOutcome, EventEnd, ExternalEvent, GroupRecord, MAX_RECORD,
+    };
+    use karyos_archive::integrity::time_evidence::{NO_BOUND, entries_dir, read_sealed};
+    use karyos_archive::integrity::time_producer::EventClock;
+    use karyos_trace::clocks::utc::{
+        Scale, Source as UtcSource, SyncState as UtcSync, UtcReference,
+    };
+    use karyos_trace::clocks::{Calibration, ClockKey};
+    use karyos_trace::journal::ObserverId;
+
+    const GROUP: u64 = 5;
+    let key = |[low, high, journal, domain, epoch]: [u64; 5]| ClockKey {
+        observer: ObserverId {
+            driver: [low, high],
+            journal,
+        },
+        domain,
+        epoch,
+    };
+    let calibration = |valid_from: u64, valid_to: u64| {
+        Calibration {
+            from: key([1, 0, 2, 3, 4]),
+            to: key([9, 0, 9, 9, 9]),
+            reference: valid_from,
+            offset: 10,
+            offset_uncertainty: 2,
+            drift: 0,
+            drift_uncertainty: 0,
+            valid_from,
+            valid_to,
+        }
+        .encode()
+        .unwrap()
+    };
+    let reference = |valid_from: u64, valid_to: u64| {
+        UtcReference {
+            clock: key([9, 0, 9, 9, 9]),
+            source: UtcSource::Gnss,
+            sync_state: UtcSync::Synchronised,
+            bound: 100,
+            valid_from,
+            valid_to,
+            tick_fs: 1_000_000,
+            scale: Scale::Tai,
+            origin: 0,
+            origin_scale_ns: 2_000_000_000_000_000_000,
+            leap_table: 69,
+            transform_uncertainty_ns: 0,
+        }
+        .encode()
+        .unwrap()
+    };
+    let root = std::env::temp_dir().join(format!(
+        "karyos-verify-calibration-journal-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let archive = Archive { root };
+    let groups = archive.dir();
+    std::fs::create_dir_all(entries_dir(&groups)).unwrap();
+    std::fs::create_dir_all(archive.anchors()).unwrap();
+    let host = archive.root.join("host");
+    std::fs::create_dir_all(&host).unwrap();
+    let calibrations = archive.root.join("calibrations");
+    // The producer's CLI, as an operator pipes `calibrate phc` into it.
+    let append = |records: &[[u64; 18]]| {
+        let text: String = records
+            .iter()
+            .map(|words| {
+                let words: Vec<String> = words.iter().map(|word| format!("{word:#018x}")).collect();
+                format!("record {}\n", words.join(" "))
+            })
+            .collect();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let status = crate::calibrate::journal::run(
+            [OsString::from("--journal"), calibrations.clone().into()].into_iter(),
+            &mut std::io::Cursor::new(text.into_bytes()),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(status, 0, "{}", String::from_utf8_lossy(&err));
+    };
+    append(&[calibration(0, 100), reference(0, 1999)]);
+
+    let config =
+        AgentConfig::default().with_seal_interval(Some(std::time::Duration::from_millis(1)));
+    let agent = ArchiveHandle::spawn(StdDisk, &host, config).unwrap();
+    agent
+        .set_calibration_source(crate::daemon_archive::calibration_source(&calibrations))
+        .unwrap();
+    let clock = EventClock {
+        clock: [1, 0, 2, 3, 4],
+        granularity: 1,
+    };
+    let start = StartGroup::new(
+        GROUP,
+        groups.clone(),
+        JournalConfig::new(
+            karyos_archive::group::journal::MIN_SEGMENT_LENGTH,
+            SyncPolicy::Every { interval_ns: 0 },
+        ),
+        CaptureConfig::new(1 << 16, 4096, 64),
+    )
+    .with_new(NewGroup::new(1, 4096, Capture::Strict, b"m".to_vec()))
+    .with_time_evidence(GroupTimeEvidence::new(
+        clock,
+        std::time::Duration::from_secs(30),
+    ));
+    let mut sender = agent.start_group(start).unwrap();
+    let mut out = vec![0u8; MAX_RECORD];
+    for seq in 1..=3u64 {
+        let mut bytes = Vec::new();
+        for record in [
+            GroupRecord::External(ExternalEvent {
+                group_seq: seq,
+                logical_time: seq,
+                kind: 1,
+                value: b"x",
+            }),
+            GroupRecord::End(EventEnd {
+                group_seq: seq,
+                observations: 0,
+                outcome: EndOutcome::Complete,
+            }),
+        ] {
+            let length = record.encode(&mut out).unwrap();
+            bytes.extend_from_slice(&out[..length]);
+        }
+        sender.admit().unwrap();
+        sender.send(&bytes, seq).unwrap();
+    }
+    assert_eq!(
+        sender
+            .waiter()
+            .wait_durable(3, std::time::Duration::from_secs(5)),
+        Ok(3)
+    );
+    // The range is sealed and waits: the journal holds no completeness
+    // boundary past it yet.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(read_sealed(StdDisk, &groups).unwrap().is_empty());
+    // The producer publishes past it, while the agent runs.
+    append(&[calibration(1000, 2000), reference(2000, 3000)]);
+    let mut entries = Vec::new();
+    for _ in 0..10_000 {
+        entries = read_sealed(StdDisk, &groups).unwrap();
+        if !entries.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    agent.shutdown().unwrap();
+    assert!(!entries.is_empty(), "no entry produced");
+    for entry in &entries {
+        assert_eq!(entry.recording, GROUP);
+        assert_eq!(entry.clock, [1, 0, 2, 3, 4]);
+        assert_ne!(entry.bound_min_ns, NO_BOUND);
+        assert_ne!(entry.utc_reference, [0; 32]);
+    }
+
+    sign_time_evidence(&archive, &entries_dir(&groups), 1);
+    let (_, out, err) = time_run(&archive, &["--time-requirement", "1000:1"]);
+    assert_eq!(err, "", "{out}");
+    // Every event range is met through the journal's records. The group
+    // journal's header, before the session's first event, carries no
+    // timestamp and has no entry, as for any group (karyos#1137), so the
+    // combined verdict stays no_evidence.
+    let met = out
+        .lines()
+        .filter(|line| line.starts_with(&format!("time recording {GROUP} [")))
+        .filter(|line| line.ends_with("clock 3:4 met"))
+        .count();
+    assert!(met >= 1, "{out}");
+    assert!(!out.contains("clock 3:4 no_evidence"), "{out}");
+    assert!(!out.contains("clock 3:4 not_met"), "{out}");
+    let (_, out, _) = time_run(&archive, &["--time-requirement", "50:1"]);
+    assert!(out.contains("clock 3:4 not_met"), "{out}");
+    assert!(out.ends_with("time verdict: not_met\n"), "{out}");
+    std::fs::remove_dir_all(&archive.root).unwrap();
 }

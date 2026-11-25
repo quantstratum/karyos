@@ -48,6 +48,7 @@
 //! the chain distinguishes them, which is the point.
 
 pub mod anchor;
+pub mod calibration_journal;
 pub mod copies;
 pub mod damage;
 pub mod export;

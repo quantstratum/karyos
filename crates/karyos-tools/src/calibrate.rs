@@ -27,6 +27,8 @@ use karyos_trace::calibrate::{PairedRead, fit};
 use karyos_trace::clocks::ClockKey;
 use karyos_trace::journal::ObserverId;
 
+pub mod journal;
+
 /// The most reads one run takes: 16 MiB of reads, a few minutes at the
 /// default interval.
 pub const MAX_READS: usize = 1 << 20;
@@ -46,6 +48,7 @@ this host, with measured uncertainties (Linux).
 Usage: karyos-tools calibrate phc [--device /dev/ptp0] [--reads 4096]
            [--keep 25] [--interval-us 500] [--extension-ms 0]
            [--source-domain N] [--target-domain N] [--epoch N]
+       karyos-tools calibrate append --journal <dir> [<word>...]
 
 It reads CLOCK_MONOTONIC_RAW (the TSC at a fixed scale on a host whose
 clock source is tsc), the PHC, and CLOCK_MONOTONIC_RAW again, --reads
@@ -209,6 +212,9 @@ pub fn run(
     let mut args = args;
     match args.next().as_ref().and_then(|arg| arg.to_str()) {
         Some("phc") => {}
+        Some("append") => {
+            return journal::run(args, &mut std::io::stdin().lock(), out, err);
+        }
         None | Some("-h" | "--help") => {
             let _ = out.write_all(HELP.as_bytes());
             return 0;
