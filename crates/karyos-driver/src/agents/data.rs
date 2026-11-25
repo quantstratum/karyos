@@ -290,8 +290,9 @@ struct EtfDrops {
     ledger: etf::EtfLedger,
     /// One drain's reports.
     reports: Vec<karyos_io::sockets::errqueue::ErrEntry>,
-    /// Per lane, the catch-up job repairing its first dropped range.
-    jobs: [Option<crate::repair::jobs::JobRef>; MAX_LANES],
+    /// Per lane, the catch-up job repairing a dropped range, and the range
+    /// it was given.
+    jobs: [Option<(crate::repair::jobs::JobRef, (u64, u64))>; MAX_LANES],
 }
 
 /// The counters of one outbound publication; checked, sticky on overflow.
@@ -1619,17 +1620,26 @@ impl<T: StreamTerms> Outbound<T> {
     }
 
     /// Hands its late drop reports, oldest first, to `post` (which says
-    /// whether it took one) for the driver's diagnostic ring; one `post`
-    /// refused is offered again at the next call.
-    pub(crate) fn post_etf_late(&mut self, mut post: impl FnMut(etf::LateReport) -> bool) {
+    /// whether it took one) for the driver's diagnostic ring, each with the
+    /// count it stands for, then those the ledger could only count, as one
+    /// count with no report (`None`); one `post` refused is offered again
+    /// at the next call.
+    pub(crate) fn post_etf_late(
+        &mut self,
+        mut post: impl FnMut(Option<etf::LateReport>, u64) -> bool,
+    ) {
         let Some(drops) = self.etf_drops.as_deref_mut() else {
             return;
         };
         while let Some(report) = drops.ledger.peek_late() {
-            if !post(report) {
+            if !post(Some(report), report.unrecorded.saturating_add(1)) {
                 return;
             }
             drops.ledger.pop_late();
+        }
+        let unrecorded = drops.ledger.take_unrecorded();
+        if unrecorded > 0 && !post(None, unrecorded) {
+            drops.ledger.restore_unrecorded(unrecorded);
         }
     }
 
@@ -1669,25 +1679,32 @@ impl<T: StreamTerms> Outbound<T> {
             let (Ok(lane8), Some(job)) = (u8::try_from(lane), drops.jobs.get_mut(lane)) else {
                 continue;
             };
-            if let Some(current) = *job {
+            // The job's own progress: the lane's watermark restarted at its
+            // start, and only it runs on the lane. What it did not send goes
+            // back to the ranges, in position order with any newer drops.
+            if let Some((current, (from, to))) = *job {
                 if repair.catch_up_pending(current) {
                     continue;
                 }
                 *job = None;
-                drops
-                    .ledger
-                    .caught_up_through(lane, repair.catch_up_through(lane8));
+                let through = repair.catch_up_through(lane8).max(from);
+                drops.ledger.give_back(lane, (through, to));
             }
-            let Some((from, to)) = drops.ledger.next_catch_up(lane) else {
+            let Some((from, to)) = drops.ledger.take_catch_up(lane) else {
                 continue;
             };
+            repair.restart_catch_up(lane8, from);
             match repair.catch_up(lane8, (from, to), reader.floor()) {
-                super::repair::CatchUp::Queued { job: queued, .. } => *job = Some(queued),
+                super::repair::CatchUp::Queued {
+                    job: queued,
+                    from: start,
+                    ..
+                } => *job = Some((queued, (start, to))),
                 // A full share tries again next duty.
-                super::repair::CatchUp::Full { .. } => {}
+                super::repair::CatchUp::Full { .. } => drops.ledger.give_back(lane, (from, to)),
                 // Below the retention floor, counted lost by the repair
                 // path: nothing more to send.
-                super::repair::CatchUp::Done => drops.ledger.caught_up_through(lane, to),
+                super::repair::CatchUp::Done => {}
             }
         }
     }

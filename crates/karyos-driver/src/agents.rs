@@ -1003,10 +1003,12 @@ pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
         alias: karyos_protocol::network::Alias,
         /// Its registration.
         registration: u64,
-        /// The lane.
-        lane: u8,
-        /// The report's time, in `CLOCK_TAI` nanoseconds.
-        txtime: u64,
+        /// The lane and the report's time, in `CLOCK_TAI` nanoseconds;
+        /// `None` for reports the sender could only count.
+        report: Option<(u8, u64)>,
+        /// The late reports it stands for: this one and those before it
+        /// the sender could only count.
+        count: u64,
     },
     /// The sender stopped the publication; `outbound` is its data path,
     /// `None` when it held no such publication.
@@ -1753,8 +1755,8 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
     }
 
     /// What the etf drop ledger of its `index`-th publication counted, on
-    /// the etf route (tests).
-    #[cfg(test)]
+    /// the etf route (the Linux end to end tests).
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn etf_counts(&self, index: usize) -> Option<data::etf::EtfCounts> {
         self.role
             .outbound(index)

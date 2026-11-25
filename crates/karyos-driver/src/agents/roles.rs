@@ -6019,16 +6019,14 @@ impl<T: StreamTerms> SenderRole<T> {
                 continue;
             };
             let mut refused = false;
-            outbound.post_etf_late(|report| {
-                let Ok(lane) = u8::try_from(report.lane) else {
-                    return true;
-                };
+            outbound.post_etf_late(|report, count| {
+                let lane = report.and_then(|report| u8::try_from(report.lane).ok());
                 refused = !post(AgentEvent::EtfLateDropReport {
                     endpoint,
                     alias,
                     registration: identity.registration_id,
-                    lane,
-                    txtime: report.txtime,
+                    report: report.zip(lane).map(|(report, lane)| (lane, report.txtime)),
+                    count,
                 });
                 !refused
             });

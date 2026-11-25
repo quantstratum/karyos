@@ -27,7 +27,8 @@
 //!   ([`EtfLedger::take_late`]).
 //! - **Policies.** A dropped range of a reliable lane is caught up late on
 //!   the immediate route, in position order (the repair path's catch-up
-//!   job, one at a time per lane, [`EtfLedger::next_catch_up`]); one of an
+//!   job, one at a time per lane, [`EtfLedger::take_catch_up`], and what a
+//!   job did not send goes back, [`EtfLedger::give_back`]); one of an
 //!   unreliable lane is a gap at the receiver, counted in
 //!   [`EtfCounts::gaps`].
 //!
@@ -85,13 +86,16 @@ fn bump(count: &mut u64, overflows: &mut u64) {
 }
 
 /// A late drop report, for the driver's diagnostic ring: the lane and the
-/// report's time.
+/// report's time, and the late reports before it that found no room to
+/// wait (counted with it, recorded only as a count).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LateReport {
     /// The lane.
     pub lane: usize,
     /// The report's time, in `CLOCK_TAI` nanoseconds.
     pub txtime: u64,
+    /// Late reports before it that were counted but not kept.
+    pub unrecorded: u64,
 }
 
 /// One lane of the ledger.
@@ -114,6 +118,9 @@ pub struct EtfLedger {
     /// Late reports not yet posted, oldest first.
     late: VecDeque<LateReport>,
     late_bound: usize,
+    /// Late reports past `late_bound`: counted, posted with the next one
+    /// ([`LateReport::unrecorded`]), never lost from the count.
+    late_unrecorded: u64,
     counts: EtfCounts,
 }
 
@@ -135,6 +142,7 @@ impl EtfLedger {
             expiry: advance.saturating_add(EXPIRY_MARGIN),
             late: VecDeque::with_capacity(DRAIN_BATCH),
             late_bound: DRAIN_BATCH,
+            late_unrecorded: 0,
             counts: EtfCounts::default(),
         }
     }
@@ -220,7 +228,14 @@ impl EtfLedger {
                 &mut self.counts.overflows,
             );
             if self.late.len() < self.late_bound {
-                self.late.push_back(LateReport { lane, txtime });
+                let unrecorded = std::mem::take(&mut self.late_unrecorded);
+                self.late.push_back(LateReport {
+                    lane,
+                    txtime,
+                    unrecorded,
+                });
+            } else {
+                self.late_unrecorded = self.late_unrecorded.saturating_add(1);
             }
         }
         dropped
@@ -265,27 +280,50 @@ impl EtfLedger {
         let _ = self.late.pop_front();
     }
 
-    /// The first dropped range of `lane` waiting for its catch-up, in
-    /// position order, if any.
+    /// Takes the late reports counted but not kept that no kept report
+    /// carries: once every kept one is posted, the sender posts them as a
+    /// count, so none is lost from the publication's count.
+    pub fn take_unrecorded(&mut self) -> u64 {
+        if self.late.is_empty() {
+            std::mem::take(&mut self.late_unrecorded)
+        } else {
+            0
+        }
+    }
+
+    /// Puts back late reports a refused post did not carry.
+    pub fn restore_unrecorded(&mut self, count: u64) {
+        self.late_unrecorded = self.late_unrecorded.saturating_add(count);
+    }
+
+    /// Takes `lane`'s first dropped range for its catch-up, in position
+    /// order; what the job does not send comes back with
+    /// [`Self::give_back`].
+    pub fn take_catch_up(&mut self, lane: usize) -> Option<(u64, u64)> {
+        self.lanes
+            .get_mut(lane)
+            .and_then(|state| state.catch_ups.pop_front())
+    }
+
+    /// Returns the part of `lane`'s range a catch-up did not send, or a
+    /// range whose catch-up could not start, to its ranges in position
+    /// order.
+    pub fn give_back(&mut self, lane: usize, range: (u64, u64)) {
+        if range.0 >= range.1 {
+            return;
+        }
+        if let Some(state) = self.lanes.get_mut(lane) {
+            insert_merged(&mut state.catch_ups, range);
+        }
+    }
+
+    /// The first dropped range of `lane` waiting for its catch-up (tests).
+    #[cfg(test)]
     #[must_use]
     pub fn next_catch_up(&self, lane: usize) -> Option<(u64, u64)> {
         self.lanes
             .get(lane)
             .and_then(|state| state.catch_ups.front().copied())
-    }
-
-    /// The catch-up of `lane`'s first range covered it up to `through`: the
-    /// range shrinks to what is left, and goes once nothing is.
-    pub fn caught_up_through(&mut self, lane: usize, through: u64) {
-        let Some(state) = self.lanes.get_mut(lane) else {
-            return;
-        };
-        if let Some(front) = state.catch_ups.front_mut() {
-            front.0 = front.0.max(through);
-            if front.0 >= front.1 {
-                let _ = state.catch_ups.pop_front();
-            }
-        }
     }
 
     /// Forgets `lane`'s entries and catch-ups: its queue was reset, and a
@@ -299,12 +337,47 @@ impl EtfLedger {
 }
 
 /// Inserts `range` into `ranges`, kept ordered by start and merged where
-/// two touch or overlap. The list is bounded by the in-flight list, whose
-/// entries each give at most one range.
+/// two touch or overlap, never past the list's allocated capacity: when
+/// the list is full and `range` touches none, it joins its nearest
+/// neighbour (the span between is caught up as well: a reliable
+/// receiver drops what it already has), so the sender duty never
+/// allocates.
 fn insert_merged(ranges: &mut VecDeque<(u64, u64)>, range: (u64, u64)) {
     let at = ranges.partition_point(|existing| existing.0 < range.0);
+    if ranges.len() >= ranges.capacity() {
+        let before = at
+            .checked_sub(1)
+            .and_then(|index| ranges.get(index).copied());
+        let after = ranges.get(at).copied();
+        let join = match (before, after) {
+            (Some(left), Some(right)) => {
+                if range.0.saturating_sub(left.1) <= right.0.saturating_sub(range.1) {
+                    at.checked_sub(1)
+                } else {
+                    Some(at)
+                }
+            }
+            (Some(_), None) => at.checked_sub(1),
+            (None, Some(_)) => Some(at),
+            (None, None) => None,
+        };
+        let Some(index) = join else {
+            return;
+        };
+        if let Some(neighbour) = ranges.get_mut(index) {
+            neighbour.0 = neighbour.0.min(range.0);
+            neighbour.1 = neighbour.1.max(range.1);
+        }
+        merge_around(ranges, index);
+        return;
+    }
     ranges.insert(at, range);
-    // Merge with the neighbours.
+    merge_around(ranges, at);
+}
+
+/// Merges the range at `at` with its neighbours where they touch or
+/// overlap.
+fn merge_around(ranges: &mut VecDeque<(u64, u64)>, at: usize) {
     let mut index = at.saturating_sub(1);
     while index.saturating_add(1) < ranges.len() {
         let (Some(left), Some(right)) = (

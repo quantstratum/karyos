@@ -5888,8 +5888,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .and_then(crate::net::Network::pop_etf_late_report)
         {
             let message = format!(
-                "a late etf drop report on lane {} at TAI {}: retired as sent, nothing resubmitted",
-                report.lane, report.txtime
+                "a late etf drop report on lane {} at TAI {}: retired as sent, nothing resubmitted \
+                 ({} earlier late reports counted, not logged)",
+                report.lane, report.txtime, report.unlogged
             );
             self.diagnostics.error(
                 &mut self.counters,

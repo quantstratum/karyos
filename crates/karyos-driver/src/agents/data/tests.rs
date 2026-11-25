@@ -1688,23 +1688,27 @@ fn an_expired_entry_is_retired_and_a_later_report_is_late() {
     assert_eq!(f.counts().dropped, 0);
     assert_eq!(f.data_sent_again(), 0, "nothing resubmitted");
     let mut posted = Vec::new();
-    f.path.post_etf_late(|report| {
-        posted.push(report);
+    f.path.post_etf_late(|report, count| {
+        posted.push((report, count));
         true
     });
     assert_eq!(
         posted,
-        vec![super::etf::LateReport {
-            lane: 0,
-            txtime: 100 + ETF_OFFSET
-        }]
+        vec![(
+            Some(super::etf::LateReport {
+                lane: 0,
+                txtime: 100 + ETF_OFFSET,
+                unrecorded: 0,
+            }),
+            1
+        )]
     );
     // A refused post is offered again.
     f.drop_report(100);
     f.serve(past + 3);
-    f.path.post_etf_late(|_| false);
+    f.path.post_etf_late(|_, _| false);
     let mut again = 0;
-    f.path.post_etf_late(|_| {
+    f.path.post_etf_late(|_, _| {
         again += 1;
         true
     });

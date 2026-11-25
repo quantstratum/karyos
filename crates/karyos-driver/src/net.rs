@@ -728,6 +728,9 @@ struct ScheduleViolations {
     /// log, bounded like `pending`; one past the bound is counted in the
     /// publication's counter only.
     etf_late: Vec<EtfLateReport>,
+    /// Late reports counted in their publication but not logged yet:
+    /// carried by the next record.
+    etf_unlogged: u64,
 }
 
 /// A late etf drop report of a live publication, for the conductor's
@@ -740,6 +743,8 @@ pub(crate) struct EtfLateReport {
     pub(crate) lane: u8,
     /// The report's time, in `CLOCK_TAI` nanoseconds.
     pub(crate) txtime: u64,
+    /// Late reports before it that were counted but not logged.
+    pub(crate) unlogged: u64,
 }
 
 impl ScheduleViolations {
@@ -1068,6 +1073,7 @@ impl<T: StreamTerms> Network<T> {
                         .checked_mul(karyos_protocol::network::MAX_LANES)
                         .unwrap_or(config.agents.publications),
                 ),
+                etf_unlogged: 0,
             },
             guard_deregister_failures: 0,
             control_groups: config.nak_control_groups,
@@ -3950,19 +3956,36 @@ fn publication_answer<T: StreamTerms>(
             endpoint,
             alias,
             registration,
-            lane,
-            txtime,
+            report,
+            count,
         } => {
             if let Some(entry) = find(publications, endpoint, alias, registration)
                 .and_then(|index| publications.get_mut(index))
             {
-                entry.etf_late_drop_reports = entry.etf_late_drop_reports.saturating_add(1);
-                if violations.etf_late.len() < violations.etf_late.capacity() {
-                    violations.etf_late.push(EtfLateReport {
-                        registration,
-                        lane,
-                        txtime,
-                    });
+                entry.etf_late_drop_reports = entry.etf_late_drop_reports.saturating_add(count);
+                // Every report is counted; one the error log has no room
+                // for, or that came as a count only, is logged as a count
+                // with the next record.
+                let unlogged = count.saturating_sub(u64::from(report.is_some()));
+                match report {
+                    Some((lane, txtime))
+                        if violations.etf_late.len() < violations.etf_late.capacity() =>
+                    {
+                        let unlogged =
+                            unlogged.saturating_add(std::mem::take(&mut violations.etf_unlogged));
+                        violations.etf_late.push(EtfLateReport {
+                            registration,
+                            lane,
+                            txtime,
+                            unlogged,
+                        });
+                    }
+                    _ => {
+                        violations.etf_unlogged = violations
+                            .etf_unlogged
+                            .saturating_add(unlogged)
+                            .saturating_add(u64::from(report.is_some()));
+                    }
                 }
             }
         }
