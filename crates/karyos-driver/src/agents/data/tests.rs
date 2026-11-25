@@ -1485,10 +1485,14 @@ struct EtfFixture {
 
 const ETF_OFFSET: u64 = 37_000_000_000;
 
-static ETF_MONOTONIC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Each test's own clock: tests run in parallel, one thread each, and the
+// fixture serves on its test's thread.
+thread_local! {
+    static ETF_MONOTONIC: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 fn etf_monotonic() -> u64 {
-    ETF_MONOTONIC.load(std::sync::atomic::Ordering::Relaxed)
+    ETF_MONOTONIC.with(std::cell::Cell::get)
 }
 
 impl EtfFixture {
@@ -1581,7 +1585,7 @@ impl EtfFixture {
     }
 
     fn serve(&mut self, now: u64) {
-        ETF_MONOTONIC.store(now, std::sync::atomic::Ordering::Relaxed);
+        ETF_MONOTONIC.with(|clock| clock.set(now));
         self.observer.set_tai_now_ns(Some(now + ETF_OFFSET));
         let budget = Budget {
             work: 64,
