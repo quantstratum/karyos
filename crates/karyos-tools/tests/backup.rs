@@ -90,6 +90,21 @@ fn node(log: &Path, snapshots: &Path) {
         .unwrap();
 }
 
+/// Every file under `dir`, with its bytes, sorted.
+fn contents(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(contents(&path));
+        } else {
+            out.push((path.clone(), std::fs::read(&path).unwrap()));
+        }
+    }
+    out.sort();
+    out
+}
+
 fn backup(args: &[&str]) -> (bool, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_karyos-backup"))
         .args(args)
@@ -111,6 +126,33 @@ fn a_node_is_exported_verified_and_rebuilt_end_to_end() {
     node(&log, &snapshots);
     let cluster = "c1".repeat(32);
     let path = |path: &Path| path.to_str().unwrap().to_owned();
+    let before = (contents(&log), contents(&snapshots));
+    // Retention required of a directory, which enforces none: refused,
+    // with no manifest left.
+    let (ok, out) = backup(&[
+        "export",
+        "--log",
+        &path(&log),
+        "--snapshots",
+        &path(&snapshots),
+        "--geometry",
+        GEOMETRY,
+        "--cluster",
+        &cluster,
+        "--remote",
+        &path(&remote),
+        "--require-retention",
+    ]);
+    assert!(!ok);
+    assert!(
+        out.contains("does not enforce the required retention: Unsupported"),
+        "{out}"
+    );
+    let (ok, out) = backup(&["verify", "--cluster", &cluster, "--remote", &path(&remote)]);
+    assert!(!ok && out.contains("missing"), "{out}");
+    for leftover in std::fs::read_dir(&remote).unwrap() {
+        std::fs::remove_file(leftover.unwrap().path()).unwrap();
+    }
     let (ok, out) = backup(&[
         "export",
         "--log",
@@ -126,8 +168,16 @@ fn a_node_is_exported_verified_and_rebuilt_end_to_end() {
     ]);
     assert!(ok, "{out}");
     assert!(
-        out.starts_with("export base=1000:2 top=2400:2 entries=1400 objects=4\n"),
+        out.starts_with(
+            "export base=1000:2 top=2400:2 entries=1400 objects=4\nretention=Unsupported\n"
+        ),
         "{out}"
+    );
+    // The node's own directories were only read.
+    assert_eq!(
+        (contents(&log), contents(&snapshots)),
+        before,
+        "an export changed its source"
     );
     assert!(
         out.contains("not included: entries past the commit index"),

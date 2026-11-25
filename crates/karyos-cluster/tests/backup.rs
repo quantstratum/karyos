@@ -22,7 +22,7 @@ use karyos_archive::integrity::copies::Enforcement;
 use karyos_archive::integrity::tiering::{ObjectKey, ObjectStore};
 use karyos_archive::segment::Geometry;
 use karyos_cluster::backup::{
-    self, BackupError, LOG_OBJECTS, MANIFEST_OBJECT, NOT_INCLUDED, Target,
+    self, BackupError, LOG_OBJECTS, MANIFEST_OBJECT, NOT_INCLUDED, Retention, Target,
 };
 use karyos_cluster::snapshot::{Section, SectionKind, SnapshotConfig, SnapshotStore};
 use karyos_cluster::{Entry, HardState, RaftLog};
@@ -51,6 +51,10 @@ impl Drop for TempDir {
 struct Bucket {
     objects: BTreeMap<String, Vec<u8>>,
     corrupt_puts: bool,
+    /// What its puts enforce: `Unsupported` unless set.
+    enforces: Option<Enforcement>,
+    /// Every get fails, other than for a missing key.
+    unreadable: bool,
 }
 
 impl ObjectStore for Bucket {
@@ -62,10 +66,13 @@ impl ObjectStore for Bucket {
             *first ^= 0xFF;
         }
         self.objects.insert(key.name(), stored);
-        Ok(Enforcement::Unsupported)
+        Ok(self.enforces.unwrap_or(Enforcement::Unsupported))
     }
 
     fn get(&mut self, key: &ObjectKey) -> io::Result<Vec<u8>> {
+        if self.unreadable {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, key.name()));
+        }
         self.objects
             .get(&key.name())
             .cloned()
@@ -159,7 +166,14 @@ fn a_rebuild_matches_its_source_up_to_the_reported_top() {
     let source_dir = TempDir::new("source");
     let (mut log, snapshots) = source(&source_dir.0);
     let mut bucket = Bucket::default();
-    let exported = backup::export(&snapshots, &mut log, &mut bucket, CLUSTER, u64::MAX).unwrap();
+    let exported = backup::export(
+        &snapshots,
+        &mut log,
+        &mut bucket,
+        CLUSTER,
+        Retention::until(u64::MAX),
+    )
+    .unwrap();
     assert_eq!(exported.base, (100, entry(100).term));
     assert_eq!(
         exported.top,
@@ -221,7 +235,14 @@ fn a_damaged_object_is_refused_naming_its_range_before_anything_is_written() {
     let source_dir = TempDir::new("damaged-source");
     let (mut log, snapshots) = source(&source_dir.0);
     let mut bucket = Bucket::default();
-    let _ = backup::export(&snapshots, &mut log, &mut bucket, CLUSTER, u64::MAX).unwrap();
+    let _ = backup::export(
+        &snapshots,
+        &mut log,
+        &mut bucket,
+        CLUSTER,
+        Retention::until(u64::MAX),
+    )
+    .unwrap();
     // One byte of the log range flipped in storage.
     let name = bucket
         .objects
@@ -276,7 +297,13 @@ fn an_export_whose_copy_does_not_read_back_counts_nothing() {
         ..Bucket::default()
     };
     assert!(matches!(
-        backup::export(&snapshots, &mut log, &mut bucket, CLUSTER, u64::MAX),
+        backup::export(
+            &snapshots,
+            &mut log,
+            &mut bucket,
+            CLUSTER,
+            Retention::until(u64::MAX)
+        ),
         Err(BackupError::Damaged { .. })
     ));
     assert!(matches!(
@@ -293,7 +320,14 @@ fn a_rebuild_into_a_node_s_directories_is_refused_and_changes_nothing() {
     let source_dir = TempDir::new("occupied-source");
     let (mut log, snapshots) = source(&source_dir.0);
     let mut bucket = Bucket::default();
-    let _ = backup::export(&snapshots, &mut log, &mut bucket, CLUSTER, u64::MAX).unwrap();
+    let _ = backup::export(
+        &snapshots,
+        &mut log,
+        &mut bucket,
+        CLUSTER,
+        Retention::until(u64::MAX),
+    )
+    .unwrap();
     let occupied = TempDir::new("occupied-target");
     drop(source(&occupied.0));
     let before = files(&occupied.0);
@@ -322,7 +356,14 @@ fn a_manifest_that_does_not_cover_the_log_is_refused() {
     let source_dir = TempDir::new("gap-source");
     let (mut log, snapshots) = source(&source_dir.0);
     let mut bucket = Bucket::default();
-    let _ = backup::export(&snapshots, &mut log, &mut bucket, CLUSTER, u64::MAX).unwrap();
+    let _ = backup::export(
+        &snapshots,
+        &mut log,
+        &mut bucket,
+        CLUSTER,
+        Retention::until(u64::MAX),
+    )
+    .unwrap();
     let manifest = backup::manifest(&mut bucket, CLUSTER).unwrap();
     let key = ObjectKey {
         archive: CLUSTER,
@@ -372,9 +413,22 @@ fn an_export_refuses_a_foreign_snapshot_a_low_commit_and_a_used_remote() {
     let source_dir = TempDir::new("checks-source");
     let (mut log, mut snapshots) = source(&source_dir.0);
     let mut bucket = Bucket::default();
-    let _ = backup::export(&snapshots, &mut log, &mut bucket, CLUSTER, u64::MAX).unwrap();
+    let _ = backup::export(
+        &snapshots,
+        &mut log,
+        &mut bucket,
+        CLUSTER,
+        Retention::until(u64::MAX),
+    )
+    .unwrap();
     assert!(matches!(
-        backup::export(&snapshots, &mut log, &mut bucket, CLUSTER, u64::MAX),
+        backup::export(
+            &snapshots,
+            &mut log,
+            &mut bucket,
+            CLUSTER,
+            Retention::until(u64::MAX)
+        ),
         Err(BackupError::Exists)
     ));
     // A snapshot at 200 with another term than the log's there.
@@ -391,7 +445,7 @@ fn an_export_refuses_a_foreign_snapshot_a_low_commit_and_a_used_remote() {
             &mut log,
             &mut Bucket::default(),
             CLUSTER,
-            u64::MAX
+            Retention::until(u64::MAX)
         ),
         Err(BackupError::SnapshotTerm { index: 200, .. })
     ));
@@ -409,11 +463,154 @@ fn an_export_refuses_a_foreign_snapshot_a_low_commit_and_a_used_remote() {
             &mut log,
             &mut Bucket::default(),
             CLUSTER,
-            u64::MAX
+            Retention::until(u64::MAX)
         ),
         Err(BackupError::CommitBelowBase {
             base: 295,
             commit: Some(290)
         })
     ));
+}
+
+/// The report states the weakest retention the store enforced; an export
+/// that requires it fails on the first object the store does not enforce
+/// it for, leaving no manifest.
+#[test]
+fn an_export_reports_retention_and_fails_when_it_is_required_and_not_enforced() {
+    let source_dir = TempDir::new("retention");
+    let (mut log, snapshots) = source(&source_dir.0);
+    let mut locked = Bucket {
+        enforces: Some(Enforcement::ObjectLock),
+        ..Bucket::default()
+    };
+    let required = Retention::until(u64::MAX).required();
+    let report = backup::export(&snapshots, &mut log, &mut locked, CLUSTER, required).unwrap();
+    assert_eq!(report.retention, Enforcement::ObjectLock);
+    let mut plain = Bucket::default();
+    let report = backup::export(
+        &snapshots,
+        &mut log,
+        &mut plain,
+        CLUSTER,
+        Retention::until(1),
+    )
+    .unwrap();
+    assert_eq!(report.retention, Enforcement::Unsupported);
+    let mut plain = Bucket::default();
+    assert!(matches!(
+        backup::export(&snapshots, &mut log, &mut plain, CLUSTER, required),
+        Err(BackupError::RetentionNotEnforced(Enforcement::Unsupported))
+    ));
+    assert_eq!(plain.objects.len(), 1, "stopped at the first object");
+    assert!(matches!(
+        backup::verify(&mut plain, CLUSTER),
+        Err(BackupError::Manifest("missing"))
+    ));
+}
+
+/// A manifest lookup that fails other than for a missing key is the
+/// store's error: an export puts nothing, and a check does not call the
+/// manifest missing.
+#[test]
+fn a_failed_manifest_lookup_is_not_taken_for_a_missing_one() {
+    let source_dir = TempDir::new("lookup");
+    let (mut log, snapshots) = source(&source_dir.0);
+    let mut bucket = Bucket {
+        unreadable: true,
+        ..Bucket::default()
+    };
+    assert!(matches!(
+        backup::export(&snapshots, &mut log, &mut bucket, CLUSTER, Retention::until(u64::MAX)),
+        Err(BackupError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
+    ));
+    assert!(
+        bucket.objects.is_empty(),
+        "an export put with its lookup failed"
+    );
+    assert!(matches!(
+        backup::verify(&mut bucket, CLUSTER),
+        Err(BackupError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
+    ));
+}
+
+/// A section the service's check refuses fails the check and the rebuild,
+/// naming its kind, before anything is written.
+#[test]
+fn a_section_the_service_check_refuses_is_refused_before_anything_is_written() {
+    let source_dir = TempDir::new("sections-source");
+    let (mut log, snapshots) = source(&source_dir.0);
+    let mut bucket = Bucket::default();
+    let _ = backup::export(
+        &snapshots,
+        &mut log,
+        &mut bucket,
+        CLUSTER,
+        Retention::until(u64::MAX),
+    )
+    .unwrap();
+    let mut seen = Vec::new();
+    let mut check = |kind: SectionKind, version: u64, bytes: &[u8]| {
+        seen.push((kind, version, bytes.len()));
+        if kind == SectionKind::Sessions && bytes != b"a session table" {
+            return Err("not a session table".to_owned());
+        }
+        Ok(())
+    };
+    assert!(matches!(
+        backup::verify_with(&mut bucket, CLUSTER, &mut check),
+        Err(BackupError::Section { kind: SectionKind::Sessions, reason })
+            if reason == "not a session table"
+    ));
+    assert_eq!(
+        seen,
+        vec![
+            (SectionKind::Service, 2, 70_000),
+            (SectionKind::Sessions, 1, 8)
+        ]
+    );
+    let rebuilt_dir = TempDir::new("sections-rebuilt");
+    let (log_dir, snap_dir) = target(&rebuilt_dir.0);
+    assert!(matches!(
+        backup::rebuild_with(
+            &mut bucket,
+            CLUSTER,
+            &Target {
+                disk: &StdDisk,
+                log: &log_dir,
+                snapshots: &snap_dir,
+                geometry: geometry(),
+            },
+            &mut |kind, _, _| if kind == SectionKind::Service {
+                Err("the service cannot open it".to_owned())
+            } else {
+                Ok(())
+            },
+        ),
+        Err(BackupError::Section {
+            kind: SectionKind::Service,
+            ..
+        })
+    ));
+    for dir in [&log_dir, &snap_dir] {
+        assert_eq!(
+            std::fs::read_dir(dir).unwrap().count(),
+            0,
+            "a refused rebuild wrote"
+        );
+    }
+    // A check that takes every section rebuilds.
+    assert!(
+        backup::rebuild_with(
+            &mut bucket,
+            CLUSTER,
+            &Target {
+                disk: &StdDisk,
+                log: &log_dir,
+                snapshots: &snap_dir,
+                geometry: geometry(),
+            },
+            &mut |_, _, _| Ok(()),
+        )
+        .is_ok()
+    );
 }

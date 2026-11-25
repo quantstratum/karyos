@@ -10,13 +10,24 @@
 //!   its committed log after the snapshot's base go to remote storage
 //!   through the Archive's [`ObjectStore`] (the S3 client implements it;
 //!   nothing here depends on it), each retained until the caller's
-//!   deadline. The snapshot's term is checked against the log's term at
-//!   its base, and the commit must reach the base. Every object is read
-//!   back and checked against the CRC-32C taken before the put before it
-//!   counts, and the manifest goes last. An export refuses a remote that
-//!   already holds an export of the cluster ([`BackupError::Exists`]): an
-//!   export never overwrites another. It reads the stores only, on the
-//!   control path: nothing on the data path calls it.
+//!   deadline ([`Retention`]); the report states the weakest enforcement
+//!   the store gave ([`Report::retention`]), and an export that requires
+//!   retention fails on the first object the store does not enforce it for
+//!   ([`BackupError::RetentionNotEnforced`]). The snapshot's term is
+//!   checked against the log's term at its base, and the commit must reach
+//!   the base. Every object is read back and checked against the CRC-32C
+//!   taken before the put before it counts, and the manifest goes last. An
+//!   export refuses a remote that already holds an export of the cluster
+//!   ([`BackupError::Exists`]): an export never overwrites another; a
+//!   lookup that fails other than for a missing manifest fails the export
+//!   before anything is put. The check is not atomic with the manifest's
+//!   put: two exports of one cluster to one remote at once can interleave
+//!   their objects, so the caller runs one at a time per remote (the
+//!   `karyos-backup` tool holds a lock on its remote for that). Opening a
+//!   node's stores runs their recovery, which can repair a torn tail: the
+//!   caller exports from a copy of a stopped node's directories, never the
+//!   node's own (the tool copies them first). It runs on the control path:
+//!   nothing on the data path calls it.
 //! - **Check** ([`verify`]): the manifest's structure (exactly one snapshot
 //!   first, then log ranges covering the base's next index to the top in
 //!   order, with no gap or overlap), then every object, one at a time: its
@@ -30,9 +41,17 @@
 //!   target is refused ([`BackupError::NotEmpty`]): a rebuild never
 //!   installs over a node's state, so it never purges anything, and in
 //!   particular nothing an Archive hold keeps (owner decisions 2026-10-21,
-//!   item 35). A failure after the checks (a disk error) can leave the
-//!   target partly written: it is discarded, and the rebuild run again into
-//!   empty directories.
+//!   item 35). A rebuild is not a unit: a failure after the checks (a disk
+//!   error, or an object that changed or vanished between the check and its
+//!   second read, [`BackupError::Damaged`] or remote storage's error) can
+//!   leave the target partly written, a node that opens short of the top.
+//!   Only a rebuild that returned its report is whole: anything else is
+//!   discarded and the rebuild run again into empty directories. One
+//!   rebuild runs per target at a time (the tool locks both directories).
+//! - **Sections.** The check reads each snapshot section's framing; what a section's bytes must hold is the
+//!   service's, checked by the hook [`verify_with`] and [`rebuild_with`]
+//!   take, run on every section before anything is written. Without one,
+//!   a snapshot whose service bytes the service cannot open passes.
 //! - **Report**: an export and a rebuild each report the index and term
 //!   their state reaches and what they do not include ([`NOT_INCLUDED`]).
 //!
@@ -54,6 +73,7 @@ use std::path::Path;
 use karyos_archive::crc32c::crc32c;
 use karyos_archive::disk::Disk;
 use karyos_archive::integrity::Digest;
+use karyos_archive::integrity::copies::Enforcement;
 use karyos_archive::integrity::tiering::{ObjectKey, ObjectKind, ObjectStore};
 use karyos_archive::segment::Geometry;
 
@@ -116,6 +136,37 @@ pub struct Manifest {
     pub objects: Vec<Listed>,
 }
 
+/// How long an export's objects are retained, and whether the store must
+/// enforce it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retention {
+    /// The deadline, in nanoseconds since the epoch.
+    pub until_ns: u64,
+    /// Whether an object whose retention the store does not enforce fails
+    /// the export.
+    pub required: bool,
+}
+
+impl Retention {
+    /// Retained until `until_ns`, as far as the store enforces it.
+    #[must_use]
+    pub const fn until(until_ns: u64) -> Self {
+        Self {
+            until_ns,
+            required: false,
+        }
+    }
+
+    /// The same, the store required to enforce it.
+    #[must_use]
+    pub const fn required(self) -> Self {
+        Self {
+            required: true,
+            ..self
+        }
+    }
+}
+
 /// What an export or a rebuild reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
@@ -129,6 +180,9 @@ pub struct Report {
     pub objects: u64,
     /// What it does not include.
     pub not_included: &'static [&'static str],
+    /// An export's: the weakest retention the store enforced for its
+    /// objects. A rebuild's: [`Enforcement::Unsupported`].
+    pub retention: Enforcement,
 }
 
 /// Why an export or a rebuild did not complete.
@@ -163,6 +217,18 @@ pub enum BackupError {
     LogShort {
         /// The snapshot's base.
         base: u64,
+    },
+    /// Retention was required, and the store did not enforce it for an
+    /// object: its enforcement.
+    #[error("the store does not enforce the required retention: {0:?}")]
+    RetentionNotEnforced(Enforcement),
+    /// A snapshot section the check refused: its kind, and why.
+    #[error("the snapshot's {kind:?} section is refused: {reason}")]
+    Section {
+        /// Its kind.
+        kind: SectionKind,
+        /// Why.
+        reason: String,
     },
     /// The remote already holds an export of the cluster: an export never
     /// overwrites another.
@@ -226,19 +292,38 @@ fn put_checked(
     cluster: Digest,
     listed: &Listed,
     bytes: &[u8],
-    retain_until_ns: u64,
-) -> Result<(), BackupError> {
+    retention: Retention,
+) -> Result<Enforcement, BackupError> {
     let key = key(cluster, listed.recording, listed.start, listed.end);
-    let _ = store.put(&key, bytes, retain_until_ns)?;
+    let enforced = store.put(&key, bytes, retention.until_ns)?;
+    if retention.required && enforced == Enforcement::Unsupported {
+        return Err(BackupError::RetentionNotEnforced(enforced));
+    }
     let back = store.get(&key)?;
     if back.len() as u64 != listed.length || crc32c(&back) != listed.crc {
         return Err(damaged(listed));
     }
-    Ok(())
+    Ok(enforced)
+}
+
+/// The weaker of two enforcements.
+const fn weaker(a: Enforcement, b: Enforcement) -> Enforcement {
+    if (a as u8) <= (b as u8) { a } else { b }
+}
+
+/// Whether the export's manifest under `cluster` is there: a missing one is
+/// `false`; any other failure to look is the store's error.
+fn has_manifest(store: &mut impl ObjectStore, cluster: Digest) -> Result<bool, BackupError> {
+    match store.get(&key(cluster, MANIFEST_OBJECT, 0, 0)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(BackupError::Io(error)),
+    }
 }
 
 /// Exports a stopped node's latest snapshot and its committed log after it
-/// to `store` under `cluster`, retained until `retain_until_ns`.
+/// to `store` under `cluster`, retained as `retention` says. The stores are
+/// a copy of the node's directories: opening them runs their recovery.
 ///
 /// # Errors
 ///
@@ -246,7 +331,9 @@ fn put_checked(
 /// [`BackupError::NoSnapshot`], [`BackupError::SnapshotTerm`],
 /// [`BackupError::CommitBelowBase`] and [`BackupError::LogShort`], before
 /// anything is put; [`BackupError::Damaged`] for a copy that does not read
-/// back whole; the stores' errors. An export that fails before its
+/// back whole; [`BackupError::RetentionNotEnforced`] when retention is
+/// required and the store does not enforce it; the stores' errors, a
+/// failed manifest lookup among them. An export that fails before its
 /// manifest's put has no manifest; one whose manifest's read-back fails may
 /// have one, which [`verify`] then judges.
 pub fn export<D: Disk + Clone, E: Disk + Clone>(
@@ -254,9 +341,9 @@ pub fn export<D: Disk + Clone, E: Disk + Clone>(
     log: &mut RaftLog<D>,
     store: &mut impl ObjectStore,
     cluster: Digest,
-    retain_until_ns: u64,
+    retention: Retention,
 ) -> Result<Report, BackupError> {
-    if store.get(&key(cluster, MANIFEST_OBJECT, 0, 0)).is_ok() {
+    if has_manifest(store, cluster)? {
         return Err(BackupError::Exists);
     }
     let info = snapshots.latest().ok_or(BackupError::NoSnapshot)?;
@@ -303,7 +390,7 @@ pub fn export<D: Disk + Clone, E: Disk + Clone>(
         length: bytes.len() as u64,
         crc: crc32c(&bytes),
     };
-    put_checked(store, cluster, &snapshot, &bytes, retain_until_ns)?;
+    let mut enforced = put_checked(store, cluster, &snapshot, &bytes, retention)?;
     drop(bytes);
     let mut objects = vec![snapshot];
     // The committed log after the base, in ranges bounded in entries and
@@ -339,7 +426,10 @@ pub fn export<D: Disk + Clone, E: Disk + Clone>(
             length: chunk.len() as u64,
             crc: crc32c(&chunk),
         };
-        put_checked(store, cluster, &listed, &chunk, retain_until_ns)?;
+        enforced = weaker(
+            enforced,
+            put_checked(store, cluster, &listed, &chunk, retention)?,
+        );
         objects.push(listed);
         next = at;
     }
@@ -357,13 +447,22 @@ pub fn export<D: Disk + Clone, E: Disk + Clone>(
         length: encoded.len() as u64,
         crc: crc32c(&encoded),
     };
-    put_checked(store, cluster, &listed, &encoded, retain_until_ns)?;
+    // Looked for again: an export that started since is caught here, but
+    // the caller still runs one at a time.
+    if has_manifest(store, cluster)? {
+        return Err(BackupError::Exists);
+    }
+    enforced = weaker(
+        enforced,
+        put_checked(store, cluster, &listed, &encoded, retention)?,
+    );
     Ok(Report {
         base: manifest.base,
         top,
         entries,
         objects: manifest.objects.len() as u64 + 1,
         not_included: NOT_INCLUDED,
+        retention: enforced,
     })
 }
 
@@ -571,11 +670,15 @@ fn fetch(
 ///
 /// # Errors
 ///
-/// [`BackupError::Manifest`] when it is missing, damaged or invalid.
+/// [`BackupError::Manifest`] when it is missing, damaged or invalid;
+/// remote storage's error when it cannot be looked for.
 pub fn manifest(store: &mut impl ObjectStore, cluster: Digest) -> Result<Manifest, BackupError> {
     let bytes = store
         .get(&key(cluster, MANIFEST_OBJECT, 0, 0))
-        .map_err(|_| BackupError::Manifest("missing"))?;
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => BackupError::Manifest("missing"),
+            _ => BackupError::Io(error),
+        })?;
     let manifest = Manifest::decode(&bytes)?;
     manifest.validate()?;
     Ok(manifest)
@@ -591,13 +694,47 @@ pub fn manifest(store: &mut impl ObjectStore, cluster: Digest) -> Result<Manifes
 /// [`BackupError::Manifest`] and [`BackupError::Damaged`], naming the
 /// first damaged object.
 pub fn verify(store: &mut impl ObjectStore, cluster: Digest) -> Result<Manifest, BackupError> {
+    verify_with(store, cluster, &mut |_, _, _| Ok(()))
+}
+
+/// A check of one snapshot section: its kind, version and bytes; why it is
+/// refused, if it is.
+pub type SectionCheck<'a> = dyn FnMut(SectionKind, u64, &[u8]) -> Result<(), String> + 'a;
+
+/// Checks each snapshot section, through `check`.
+fn check_sections(
+    sections: &[(SectionKind, u64, &[u8])],
+    check: &mut SectionCheck<'_>,
+) -> Result<(), BackupError> {
+    for (kind, version, body) in sections {
+        check(*kind, *version, body).map_err(|reason| BackupError::Section {
+            kind: *kind,
+            reason,
+        })?;
+    }
+    Ok(())
+}
+
+/// [`verify`], each snapshot section also run through `check`: what the
+/// service its snapshot restores requires of its bytes.
+///
+/// # Errors
+///
+/// As [`verify`], and [`BackupError::Section`] for a section `check`
+/// refuses.
+pub fn verify_with(
+    store: &mut impl ObjectStore,
+    cluster: Digest,
+    check: &mut SectionCheck<'_>,
+) -> Result<Manifest, BackupError> {
     let manifest = manifest(store, cluster)?;
     let mut floor = manifest.base.1;
     let mut last = manifest.base;
     for listed in &manifest.objects {
         let bytes = fetch(store, cluster, listed)?;
         if listed.recording == SNAPSHOT_OBJECT {
-            snapshot_sections(&bytes).ok_or_else(|| damaged(listed))?;
+            let sections = snapshot_sections(&bytes).ok_or_else(|| damaged(listed))?;
+            check_sections(&sections, check)?;
         } else {
             let entries = log_entries(&bytes, listed, floor).ok_or_else(|| damaged(listed))?;
             if let Some(entry) = entries.last() {
@@ -635,12 +772,30 @@ pub struct Target<'a, D> {
 /// # Errors
 ///
 /// [`BackupError::NotEmpty`], [`BackupError::Manifest`] and
-/// [`BackupError::Damaged`], before anything is written; the stores'
-/// errors after, which may leave the target partly written.
+/// [`BackupError::Damaged`], before anything is written. After, the
+/// stores' errors, or [`BackupError::Damaged`] for an object that changed
+/// since its check, leave the target partly written: a node that may open
+/// short of the top, to be discarded.
 pub fn rebuild<D: Disk + Clone>(
     store: &mut impl ObjectStore,
     cluster: Digest,
     target: &Target<'_, D>,
+) -> Result<Report, BackupError> {
+    rebuild_with(store, cluster, target, &mut |_, _, _| Ok(()))
+}
+
+/// [`rebuild`], each snapshot section run through `check` (as
+/// [`verify_with`]) before anything is written, and again before it is.
+///
+/// # Errors
+///
+/// As [`rebuild`], and [`BackupError::Section`] for a section `check`
+/// refuses.
+pub fn rebuild_with<D: Disk + Clone>(
+    store: &mut impl ObjectStore,
+    cluster: Digest,
+    target: &Target<'_, D>,
+    check: &mut SectionCheck<'_>,
 ) -> Result<Report, BackupError> {
     for dir in [target.log, target.snapshots] {
         let names = target
@@ -652,7 +807,7 @@ pub fn rebuild<D: Disk + Clone>(
             return Err(BackupError::NotEmpty(dir.display().to_string()));
         }
     }
-    let manifest = verify(store, cluster)?;
+    let manifest = verify_with(store, cluster, check)?;
     let (base, base_term) = manifest.base;
     let mut snapshots = SnapshotStore::open(
         target.disk.clone(),
@@ -669,6 +824,7 @@ pub fn rebuild<D: Disk + Clone>(
         let bytes = fetch(store, cluster, listed)?;
         if listed.recording == SNAPSHOT_OBJECT {
             let sections = snapshot_sections(&bytes).ok_or_else(|| damaged(listed))?;
+            check_sections(&sections, check)?;
             let mut pending = snapshots.begin(base, base_term)?;
             for (kind, version, body) in sections {
                 pending.section(kind, version, body.len() as u64)?;
@@ -699,5 +855,6 @@ pub fn rebuild<D: Disk + Clone>(
         entries,
         objects: manifest.objects.len() as u64 + 1,
         not_included: NOT_INCLUDED,
+        retention: Enforcement::Unsupported,
     })
 }
