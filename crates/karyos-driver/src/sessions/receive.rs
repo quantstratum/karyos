@@ -207,6 +207,9 @@ pub enum AnswerOutcome {
         term: TermParams,
         /// Each lane's join position.
         joins: karyos_protocol::network::Lanes<u64>,
+        /// The establishment's challenge nonce: with the boot id it salts
+        /// the unicast session keys (ADR-0086 section 4).
+        nonce: [u64; 2],
     },
     /// Accepted as a later path of the active image (RP-1): bound, no
     /// image created.
@@ -1351,6 +1354,7 @@ impl ReceiveSessions {
             identity,
             term,
             joins: answer.joins,
+            nonce,
         }
     }
 
@@ -1449,6 +1453,7 @@ impl ReceiveSessions {
             identity,
             term: answer.term,
             joins: answer.joins,
+            nonce,
         }
     }
 

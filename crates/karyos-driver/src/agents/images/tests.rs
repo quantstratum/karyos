@@ -6912,3 +6912,280 @@ fn a_path_lost_and_bound_again_moves_no_cursor() {
     assert_eq!(seen, (0..next).collect::<Vec<u8>>());
     assert!(rig.agents.receiver.role.has_image(slot));
 }
+
+/// The channel key and the pairwise key of an authenticated image (ADR-0086
+/// section 4): the publisher's DATA verifies under the first, the
+/// receiver's controls are sealed under the second.
+fn auth_keys(receiver_id: u64) -> (crate::wire_keys::KeyFile, crate::wire_keys::KeyFile) {
+    let channel = crate::wire_keys::parse(
+        "3-1.key",
+        b"format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=1\npurpose=channel\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=1111111111111111111111111111111111111111111111111111111111111111\nchannel_id=7\nstream_id=6\n",
+    )
+    .unwrap();
+    let text = format!(
+        "format=karyos-wire-key-v1\nkey_id=9\nfile_epoch=1\npurpose=pairwise\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=2222222222222222222222222222222222222222222222222222222222222222\nreceiver_id={receiver_id}\npublisher_id=5\n"
+    );
+    let pairwise = crate::wire_keys::parse("9-1.key", text.as_bytes()).unwrap();
+    (channel, pairwise)
+}
+
+fn auth_wall() -> i64 {
+    1_795_000_000
+}
+
+/// `frames` sealed by `sealer` into one datagram.
+fn sealed(sealer: &mut crate::wire_auth::Sealer, frames: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0u8; frames.len() + crate::wire_auth::ENVELOPE_LEN];
+    bytes[..frames.len()].copy_from_slice(frames);
+    let length = sealer.seal(&mut bytes, frames.len()).unwrap();
+    bytes.truncate(length);
+    bytes
+}
+
+/// An established image made authenticated, its publisher silent: the
+/// rig, the subscriber endpoint, the publisher's source, the image's slot
+/// and its sender's and receiver's parties and keys.
+struct AuthRig {
+    rig: Rig,
+    b: EndpointId,
+    source: SocketAddr,
+    slot: SlotRef,
+    sender: crate::wire_auth::Party,
+    receiver: crate::wire_auth::Party,
+    channel: crate::wire_keys::KeyFile,
+    pairwise: crate::wire_keys::KeyFile,
+}
+
+fn auth_rig() -> AuthRig {
+    let (mut rig, b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    rig.sender_stopped = true;
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let receiver_id = rig.agents.receiver.role.receiver_of(slot).receiver_id;
+    let (channel, pairwise) = auth_keys(receiver_id);
+    let (sender, receiver) = rig
+        .agents
+        .receiver
+        .role
+        .authenticate_image(slot, &channel, &pairwise, auth_wall)
+        .unwrap();
+    // The controls the trusted image queued before go.
+    while rig.agents.sender.role.take_control().is_some() {}
+    AuthRig {
+        rig,
+        b,
+        source,
+        slot,
+        sender,
+        receiver,
+        channel,
+        pairwise,
+    }
+}
+
+impl AuthRig {
+    fn inject(&mut self, bytes: &[u8]) {
+        let receiver = &mut self.rig.agents.receiver;
+        receiver
+            .role
+            .inject_datagram(&receiver.sessions, self.b, self.source, bytes, self.rig.now);
+    }
+
+    fn counters(&self) -> crate::agents::roles::ReceiverCounters {
+        self.rig.agents.receiver.counters()
+    }
+
+    fn sessions(&self) -> crate::sessions::receive::SessionCounters {
+        self.rig.agents.receiver.role.session_counters()
+    }
+}
+
+/// `after` equals `before` but for the datagram count and `changed`.
+fn only_changed(
+    before: crate::agents::roles::ReceiverCounters,
+    mut after: crate::agents::roles::ReceiverCounters,
+    changed: fn(&mut crate::agents::roles::ReceiverCounters) -> &mut u64,
+    by: u64,
+) {
+    assert_eq!(*changed(&mut after), *changed(&mut before.clone()) + by);
+    *changed(&mut after) = *changed(&mut before.clone());
+    after.datagrams = before.datagrams;
+    assert_eq!(after, before, "a refusal changes nothing but its counter");
+}
+
+/// ADR-0086 section 2: an authenticated image delivers only DATA that
+/// opens under its key. A replayed, altered or forged envelope, a bare
+/// DATA frame for it, and an envelope for no binding are each dropped and
+/// counted, and change nothing else: no commit, no SOLICIT, no state.
+#[test]
+fn an_authenticated_image_delivers_only_datagrams_that_open_under_its_key() {
+    use crate::wire_auth::Sealer;
+
+    let mut auth = auth_rig();
+    let mut sealer = Sealer::new(&auth.channel, auth.sender, alias()).unwrap();
+    let first = sealed(&mut sealer, &stale_frame(9, 0, 32));
+    let before = auth.counters();
+    auth.inject(&first);
+    let after = auth.counters();
+    assert_eq!(after.data_committed, before.data_committed + 1, "{after:?}");
+    assert_eq!(
+        (after.auth_rejected, after.auth_bare, after.auth_unbound),
+        (0, 0, 0)
+    );
+    let sessions = auth.sessions();
+    // A replay of the same envelope: refused by the window.
+    let before = auth.counters();
+    auth.inject(&first);
+    only_changed(before, auth.counters(), |c| &mut c.auth_rejected, 1);
+    // An altered one: refused by the tag.
+    let mut altered = sealed(&mut sealer, &stale_frame(9, 64, 32));
+    let at = 32 + 40;
+    altered[at] ^= 1;
+    let before = auth.counters();
+    auth.inject(&altered);
+    only_changed(before, auth.counters(), |c| &mut c.auth_rejected, 1);
+    // A forged one, under another key of the same key id.
+    let (mut forged_channel, _) = auth_keys(1);
+    if let crate::wire_keys::Material::Secret(secret) = &mut forged_channel.material {
+        secret[0] ^= 0xff;
+    }
+    let mut forger = Sealer::new(&forged_channel, auth.sender, alias()).unwrap();
+    let forged = sealed(&mut forger, &stale_frame(9, 64, 32));
+    let before = auth.counters();
+    auth.inject(&forged);
+    only_changed(before, auth.counters(), |c| &mut c.auth_rejected, 1);
+    // A bare DATA frame for the authenticated binding.
+    let before = auth.counters();
+    auth.inject(&stale_frame(9, 64, 32));
+    only_changed(before, auth.counters(), |c| &mut c.auth_bare, 1);
+    // A bare PATH_HB for it.
+    let heartbeat = encoded(karyos_protocol::network::Control::PathHeartbeat(
+        karyos_protocol::network::PathHeartbeat {
+            alias: alias(),
+            identity: identity(),
+        },
+    ));
+    let before = auth.counters();
+    auth.inject(&heartbeat);
+    only_changed(before, auth.counters(), |c| &mut c.auth_bare, 1);
+    // An envelope for no binding: another session, never solicited.
+    let other = Alias {
+        session_id: 99,
+        ..alias()
+    };
+    let mut stranger = Sealer::new(&auth.channel, auth.sender, other).unwrap();
+    let mut frame = stale_frame(9, 64, 32);
+    frame[12..16].copy_from_slice(&99i32.to_le_bytes());
+    let unbound = sealed(&mut stranger, &frame);
+    let before = auth.counters();
+    auth.inject(&unbound);
+    only_changed(before, auth.counters(), |c| &mut c.auth_unbound, 1);
+    assert_eq!(auth.sessions(), sessions, "no SOLICIT, no session change");
+    // The next genuine envelope still delivers.
+    let before = auth.counters();
+    auth.inject(&sealed(&mut sealer, &stale_frame(9, 64, 32)));
+    assert_eq!(auth.counters().data_committed, before.data_committed + 1);
+}
+
+/// ADR-0086 sections 2 and 7a: an authenticated image's SMs and NAKs leave
+/// sealed in domain 4 and open under a verifier of the receiver's party;
+/// none is handed over to go bare.
+#[test]
+fn an_authenticated_images_sm_and_nak_go_sealed_in_domain_4() {
+    use std::sync::{Arc, Mutex};
+
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+    use karyos_protocol::network::{Control, classify};
+    use karyos_protocol::protection::hmac_sha256::Domain;
+
+    use super::super::control::{ControlItem, ControlRoutes, ControlSeal};
+    use crate::wire_auth::{Sealer, Verifier};
+
+    let mut auth = auth_rig();
+    let mut sealer = Sealer::new(&auth.channel, auth.sender, alias()).unwrap();
+    // A gap: position 64 arrives, 0 is lost, so a NAK falls due.
+    auth.inject(&sealed(&mut sealer, &stale_frame(9, 64, 32)));
+    let mut items = Vec::new();
+    for _ in 0..400 {
+        auth.rig.round(true);
+        while let Some(item) = auth.rig.agents.sender.role.take_control() {
+            items.push(item);
+        }
+        let kinds = |nak: bool| {
+            items.iter().any(|item| {
+                matches!(
+                    item,
+                    ControlItem::Outgoing {
+                        control: Control::Nak(_),
+                        ..
+                    }
+                ) == nak
+            })
+        };
+        if kinds(true) && kinds(false) {
+            break;
+        }
+    }
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    observer.set_send_hook(Box::new(move |_, datagrams| {
+        for datagram in datagrams {
+            record.lock().unwrap().push(datagram.to_vec());
+        }
+    }));
+    for _ in 0..items.len() {
+        observer.push_send(karyos_io::sockets::ops::SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let config = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let endpoint = SocketsEndpoint::open(&config, InstanceId::FIRST, socket).unwrap();
+    let (mut tx, _rx) = endpoint.split().unwrap();
+    let mut routes = ControlRoutes::new(2);
+    let (mut sms, mut naks) = (0, 0);
+    let mut expected = Vec::new();
+    for item in items {
+        let ControlItem::Outgoing {
+            control,
+            destination,
+            seal,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        let mut seal = seal.expect("an authenticated image's control carries its sealer");
+        assert_eq!(seal.domain(), Domain::ReceiverToPublisher);
+        match control {
+            Control::Status(_) => sms += 1,
+            Control::Nak(_) => naks += 1,
+            _ => {}
+        }
+        routes
+            .send_sealed(&mut tx, destination, &control, &mut seal)
+            .unwrap();
+        expected.push(control);
+    }
+    assert!(sms > 0 && naks > 0, "{sms} SMs, {naks} NAKs");
+    let mut verifier = Verifier::new([&auth.pairwise], auth.receiver, alias()).unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), expected.len());
+    for (bytes, control) in seen.iter().zip(&expected) {
+        assert!(classify(bytes).is_err(), "never bare");
+        let opened = verifier.open(bytes, auth_wall()).unwrap();
+        let inner = &bytes[opened.start..][..opened.frames];
+        let karyos_protocol::network::Datagram::Control(decoded) = classify(inner).unwrap() else {
+            panic!("not a control");
+        };
+        assert_eq!(&decoded, control);
+    }
+    let _ = auth.slot;
+}

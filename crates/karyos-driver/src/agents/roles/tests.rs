@@ -587,6 +587,7 @@ fn a_full_ring_counts_each_kind() {
         destination: source,
         control,
         guard: None,
+        seal: None,
     };
     let incoming = |control| super::ControlItem::Incoming {
         endpoint: EndpointId(1),
@@ -1628,6 +1629,8 @@ fn installed_image_with(
             generation: 1,
         }),
         group_tag: 0,
+        nonce: [0; 2],
+        auth: None,
     };
     (image, params)
 }
@@ -1875,6 +1878,7 @@ fn rttm_probes_measure_bound_paths() {
             destination,
             control: Control::Rttm(request),
             guard: Some(ItemGuard::Report(guard)),
+            seal: None,
         })) => {
             assert_eq!((endpoint, destination), (key.endpoint, key.source));
             (request, guard)
@@ -2069,6 +2073,7 @@ fn rttm_requests_are_reported_and_answered() {
         destination: source,
         control: Control::Rttm(request),
         guard: Some(ItemGuard::Report(ReportGuard::take(slot))),
+        seal: None,
     };
     observer.push_send(SendResult::Sent {
         sent: 1,
@@ -3013,6 +3018,7 @@ fn a_full_ring_reports_the_nak_not_submitted() {
             lane_count: 1,
         }),
         guard: None,
+        seal: None,
     };
     while receiver.to_sender.try_post(filler()).is_ok() {}
     receiver.repair(0, 1).unwrap();
@@ -3545,6 +3551,7 @@ fn a_skipped_copy_leaves_its_slot_free() {
         destination: image.key.source,
         control: karyos_protocol::network::Control::Nak(nak),
         guard: None,
+        seal: None,
     };
     assert!(to_sender.try_post(filler).is_ok());
     let _ = super::post_copies(
@@ -7357,4 +7364,99 @@ fn a_sealed_control_opens_under_its_key_and_an_unsealable_one_is_not_sent() {
     for bytes in seen.iter() {
         assert!(!matches!(classify(bytes), Ok(Datagram::Control(_))));
     }
+}
+
+/// ADR-0086 section 2: the sender agent sends a receiver's control that
+/// carries its image's sealer only sealed, opening under the receiver's
+/// party; one it cannot seal is never sent bare, and is counted. A control
+/// without a sealer goes bare, as before.
+#[test]
+fn the_sender_sends_a_sealed_receiver_control_only_sealed() {
+    use std::sync::{Arc, Mutex};
+
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::ops::SendResult;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+    use karyos_protocol::network::{Datagram, classify};
+
+    use super::super::Half;
+    use super::super::control::{ControlItem, SharedSealer};
+    use crate::wire_auth::{Party, Sealer, Verifier};
+    use karyos_protocol::network::Receiver;
+
+    let (mut sender, role) = receiver_with(AgentConfig::default());
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    observer.set_send_hook(Box::new(move |_, datagrams| {
+        for datagram in datagrams {
+            record.lock().unwrap().push(datagram.to_vec());
+        }
+    }));
+    for _ in 0..4 {
+        observer.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let endpoint = SocketsEndpoint::open(&loopback(), InstanceId::FIRST, socket).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    let mut halves = vec![(EndpointId(1), Half::Tx(Box::new(tx)))];
+    let pair = crate::wire_keys::parse(
+        "9-1.key",
+        b"format=karyos-wire-key-v1\nkey_id=9\nfile_epoch=1\npurpose=pairwise\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=2222222222222222222222222222222222222222222222222222222222222222\nreceiver_id=66\npublisher_id=5\n",
+    )
+    .unwrap();
+    let party = Party::Receiver {
+        identity: identity(),
+        receiver_boot_id: [7, 8],
+        receiver_id: 66,
+    };
+    let seal = SharedSealer::new(Sealer::new(&pair, party, alias()).unwrap());
+    let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let nak = Control::Nak(karyos_protocol::network::Nak {
+        alias: alias(),
+        identity: identity(),
+        receiver: Receiver {
+            receiver_boot_id: [7, 8],
+            receiver_id: 66,
+        },
+        range: karyos_protocol::network::NakRange {
+            lane: karyos_protocol::frame::Lane::ZERO,
+            length: 32,
+            start: 0,
+        },
+    });
+    let item = |control, seal| ControlItem::Outgoing {
+        endpoint: EndpointId(1),
+        destination,
+        control,
+        guard: None,
+        seal,
+    };
+    // Sealed; an RSP_SETUP is not domain 4's, so it is not sent; bare.
+    role.to_sender
+        .try_post(item(nak, Some(seal.clone())))
+        .unwrap();
+    role.to_sender
+        .try_post(item(challenge_control(), Some(seal)))
+        .unwrap();
+    role.to_sender.try_post(item(nak, None)).unwrap();
+    let _ = sender.duty(&mut halves, 10).unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "the unsealable control is not sent");
+    assert_eq!(sender.counters().seal_failures, 1);
+    let mut verifier = Verifier::new([&pair], party, alias()).unwrap();
+    let opened = verifier.open(&seen[0], 1_795_000_000).unwrap();
+    let inner = &seen[0][opened.start..][..opened.frames];
+    assert_eq!(inner, encoded(&nak).as_slice());
+    assert!(classify(&seen[0]).is_err(), "never bare");
+    assert_eq!(
+        seen[1],
+        encoded(&nak),
+        "a trusted control is byte-identical"
+    );
+    assert!(matches!(classify(&seen[1]), Ok(Datagram::Control(_))));
 }
