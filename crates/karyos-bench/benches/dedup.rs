@@ -46,6 +46,9 @@ const LIVE: [u32; 4] = [1, 32, 64, 1024];
 /// W2's payload and W1's largest.
 const REPLIES: [usize; 2] = [256, 8 * 1024];
 
+/// Every request's command: one identity, one payload (karyos#750).
+const COMMAND: &[u8] = b"order";
+
 fn profiles() -> [(&'static str, DedupConfig); 2] {
     [
         ("default", DedupConfig::default()),
@@ -84,6 +87,7 @@ fn fill(table: &mut SessionTable) {
         for sequence in 0..u64::from(config.window) {
             let outcome = table.request(
                 Request::new(client, client, sequence, 0),
+                COMMAND,
                 u64::from(config.sessions),
                 answer(length),
             );
@@ -179,6 +183,7 @@ fn lookup(c: &mut Criterion) {
             expect(matches!(
                 table.request(
                     Request::new(client, client, sequence, sequence),
+                    COMMAND,
                     u64::from(live),
                     answer(length)
                 ),
@@ -194,8 +199,12 @@ fn lookup(c: &mut Criterion) {
                         // never fills.
                         let request = Request::new(client, client, sequence, sequence);
                         sequence += 1;
-                        let outcome =
-                            table.request(black_box(request), u64::from(live), answer(length));
+                        let outcome = table.request(
+                            black_box(request),
+                            COMMAND,
+                            u64::from(live),
+                            answer(length),
+                        );
                         black_box(outcome);
                     });
                 },
@@ -215,7 +224,7 @@ fn lookup(c: &mut Criterion) {
                     next = (next + 1) % sequences.len();
                     let request = Request::new(client, client, sequence, sequence);
                     matches!(
-                        table.request(black_box(request), u64::from(live), answer(length)),
+                        table.request(black_box(request), COMMAND, u64::from(live), answer(length)),
                         Outcome::Applied(_)
                     )
                 };
@@ -247,6 +256,7 @@ fn retry(c: &mut Criterion) {
             expect(matches!(
                 table.request(
                     Request::new(client, client, sequence, 0),
+                    COMMAND,
                     u64::from(live),
                     answer(256),
                 ),
@@ -256,6 +266,7 @@ fn retry(c: &mut Criterion) {
         expect(matches!(
             table.request(
                 Request::new(client, client, window - 1, 0),
+                COMMAND,
                 u64::from(live),
                 answer(256)
             ),
@@ -264,6 +275,7 @@ fn retry(c: &mut Criterion) {
         expect(matches!(
             table.request(
                 Request::new(client, client, window, 0),
+                COMMAND,
                 u64::from(live),
                 answer(256)
             ),
@@ -274,6 +286,7 @@ fn retry(c: &mut Criterion) {
             b.iter(|| {
                 let outcome = table.request(
                     black_box(Request::new(client, client, window - 1, 0)),
+                    COMMAND,
                     u64::from(live),
                     answer(256),
                 );
@@ -286,6 +299,7 @@ fn retry(c: &mut Criterion) {
                 b.iter(|| {
                     let outcome = table.request(
                         black_box(Request::new(client, client, window, 0)),
+                        COMMAND,
                         u64::from(live),
                         answer(256),
                     );
