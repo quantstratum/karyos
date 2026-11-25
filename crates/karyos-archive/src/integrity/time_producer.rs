@@ -31,7 +31,7 @@ use karyos_trace::journal::ObserverId;
 use sha2::{Digest as _, Sha256};
 
 use super::Digest;
-use super::time::{Source, SyncState};
+use super::time::{ClusterTime, Source, SyncState, classify_cluster_time};
 use super::time_evidence::{Entry, NO_BOUND};
 
 #[cfg(test)]
@@ -204,14 +204,58 @@ pub fn produce(
     clock: Option<&EventClock>,
     snapshot: &Snapshot,
 ) -> Vec<Entry> {
+    produce_marked(group, events, &vec![false; events.len()], clock, snapshot)
+}
+
+/// The entries of a recording whose events are a Cluster log history's
+/// entries, under contract C-TIME (ADR-0111, decision 5): as [`produce`],
+/// except that each event is first classified by
+/// [`classify_cluster_time`] against the watermark of the history before
+/// it, `watermark` (0 at the log's first entry, the snapshot's log time
+/// after a snapshot, `None` when the producer cannot establish it) raised
+/// by every earlier event. A possibly clamped event, or one whose
+/// watermark is unknown, keeps the declared clock but never a bound:
+/// its raw value is unknown, so it is `no_evidence`. An event strictly
+/// above the watermark is the raw clock's reading and is bounded as
+/// [`produce`] bounds it. The two kinds never share an entry, so the
+/// entries split where the clamp ends.
+#[must_use]
+pub fn produce_cluster(
+    recording: u64,
+    events: &[Event],
+    watermark: Option<u64>,
+    clock: Option<&EventClock>,
+    snapshot: &Snapshot,
+) -> Vec<Entry> {
+    let mut mark = watermark;
+    let clamped: Vec<bool> = events
+        .iter()
+        .map(|event| {
+            let raw = classify_cluster_time(event.time, mark) == ClusterTime::Raw;
+            mark = mark.map(|mark| mark.max(event.time));
+            !raw
+        })
+        .collect();
+    produce_marked(recording, events, &clamped, clock, snapshot)
+}
+
+/// [`produce`], with the events `clamped` marks never proven.
+fn produce_marked(
+    group: u64,
+    events: &[Event],
+    clamped: &[bool],
+    clock: Option<&EventClock>,
+    snapshot: &Snapshot,
+) -> Vec<Entry> {
     // A declaration of the reserved zero tuple declares nothing.
     let clock = clock.filter(|clock| clock.clock != [0; 5]);
     let largest = events.iter().map(|event| event.time).max().unwrap_or(0);
     let mut entries: Vec<(Provenance, Entry)> = Vec::new();
-    for event in events {
+    for (event, &clamped) in events.iter().zip(clamped) {
         let provenance = match clock {
             Some(_) if !event.in_session => Provenance::Unknown,
             None => Provenance::Unknown,
+            Some(_) if clamped => Provenance::Declared,
             Some(clock) => {
                 proven(snapshot, &clock.key(), event.time, largest).unwrap_or(Provenance::Declared)
             }

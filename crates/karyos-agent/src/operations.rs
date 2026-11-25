@@ -73,6 +73,11 @@ pub enum GuardAnswer {
         /// The operation id.
         operation: u64,
     },
+    /// A reopen of a class this deployment marks for two people
+    /// (R-CORE-20, karyos#739): only `submit` after its preview enters
+    /// the approval flow; a direct request is refused, unsent and
+    /// unjournalled.
+    TwoPersonRequired,
 }
 
 /// One guard command to make.

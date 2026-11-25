@@ -246,6 +246,66 @@ fn journal_view(out: &mut Out<'_>, journal: &JournalView) {
         fields
             .key("alerts")
             .array(&journal.alerts, |out, alert| alert_json(out, alert));
+        fields
+            .key("integrity")
+            .option(journal.integrity.as_deref(), |out, ranges| {
+                out.array(ranges, |out, range| range_json(out, range));
+            });
+        fields
+            .key("integrity_truncated")
+            .bool(journal.integrity_truncated);
+        // Retention (ADR-0113, point 9).
+        fields
+            .key("hold")
+            .option(journal.hold, |out, hold| out.string(hold));
+        fields.key("policy").option(journal.policy, |out, policy| {
+            out.object(|fields| {
+                fields.number("id", policy.policy);
+                fields.number("version", policy.version);
+                fields.number("retain_for_ns", policy.retain_for_ns);
+                fields.number("min_copies", u64::from(policy.min_copies.get()));
+                fields.string(
+                    "purge",
+                    match policy.purge {
+                        karyos_archive::integrity::retention::PurgeMode::AfterExpiry => {
+                            "after_expiry"
+                        }
+                        _ => "manual",
+                    },
+                );
+            });
+        });
+        fields.key("purged").array(&journal.purged, |out, purged| {
+            out.object(|fields| {
+                fields.number("start", purged.start);
+                fields.number("end", purged.end);
+                fields.number("counter", purged.counter);
+                fields.string("seals", &hex(&purged.seals));
+                fields.string("record", &hex(&purged.record));
+            });
+        });
+        fields.key("purge_pending").bool(journal.purge_pending);
+    });
+}
+
+/// `bytes` as lowercase hex.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
+}
+
+/// One range's integrity outcome, the verifier's names.
+fn range_json(out: &mut Out<'_>, range: &crate::retention::RangeOutcome) {
+    out.object(|fields| {
+        fields.number("start", range.start);
+        fields.number("end", range.end);
+        fields.string("outcome", &range.outcome);
+        fields
+            .key("reasons")
+            .array(&range.reasons, |out, reason| out.string(reason));
     });
 }
 
@@ -339,6 +399,7 @@ pub fn guard_answer(answer: &crate::operations::GuardAnswer) -> String {
         GuardAnswer::UnknownDriver => fields.string("error", "unknown driver"),
         GuardAnswer::Unattached => fields.string("error", "driver unavailable"),
         GuardAnswer::InstanceChanged => fields.string("error", "target changed"),
+        GuardAnswer::TwoPersonRequired => fields.string("error", "two-person required"),
     });
     text
 }
@@ -411,16 +472,9 @@ pub fn retention_answer(answer: &crate::retention::RetentionAnswer) -> String {
         }
         RetentionAnswer::Verified { operation, ranges } => {
             fields.number("operation", operation);
-            fields.key("ranges").array(ranges, |out, range| {
-                out.object(|fields| {
-                    fields.number("start", range.start);
-                    fields.number("end", range.end);
-                    fields.string("outcome", &range.outcome);
-                    fields
-                        .key("reasons")
-                        .array(&range.reasons, |out, reason| out.string(reason));
-                });
-            });
+            fields
+                .key("ranges")
+                .array(ranges, |out, range| range_json(out, range));
         }
         RetentionAnswer::NoAnswer { operation } => {
             fields.string("error", "no answer");
@@ -429,6 +483,11 @@ pub fn retention_answer(answer: &crate::retention::RetentionAnswer) -> String {
         RetentionAnswer::JournalUnavailable => fields.string("error", "journal unavailable"),
         RetentionAnswer::NoArchive => fields.string("error", "no archive"),
         RetentionAnswer::Busy => fields.string("error", "busy"),
+        RetentionAnswer::HoldNotDurable { operation } => {
+            fields.string("error", "hold not durable");
+            fields.number("operation", operation);
+            fields.key("evidenced").bool(false);
+        }
     });
     text
 }
@@ -509,7 +568,40 @@ pub fn cluster_answer(answer: &crate::cluster_admin::ClusterAnswer) -> String {
         }
         ClusterAnswer::JournalUnavailable => fields.string("error", "journal unavailable"),
         ClusterAnswer::Busy => fields.string("error", "busy"),
+        ClusterAnswer::TwoPersonRequired => fields.string("error", "two-person required"),
     });
+    text
+}
+
+/// The answer of a request that may enter the two-person flow, of
+/// `approve` and of `withdraw` (R-CORE-20, karyos#739): pending
+/// `{"operation":N,"outcome":"pending_approval","expires_in_ms":N}`,
+/// withdrawn `{"operation":N,"outcome":"withdrawn"}`, an operation's
+/// outcome as [`guard_answer`] or [`cluster_answer`] write it, or a
+/// refusal `{"error":TEXT}`.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn approval_answer(answer: &crate::approval::ApprovalAnswer) -> String {
+    use crate::approval::ApprovalAnswer;
+    let mut text = String::new();
+    match answer {
+        ApprovalAnswer::Guard(answer) => return guard_answer(answer),
+        ApprovalAnswer::Cluster(answer) => return cluster_answer(answer),
+        ApprovalAnswer::Submit(refusal) => return error(refusal.text(), None),
+        ApprovalAnswer::Refused(refusal) => return error(refusal.text(), None),
+        ApprovalAnswer::Pending {
+            operation,
+            expires_in_ms,
+        } => Out(&mut text).object(|fields| {
+            fields.number("operation", *operation);
+            fields.string("outcome", "pending_approval");
+            fields.number("expires_in_ms", *expires_in_ms);
+        }),
+        ApprovalAnswer::Withdrawn { operation } => Out(&mut text).object(|fields| {
+            fields.number("operation", *operation);
+            fields.string("outcome", "withdrawn");
+        }),
+    }
     text
 }
 

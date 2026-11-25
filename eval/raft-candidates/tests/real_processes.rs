@@ -66,12 +66,32 @@ fn free_addresses(nodes: u32) -> Vec<String> {
         .collect()
 }
 
+/// One real-process run at a time. Each node makes every vote and append
+/// durable before it answers, and on Apple targets `StdDisk` syncs with
+/// `F_FULLFSYNC`, which flushes the whole device's cache: libtest's
+/// parallel runs (six at once, 24 processes) then wait on one another's
+/// flushes, and every run takes about the node's 60 s deadline (they all
+/// apply their commands, at that pace) while each run alone takes
+/// seconds. Serialised here, on every platform, so the runs are the
+/// functional checks they are meant to be, not a measure of the host's
+/// flush contention.
+static ONE_RUN_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// How long the test waits for its processes: past the nodes' own 60 s
+/// deadline (`raft-eval-node`), so a node that gives up reports its own
+/// error instead of the test's timeout.
+const WAIT: Duration = Duration::from_secs(75);
+
 /// Attempts at the run: a port can still be taken by another process
 /// between its release here and a child's bind; only that failure is
 /// retried, with fresh ports (karyos#956 review).
 const ATTEMPTS: usize = 3;
 
 fn processes_commit_and_apply_the_same_commands(core: &str, nodes: u32) {
+    // A failed run's panic poisons the lock; the next run still goes.
+    let _serial = ONE_RUN_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for attempt in 1..=ATTEMPTS {
         match run_once(core, nodes) {
             Ok(probes) => {
@@ -274,7 +294,7 @@ fn run_once(core: &str, nodes: u32) -> Result<Vec<Probe>, String> {
             .unwrap();
         run.children.push(child);
     }
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + WAIT;
     loop {
         let statuses: Vec<_> = run
             .children
@@ -292,8 +312,19 @@ fn run_once(core: &str, nodes: u32) -> Result<Vec<Probe>, String> {
             break;
         }
         if Instant::now() > deadline {
-            // The guard kills, reaps and cleans up.
-            panic!("the processes did not finish");
+            // Each node's stderr says where it stood; the guard reaps the
+            // rest and cleans up.
+            let stderr: Vec<String> = std::mem::take(&mut run.children)
+                .into_iter()
+                .map(|mut child| {
+                    let _ = child.kill();
+                    child.wait_with_output().map_or_else(
+                        |error| error.to_string(),
+                        |output| String::from_utf8_lossy(&output.stderr).into_owned(),
+                    )
+                })
+                .collect();
+            panic!("the processes did not finish: {stderr:?}");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
