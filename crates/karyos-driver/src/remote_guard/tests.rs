@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use karyos_protocol::network::Receiver;
 use karyos_protocol::network::authenticated::{GuardState, GuardStatus, GuardWord};
@@ -18,16 +18,29 @@ const RECEIVER: Receiver = Receiver {
     receiver_id: 66,
 };
 
-/// Marks in memory; `fail` makes every commit fail.
+/// Marks in memory; `fail` makes every commit fail, `unreadable` every
+/// read.
 #[derive(Debug, Default)]
-struct Marks {
-    held: HashMap<u64, u64>,
-    fail: bool,
+pub(crate) struct Marks {
+    pub(crate) held: HashMap<u64, u64>,
+    pub(crate) latched: HashSet<u64>,
+    pub(crate) fail: bool,
+    pub(crate) unreadable: bool,
 }
 
 impl MarkStore for Marks {
     fn load(&self, guard_id: u64) -> Result<u64, MarkError> {
+        if self.unreadable {
+            return Err(MarkError::Unreadable);
+        }
         Ok(self.held.get(&guard_id).copied().unwrap_or(0))
+    }
+
+    fn latched(&self, guard_id: u64) -> Result<bool, MarkError> {
+        if self.unreadable {
+            return Err(MarkError::Unreadable);
+        }
+        Ok(self.latched.contains(&guard_id))
     }
 
     fn persist(&mut self, guard_id: u64, epoch: u64) -> Result<(), MarkError> {
@@ -36,6 +49,14 @@ impl MarkStore for Marks {
         }
         let held = self.held.entry(guard_id).or_insert(0);
         *held = (*held).max(epoch);
+        Ok(())
+    }
+
+    fn latch(&mut self, guard_id: u64) -> Result<(), MarkError> {
+        if self.fail {
+            return Err(MarkError::Commit);
+        }
+        self.latched.insert(guard_id);
         Ok(())
     }
 }
@@ -342,7 +363,7 @@ fn a_failed_mark_commit_opens_nothing() {
 
 /// A directory in memory.
 #[derive(Debug, Default)]
-struct MemoryFiles(RefCell<HashMap<String, Vec<u8>>>);
+pub(crate) struct MemoryFiles(RefCell<HashMap<String, Vec<u8>>>);
 
 impl Files for MemoryFiles {
     fn names(&self) -> Result<Vec<String>, FileError> {
@@ -376,4 +397,168 @@ fn guard_marks_persist_and_only_rise() {
     marks.persist(11, 4).unwrap();
     assert_eq!(marks.load(11), Ok(6));
     assert_eq!(marks.load(12), Ok(0));
+}
+
+/// Finding 3 of the H8 review (design 4.1, ADR-0086 section 7): a
+/// verified higher `Closed` STATE whose mark cannot be persisted still
+/// raises the floor in memory and retires the outstanding round, so once
+/// the store is writable again neither the old round's still-live `Open`
+/// STATUS nor a fresh one at the old floor reopens; only a fresh STATUS
+/// meeting the raised floor, persisted first, does.
+#[test]
+fn a_close_that_cannot_be_persisted_never_lets_the_old_floor_reopen() {
+    let mut nonces = Counter(0);
+    let mut marks = Marks::default();
+    let mut guard = recovered(2, &mut marks, &mut nonces);
+    // A renewal round is outstanding when the authority closes.
+    let renewal = guard.challenge(RECEIVER, 2 * MS, &mut nonces).unwrap();
+    marks.fail = true;
+    assert_eq!(
+        guard.on_state(&state(3, 5_000), 2 * MS, &mut marks),
+        Err(GuardRefusal::Persist)
+    );
+    assert!(!guard.is_open(2 * MS));
+    assert_eq!(guard.floor(), 3, "the floor rose in memory");
+    assert_eq!(marks.held[&11], 2, "but is not durable yet");
+    // The store is writable again.
+    marks.fail = false;
+    assert_eq!(
+        guard.on_status(&status(renewal.nonce, 2), RECEIVER, 3 * MS, &mut marks),
+        Err(GuardRefusal::StaleNonce),
+        "the old round was retired"
+    );
+    let fresh = guard.challenge(RECEIVER, 3 * MS, &mut nonces).unwrap();
+    assert_eq!(
+        guard.on_status(&status(fresh.nonce, 2), RECEIVER, 4 * MS, &mut marks),
+        Err(GuardRefusal::Stale)
+    );
+    assert!(!guard.is_open(4 * MS));
+    assert_eq!(marks.held[&11], 2);
+    // An `Open` STATE that cannot be persisted closes the same way and
+    // only makes a confirmation due; its STATUS persists, then opens.
+    marks.fail = true;
+    assert_eq!(
+        guard.on_state(&state(4, 5_000), 5 * MS, &mut marks),
+        Err(GuardRefusal::Persist)
+    );
+    assert!(guard.round_due(5 * MS));
+    marks.fail = false;
+    let confirm = guard.challenge(RECEIVER, 5 * MS, &mut nonces).unwrap();
+    assert!(matches!(
+        guard.on_status(&status(confirm.nonce, 4), RECEIVER, 6 * MS, &mut marks),
+        Ok(GuardChange::Applied(Phase::Open { epoch: 4, .. }))
+    ));
+    assert_eq!(marks.held[&11], 4, "durable before it opened");
+}
+
+/// Finding 3: a verified STATUS whose epoch cannot be persisted raises the
+/// floor in memory; a lower one later is refused, not opened.
+#[test]
+fn a_status_that_cannot_be_persisted_still_raises_the_floor() {
+    let mut nonces = Counter(0);
+    let mut marks = Marks::default();
+    let mut guard = recovered(2, &mut marks, &mut nonces);
+    let first = guard.challenge(RECEIVER, 2 * MS, &mut nonces).unwrap();
+    marks.fail = true;
+    assert_eq!(
+        guard.on_status(&status(first.nonce, 3), RECEIVER, 3 * MS, &mut marks),
+        Err(GuardRefusal::Persist)
+    );
+    assert_eq!((guard.floor(), guard.phase(3 * MS)), (3, Phase::Closed));
+    marks.fail = false;
+    let second = guard.challenge(RECEIVER, 4 * MS, &mut nonces).unwrap();
+    assert_eq!(
+        guard.on_status(&status(second.nonce, 2), RECEIVER, 5 * MS, &mut marks),
+        Err(GuardRefusal::Stale)
+    );
+    assert!(!guard.is_open(5 * MS));
+}
+
+/// Finding 9 of the H8 review (ADR-0107 decision 6, design 4.4 step 3):
+/// the rollback latch is durable: after a restart the same guard id loads
+/// latched, through its mark file; another configured guard id does not.
+#[test]
+fn the_rollback_latch_survives_a_restart() {
+    let mut nonces = Counter(0);
+    let mut marks = GuardMarks::new(MemoryFiles::default());
+    marks.persist(11, 6).unwrap();
+    let mut guard = RemoteGuard::load(10, 11, &marks);
+    let challenge = guard.challenge(RECEIVER, 0, &mut nonces).unwrap();
+    assert_eq!(
+        guard.on_status(&status(challenge.nonce, 4), RECEIVER, MS, &mut marks),
+        Err(GuardRefusal::Latched)
+    );
+    assert_eq!(marks.latched(11), Ok(true));
+    assert_eq!(marks.load(11), Ok(6), "the epoch is kept");
+    // Restart.
+    let mut after = RemoteGuard::load(10, 11, &marks);
+    assert_eq!((after.phase(0), after.floor()), (Phase::Latched, 6));
+    assert!(after.challenge(RECEIVER, 0, &mut nonces).is_none());
+    // A later raise keeps the latch.
+    marks.persist(11, 8).unwrap();
+    assert_eq!(marks.latched(11), Ok(true));
+    // Only another configured guard id starts afresh.
+    assert_eq!(
+        RemoteGuard::load(10, 12, &marks).phase(0),
+        Phase::Recovering
+    );
+}
+
+/// Finding 9: a latch that cannot be stored still latches in memory,
+/// counted as a persist failure too.
+#[test]
+fn a_latch_that_cannot_be_stored_still_latches() {
+    let mut nonces = Counter(0);
+    let mut marks = Marks::default();
+    marks.held.insert(11, 6);
+    let mut guard = RemoteGuard::load(10, 11, &marks);
+    let challenge = guard.challenge(RECEIVER, 0, &mut nonces).unwrap();
+    marks.fail = true;
+    assert_eq!(
+        guard.on_status(&status(challenge.nonce, 4), RECEIVER, MS, &mut marks),
+        Err(GuardRefusal::Latched)
+    );
+    assert_eq!(guard.phase(MS), Phase::Latched);
+    assert_eq!(guard.refusals(GuardRefusal::Persist), 1);
+}
+
+/// Finding 9: the mark file format is versioned and parsed fail closed:
+/// v1 (epoch only) reads unlatched; v2 carries the latch; an unknown
+/// version or a malformed field loads latched, and no commit overwrites a
+/// mark it cannot read.
+#[test]
+fn the_mark_format_is_versioned_and_fails_closed() {
+    let files = MemoryFiles::default();
+    let put = |name: &str, text: &str| {
+        files
+            .0
+            .borrow_mut()
+            .insert(name.to_owned(), text.as_bytes().to_vec());
+    };
+    put("guard-1", "karyos-guard-mark-v1\nepoch=4\n");
+    put("guard-2", "karyos-guard-mark-v2\nepoch=4\nlatched=1\n");
+    put("guard-3", "karyos-guard-mark-v3\nepoch=4\nlatched=0\n");
+    put("guard-4", "karyos-guard-mark-v2\nepoch=4\nlatched=2\n");
+    put("guard-5", "karyos-guard-mark-v2\nepoch=4\n");
+    put("guard-6", "karyos-guard-mark-v2\nepoch=+4\nlatched=0\n");
+    let mut marks = GuardMarks::new(files);
+    assert_eq!((marks.load(1), marks.latched(1)), (Ok(4), Ok(false)));
+    assert_eq!(RemoteGuard::load(10, 1, &marks).phase(0), Phase::Recovering);
+    assert_eq!((marks.load(2), marks.latched(2)), (Ok(4), Ok(true)));
+    assert_eq!(RemoteGuard::load(10, 2, &marks).phase(0), Phase::Latched);
+    for guard_id in 3..=6 {
+        assert_eq!(marks.latched(guard_id), Err(MarkError::Unreadable));
+        assert_eq!(
+            RemoteGuard::load(10, guard_id, &marks).phase(0),
+            Phase::Latched
+        );
+        assert_eq!(marks.persist(guard_id, 9), Err(MarkError::Unreadable));
+        assert_eq!(marks.latch(guard_id), Err(MarkError::Unreadable));
+    }
+    // A v1 mark is rewritten as v2 on its next raise.
+    marks.persist(1, 6).unwrap();
+    assert_eq!((marks.load(1), marks.latched(1)), (Ok(6), Ok(false)));
+    // The authority's committed epochs are named apart.
+    let authority = GuardMarks::authority(MemoryFiles::default());
+    assert_eq!(authority.name(11).as_str(), "authority-guard-11");
 }

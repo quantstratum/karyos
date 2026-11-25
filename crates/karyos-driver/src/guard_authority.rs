@@ -20,6 +20,14 @@
 //! is dropped and counted by reason. A challenge never changes authority
 //! state. The configuration is refused at load beyond the capacity limits
 //! of section 4.2.
+//!
+//! Only a committed word is signed: each guard's highest committed epoch
+//! is kept in a durable [`MarkStore`] ([`crate::remote_guard::GuardMarks::authority`]),
+//! and a word above it is committed there before its STATUS is signed. A
+//! word below it is a rollback of the authority's own state and is never
+//! signed. Unreadable committed state at load, or a failed commit,
+//! disables signing for good (counted); its receivers' guards then lapse
+//! closed.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -31,6 +39,7 @@ use karyos_protocol::network::authenticated::{
 use karyos_protocol::protection::signed::{SignedBinding, SignedDomain, seal_signed};
 
 use crate::authority::Ed25519Signer;
+use crate::remote_guard::MarkStore;
 use crate::sessions::rate::normalized;
 use crate::signed_control::Bucket;
 
@@ -95,10 +104,15 @@ pub enum ChallengeRefusal {
     CorruptWord,
     /// Signing failed, or the sequence is exhausted.
     Sign,
+    /// Signing is disabled: the committed state was unreadable at load,
+    /// or a commit failed.
+    Uncommitted,
+    /// The word is below the guard's committed epoch: never signed.
+    BelowCommitted,
 }
 
 /// Refusal reasons.
-pub const CHALLENGE_REFUSALS: usize = ChallengeRefusal::Sign as usize + 1;
+pub const CHALLENGE_REFUSALS: usize = ChallengeRefusal::BelowCommitted as usize + 1;
 
 /// A signed STATUS and where it goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +140,12 @@ pub struct GuardAuthority {
     signer: Ed25519Signer,
     seq: u64,
     guards: Vec<AuthorityGuard>,
+    /// Each guard's highest committed epoch, by position in `guards`.
+    committed: Vec<u64>,
+    /// Where the committed epochs are durable.
+    commits: Box<dyn MarkStore + Send>,
+    /// False once the committed state was unreadable or a commit failed.
+    signing: bool,
     cycle_left: u32,
     driver: Bucket,
     /// One bucket per distinct configured endpoint.
@@ -147,7 +167,9 @@ impl core::fmt::Debug for GuardAuthority {
 
 impl GuardAuthority {
     /// The authority `authority_id` signing with `signer` under `key_id`,
-    /// owning `guards`; its budgets full at `now` and allocated now.
+    /// owning `guards`, their committed epochs in `commits`; its budgets
+    /// full at `now` and allocated now. Unreadable committed state leaves
+    /// signing disabled.
     ///
     /// # Errors
     ///
@@ -158,9 +180,20 @@ impl GuardAuthority {
         key_id: u32,
         signer: Ed25519Signer,
         guards: Vec<AuthorityGuard>,
+        commits: Box<dyn MarkStore + Send>,
         now: u64,
     ) -> Result<Self, AuthorityConfigError> {
         check(authority_id, &guards)?;
+        let mut signing = true;
+        let committed = guards
+            .iter()
+            .map(|guard| {
+                commits.load(guard.guard_id).unwrap_or_else(|_| {
+                    signing = false;
+                    u64::MAX
+                })
+            })
+            .collect();
         let mut endpoints: Vec<(SocketAddr, Bucket)> = Vec::new();
         for guard in &guards {
             for (_, endpoint) in &guard.receivers {
@@ -179,6 +212,9 @@ impl GuardAuthority {
             signer,
             seq: 0,
             guards,
+            committed,
+            commits,
+            signing,
             cycle_left: STATUS_PER_CYCLE,
             driver: Bucket::full(DRIVER_STATUS_RATE, DRIVER_STATUS_RATE, now),
             endpoints,
@@ -190,6 +226,12 @@ impl GuardAuthority {
     /// A new duty cycle.
     pub fn new_cycle(&mut self) {
         self.cycle_left = STATUS_PER_CYCLE;
+    }
+
+    /// Whether STATUS answers are still signed.
+    #[must_use]
+    pub fn signing(&self) -> bool {
+        self.signing
     }
 
     /// The refusals for `reason`.
@@ -231,10 +273,14 @@ impl GuardAuthority {
         if challenge.authority_id != self.authority_id {
             return Err(ChallengeRefusal::WrongAuthority);
         }
-        let guard = self
+        let index = self
             .guards
             .iter()
-            .find(|guard| guard.guard_id == challenge.guard_id)
+            .position(|guard| guard.guard_id == challenge.guard_id)
+            .ok_or(ChallengeRefusal::UnknownGuard)?;
+        let guard = self
+            .guards
+            .get(index)
             .ok_or(ChallengeRefusal::UnknownGuard)?;
         let destination = guard
             .receivers
@@ -263,6 +309,25 @@ impl GuardAuthority {
             return Err(ChallengeRefusal::DestinationBudget);
         }
         let word = word.ok_or(ChallengeRefusal::CorruptWord)?;
+        if !self.signing {
+            return Err(ChallengeRefusal::Uncommitted);
+        }
+        // Only a committed word is signed: commit a higher one first.
+        let committed = self
+            .committed
+            .get_mut(index)
+            .ok_or(ChallengeRefusal::UnknownGuard)?;
+        let epoch = word.epoch();
+        if epoch < *committed {
+            return Err(ChallengeRefusal::BelowCommitted);
+        }
+        if epoch > *committed {
+            if self.commits.persist(challenge.guard_id, epoch).is_err() {
+                self.signing = false;
+                return Err(ChallengeRefusal::Uncommitted);
+            }
+            *committed = epoch;
+        }
         bucket.take();
         self.driver.take();
         self.cycle_left -= 1;

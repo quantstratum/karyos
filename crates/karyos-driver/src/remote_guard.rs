@@ -12,10 +12,14 @@
 //! the receiver's own unexpired, unconsumed nonce for its current boot id.
 //! On it the floor becomes the STATUS epoch, persisted in [`GuardMarks`]
 //! before anything opens; a STATUS below the durable mark latches the
-//! guard closed for good. After recovery a `Closed` STATE above the floor
-//! raises the floor and closes at once; an `Open` STATE above it raises
-//! the floor and only starts a confirmation round. An `Open` lapses one
-//! lifetime after its last confirmation. The verified datagrams come from
+//! guard closed for good, the latch persisted with the mark so a restart
+//! keeps it (only another configured guard id starts afresh). After
+//! recovery a STATE above the floor raises the floor at once, in memory
+//! even when it cannot yet be persisted, and retires any outstanding
+//! round: a `Closed` one closes, an `Open` one closes and only starts a
+//! confirmation round. Nothing opens until the raised floor is durable
+//! and a fresh STATUS meets it. An `Open` lapses one lifetime after its
+//! last confirmation. The verified datagrams come from
 //! [`crate::signed_control::SignedIntake`]; this module is its epoch check
 //! and state change. Nothing here allocates after construction.
 
@@ -31,7 +35,8 @@ pub const CHALLENGE_TIMEOUT_NS: u64 = 1_000_000_000;
 pub const DEFAULT_LIFETIME_NS: u64 = 5_000_000_000;
 
 /// The durable guard epoch marks: one small file per guard, replaced
-/// atomically and durably, only ever raised.
+/// atomically and durably, its epoch only ever raised and its rollback
+/// latch only ever set.
 pub trait MarkStore: core::fmt::Debug {
     /// The durable mark of `guard_id`: 0 when none was ever stored.
     ///
@@ -40,12 +45,30 @@ pub trait MarkStore: core::fmt::Debug {
     /// [`MarkError`] when it exists and cannot be read; the guard then
     /// stays closed.
     fn load(&self, guard_id: u64) -> Result<u64, MarkError>;
-    /// Persists `epoch` as `guard_id`'s mark before it is acted on.
+    /// Whether `guard_id`'s durable rollback latch is set: false when no
+    /// mark was ever stored.
     ///
     /// # Errors
     ///
-    /// [`MarkError`] when the commit fails; nothing may then open.
+    /// [`MarkError`] when the mark exists and cannot be read; the guard
+    /// then stays latched closed.
+    fn latched(&self, guard_id: u64) -> Result<bool, MarkError>;
+    /// Persists `epoch` as `guard_id`'s mark before it is acted on,
+    /// keeping its latch.
+    ///
+    /// # Errors
+    ///
+    /// [`MarkError`] when the mark cannot be read or the commit fails;
+    /// nothing may then open.
     fn persist(&mut self, guard_id: u64, epoch: u64) -> Result<(), MarkError>;
+    /// Sets `guard_id`'s rollback latch durably, keeping its epoch. Never
+    /// cleared: only a different guard id has a mark of its own.
+    ///
+    /// # Errors
+    ///
+    /// [`MarkError`] when the mark cannot be read or the commit fails; the
+    /// guard is latched in memory regardless.
+    fn latch(&mut self, guard_id: u64) -> Result<(), MarkError>;
 }
 
 /// Why a mark cannot be read or stored.
@@ -57,13 +80,54 @@ pub enum MarkError {
     Commit,
 }
 
-const MARK_FORMAT: &str = "karyos-guard-mark-v1";
+/// The epoch-only format, read as unlatched; never written.
+const MARK_FORMAT_V1: &str = "karyos-guard-mark-v1";
+/// The epoch and the rollback latch.
+const MARK_FORMAT: &str = "karyos-guard-mark-v2";
+
+/// A small text built on the stack: a mark file and its name allocate
+/// nothing.
+struct StackText {
+    buf: [u8; 96],
+    len: usize,
+}
+
+impl StackText {
+    fn new() -> Self {
+        Self {
+            buf: [0; 96],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        self.buf
+            .get(..self.len)
+            .and_then(|bytes| core::str::from_utf8(bytes).ok())
+            .unwrap_or("")
+    }
+}
+
+impl core::fmt::Write for StackText {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let end = self.len.checked_add(text.len()).ok_or(core::fmt::Error)?;
+        self.buf
+            .get_mut(self.len..end)
+            .ok_or(core::fmt::Error)?
+            .copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
 
 /// [`MarkStore`] over a state directory ([`Files`]: on Linux a
 /// `karyos_sys::secure_dir::SecureDir`), with the commit discipline of
-/// the key state: an atomic, durable replace.
+/// the key state: an atomic, durable replace. A followed guard's marks
+/// ([`GuardMarks::new`]) and an authority's committed epochs
+/// ([`GuardMarks::authority`]) are named apart.
 pub struct GuardMarks<F: Files> {
     files: F,
+    prefix: &'static str,
 }
 
 impl<F: Files> core::fmt::Debug for GuardMarks<F> {
@@ -73,22 +137,37 @@ impl<F: Files> core::fmt::Debug for GuardMarks<F> {
 }
 
 impl<F: Files> GuardMarks<F> {
-    /// The marks of `files`.
+    /// The marks of the guards this driver follows, in `files`.
     pub fn new(files: F) -> Self {
-        Self { files }
+        Self {
+            files,
+            prefix: "guard-",
+        }
     }
 
-    fn name(guard_id: u64) -> String {
-        format!("guard-{guard_id}")
+    /// The committed epochs of the guards this driver is the authority
+    /// of, in `files` ([`crate::guard_authority::GuardAuthority`]).
+    pub fn authority(files: F) -> Self {
+        Self {
+            files,
+            prefix: "authority-guard-",
+        }
     }
-}
 
-impl<F: Files> MarkStore for GuardMarks<F> {
-    fn load(&self, guard_id: u64) -> Result<u64, MarkError> {
-        let mut buf = [0u8; 64];
-        let len = match self.files.read(&Self::name(guard_id), &mut buf) {
+    fn name(&self, guard_id: u64) -> StackText {
+        let mut name = StackText::new();
+        // At most 16 + 20 bytes: it fits.
+        let _ = core::fmt::Write::write_fmt(&mut name, format_args!("{}{guard_id}", self.prefix));
+        name
+    }
+
+    /// The epoch and latch of `guard_id`: `(0, false)` when none was
+    /// stored. Any other format, or a malformed one, is unreadable.
+    fn read(&self, guard_id: u64) -> Result<(u64, bool), MarkError> {
+        let mut buf = [0u8; 96];
+        let len = match self.files.read(self.name(guard_id).as_str(), &mut buf) {
             Ok(len) => len,
-            Err(FileError::NotFound) => return Ok(0),
+            Err(FileError::NotFound) => return Ok((0, false)),
             Err(FileError::Refused) => return Err(MarkError::Unreadable),
         };
         let text = buf
@@ -96,29 +175,72 @@ impl<F: Files> MarkStore for GuardMarks<F> {
             .and_then(|bytes| core::str::from_utf8(bytes).ok())
             .ok_or(MarkError::Unreadable)?;
         let mut lines = text.split('\n');
-        if lines.next() != Some(MARK_FORMAT) {
-            return Err(MarkError::Unreadable);
-        }
+        let v2 = match lines.next() {
+            Some(MARK_FORMAT) => true,
+            Some(MARK_FORMAT_V1) => false,
+            _ => return Err(MarkError::Unreadable),
+        };
         let epoch = lines
             .next()
             .and_then(|line| line.strip_prefix("epoch="))
+            .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
             .and_then(|value| value.parse::<u64>().ok())
             .ok_or(MarkError::Unreadable)?;
+        let latched = if v2 {
+            match lines.next() {
+                Some("latched=0") => false,
+                Some("latched=1") => true,
+                _ => return Err(MarkError::Unreadable),
+            }
+        } else {
+            false
+        };
         if lines.next() != Some("") || lines.next().is_some() {
             return Err(MarkError::Unreadable);
         }
-        Ok(epoch)
+        Ok((epoch, latched))
+    }
+
+    fn write(&self, guard_id: u64, epoch: u64, latched: bool) -> Result<(), MarkError> {
+        let mut text = StackText::new();
+        core::fmt::Write::write_fmt(
+            &mut text,
+            format_args!(
+                "{MARK_FORMAT}\nepoch={epoch}\nlatched={}\n",
+                u8::from(latched)
+            ),
+        )
+        .map_err(|_| MarkError::Commit)?;
+        self.files
+            .write_atomic(self.name(guard_id).as_str(), text.as_str().as_bytes())
+            .map_err(|_| MarkError::Commit)
+    }
+}
+
+impl<F: Files> MarkStore for GuardMarks<F> {
+    fn load(&self, guard_id: u64) -> Result<u64, MarkError> {
+        self.read(guard_id).map(|(epoch, _)| epoch)
+    }
+
+    fn latched(&self, guard_id: u64) -> Result<bool, MarkError> {
+        self.read(guard_id).map(|(_, latched)| latched)
     }
 
     fn persist(&mut self, guard_id: u64, epoch: u64) -> Result<(), MarkError> {
-        // Only ever raised: a lower mark is never written.
-        if self.load(guard_id).is_ok_and(|held| held >= epoch) {
+        // Only ever raised, and never over a mark it cannot read.
+        let (held, latched) = self.read(guard_id)?;
+        if held >= epoch {
             return Ok(());
         }
-        let text = format!("{MARK_FORMAT}\nepoch={epoch}\n");
-        self.files
-            .write_atomic(&Self::name(guard_id), text.as_bytes())
-            .map_err(|_| MarkError::Commit)
+        self.write(guard_id, epoch, latched)
+    }
+
+    fn latch(&mut self, guard_id: u64) -> Result<(), MarkError> {
+        let (held, latched) = self.read(guard_id)?;
+        if latched {
+            return Ok(());
+        }
+        self.write(guard_id, held, true)
     }
 }
 
@@ -136,8 +258,9 @@ pub enum Phase {
         /// When it lapses without a confirmation.
         until: u64,
     },
-    /// A STATUS below the durable mark was seen: closed for good under this
-    /// `guard_id` (design section 4.4, step 3).
+    /// A STATUS below the durable mark was seen during recovery: closed
+    /// for good under this `guard_id`, durably (design section 4.4, step
+    /// 3; ADR-0107 decision 6).
     Latched,
 }
 
@@ -211,12 +334,16 @@ impl RemoteGuard {
         }
     }
 
-    /// The guard, its marks read from `marks`: unreadable marks leave it
-    /// latched closed (fail closed).
+    /// The guard, its marks read from `marks`: a durable latch, or
+    /// unreadable marks, leave it latched closed (fail closed).
     pub fn load(authority_id: u64, guard_id: u64, marks: &dyn MarkStore) -> Self {
-        match marks.load(guard_id) {
-            Ok(mark) => Self::new(authority_id, guard_id, mark),
-            Err(_) => Self {
+        match (marks.load(guard_id), marks.latched(guard_id)) {
+            (Ok(mark), Ok(false)) => Self::new(authority_id, guard_id, mark),
+            (Ok(mark), Ok(true)) => Self {
+                phase: Phase::Latched,
+                ..Self::new(authority_id, guard_id, mark)
+            },
+            _ => Self {
                 phase: Phase::Latched,
                 ..Self::new(authority_id, guard_id, u64::MAX)
             },
@@ -381,13 +508,22 @@ impl RemoteGuard {
         let recovering = self.phase == Phase::Recovering;
         if epoch < self.floor {
             if recovering {
-                // The authority is behind this receiver: latched closed.
+                // The authority is behind this receiver: latched closed,
+                // durably, so a restart keeps it (closed in memory even
+                // if the latch cannot be stored).
                 self.phase = Phase::Latched;
+                if marks.latch(self.guard_id).is_err() {
+                    self.refuse(GuardRefusal::Persist);
+                }
                 return Err(self.refuse(GuardRefusal::Latched));
             }
             return Err(self.refuse(GuardRefusal::Stale));
         }
         if marks.persist(self.guard_id, epoch).is_err() {
+            // The verified epoch is still the safety floor: nothing below
+            // it opens, and nothing opens until a fresh STATUS at or above
+            // it is persisted.
+            self.floor = epoch;
             self.phase = if recovering {
                 Phase::Recovering
             } else {
@@ -415,9 +551,12 @@ impl RemoteGuard {
     }
 
     /// A verified STATE at `now`: discarded during recovery or once
-    /// latched; refused at or below the floor; above it, `Closed` raises
-    /// the floor (persisted first) and closes, `Open` raises it and only
-    /// makes a confirmation round due.
+    /// latched; refused at or below the floor. Above it the guard closes,
+    /// the floor rises in memory at once and the outstanding round is
+    /// retired, before the floor is persisted: a failed commit never
+    /// leaves the old floor or an old nonce able to reopen it. `Closed`
+    /// stops there; `Open` only makes a confirmation round due, which
+    /// opens once a fresh STATUS meets the floor and persists it.
     ///
     /// # Errors
     ///
@@ -440,27 +579,32 @@ impl RemoteGuard {
         if epoch <= self.floor {
             return Err(self.refuse(GuardRefusal::Stale));
         }
-        if !state.word.is_open() {
-            // Closing is always safe: it closes even if the mark cannot
-            // be stored.
-            self.phase = Phase::Closed;
-            if marks.persist(self.guard_id, epoch).is_err() {
-                return Err(self.refuse(GuardRefusal::Persist));
-            }
-            self.floor = epoch;
-            return Ok(GuardChange::Applied(Phase::Closed));
+        // A transition: whatever was open or being confirmed is over.
+        // Closing, raising the floor and retiring the round are always
+        // safe, so they happen even if the mark cannot be stored.
+        self.phase = Phase::Closed;
+        self.floor = epoch;
+        if let Some((nonce, _)) = self.round.take() {
+            self.retired = Some(nonce);
         }
+        let open = state.word.is_open();
+        // An `Open` needs a fresh confirmation: until then it is closed.
+        self.pending = open.then(|| {
+            (
+                epoch,
+                u64::from(state.lifetime_ms).saturating_mul(1_000_000),
+            )
+        });
         if marks.persist(self.guard_id, epoch).is_err() {
             return Err(self.refuse(GuardRefusal::Persist));
         }
-        self.floor = epoch;
-        // An `Open` needs a fresh confirmation: until then it is closed.
-        self.phase = Phase::Closed;
-        let lifetime = u64::from(state.lifetime_ms).saturating_mul(1_000_000);
-        self.pending = Some((epoch, lifetime));
-        Ok(GuardChange::ConfirmationDue)
+        Ok(if open {
+            GuardChange::ConfirmationDue
+        } else {
+            GuardChange::Applied(Phase::Closed)
+        })
     }
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

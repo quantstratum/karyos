@@ -7642,9 +7642,17 @@ impl crate::remote_guard::MarkStore for MemoryMarks {
         Ok(self.0.get(&guard_id).copied().unwrap_or(0))
     }
 
+    fn latched(&self, _: u64) -> Result<bool, crate::remote_guard::MarkError> {
+        Ok(false)
+    }
+
     fn persist(&mut self, guard_id: u64, epoch: u64) -> Result<(), crate::remote_guard::MarkError> {
         let held = self.0.entry(guard_id).or_insert(0);
         *held = (*held).max(epoch);
+        Ok(())
+    }
+
+    fn latch(&mut self, _: u64) -> Result<(), crate::remote_guard::MarkError> {
         Ok(())
     }
 }
@@ -7837,7 +7845,15 @@ fn remotely_guarded_rig(
             receivers: vec![(66, a_at)],
         }];
         receiver.set_guard_authority(Some(
-            GuardAuthority::new(10, 10, Ed25519Signer::from_seed(&[9; 32]), guards, 0).unwrap(),
+            GuardAuthority::new(
+                10,
+                10,
+                Ed25519Signer::from_seed(&[9; 32]),
+                guards,
+                Box::new(MemoryMarks::default()),
+                0,
+            )
+            .unwrap(),
         ));
     }
     (rig, b_at, signer)

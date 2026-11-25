@@ -11,6 +11,8 @@ use karyos_protocol::network::authenticated::{AuthControl, StatusChallenge};
 
 use super::*;
 use crate::authority::Ed25519Signer;
+use crate::remote_guard::tests::Marks;
+use crate::remote_guard::{MarkError, MarkStore};
 use crate::signed_control::{Authority, Received, SignedIntake};
 
 const SECOND: u64 = 1_000_000_000;
@@ -43,7 +45,15 @@ fn guard(guard_id: u64, receivers: &[(u64, SocketAddr)]) -> AuthorityGuard {
 }
 
 fn authority(guards: Vec<AuthorityGuard>) -> GuardAuthority {
-    GuardAuthority::new(10, 10, Ed25519Signer::from_seed(&[9; 32]), guards, 0).unwrap()
+    GuardAuthority::new(
+        10,
+        10,
+        Ed25519Signer::from_seed(&[9; 32]),
+        guards,
+        Box::new(Marks::default()),
+        0,
+    )
+    .unwrap()
 }
 
 fn challenge(guard_id: u64, receiver_id: u64, nonce: u64) -> Vec<u8> {
@@ -182,7 +192,9 @@ fn a_challenge_flood_is_held_to_its_budgets() {
 #[test]
 fn configurations_over_capacity_are_refused_at_load() {
     let signer = || Ed25519Signer::from_seed(&[9; 32]);
-    let make = |guards| GuardAuthority::new(10, 10, signer(), guards, 0).map(|_| ());
+    let make = |guards| {
+        GuardAuthority::new(10, 10, signer(), guards, Box::new(Marks::default()), 0).map(|_| ())
+    };
     // 321 receivers at 5 s: above 64 × 5.
     let many: Vec<(u64, SocketAddr)> = (1..=321)
         .map(|id| (id, at(u16::try_from(id).unwrap())))
@@ -206,4 +218,117 @@ fn configurations_over_capacity_are_refused_at_load() {
         make(vec![guard(11, &[(66, at(1))]), guard(11, &[(67, at(2))])]),
         Err(AuthorityConfigError::Invalid)
     );
+}
+
+/// Committed epochs shared with the test after the authority takes them.
+#[derive(Debug, Clone, Default)]
+struct Shared(Arc<std::sync::Mutex<Marks>>);
+
+impl MarkStore for Shared {
+    fn load(&self, guard_id: u64) -> Result<u64, MarkError> {
+        self.0.lock().unwrap().load(guard_id)
+    }
+
+    fn latched(&self, guard_id: u64) -> Result<bool, MarkError> {
+        self.0.lock().unwrap().latched(guard_id)
+    }
+
+    fn persist(&mut self, guard_id: u64, epoch: u64) -> Result<(), MarkError> {
+        self.0.lock().unwrap().persist(guard_id, epoch)
+    }
+
+    fn latch(&mut self, guard_id: u64) -> Result<(), MarkError> {
+        self.0.lock().unwrap().latch(guard_id)
+    }
+}
+
+fn set_word(word: &HeapWords, epoch: u64, open: bool) {
+    word.words()[0].store(
+        karyos_sys::guard::encode(karyos_sys::guard::GuardState { epoch, open }).unwrap(),
+        karyos_sys::sync::Ordering::Release,
+    );
+}
+
+/// Finding 9 of the H8 review (design 4.4, ADR-0086 section 7): the
+/// authority signs only a committed word: a word above the committed epoch
+/// is committed before it is signed, one below it is never signed, and a
+/// failed commit disables signing for good, counted.
+#[test]
+fn only_a_committed_word_is_signed() {
+    let word = Arc::new(HeapWords::zeroed(1));
+    set_word(&word, 2, true);
+    let store = Shared::default();
+    let mut authority = GuardAuthority::new(
+        10,
+        10,
+        Ed25519Signer::from_seed(&[9; 32]),
+        vec![AuthorityGuard {
+            guard_id: 11,
+            word: Arc::clone(&word) as Arc<dyn SharedWords>,
+            lifetime_ms: 5_000,
+            receivers: vec![(66, at(1))],
+        }],
+        Box::new(store.clone()),
+        0,
+    )
+    .unwrap();
+    assert!(authority.answer(&challenge(11, 66, 1), at(1), 0).is_ok());
+    assert_eq!(store.0.lock().unwrap().held[&11], 2, "committed first");
+    // The authority's own word rolled back below its committed epoch.
+    set_word(&word, 5, false);
+    authority.new_cycle();
+    assert!(authority.answer(&challenge(11, 66, 2), at(1), 0).is_ok());
+    set_word(&word, 2, true);
+    authority.new_cycle();
+    assert_eq!(
+        authority
+            .answer(&challenge(11, 66, 3), at(1), 0)
+            .unwrap_err(),
+        ChallengeRefusal::BelowCommitted
+    );
+    // A commit that fails disables signing.
+    set_word(&word, 6, true);
+    store.0.lock().unwrap().fail = true;
+    assert_eq!(
+        authority
+            .answer(&challenge(11, 66, 4), at(1), SECOND)
+            .unwrap_err(),
+        ChallengeRefusal::Uncommitted
+    );
+    assert!(!authority.signing());
+    store.0.lock().unwrap().fail = false;
+    assert_eq!(
+        authority
+            .answer(&challenge(11, 66, 5), at(1), 2 * SECOND)
+            .unwrap_err(),
+        ChallengeRefusal::Uncommitted
+    );
+    assert_eq!(authority.refusals(ChallengeRefusal::Uncommitted), 2);
+    assert_eq!(store.0.lock().unwrap().held[&11], 5);
+    assert_eq!(authority.answered, 2);
+}
+
+/// Finding 9: unreadable committed state at load disables signing.
+#[test]
+fn unreadable_committed_state_disables_signing() {
+    let mut authority = GuardAuthority::new(
+        10,
+        10,
+        Ed25519Signer::from_seed(&[9; 32]),
+        vec![guard(11, &[(66, at(1))])],
+        Box::new(Marks {
+            unreadable: true,
+            ..Marks::default()
+        }),
+        0,
+    )
+    .unwrap();
+    assert!(!authority.signing());
+    assert_eq!(
+        authority
+            .answer(&challenge(11, 66, 1), at(1), 0)
+            .unwrap_err(),
+        ChallengeRefusal::Uncommitted
+    );
+    assert_eq!(authority.answered, 0);
 }
