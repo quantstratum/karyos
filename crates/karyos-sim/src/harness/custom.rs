@@ -50,6 +50,11 @@
 //! - Time: the first tick sets the clock's baseline; each later tick runs
 //!   the core once per unit of time passed, at most
 //!   [`MAX_TICKS_PER_CALL`] per call, and the rest in the next calls.
+//!   Its entries, proposals and a new leader's no-op alike, are stamped
+//!   with [`karyos_cluster::stamp`]: the latest reading clamped to the
+//!   log's watermark (contract C-TIME, ADR-0111), which is the last
+//!   entry's event time; after a restart, the largest event time of the
+//!   recovered log's entries and the snapshot's log time.
 //!
 //! **Buffers.** Entries and their vectors come from one pool per thread,
 //! shared by every node the simulation runs on it: what a follower is
@@ -80,7 +85,7 @@ use karyos_cluster::consensus::{
     Backpressure, Config, Core, Effects, Limits as CoreLimits, LogTerms, Message as CoreMessage,
     ProposeError, Role, TermVote,
 };
-use karyos_cluster::{Entry, HardState};
+use karyos_cluster::{Entry, HardState, stamp};
 
 use super::core::{
     ConsensusCore, InstallRefused, Limit, Limits, LogView, NotLeader, Persisted, Ready, ReadyBuf,
@@ -387,8 +392,11 @@ pub struct Custom {
     /// What one core call sent, before it is filled.
     sent: Vec<(u64, CoreMessage)>,
     sent_after: Vec<(u64, CoreMessage)>,
-    /// The latest clock reading: the event time of its entries.
+    /// The latest clock reading: the raw event time of its entries.
     now: u64,
+    /// The C-TIME watermark (ADR-0111): the event time of its log's last
+    /// entry, written or not, or its snapshot's log time.
+    watermark: u64,
     /// The clock the core has ticked up to; `None` before the first tick.
     ticked: Option<u64>,
     /// The last index, written or not, after the last call.
@@ -619,6 +627,9 @@ impl Custom {
             sent: Vec::with_capacity(READY_MESSAGES),
             sent_after: Vec::with_capacity(READY_MESSAGES),
             now: 0,
+            // The largest event time of the recovered log's entries and
+            // the snapshot's log time.
+            watermark: log.watermark().unwrap_or(0),
             ticked: None,
             received: log
                 .last_index()
@@ -694,9 +705,13 @@ impl Custom {
                 .unwrap_or(usize::MAX)
                 .min(incoming.len());
             self.pending.extend(incoming.drain(skip..));
+            if let Some(last) = self.pending.last() {
+                self.watermark = last.event_time;
+            }
         }
         if let Some((index, term)) = append {
-            self.pending.push(pooled(index, term, self.now, &[]));
+            self.watermark = stamp(self.now, self.watermark);
+            self.pending.push(pooled(index, term, self.watermark, &[]));
         }
         // Each append filled now, from the view the core just read.
         let mut sent = std::mem::take(&mut self.sent);
@@ -875,7 +890,9 @@ impl ConsensusCore for Custom {
         if frame_len(command.len()).is_none_or(|frame| frame > self.read_bytes) {
             return Err(Refused::Backpressure(Limit::LogRead));
         }
-        self.pending.push(pooled(index, term, self.now, command));
+        self.watermark = stamp(self.now, self.watermark);
+        self.pending
+            .push(pooled(index, term, self.watermark, command));
         self.call(log, &mut none, |core, view, sink| {
             core.replicate(view, sink)
         });
@@ -1041,6 +1058,16 @@ impl ConsensusCore for Custom {
         release(&mut dropped);
         self.truncate = None;
         self.handed = self.handed.max(base.index);
+        // What is left pending follows the base; with nothing, the
+        // watermark is the snapshot's log time.
+        match self.pending.last() {
+            Some(last) => self.watermark = last.event_time,
+            None => {
+                if let Some(log_time) = log.base_time() {
+                    self.watermark = log_time;
+                }
+            }
+        }
         Ok(())
     }
 }

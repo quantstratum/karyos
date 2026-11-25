@@ -375,6 +375,10 @@ pub struct Attached {
     /// another command to this Cluster is `busy`, neither journalled nor
     /// sent.
     in_flight: Arc<AtomicBool>,
+    /// Its attach instance: distinct for each attach of an agent's run, so
+    /// that a pending operation bound to it sees a gateway that attached
+    /// again since (karyos#739).
+    instance: u64,
 }
 
 /// A Cluster's in-flight reservation: cleared when dropped.
@@ -408,6 +412,22 @@ impl Attached {
     pub fn commands(&self) -> &[AdminCommand] {
         &self.commands
     }
+
+    /// Its attach instance (karyos#739).
+    #[must_use]
+    pub const fn instance(&self) -> u64 {
+        self.instance
+    }
+
+    /// The authority its command `name` needs; `None` for a name it did
+    /// not register.
+    #[must_use]
+    pub fn authority(&self, name: &str) -> Option<Authority> {
+        self.commands
+            .iter()
+            .find(|command| command.name == name)
+            .map(|command| command.authority)
+    }
 }
 
 /// Why a Cluster could not be attached.
@@ -433,6 +453,8 @@ pub enum AttachError {
 #[derive(Debug, Default)]
 pub struct Clusters {
     attached: Vec<Attached>,
+    /// The attach instances given so far (karyos#739).
+    attaches: u64,
 }
 
 impl Clusters {
@@ -465,13 +487,23 @@ impl Clusters {
         if names.len() != commands.len() || commands.len() > MAX_COMMANDS {
             return Err(AttachError::Registration);
         }
+        self.attaches = self.attaches.saturating_add(1);
         self.attached.push(Attached {
             name: name.to_owned(),
             commands,
             gateway: Arc::new(Mutex::new(gateway)),
             in_flight: Arc::default(),
+            instance: self.attaches,
         });
         Ok(())
+    }
+
+    /// Detaches the Cluster attached as `name`; `false` when none is. A
+    /// later attach under the name is another instance (karyos#739).
+    pub fn detach(&mut self, name: &str) -> bool {
+        let before = self.attached.len();
+        self.attached.retain(|cluster| cluster.name != name);
+        self.attached.len() != before
     }
 
     /// The Cluster attached as `name`.
@@ -590,6 +622,10 @@ pub enum ClusterAnswer {
     /// An operation id of 0, or parameters past [`MAX_PARAMETERS`]:
     /// neither journalled nor sent.
     BadArguments,
+    /// A command of a class this deployment marks for two people
+    /// (R-CORE-20, karyos#739) on a path that does not enter the approval
+    /// flow: neither journalled nor sent.
+    TwoPersonRequired,
     /// Sent, and no answer came: unknown, journalled as such.
     NoAnswer {
         /// The operation id.
@@ -680,42 +716,15 @@ enum Dispatched {
 /// Checks `command`, journals its request and calls the gateway: every
 /// step of [`cluster_command`] but the outcome record.
 fn dispatch(
-    journal: Option<&mut Journal>,
+    mut journal: Option<&mut Journal>,
     clusters: &Clusters,
     command: &Command<'_>,
     (wait, mut used): (Duration, impl FnMut(u64, bool) -> bool),
     now: &mut impl FnMut() -> u64,
 ) -> Dispatched {
-    // Checked here, whoever calls: nothing is journalled or sent.
-    if command.operation == 0 || command.parameters.len() > MAX_PARAMETERS {
-        return Dispatched::Answered(ClusterAnswer::BadArguments);
-    }
-    let refusal = match clusters.find(command.cluster) {
-        None => Err(RefusalCode::UnknownCluster),
-        Some(cluster) => match cluster
-            .commands
-            .iter()
-            .find(|registered| registered.name == command.command)
-        {
-            None => Err(RefusalCode::UnregisteredCommand),
-            Some(registered) if !command.clearance.allows(registered.authority) => {
-                Err(RefusalCode::Forbidden)
-            }
-            // Checked, not taken: an id is used up only once sent.
-            Some(_) if used(command.operation, false) => Err(RefusalCode::OperationConflict),
-            Some(_) => Ok(cluster),
-        },
-    };
-    let cluster = match refusal {
+    let cluster = match check(journal.as_deref_mut(), clusters, command, &mut used, now) {
         Ok(cluster) => cluster,
-        Err(code) => {
-            let journalled = journal.is_some_and(|journal| {
-                let mut record = command.record(Kind::ClusterRefused, now());
-                record.code = code.code();
-                journal.append(&record, record.time).is_ok()
-            });
-            return Dispatched::Answered(ClusterAnswer::Rejected { code, journalled });
-        }
+        Err(answer) => return Dispatched::Answered(answer),
     };
     // Reserved before the request record and held by the worker until it
     // exits, so a second command is `busy`, unjournalled and unsent, even
@@ -756,6 +765,48 @@ fn dispatch(
             operation,
             journalled,
         },
+    })
+}
+
+/// The Cluster `command` goes to, once checked: a bad argument answered,
+/// neither journalled nor sent; an unknown Cluster, an unregistered
+/// command, a caller without its authority or an id `used` reports taken
+/// refused and journalled, unsent. The two-person flow checks a request
+/// with it before it pends (karyos#739).
+pub(crate) fn check<'c>(
+    journal: Option<&mut Journal>,
+    clusters: &'c Clusters,
+    command: &Command<'_>,
+    used: &mut impl FnMut(u64, bool) -> bool,
+    now: &mut impl FnMut() -> u64,
+) -> Result<&'c Attached, ClusterAnswer> {
+    // Checked here, whoever calls: nothing is journalled or sent.
+    if command.operation == 0 || command.parameters.len() > MAX_PARAMETERS {
+        return Err(ClusterAnswer::BadArguments);
+    }
+    let refusal = match clusters.find(command.cluster) {
+        None => Err(RefusalCode::UnknownCluster),
+        Some(cluster) => match cluster
+            .commands
+            .iter()
+            .find(|registered| registered.name == command.command)
+        {
+            None => Err(RefusalCode::UnregisteredCommand),
+            Some(registered) if !command.clearance.allows(registered.authority) => {
+                Err(RefusalCode::Forbidden)
+            }
+            // Checked, not taken: an id is used up only once sent.
+            Some(_) if used(command.operation, false) => Err(RefusalCode::OperationConflict),
+            Some(_) => Ok(cluster),
+        },
+    };
+    refusal.map_err(|code| {
+        let journalled = journal.is_some_and(|journal| {
+            let mut record = command.record(Kind::ClusterRefused, now());
+            record.code = code.code();
+            journal.append(&record, record.time).is_ok()
+        });
+        ClusterAnswer::Rejected { code, journalled }
     })
 }
 

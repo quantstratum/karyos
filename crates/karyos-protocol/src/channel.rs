@@ -338,6 +338,26 @@ pub struct UdpConfig {
     /// [`MAX_PATH_SKEW`]. Both sides of the channel use it; `None` keeps
     /// the driver's settings, whose default is 1 ms.
     pub path_skew: Option<Duration>,
+    /// The `etf` declaration of a timed publication on the `etf` route
+    /// (`etf-priority` and `etf-delta`, ADR-0109 point 2): where the
+    /// deployment configured the `etf` leaf that releases its timed
+    /// datagrams. Unicast `endpoint` with `interface` only; `None` for
+    /// every other channel.
+    pub etf: Option<EtfDeclaration>,
+}
+
+/// A channel's `etf` declaration (ADR-0109 point 2). Karyos changes no
+/// qdisc and cannot probe one: the deployment maps `priority` on the
+/// channel's `interface` to a TX queue holding an `etf` leaf with
+/// `clockid CLOCK_TAI`, no deadline mode, and this `delta`, which the
+/// driver checks is at most the publication's declared advance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EtfDeclaration {
+    /// The `SO_PRIORITY` the interface's root qdisc maps to the leaf's
+    /// queue (`etf-priority`).
+    pub priority: u32,
+    /// The leaf's `delta` (`etf-delta`): positive, below 2^32 ns.
+    pub delta: Duration,
 }
 
 /// The longest `linger` (owner item 16): 60 s, the driver's own bound.
@@ -393,9 +413,11 @@ enum Key {
     NakControl,
     Linger,
     PathSkew,
+    EtfPriority,
+    EtfDelta,
 }
 
-const KEYS: [(&str, Key); 21] = [
+const KEYS: [(&str, Key); 23] = [
     ("endpoint", Key::Endpoint),
     ("group", Key::Group),
     ("interface", Key::Interface),
@@ -417,6 +439,8 @@ const KEYS: [(&str, Key); 21] = [
     ("nak-control", Key::NakControl),
     ("linger", Key::Linger),
     ("path-skew", Key::PathSkew),
+    ("etf-priority", Key::EtfPriority),
+    ("etf-delta", Key::EtfDelta),
 ];
 
 /// Whether `name` is kebab-case (`CHANNEL-URI.md` section 2): words of
@@ -769,6 +793,7 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
             second: Key::RetransmitWindow.name(),
         });
     }
+    let etf = parse_etf(get, &destination, interface.as_ref())?;
     Ok(UdpConfig {
         destination,
         interface,
@@ -780,7 +805,44 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
         nak_control,
         linger,
         path_skew,
+        etf,
     })
+}
+
+/// The `etf` declaration (ADR-0109 point 2): `etf-priority` and
+/// `etf-delta` together, on a unicast `endpoint` with an `interface`
+/// address, the one the leaf's interface holds.
+fn parse_etf<'a>(
+    get: &impl Fn(Key) -> Option<&'a str>,
+    destination: &Destination,
+    interface: Option<&Interface>,
+) -> Result<Option<EtfDeclaration>, ChannelError> {
+    let (priority, delta) = match (get(Key::EtfPriority), get(Key::EtfDelta)) {
+        (None, None) => return Ok(None),
+        (Some(priority), Some(delta)) => (priority, delta),
+        (Some(_), None) => {
+            return Err(invalid(Key::EtfPriority, "without `etf-delta`"));
+        }
+        (None, Some(_)) => return Err(invalid(Key::EtfDelta, "without `etf-priority`")),
+    };
+    if !matches!(destination, Destination::Unicast(_)) {
+        return Err(ChannelError::NotApplicable {
+            key: Key::EtfPriority.name(),
+        });
+    }
+    if !matches!(interface, Some(Interface::Address(_))) {
+        return Err(invalid(Key::EtfPriority, "without an `interface` address"));
+    }
+    let priority = decimal::<u32>(priority)
+        .ok_or_else(|| invalid(Key::EtfPriority, "an integer from 0 to 4294967295"))?;
+    let delta = parse_duration(delta).map_err(|error| ChannelError::InvalidDuration {
+        key: Key::EtfDelta.name(),
+        error,
+    })?;
+    if delta.is_zero() || delta.as_nanos() > u128::from(u32::MAX) {
+        return Err(invalid(Key::EtfDelta, "zero, or not below 2^32 ns"));
+    }
+    Ok(Some(EtfDeclaration { priority, delta }))
 }
 
 /// The destination named by `endpoint`, `group`, `destinations` and

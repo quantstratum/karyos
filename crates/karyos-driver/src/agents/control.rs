@@ -25,6 +25,7 @@
 
 use std::net::SocketAddr;
 use std::num::NonZeroU16;
+use std::sync::{Arc, Mutex};
 
 use karyos_io::backend::{
     Authority, BackendEpoch, Commit, Exposure, FlushRequest, FlushStop, GateDecision, PendingCause,
@@ -226,6 +227,10 @@ pub enum ControlItem {
         /// An SM's slot or an RTTM REQUEST's report, settled once the
         /// control was sent.
         guard: Option<ItemGuard>,
+        /// The image's domain 4 sealer on an authenticated channel: the
+        /// control then goes only sealed, never bare (ADR-0086 section 2);
+        /// `None` on a trusted channel, whose controls go bare.
+        seal: Option<SharedSealer>,
     },
     /// `control` arrived on `endpoint` from `source`, for a local
     /// publication.
@@ -400,6 +405,46 @@ impl ControlSeal for Sealer {
 
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
         self.seal(buffer, frames).ok()
+    }
+}
+
+/// An image's session [`Sealer`], shared between the receiver agent, which
+/// owns the image, and the sender agent, which seals and sends its
+/// controls: a clone allocates nothing. A poisoned lock seals nothing, so
+/// the control is not sent (fail closed).
+#[derive(Clone)]
+pub struct SharedSealer {
+    sealer: Arc<Mutex<Sealer>>,
+    domain: Domain,
+}
+
+impl core::fmt::Debug for SharedSealer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SharedSealer")
+            .field("domain", &self.domain)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedSealer {
+    /// Shares `sealer`.
+    #[must_use]
+    pub fn new(sealer: Sealer) -> Self {
+        let domain = sealer.domain();
+        Self {
+            sealer: Arc::new(Mutex::new(sealer)),
+            domain,
+        }
+    }
+}
+
+impl ControlSeal for SharedSealer {
+    fn domain(&self) -> Domain {
+        self.domain
+    }
+
+    fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
+        self.sealer.lock().ok()?.seal(buffer, frames).ok()
     }
 }
 

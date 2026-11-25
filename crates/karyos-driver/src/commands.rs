@@ -3166,6 +3166,7 @@ mod tests {
             reliable: true,
             flow_control: None,
             security: Security::Trusted,
+            etf: None,
         };
         let publication = driver
             .add_timed_network_publication(

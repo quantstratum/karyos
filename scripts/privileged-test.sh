@@ -11,7 +11,9 @@
 #    and a network namespace with iproute2 (the links are listed in
 #    crates/karyos-io/src/sockets/endpoint/tests/loopback/privileged.rs),
 #    sets KARYOS_PRIVILEGED_NET=1 and runs the ignored `privileged_` tests
-#    of multicast, path MTU and a small send buffer.
+#    of multicast, path MTU and a small send buffer, then the driver's
+#    `privileged_etf` end to end test of the etf route (karyos#625) over e0
+#    to e1 in peer, behind a prio qdisc with an etf leaf.
 # 2. Seccomp: the probe test twice, under a profile that answers
 #    `sendmmsg` with ENOSYS, then with EPERM, each naming its profile in
 #    KARYOS_PRIVILEGED_SECCOMP.
@@ -110,13 +112,28 @@ docker run --rm --cap-add NET_ADMIN --cap-add SYS_ADMIN \
         ip link set s0 up
         ip -n peer link set s1 up
         tc qdisc add dev s0 root tbf rate 100kbit burst 1600 limit 1000000
+        # e0 to e1 in peer: the etf route (karyos#625). Priority 3 maps to
+        # band 0 (class 1:1), which holds an etf leaf on CLOCK_TAI with a
+        # 300 ms delta; every other priority takes band 1.
+        ip link add e0 type veth peer name e1 netns peer
+        ip addr add 10.80.0.1/24 dev e0
+        ip -n peer addr add 10.80.0.2/24 dev e1
+        ip link set e0 up
+        ip -n peer link set e1 up
+        tc qdisc add dev e0 root handle 1: prio bands 2 \
+            priomap 1 1 1 0 1 1 1 1 1 1 1 1 1 1 1 1
+        tc qdisc add dev e0 parent 1:1 etf clockid CLOCK_TAI delta 300000000
         ip -br addr
         KARYOS_PRIVILEGED_NET=1 cargo test "$@" privileged_ \
             -- --ignored --test-threads=1 --skip privileged_probes
+        # The driver end to end etf test; its receiver half runs in peer.
+        KARYOS_PRIVILEGED_NET=1 cargo test -p karyos-driver --lib --locked \
+            privileged_etf_drops -- --ignored --test-threads=1
     ' sh "${test_args[@]}" 2>&1 | tee "$log"
 status=${PIPESTATUS[0]}
 [ "$status" -eq 0 ] || exit "$status"
 check_ran "$log" network 4
+check_ran "$log" "the driver's etf route" 1
 
 for profile in enosys:38 eperm:1; do
     name="${profile%%:*}"

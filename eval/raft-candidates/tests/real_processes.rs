@@ -137,8 +137,12 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 /// karyos#1272): libtest runs tests in parallel, and a run's servers and
 /// clients, up to 37 processes, each `fsync`ing its log, must not share
 /// the host's disk with another run's, or every flush waits on all of
-/// them. Poison-tolerant, as the allocation tests' `SERIAL`: a failed
-/// run does not fail the next.
+/// them. On Apple targets `StdDisk` syncs with `F_FULLFSYNC`, which
+/// flushes the whole device's cache, so parallel runs there each took
+/// about the node's deadline while one alone takes seconds (karyos#1272).
+/// This is the one lock of every real-process run, on every platform: it
+/// replaces #1272's `ONE_RUN_AT_A_TIME`. Poison-tolerant, as the
+/// allocation tests' `SERIAL`: a failed run does not fail the next.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Takes [`SERIAL`] for the test's lifetime.

@@ -1543,6 +1543,92 @@ fn coalescing_after_a_dropped_head_keeps_the_age_of_what_it_was_to_cover() {
     assert!(status.alarm);
 }
 
+/// karyos#1067: reopens raced against a loop of child spawns never see a
+/// false `Locked`. A spawned child shares this process's open file
+/// descriptions, the journal's included, from its fork until its exec, so
+/// the `flock` of a journal this process just closed is still held for
+/// that window; the lock's retry within `LOCK_SPAWN_WINDOW` outlasts it.
+#[test]
+fn reopens_raced_against_spawns_are_never_refused_as_locked() {
+    use crate::disk::StdDisk;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = std::env::temp_dir().join(format!("karyos-lock-spawn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawners: Vec<_> = (0..4)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut spawned = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::process::Command::new("true").status();
+                    spawned += 1;
+                }
+                spawned
+            })
+        })
+        .collect();
+    let (mut reopened, mut locked) = (0u32, 0u32);
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(2) {
+        match IntegrityJournal::open(StdDisk, &dir) {
+            Ok(opened) => drop(opened.journal),
+            Err(IntegrityError::Locked) => locked += 1,
+            Err(error) => panic!("{error:?}"),
+        }
+        match Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, KEYS_FILE) {
+            Ok(ledger) => drop(ledger),
+            Err(IntegrityError::Locked) => locked += 1,
+            Err(error) => panic!("{error:?}"),
+        }
+        reopened += 2;
+    }
+    stop.store(true, Ordering::Relaxed);
+    let spawned: u32 = spawners
+        .into_iter()
+        .map(|spawner| spawner.join().unwrap())
+        .sum();
+    assert!(
+        spawned > 0 && reopened > 0,
+        "{spawned} spawns, {reopened} reopens"
+    );
+    assert_eq!(
+        locked, 0,
+        "{locked} of {reopened} reopens refused as Locked"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// karyos#1067: a lock another descriptor really holds is still refused
+/// with `Locked`, once the retry window has passed, and the retry is
+/// bounded in time: the refusal comes after `LOCK_SPAWN_WINDOW`, not much
+/// later.
+#[test]
+fn a_lock_really_held_is_refused_after_the_bounded_window() {
+    use crate::disk::StdDisk;
+    use crate::integrity::journal::LOCK_SPAWN_WINDOW;
+    let dir = std::env::temp_dir().join(format!("karyos-lock-held-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let held = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let start = std::time::Instant::now();
+    assert!(matches!(
+        IntegrityJournal::open(StdDisk, &dir),
+        Err(IntegrityError::Locked)
+    ));
+    let waited = start.elapsed();
+    assert!(waited >= LOCK_SPAWN_WINDOW, "refused after {waited:?}");
+    assert!(
+        waited < LOCK_SPAWN_WINDOW * 10,
+        "the retry is not bounded: {waited:?}"
+    );
+    drop(held);
+    IntegrityJournal::open(StdDisk, &dir).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn one_handle_at_a_time_writes_a_journal_or_a_ledger() {
     use crate::disk::StdDisk;

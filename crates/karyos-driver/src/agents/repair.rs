@@ -423,6 +423,13 @@ impl RepairPath {
         }
     }
 
+    /// Restarts `lane`'s catch-up watermark at `at`
+    /// ([`crate::repair::jobs::Jobs::restart_catch_up`]): the next job's
+    /// progress alone moves it from there.
+    pub fn restart_catch_up(&mut self, lane: u8, at: u64) {
+        self.jobs.restart_catch_up(lane, at);
+    }
+
     /// Whether catch-up `job` is still pending: not done, refused nor
     /// dropped.
     #[must_use]

@@ -22,6 +22,10 @@
 //! - [`derived_bound`] gives a derived timestamp, such as a clamped
 //!   `event_time = max(raw, last)`, its own distance to the raw value's
 //!   UTC interval: it never inherits the raw clock's bound.
+//! - [`classify_cluster_time`] and [`cluster_entry_bound`] are contract
+//!   C-TIME's producer rule for a Cluster log entry's `event_time`
+//!   (ADR-0111, decision 5): possibly clamped at or below the watermark of
+//!   the history before it, `no_evidence`; raw above it.
 //! - [`split`] ends an entry at every parameter change, non-monotone
 //!   sample and leap boundary.
 //! - [`clock_verdict`] is the precedence of SPEC.md's Verdict, and
@@ -332,6 +336,60 @@ pub fn derived_bound(
         i128::from(derived),
         utc_interval(raw, coordinate, calibration, reference)?,
     )
+}
+
+/// What a Cluster log entry's `event_time` is, against the watermark of
+/// the history before it (contract C-TIME, ADR-0111, decision 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterTime {
+    /// At or below the watermark: possibly clamped, or a genuine repeat of
+    /// the clock, which cannot be told apart. Its raw value is unknown.
+    PossiblyClamped,
+    /// Strictly above the watermark: the leader's raw clock reading.
+    Raw,
+    /// The watermark is not established (an earlier entry or the
+    /// snapshot's log time is unavailable): never guessed.
+    Unknown,
+}
+
+/// Classifies `event_time` against `watermark`: the largest `event_time`
+/// of every earlier entry of the history, 0 at the log's first entry, or
+/// the snapshot's log time when the history starts after a snapshot;
+/// `None` when the producer cannot establish it.
+#[must_use]
+pub const fn classify_cluster_time(event_time: u64, watermark: Option<u64>) -> ClusterTime {
+    match watermark {
+        Some(watermark) if event_time > watermark => ClusterTime::Raw,
+        Some(_) => ClusterTime::PossiblyClamped,
+        None => ClusterTime::Unknown,
+    }
+}
+
+/// The bound of a Cluster log entry's `event_time` under C-TIME, for a
+/// time evidence producer whose input is Cluster entries: the raw clock's,
+/// through [`derived_bound`] with `derived = raw`, for an entry above the
+/// watermark ([`classify_cluster_time`]); `no_evidence` for one that is
+/// possibly clamped or whose watermark is unknown. It decides the bound
+/// only: the verdict keeps [`clock_verdict`]'s precedence.
+///
+/// # Errors
+///
+/// [`Gap::Missing`] for a possibly clamped entry (its raw value, so its
+/// derived bound, is missing) or an unknown watermark; otherwise the
+/// [`Gap`] of [`derived_bound`].
+pub fn cluster_entry_bound(
+    event_time: u64,
+    watermark: Option<u64>,
+    coordinate: Coordinate,
+    calibration: &Calibration,
+    reference: &UtcReference,
+) -> Result<u64, Gap> {
+    match classify_cluster_time(event_time, watermark) {
+        ClusterTime::Raw => {
+            derived_bound(event_time, event_time, coordinate, calibration, reference)
+        }
+        ClusterTime::PossiblyClamped | ClusterTime::Unknown => Err(Gap::Missing),
+    }
 }
 
 /// One timestamped sample of a range.

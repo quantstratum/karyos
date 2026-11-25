@@ -556,6 +556,19 @@ pub enum Operation {
         /// The reason's code.
         reason: u8,
     },
+    /// A writer closed the segment `[base, end)` of `recording` at
+    /// `closed_ns` on the host's wall clock (ADR-0115): the agent's
+    /// operations journal's expiry clock. Holds and intents ignore it.
+    SegmentClosed {
+        /// The recording.
+        recording: u64,
+        /// The segment's base.
+        base: u64,
+        /// Its end, exclusive.
+        end: u64,
+        /// When it closed, in ns of the host's wall clock.
+        closed_ns: u64,
+    },
 }
 
 impl Operation {
@@ -586,6 +599,12 @@ impl Operation {
             } => (4, reason, [id, recording, 0, 0, 0, 0]),
             Self::PurgeDone { id } => (5, 0, [id, 0, 0, 0, 0, 0]),
             Self::PurgeCancelled { id, reason } => (6, reason, [id, 0, 0, 0, 0, 0]),
+            Self::SegmentClosed {
+                recording,
+                base,
+                end,
+                closed_ns,
+            } => (7, 0, [recording, base, end, closed_ns, 0, 0]),
         };
         let mut out = [0u8; OPERATION_LENGTH];
         let head = [kind, reason, 0, 0, 0, 0, 0, 0];
@@ -633,6 +652,12 @@ impl Operation {
             6 => Self::PurgeCancelled {
                 id: word(0),
                 reason,
+            },
+            7 => Self::SegmentClosed {
+                recording: word(0),
+                base: word(1),
+                end: word(2),
+                closed_ns: word(3),
             },
             _ => return None,
         })
@@ -1074,7 +1099,7 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
                     state.intents.remove(&id);
                     state.froms.remove(&id);
                 }
-                Some(Operation::PurgeRejected { .. }) => {}
+                Some(Operation::PurgeRejected { .. } | Operation::SegmentClosed { .. }) => {}
                 None => {
                     self.holds_unknown = true;
                     return false;
@@ -1168,6 +1193,28 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
         self.holds.get(&recording).copied()
     }
 
+    /// Records in the operations journal that a writer closed segment
+    /// `[base, end)` of `recording` at `closed_ns` on the host's wall
+    /// clock (ADR-0115), durably; the record's digest.
+    ///
+    /// # Errors
+    ///
+    /// The operations journal's.
+    pub fn record_segment_close(
+        &mut self,
+        recording: u64,
+        base: u64,
+        end: u64,
+        closed_ns: u64,
+    ) -> io::Result<Digest> {
+        self.operations.append(&Operation::SegmentClosed {
+            recording,
+            base,
+            end,
+            closed_ns,
+        })
+    }
+
     /// The purge intents outstanding.
     #[must_use]
     pub fn outstanding(&self) -> Vec<PurgeRequest> {
@@ -1176,7 +1223,8 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
 
     /// Raises outstanding intent `id`'s close time to `closed_ns`, in
     /// memory, never lowering it: a resumed purge is rechecked against the
-    /// segments' modification times as they are now (ADR-0093, decision 3;
+    /// close time the caller supplies (modification times for recordings,
+    /// ADR-0093, decision 3; recorded closes for the journal, ADR-0115;
     /// karyos#1121 review). Unknown ids change nothing.
     pub fn raise_close_time(&mut self, id: u64, closed_ns: u64) {
         if let Some(intent) = self.intents.get_mut(&id) {
@@ -1589,9 +1637,12 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
     /// Completes or cancels every outstanding purge intent after a crash.
     /// Each is rechecked first: `authorised` says whether its operator is
     /// still authorised, and holds, the policy and copies are evaluated
-    /// as they are now. An intent whose deletion already happened is only
-    /// recorded; one that fails the recheck is cancelled with its reason,
-    /// and nothing is deleted.
+    /// as they are now. An intent whose floor already reached its cutoff
+    /// is completed (recorded, and the files a crash left below the floor
+    /// removed) only when the recheck passes; otherwise nothing more is
+    /// deleted and it stays outstanding. One whose floor did not move that
+    /// fails the recheck is cancelled with its reason, and nothing is
+    /// deleted.
     ///
     /// # Errors
     ///
@@ -1611,9 +1662,22 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
             request.authorisation.authorised = authorised(request.authorisation.operator);
             // The completion shortcut takes the lowest retained position,
             // so an offloaded range below the start is never taken for a
-            // purged one (ADR-0104, decision 5).
+            // purged one (ADR-0104, decision 5). Holds, the policy, its
+            // expiry and the copies are rechecked first, over the intent's
+            // original range: one that fails them now deletes nothing more,
+            // the files left below the floor included, and stays
+            // outstanding, never cancelled, since its floor already moved
+            // (ADR-0113, point 8; karyos#702 review).
             if store.lowest_retained() >= request.before {
-                outcomes.push(Ok(self.complete(&request, store, journal)?));
+                let from = self
+                    .froms
+                    .get(&request.id)
+                    .copied()
+                    .unwrap_or_else(|| store.lowest_retained());
+                match self.check(&request, context, from) {
+                    Ok(()) => outcomes.push(Ok(self.complete(&request, store, journal)?)),
+                    Err(refusal) => outcomes.push(Err(refusal)),
+                }
                 continue;
             }
             // The floor moves only after the same checks a fresh purge

@@ -252,12 +252,21 @@ impl SecureDir {
     ///
     /// # Errors
     ///
-    /// [`SecureDirError::Locked`] when another descriptor holds it, and
+    /// [`SecureDirError::Locked`] when another descriptor holds it for
+    /// longer than [`crate::spawn_window::LOCK_SPAWN_WINDOW`], and
     /// [`SecureDirError::Os`] when the call fails otherwise.
     pub fn lock_exclusive(&self) -> Result<(), SecureDirError> {
-        rustix::fs::flock(
-            &self.fd,
-            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        // Tried again within `LOCK_SPAWN_WINDOW` while held: a child
+        // another thread spawns holds this descriptor's lock until its
+        // exec (karyos#1067).
+        crate::spawn_window::retry_held(
+            || {
+                rustix::fs::flock(
+                    &self.fd,
+                    rustix::fs::FlockOperation::NonBlockingLockExclusive,
+                )
+            },
+            |errno| *errno == Errno::WOULDBLOCK,
         )
         .map_err(|errno| match errno {
             Errno::WOULDBLOCK => SecureDirError::Locked,

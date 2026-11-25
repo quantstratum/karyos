@@ -1012,6 +1012,7 @@ fn a_solicit_answer_installs_an_image() {
         identity: answered,
         term: params,
         joins,
+        ..
     } = sessions.answer(key(1), &answer(4, solicit.challenge.nonce), MS, || true)
     else {
         panic!("not accepted");

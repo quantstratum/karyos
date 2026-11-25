@@ -286,8 +286,11 @@ pub struct JournalView {
     /// Its recording's id in the journal directory's catalog; `None` when
     /// it could not be opened.
     pub recording: Option<u64>,
-    /// Always `true` until A10 seals the journal: its records carry no
-    /// seal yet.
+    /// Whether a part of its recording has no seal (karyos#702): a seal
+    /// failed or the integrity journal could not be opened, records wait
+    /// past the sealed end for the next durable append, or the journal is
+    /// unavailable; `false` when the Archive's sealing covers all it
+    /// wrote. Kept in v1, now computed.
     pub unsealed: bool,
     /// Whether it refuses appends: it could not be opened, or an append
     /// failed. Closes still go ahead; reopens are refused.
@@ -300,6 +303,29 @@ pub struct JournalView {
     pub gap: Option<GapView>,
     /// The journal's alerts: [`AlertKind::JournalGap`] while `gap` is open.
     pub alerts: Vec<Alert>,
+    /// Each range's integrity outcome at the journal's last verification
+    /// (karyos#702, SPEC.md §8.4), with the outcome and reason names of
+    /// the Archive's verifier, unchanged; adjacent ranges with the same
+    /// outcome and reasons are one, at most
+    /// [`MAX_INTEGRITY_RANGES`](crate::journal::MAX_INTEGRITY_RANGES).
+    /// `None` when no verification could run.
+    pub integrity: Option<Vec<crate::retention::RangeOutcome>>,
+    /// Whether ranges past that bound were left out.
+    pub integrity_truncated: bool,
+    /// The journal's legal hold (ADR-0113): `none`, `pending`, `held`,
+    /// `unknown` (its state cannot be read: every purge is refused) or
+    /// `not_durable` (in force in memory only); `None` when the journal
+    /// could not be opened.
+    pub hold: Option<&'static str>,
+    /// The journal's retention policy in force; `None` for none, when
+    /// every purge is refused.
+    pub policy: Option<karyos_archive::integrity::retention::RetentionPolicy>,
+    /// Each purged prefix, with its purge evidence, from the last
+    /// verification.
+    pub purged: Vec<crate::journal::Purged>,
+    /// Whether a purge intent is outstanding: every further purge is
+    /// refused until it is reconciled.
+    pub purge_pending: bool,
 }
 
 /// An unknown interval in the journal: operations may have taken effect

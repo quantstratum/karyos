@@ -113,6 +113,32 @@ impl std::fmt::Display for ArchiveStartError {
 
 impl std::error::Error for ArchiveStartError {}
 
+/// The agent's calibration source for
+/// `--archive-calibration-journal <dir>` (ADR-0098 items 3 and 5;
+/// karyos#1137): the journal on disk,
+/// read again at each snapshot, so records `karyos-tools calibrate
+/// append` adds while the daemon runs are seen. A missing journal reads
+/// as empty until its producer makes it.
+#[must_use]
+pub fn calibration_source(
+    journal: &std::path::Path,
+) -> Box<dyn karyos_archive::integrity::time_producer::CalibrationSource> {
+    Box::new(karyos_archive::integrity::calibration_journal::JournalSource::new(StdDisk, journal))
+}
+
+/// The calibration source `options` configure, as the daemon's start
+/// sets it on the agent: [`calibration_source`] of
+/// `--archive-calibration-journal`, or none.
+#[must_use]
+pub fn configured_calibration_source(
+    options: &ArchiveOptions,
+) -> Option<Box<dyn karyos_archive::integrity::time_producer::CalibrationSource>> {
+    options
+        .calibration_journal
+        .as_deref()
+        .map(calibration_source)
+}
+
 /// The head signing `signer` configures (karyos#966): its trust file read,
 /// the `anchor_interval` applied.
 fn signing(
@@ -601,6 +627,11 @@ impl DaemonArchive {
             ),
         }
         .map_err(|error| ArchiveStartError::Agent(format!("{error:?}")))?;
+        if let Some(source) = configured_calibration_source(options) {
+            agent
+                .set_calibration_source(source)
+                .map_err(|error| ArchiveStartError::Agent(format!("{error:?}")))?;
+        }
         let host = DaemonHost {
             inner: DriverHost::new(driver),
             dir: options.dir.clone(),

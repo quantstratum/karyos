@@ -6361,6 +6361,11 @@ fn a_start_records_a_purge_a_crash_left_unrecorded() {
     let (id, all) = sealed_recording(&agent);
     let end = u64::try_from(all.len()).unwrap();
     agent.shutdown().unwrap();
+    // A verified copy elsewhere: recovery rechecks the copies even when
+    // the floor already reached the cutoff (ADR-0113 point 8).
+    if !copy_elsewhere(&dir, id, end) {
+        return;
+    }
     journal_intent(&dir, 1, id, end);
     let recording = Catalog::open(StdDisk, &dir)
         .unwrap()
@@ -6556,6 +6561,11 @@ fn a_start_removes_the_segments_a_crash_left_below_the_floor() {
         std::fs::read(&first).unwrap(),
         std::fs::read(&index).unwrap(),
     );
+    // A verified copy elsewhere: recovery rechecks the copies even when
+    // the floor already reached the cutoff (ADR-0113 point 8).
+    if !copy_elsewhere(&dir, id, cutoff) {
+        return;
+    }
     journal_intent(&dir, 1, id, cutoff);
     let recording = Catalog::open(StdDisk, &dir)
         .unwrap()
@@ -6635,6 +6645,11 @@ fn a_recovered_purge_is_chained_before_a_new_policy_version() {
     let (id, all) = sealed_recording(&agent);
     let end = u64::try_from(all.len()).unwrap();
     agent.shutdown().unwrap();
+    // A verified copy elsewhere: recovery rechecks the copies even when
+    // the floor already reached the cutoff (ADR-0113 point 8).
+    if !copy_elsewhere(&dir, id, end) {
+        return;
+    }
     journal_intent(&dir, 1, id, end);
     let recording = Catalog::open(StdDisk, &dir)
         .unwrap()

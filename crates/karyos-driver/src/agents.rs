@@ -588,6 +588,17 @@ impl<O: SocketOps> Half<O> {
     }
 }
 
+/// The gate of [`AgentCommand::Block`]: armed by the test (karyos#1067).
+#[cfg(test)]
+pub(crate) const BLOCK_ARMED: u8 = 0;
+/// The gate of [`AgentCommand::Block`]: the agent took the command and is
+/// blocked.
+#[cfg(test)]
+pub(crate) const BLOCK_ENTERED: u8 = 1;
+/// The gate of [`AgentCommand::Block`]: the test released the agent.
+#[cfg(test)]
+pub(crate) const BLOCK_RELEASED: u8 = 2;
+
 /// A conductor command. Each carries the reservation of its reply.
 #[derive(Debug)]
 pub enum AgentCommand<O: SocketOps, T: StreamTerms = HeapTerms> {
@@ -856,9 +867,12 @@ pub enum AgentCommand<O: SocketOps, T: StreamTerms = HeapTerms> {
     /// Test only: panic in the duty cycle.
     #[cfg(test)]
     Panic,
-    /// Test only: block the duty cycle until the flag is cleared.
+    /// Test only: block the duty cycle. The agent moves the gate from
+    /// [`BLOCK_ARMED`] to [`BLOCK_ENTERED`] when it takes the command, so a
+    /// test knows it is blocked, then spins until the test stores
+    /// [`BLOCK_RELEASED`] (karyos#1067).
     #[cfg(test)]
-    Block(Arc<AtomicBool>),
+    Block(Arc<AtomicU8>),
     /// Test only, sender: mark the publication `alias` on `endpoint` as
     /// needing an endpoint reset, as a send fault would (W4 E2).
     #[cfg(test)]
@@ -990,6 +1004,44 @@ pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
         incarnation: u64,
         /// The lane.
         lane: u8,
+    },
+    /// Posted unsolicited, once per lane, into a free slot and again each
+    /// cycle until posted: a timed lane under cancel-on-deadline missed its
+    /// deadline as its sender saw it (a head past its time plus tolerance
+    /// before it was exposed, or an `etf` drop; ADR-0109 point 8), and the
+    /// sender sends nothing more of it. The conductor seals the lane with
+    /// `SealReason::DeadlineMissed` if the identity still names the live
+    /// publication's incarnation, and drops the event otherwise.
+    DeadlineMissed {
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// Its alias.
+        alias: karyos_protocol::network::Alias,
+        /// Its registration.
+        registration: u64,
+        /// The incarnation the sender serves.
+        incarnation: u64,
+        /// The lane.
+        lane: u8,
+    },
+    /// Posted unsolicited, once per report, into a free slot and again each
+    /// cycle until posted: on the `etf` route, a drop report arrived after
+    /// its entry was retired as sent (ADR-0109 point 7). Nothing was
+    /// resubmitted; the conductor counts it in the publication's
+    /// `etf_late_drop_reports` and records one diagnostic event.
+    EtfLateDropReport {
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// Its alias.
+        alias: karyos_protocol::network::Alias,
+        /// Its registration.
+        registration: u64,
+        /// The lane and the report's time, in `CLOCK_TAI` nanoseconds;
+        /// `None` for reports the sender could only count.
+        report: Option<(u8, u64)>,
+        /// The late reports it stands for: this one and those before it
+        /// the sender could only count.
+        count: u64,
     },
     /// The sender stopped the publication; `outbound` is its data path,
     /// `None` when it held no such publication.
@@ -1254,8 +1306,14 @@ impl<O: SocketOps, T: StreamTerms> AgentCore<O, T> {
                     }
                 }
                 #[cfg(test)]
-                AgentCommand::Block(flag) => {
-                    while flag.load(Ordering::Acquire) {
+                AgentCommand::Block(gate) => {
+                    let _ = gate.compare_exchange(
+                        BLOCK_ARMED,
+                        BLOCK_ENTERED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                    while gate.load(Ordering::Acquire) != BLOCK_RELEASED {
                         std::thread::yield_now();
                     }
                 }
@@ -1735,6 +1793,15 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         self.role.outbound(index).map(data::Outbound::counters)
     }
 
+    /// What the etf drop ledger of its `index`-th publication counted, on
+    /// the etf route (the Linux end to end tests).
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn etf_counts(&self, index: usize) -> Option<data::etf::EtfCounts> {
+        self.role
+            .outbound(index)
+            .and_then(data::Outbound::etf_counts)
+    }
+
     /// The per-destination counters of its `index`-th publication (tests).
     #[cfg(test)]
     pub(crate) fn destination_counters(
@@ -1841,6 +1908,8 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         role.report_drained(|event| events.try_post(event).is_ok());
         // A schedule violation's report, likewise.
         role.report_violations(|event| events.try_post(event).is_ok());
+        role.report_deadlines(|event| events.try_post(event).is_ok());
+        role.report_etf_late(|event| events.try_post(event).is_ok());
         role.report_removals(|event| events.try_post(event).is_ok());
         role.report_limits(|event| events.try_post(event).is_ok());
         served

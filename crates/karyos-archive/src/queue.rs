@@ -191,6 +191,34 @@ impl QueueSource {
         Ok(end)
     }
 
+    /// Queues a padding block from the tail to its term's end, a whole
+    /// term when the tail starts one: the next record then starts the next
+    /// term. Returns the position after it.
+    ///
+    /// # Errors
+    ///
+    /// [`QueueError`]; nothing is queued then.
+    pub fn pad_term(&mut self) -> Result<u64, QueueError> {
+        if self.sealed {
+            return Err(QueueError::Sealed);
+        }
+        let term_length = u64::from(self.config.geometry.term_length());
+        let room = term_length
+            .checked_sub(self.tail % term_length)
+            .ok_or(QueueError::Exhausted)?;
+        let end = self.tail.checked_add(room).ok_or(QueueError::Exhausted)?;
+        let queued = end
+            .checked_sub(self.position)
+            .ok_or(QueueError::Exhausted)?;
+        if queued > self.config.max_bytes {
+            return Err(QueueError::Full);
+        }
+        let extent = u32::try_from(room).map_err(|_| QueueError::Exhausted)?;
+        self.entries.push_back(Entry::Fill { extent });
+        self.tail = end;
+        Ok(end)
+    }
+
     /// Seals the queue: once what it holds is read, it reads as sealed at
     /// its tail, and the recording ends there.
     pub fn seal(&mut self) {

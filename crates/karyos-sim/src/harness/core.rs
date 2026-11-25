@@ -78,6 +78,8 @@ pub struct LogView<'a> {
     budget: Option<&'a ReadBudget>,
     /// The latest snapshot the node holds, if any (W5).
     base: Option<SnapshotBase>,
+    /// That snapshot's log time, where the node knows it (ADR-0111).
+    base_time: Option<u64>,
 }
 
 /// What a [`LogView`] reads: C4's log over any disk, so the same core runs
@@ -224,6 +226,7 @@ impl<'a> LogView<'a> {
             log,
             budget: None,
             base: None,
+            base_time: None,
         }
     }
 
@@ -236,6 +239,7 @@ impl<'a> LogView<'a> {
             log,
             budget,
             base: None,
+            base_time: None,
         }
     }
 
@@ -329,6 +333,42 @@ impl<'a> LogView<'a> {
     pub fn with_base(mut self, base: Option<SnapshotBase>) -> Self {
         self.base = base;
         self
+    }
+
+    /// It, with `log_time` as the log time of the node's latest snapshot:
+    /// the largest event time applied up to its base, which its sessions
+    /// section records (ADR-0111, decision 4).
+    #[must_use]
+    pub fn with_base_time(mut self, log_time: Option<u64>) -> Self {
+        self.base_time = log_time;
+        self
+    }
+
+    /// The log time of the node's latest snapshot, if the node gave it:
+    /// the C-TIME watermark of a log that is empty after that snapshot.
+    #[must_use]
+    pub fn base_time(&self) -> Option<u64> {
+        self.base_time
+    }
+
+    /// The watermark of the history up to the log's last entry (contract
+    /// C-TIME, ADR-0111): the largest event time of every entry the log
+    /// holds and of the snapshot's log time, never the last entry's alone:
+    /// a tail from before C-TIME need not be ordered (`10, 50, 30` has
+    /// watermark 50). 0 for an empty log with no snapshot; `None` when an
+    /// entry cannot be read, or the log is empty after a snapshot whose
+    /// log time is not known.
+    pub fn watermark(&mut self) -> Option<u64> {
+        let Some(last) = self.last_index() else {
+            return if self.base.is_some() {
+                self.base_time
+            } else {
+                Some(0)
+            };
+        };
+        let first = self.first_index();
+        let entries = self.entries(first..last.saturating_add(1), u64::MAX).ok()?;
+        Some(max_event_time(&entries, self.base_time))
     }
 
     /// The node's latest snapshot, if any: the log holds no entry at or
@@ -566,6 +606,19 @@ pub struct Persisted {
     pub durable: Option<u64>,
     /// The hard state saved, if one was.
     pub hard_state: Option<HardState>,
+}
+
+/// The C-TIME watermark of `entries` over a snapshot of log time
+/// `base_time` (ADR-0111): the largest event time of them all, 0 for
+/// none.
+#[must_use]
+pub fn max_event_time(entries: &[Entry], base_time: Option<u64>) -> u64 {
+    entries
+        .iter()
+        .map(|entry| entry.event_time)
+        .chain(base_time)
+        .max()
+        .unwrap_or(0)
 }
 
 /// A consensus core under the harness: a test-harness trait, not the

@@ -1698,3 +1698,430 @@ fn an_authenticated_eos_is_the_bare_one_sealed() {
         bare_eos.as_slice()
     );
 }
+
+/// ADR-0109 (#625): on the `etf` route a timed head is eligible its lane's
+/// declared advance before its time, and goes on the etf socket with its
+/// time converted to `CLOCK_TAI` by the cycle's offset, `CLOCK_TAI` less
+/// the monotonic clock sampled with it, not less the cycle's (possibly
+/// stale) `now`; before that it waits. While `CLOCK_TAI` cannot be read
+/// nothing is read or staged.
+#[test]
+fn an_etf_head_goes_early_with_its_time_in_tai() {
+    use karyos_io::backend::EtfQueue;
+    use karyos_sys::log_buffer::ScheduledOutcome;
+
+    use super::testing::outbound_timed;
+    use crate::timed_gate::LatePolicy;
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // CLOCK_TAI runs this far ahead of the monotonic clock.
+    const OFFSET: u64 = 37_000_000_000;
+    static MONOTONIC: AtomicU64 = AtomicU64::new(0);
+    fn monotonic() -> u64 {
+        MONOTONIC.load(Ordering::Relaxed)
+    }
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&sent);
+    observer.set_etf_send_hook(Box::new(move |_, _, txtime| {
+        seen.lock().unwrap().push(txtime);
+    }));
+    let mut local = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+    local.etf_route = true;
+    let endpoint = SocketsEndpoint::open(&local, InstanceId::FIRST, socket).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    let alias = Alias {
+        session_id: 5,
+        stream_id: 6,
+    };
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 9,
+        mtu: 1408,
+    };
+    let destination = SocketAddr::from(([127, 0, 0, 1], 41_000));
+    let (mut path, mut log) = outbound_timed(EndpointId(1), alias, destination, term, 4);
+    let policy = LatePolicy {
+        advance: 50,
+        ..LatePolicy::default()
+    };
+    path.set_timed(&[policy], vec![None], 0).unwrap();
+    path.set_etf(
+        EtfQueue {
+            interface: 1,
+            priority: 3,
+            delta_ns: 20,
+        },
+        50,
+        false,
+    );
+    path.set_monotonic(monotonic);
+    assert!(matches!(
+        log.publications[0]
+            .append_scheduled(&[1; 100], AppendOptions::default(), 100)
+            .unwrap(),
+        ScheduledOutcome::Append(karyos_sys::log_buffer::AppendOutcome::Appended { .. })
+    ));
+    let budget = Budget {
+        work: 64,
+        bytes: 1 << 20,
+    };
+    // No CLOCK_TAI: nothing is read.
+    let _ = path.serve(&mut tx, budget, None, 10).unwrap();
+    assert_eq!(path.counters().staged, 0, "no send time without CLOCK_TAI");
+    // Staged, but not eligible before its time less the advance (50). The
+    // cycle's `now` (20) is 5 behind the clocks read with CLOCK_TAI.
+    MONOTONIC.store(25, Ordering::Relaxed);
+    observer.set_tai_now_ns(Some(25 + OFFSET));
+    let _ = path.serve(&mut tx, budget, None, 20).unwrap();
+    assert_eq!(path.counters().staged, 1);
+    assert_eq!(observer.etf_send_calls(), 0, "held until 50");
+    observer.push_etf_send(SendResult::Sent {
+        sent: 1,
+        error: None,
+    });
+    MONOTONIC.store(50, Ordering::Relaxed);
+    observer.set_tai_now_ns(Some(50 + OFFSET));
+    let _ = path.serve(&mut tx, budget, None, 50).unwrap();
+    assert_eq!(*sent.lock().unwrap(), vec![100 + OFFSET], "its time in TAI");
+    assert_eq!(path.counters().submitted, 1);
+    let mut endpoint = SocketsEndpoint::join(tx, rx).ok().unwrap();
+    let mut report = karyos_io::backend::TxReport::new();
+    while !matches!(
+        endpoint.retire(&mut report),
+        karyos_io::sockets::endpoint::Retired::Complete { .. }
+    ) {
+        while report.pop_front().is_some() {}
+    }
+}
+
+/// An etf publication over a scripted socket whose `CLOCK_TAI` runs
+/// `ETF_OFFSET` ahead of the sender's monotonic clock, with one timed
+/// message at 100 sent on the etf socket at 50 (advance 50): what the
+/// datagrams on the immediate route carried, and the fixture.
+struct EtfFixture {
+    path: Box<super::Outbound>,
+    _log: super::testing::TestLog,
+    tx: Option<karyos_io::sockets::endpoint::SocketsTx<ScriptedSocket>>,
+    rx: Option<karyos_io::sockets::endpoint::SocketsRx<ScriptedSocket>>,
+    observer: ScriptedSocket,
+    immediate: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+const ETF_OFFSET: u64 = 37_000_000_000;
+
+// Each test's own clock: tests run in parallel, one thread each, and the
+// fixture serves on its test's thread.
+thread_local! {
+    static ETF_MONOTONIC: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn etf_monotonic() -> u64 {
+    ETF_MONOTONIC.with(std::cell::Cell::get)
+}
+
+impl EtfFixture {
+    fn new(reliable: bool) -> Self {
+        Self::with(reliable, false)
+    }
+
+    fn with(reliable: bool, cancel_on_deadline: bool) -> Self {
+        use karyos_io::backend::EtfQueue;
+        use karyos_protocol::network::Identity;
+        use karyos_sys::log_buffer::ScheduledOutcome;
+
+        use super::testing::{outbound_timed, outbound_timed_reliable};
+        use crate::agents::repair::RepairConfig;
+        use crate::timed_gate::LatePolicy;
+
+        let socket = ScriptedSocket::new();
+        let observer = socket.observer();
+        let immediate = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&immediate);
+        observer.set_send_hook(Box::new(move |_, datagrams| {
+            seen.lock()
+                .unwrap()
+                .extend(datagrams.iter().map(|datagram| datagram.to_vec()));
+        }));
+        let mut local = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+        local.etf_route = true;
+        let endpoint = SocketsEndpoint::open(&local, InstanceId::FIRST, socket).unwrap();
+        let (tx, rx) = endpoint.split().unwrap();
+        let alias = Alias {
+            session_id: 5,
+            stream_id: 6,
+        };
+        let term = TermParams {
+            term_length: 65_536,
+            initial_term_id: 9,
+            mtu: 1408,
+        };
+        let destination = SocketAddr::from(([127, 0, 0, 1], 41_000));
+        let (mut path, mut log) = if reliable {
+            outbound_timed_reliable(EndpointId(1), alias, destination, term, 4)
+        } else {
+            outbound_timed(EndpointId(1), alias, destination, term, 4)
+        };
+        let policy = LatePolicy {
+            advance: 50,
+            cancel_on_deadline,
+            ..LatePolicy::default()
+        };
+        path.set_timed(&[policy], vec![None], 0).unwrap();
+        path.set_etf(
+            EtfQueue {
+                interface: 1,
+                priority: 3,
+                delta_ns: 20,
+            },
+            50,
+            cancel_on_deadline,
+        );
+        path.set_monotonic(etf_monotonic);
+        if reliable {
+            let identity = Identity {
+                driver_id: [1, 2],
+                registration_id: 1,
+                incarnation: 1,
+            };
+            path.enable_repair(&RepairConfig::default(), term.term_length, identity)
+                .unwrap();
+        }
+        assert!(matches!(
+            log.publications[0]
+                .append_scheduled(&[9; 100], AppendOptions::default(), 100)
+                .unwrap(),
+            ScheduledOutcome::Append(karyos_sys::log_buffer::AppendOutcome::Appended { .. })
+        ));
+        let mut fixture = Self {
+            path,
+            _log: log,
+            tx: Some(tx),
+            rx: Some(rx),
+            observer,
+            immediate,
+        };
+        fixture.observer.push_etf_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+        fixture.serve(50);
+        assert_eq!(
+            fixture.observer.etf_send_calls(),
+            1,
+            "sent on the etf socket"
+        );
+        assert_eq!(fixture.counts().reserved, 1);
+        fixture
+    }
+
+    fn serve(&mut self, now: u64) {
+        ETF_MONOTONIC.with(|clock| clock.set(now));
+        self.observer.set_tai_now_ns(Some(now + ETF_OFFSET));
+        let budget = Budget {
+            work: 64,
+            bytes: 1 << 20,
+        };
+        let tx = self.tx.as_mut().unwrap();
+        let _ = self.path.serve(tx, budget, None, now).unwrap();
+        for _ in 0..4 {
+            self.observer.push_send(SendResult::Sent {
+                sent: 1,
+                error: None,
+            });
+        }
+        let mut repair = crate::repair::scheduler::RepairBudget::default();
+        let _ = self.path.serve_repair(tx, &mut repair, now);
+    }
+
+    fn counts(&self) -> super::etf::EtfCounts {
+        self.path.etf_counts().unwrap()
+    }
+
+    fn drop_report(&self, time: u64) {
+        self.observer
+            .push_etf_error(karyos_io::sockets::errqueue::ErrEntry::Txtime {
+                txtime_ns: time + ETF_OFFSET,
+                code: karyos_io::sockets::errqueue::TxtimeCode::Missed,
+                errno: 62,
+            });
+    }
+
+    fn data_sent_again(&self) -> usize {
+        self.immediate
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|datagram| datagram.windows(100).any(|window| window == [9; 100]))
+            .count()
+    }
+}
+
+impl Drop for EtfFixture {
+    fn drop(&mut self) {
+        let (Some(tx), Some(rx)) = (self.tx.take(), self.rx.take()) else {
+            return;
+        };
+        if let Ok(mut endpoint) = SocketsEndpoint::join(tx, rx) {
+            let mut report = karyos_io::backend::TxReport::new();
+            while !matches!(
+                endpoint.retire(&mut report),
+                karyos_io::sockets::endpoint::Retired::Complete { .. }
+            ) {
+                while report.pop_front().is_some() {}
+            }
+        }
+    }
+}
+
+/// ADR-0109 point 8 (#625): a reliable lane's datagram the qdisc dropped
+/// is drained by its time and sent again late on the immediate route, by
+/// the repair path's catch-up; nothing else is resent.
+#[test]
+fn an_etf_drop_of_a_reliable_lane_is_caught_up_on_the_immediate_route() {
+    let mut f = EtfFixture::new(true);
+    assert_eq!(f.data_sent_again(), 0);
+    f.drop_report(100);
+    f.serve(60);
+    let counts = f.counts();
+    assert_eq!((counts.dropped, counts.caught_up, counts.gaps), (1, 1, 0));
+    f.serve(61);
+    assert_eq!(
+        f.data_sent_again(),
+        1,
+        "caught up once, on the immediate route"
+    );
+    assert_eq!(f.counts().late_drop_reports, 0);
+}
+
+/// ADR-0109 point 8 (#625): an unreliable lane's drop is a gap at the
+/// receiver, counted; nothing is sent again.
+#[test]
+fn an_etf_drop_of_an_unreliable_lane_is_a_counted_gap() {
+    let mut f = EtfFixture::new(false);
+    f.drop_report(100);
+    f.serve(60);
+    f.serve(61);
+    let counts = f.counts();
+    assert_eq!((counts.dropped, counts.gaps, counts.caught_up), (1, 1, 0));
+    assert_eq!(f.data_sent_again(), 0);
+}
+
+/// ADR-0109 point 7 (#625): with no report by `txtime + advance + margin`
+/// an entry is retired as sent; a report after that resubmits nothing and
+/// is a late drop report, posted once for the diagnostic ring.
+#[test]
+fn an_expired_entry_is_retired_and_a_later_report_is_late() {
+    let mut f = EtfFixture::new(true);
+    let past = 100 + 50 + super::etf::EXPIRY_MARGIN + 1;
+    f.serve(past);
+    assert_eq!(f.counts().expired, 1);
+    f.drop_report(100);
+    f.serve(past + 1);
+    f.serve(past + 2);
+    assert_eq!(f.counts().late_drop_reports, 1);
+    assert_eq!(f.counts().dropped, 0);
+    assert_eq!(f.data_sent_again(), 0, "nothing resubmitted");
+    let mut posted = Vec::new();
+    f.path.post_etf_late(|report, count| {
+        posted.push((report, count));
+        true
+    });
+    assert_eq!(
+        posted,
+        vec![(
+            Some(super::etf::LateReport {
+                lane: 0,
+                txtime: 100 + ETF_OFFSET,
+                unrecorded: 0,
+            }),
+            1
+        )]
+    );
+    // A refused post is offered again.
+    f.drop_report(100);
+    f.serve(past + 3);
+    f.path.post_etf_late(|_, _| false);
+    let mut again = 0;
+    f.path.post_etf_late(|_, _| {
+        again += 1;
+        true
+    });
+    assert_eq!(again, 1);
+}
+
+/// ADR-0109 point 8 (#625): under cancel-on-deadline an etf drop is a
+/// miss the sender saw: nothing is caught up, the lane aborts (counted
+/// once), and it is reported once for the conductor to seal.
+#[test]
+fn an_etf_drop_under_cancel_aborts_the_lane() {
+    for reliable in [true, false] {
+        let mut f = EtfFixture::with(reliable, true);
+        assert_eq!(f.path.deadline_unreported(), None);
+        f.drop_report(100);
+        f.serve(60);
+        f.serve(61);
+        let counts = f.counts();
+        assert_eq!((counts.dropped, counts.aborts), (1, 1), "{counts:?}");
+        assert_eq!((counts.caught_up, counts.gaps), (0, 0), "{counts:?}");
+        assert_eq!(f.data_sent_again(), 0, "nothing resubmitted");
+        assert_eq!(f.path.timed_counts().unwrap().deadline_aborts, 1);
+        assert_eq!(f.path.deadline_unreported(), Some(0));
+        f.path.deadline_reported(0);
+        assert_eq!(f.path.deadline_unreported(), None, "reported once");
+    }
+}
+
+/// Codex review of #1267 (P1): under cancel-on-deadline a drop report
+/// whose entry already expired still aborts the lane: the qdisc did drop
+/// the datagram.
+#[test]
+fn a_late_drop_report_under_cancel_still_aborts() {
+    let mut f = EtfFixture::with(true, true);
+    let past = 100 + 50 + super::etf::EXPIRY_MARGIN + 1;
+    f.serve(past);
+    assert_eq!(f.counts().expired, 1);
+    f.drop_report(100);
+    f.serve(past + 1);
+    assert_eq!(f.counts().late_drop_reports, 1);
+    assert_eq!(f.path.deadline_unreported(), Some(0));
+    assert_eq!(f.path.timed_counts().unwrap().deadline_aborts, 1);
+}
+
+/// Codex review of #1267 (P2): a lane that missed its deadline stages
+/// nothing more, and the heads still queued on it are returned, counted
+/// dropped, so its TX slots are freed.
+#[test]
+fn a_missed_lane_returns_its_queued_heads_and_stages_nothing() {
+    use karyos_sys::log_buffer::ScheduledOutcome;
+
+    let mut f = EtfFixture::with(false, true);
+    // A second message, staged but not eligible before 150.
+    assert!(matches!(
+        f._log.publications[0]
+            .append_scheduled(&[8; 100], AppendOptions::default(), 200)
+            .unwrap(),
+        ScheduledOutcome::Append(karyos_sys::log_buffer::AppendOutcome::Appended { .. })
+    ));
+    f.serve(55);
+    assert_eq!(f.path.sender.pending(0), Some(1), "queued, waiting");
+    // The first message's drop aborts the lane in the next duty.
+    f.drop_report(100);
+    f.serve(60);
+    assert_eq!(f.path.deadline_unreported(), Some(0));
+    assert_eq!(f.path.sender.pending(0), Some(0), "returned");
+    assert_eq!(f.path.timed_counts().unwrap().dropped, 1);
+    // A third message is never read.
+    assert!(matches!(
+        f._log.publications[0]
+            .append_scheduled(&[7; 100], AppendOptions::default(), 300)
+            .unwrap(),
+        ScheduledOutcome::Append(karyos_sys::log_buffer::AppendOutcome::Appended { .. })
+    ));
+    let staged = f.path.counters().staged;
+    f.serve(260);
+    assert_eq!(f.path.counters().staged, staged, "nothing more staged");
+    assert_eq!(f.observer.etf_send_calls(), 1);
+}

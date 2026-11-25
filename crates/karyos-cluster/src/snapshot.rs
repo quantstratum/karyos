@@ -39,6 +39,15 @@
 //!   was durable before its publish; one that no longer reads whole, or
 //!   whose digest fails, is reported damaged and not used. A manifest that
 //!   fails its CRC is refused.
+//! - **Streamed writes** (karyos#682). [`SnapshotStore::begin`] starts a
+//!   snapshot whose sections arrive in pieces, as a leader's install
+//!   does: [`PendingSnapshot::section`] opens each with its length and
+//!   [`PendingSnapshot::write`] takes its bytes in any pieces, appended in
+//!   writes of at most [`WRITE_CHUNK`]; [`SnapshotStore::publish`] then
+//!   closes, syncs and publishes it as [`SnapshotStore::write`] does, or
+//!   [`SnapshotStore::abandon`] removes it. The bytes on disk are the
+//!   same as [`SnapshotStore::write`]'s; an unpublished snapshot is what a
+//!   crash leaves, which recovery removes.
 //! - **Reads.** [`SnapshotStore::reader`] streams a snapshot section by
 //!   section into the caller's buffer, and [`SnapshotStore::open`] and
 //!   [`SnapshotStore::verify`] check one the same way: a section's bytes
@@ -389,9 +398,23 @@ pub enum SnapshotError {
         /// Its id.
         id: u64,
     },
+    /// A section of a kind this build does not know: written by a newer
+    /// version, told apart from damage. The snapshot is not used.
+    #[error("snapshot {id} has a section of unknown kind {code}")]
+    UnknownSection {
+        /// Its id.
+        id: u64,
+        /// The kind's code.
+        code: u32,
+    },
     /// An earlier failure: reopen the store.
     #[error("the snapshot store failed; reopen it")]
     Failed,
+    /// A streamed snapshot published before its sections were whole, or
+    /// written past a section's length, or after one of its writes
+    /// failed: it is not published.
+    #[error("the streamed snapshot is incomplete")]
+    Incomplete,
     /// Ids ran out.
     #[error("snapshot ids exhausted")]
     Exhausted,
@@ -413,6 +436,10 @@ pub struct Opened<D: Disk + Clone> {
     pub removed: Vec<u64>,
     /// Published snapshots that no longer read whole: not used.
     pub damaged: Vec<SnapshotInfo>,
+    /// Published snapshots that read whole but hold a section of a kind
+    /// this build does not know (a newer writer's): not used, and told
+    /// apart from damage.
+    pub unknown: Vec<SnapshotInfo>,
 }
 
 /// A node's snapshot directory.
@@ -461,10 +488,12 @@ impl<D: Disk + Clone> SnapshotStore<D> {
         }
         let mut kept = Vec::new();
         let mut damaged = Vec::new();
+        let mut unknown = Vec::new();
         for info in &named {
             match verify_snapshot(disk.clone(), dir, geometry, info) {
                 Ok(()) => kept.push(*info),
                 Err(SnapshotError::Io(error)) => return Err(SnapshotError::Io(error)),
+                Err(SnapshotError::UnknownSection { .. }) => unknown.push(*info),
                 Err(_) => damaged.push(*info),
             }
         }
@@ -487,6 +516,7 @@ impl<D: Disk + Clone> SnapshotStore<D> {
             },
             removed,
             damaged,
+            unknown,
         })
     }
 
@@ -548,6 +578,13 @@ impl<D: Disk + Clone> SnapshotStore<D> {
             length,
             digest,
         };
+        self.publish_info(info)
+    }
+
+    /// Publishes `info`, whose bytes are durable, and purges what the
+    /// manifest no longer keeps; `failed` is set while it runs.
+    fn publish_info(&mut self, info: SnapshotInfo) -> Result<SnapshotInfo, SnapshotError> {
+        self.failed = true;
         let mut kept = self.kept.clone();
         kept.push(info);
         let keep = usize::try_from(self.config.keep).unwrap_or(usize::MAX);
@@ -570,6 +607,106 @@ impl<D: Disk + Clone> SnapshotStore<D> {
         }
         self.failed = false;
         Ok(info)
+    }
+
+    /// Starts a snapshot including log index `index` of term `term` whose
+    /// sections are written in pieces ([`PendingSnapshot`]); nothing is
+    /// published until [`SnapshotStore::publish`].
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError::NotNewer`] and [`SnapshotError::Failed`], which
+    /// change nothing; [`SnapshotError::Exhausted`]; the store's and the
+    /// disk's errors.
+    pub fn begin(&mut self, index: u64, term: u64) -> Result<PendingSnapshot<D>, SnapshotError> {
+        if self.failed {
+            return Err(SnapshotError::Failed);
+        }
+        if let Some(newest) = self.latest().filter(|newest| index <= newest.index) {
+            return Err(SnapshotError::NotNewer {
+                index,
+                newest: newest.index,
+            });
+        }
+        let id = self.next_id;
+        self.next_id = id.checked_add(1).ok_or(SnapshotError::Exhausted)?;
+        let store = SegmentStore::create(
+            self.disk.clone(),
+            &self.dir,
+            id,
+            self.geometry,
+            SyncPolicy::None,
+            0,
+        )?;
+        Ok(PendingSnapshot {
+            id,
+            index,
+            term,
+            store: Some(store),
+            digest: Crc32c::new(),
+            at: 0,
+            left: 0,
+            sections: 0,
+            broken: false,
+        })
+    }
+
+    /// Publishes a streamed snapshot whose sections are whole, as
+    /// [`SnapshotStore::write`] does: closed and synced, then published,
+    /// then what the manifest no longer keeps purged.
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError::Incomplete`] for one not whole, and
+    /// [`SnapshotError::NotNewer`] when a newer snapshot was published
+    /// meanwhile, both removing it and changing nothing else; then as
+    /// [`SnapshotStore::write`].
+    pub fn publish(
+        &mut self,
+        mut pending: PendingSnapshot<D>,
+    ) -> Result<SnapshotInfo, SnapshotError> {
+        if self.failed {
+            return Err(SnapshotError::Failed);
+        }
+        let newer = self
+            .latest()
+            .filter(|newest| pending.index <= newest.index)
+            .map(|newest| newest.index);
+        if pending.broken || pending.left > 0 || pending.sections == 0 || newer.is_some() {
+            let index = pending.index;
+            self.abandon(pending)?;
+            return Err(newer.map_or(SnapshotError::Incomplete, |newest| {
+                SnapshotError::NotNewer { index, newest }
+            }));
+        }
+        let Some(store) = pending.store.take() else {
+            return Err(SnapshotError::Incomplete);
+        };
+        self.failed = true;
+        let _ = store.close_synced()?;
+        self.failed = false;
+        let info = SnapshotInfo {
+            id: pending.id,
+            index: pending.index,
+            term: pending.term,
+            length: pending.at,
+            digest: pending.digest.finish(),
+        };
+        self.publish_info(info)
+    }
+
+    /// Removes a streamed snapshot that will not be published: an
+    /// install whose transfer broke off.
+    ///
+    /// # Errors
+    ///
+    /// The disk's errors; the files left are an unpublished snapshot,
+    /// which the next open removes.
+    pub fn abandon(&mut self, mut pending: PendingSnapshot<D>) -> Result<(), SnapshotError> {
+        drop(pending.store.take());
+        remove_recording(&mut self.disk, &self.dir, pending.id)?;
+        self.disk.sync_dir(&self.dir)?;
+        Ok(())
     }
 
     /// The sections of `info`, a kept snapshot, checked against its length
@@ -659,17 +796,146 @@ impl<D: Disk + Clone> SnapshotStore<D> {
 }
 
 /// A section's header.
-fn section_header(section: &Section<'_>) -> Result<[u8; SECTION_HEADER], SnapshotError> {
-    let length = u64::try_from(section.bytes.len()).map_err(|_| SegmentError::PositionOverflow)?;
+/// A snapshot written in pieces ([`SnapshotStore::begin`]), not yet
+/// published.
+#[derive(Debug)]
+pub struct PendingSnapshot<D: Disk> {
+    id: u64,
+    index: u64,
+    term: u64,
+    store: Option<SegmentStore<D>>,
+    digest: Crc32c,
+    /// Bytes written.
+    at: u64,
+    /// Bytes the current section still expects.
+    left: u64,
+    sections: u32,
+    /// A write failed or went past a section: it is never published.
+    broken: bool,
+}
+
+impl<D: Disk> PendingSnapshot<D> {
+    /// The index it includes.
+    #[must_use]
+    pub const fn index(&self) -> u64 {
+        self.index
+    }
+
+    /// Its term.
+    #[must_use]
+    pub const fn term(&self) -> u64 {
+        self.term
+    }
+
+    /// Bytes the current section still expects.
+    #[must_use]
+    pub const fn left(&self) -> u64 {
+        self.left
+    }
+
+    /// Opens the next section, of `kind`, `version` and `length` bytes,
+    /// once the previous one is whole.
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError::Incomplete`] while the previous section is not
+    /// whole, and the store's errors; any error breaks the snapshot.
+    pub fn section(
+        &mut self,
+        kind: SectionKind,
+        version: u64,
+        length: u64,
+    ) -> Result<(), SnapshotError> {
+        let result = self.open_section(kind, version, length);
+        self.broken |= result.is_err();
+        result
+    }
+
+    fn open_section(
+        &mut self,
+        kind: SectionKind,
+        version: u64,
+        length: u64,
+    ) -> Result<(), SnapshotError> {
+        self.open_coded(header_of(kind, version, length), length)
+    }
+
+    /// A section of kind `code`, which need not be one this build knows
+    /// (tests: a newer writer's section).
+    #[cfg(test)]
+    fn section_of_code(
+        &mut self,
+        code: u32,
+        version: u64,
+        length: u64,
+    ) -> Result<(), SnapshotError> {
+        let mut header = header_of(SectionKind::Service, version, length);
+        if let Some(kind) = header.get_mut(4..8) {
+            kind.copy_from_slice(&code.to_le_bytes());
+        }
+        self.open_coded(header, length)
+    }
+
+    fn open_coded(
+        &mut self,
+        header: [u8; SECTION_HEADER],
+        length: u64,
+    ) -> Result<(), SnapshotError> {
+        if self.broken || self.left > 0 {
+            return Err(SnapshotError::Incomplete);
+        }
+        let store = self.store.as_mut().ok_or(SnapshotError::Incomplete)?;
+        self.digest.update(&header);
+        self.at = store.append(self.at, &header)?;
+        self.left = length;
+        self.sections = self.sections.saturating_add(1);
+        Ok(())
+    }
+
+    /// Writes the next `bytes` of the current section, in A2 writes of at
+    /// most [`WRITE_CHUNK`].
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError::Incomplete`] for bytes past the section's length,
+    /// and the store's errors; any error breaks the snapshot.
+    pub fn write(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let result = self.write_bytes(bytes);
+        self.broken |= result.is_err();
+        result
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let length = u64::try_from(bytes.len()).map_err(|_| SegmentError::PositionOverflow)?;
+        if self.broken || length > self.left {
+            return Err(SnapshotError::Incomplete);
+        }
+        let store = self.store.as_mut().ok_or(SnapshotError::Incomplete)?;
+        for chunk in bytes.chunks(WRITE_CHUNK) {
+            self.digest.update(chunk);
+            self.at = store.append(self.at, chunk)?;
+        }
+        self.left -= length;
+        Ok(())
+    }
+}
+
+/// A section's header, from its parts.
+fn header_of(kind: SectionKind, version: u64, length: u64) -> [u8; SECTION_HEADER] {
     let mut header = [0u8; SECTION_HEADER];
     let (magic, rest) = header.split_at_mut(4);
     magic.copy_from_slice(&SECTION_MAGIC);
-    let (kind, rest) = rest.split_at_mut(4);
-    kind.copy_from_slice(&section.kind.code().to_le_bytes());
-    let (version, rest) = rest.split_at_mut(8);
-    version.copy_from_slice(&section.version.to_le_bytes());
+    let (kind_bytes, rest) = rest.split_at_mut(4);
+    kind_bytes.copy_from_slice(&kind.code().to_le_bytes());
+    let (version_bytes, rest) = rest.split_at_mut(8);
+    version_bytes.copy_from_slice(&version.to_le_bytes());
     rest.copy_from_slice(&length.to_le_bytes());
-    Ok(header)
+    header
+}
+
+fn section_header(section: &Section<'_>) -> Result<[u8; SECTION_HEADER], SnapshotError> {
+    let length = u64::try_from(section.bytes.len()).map_err(|_| SegmentError::PositionOverflow)?;
+    Ok(header_of(section.kind, section.version, length))
 }
 
 /// A section's header, as a reader meets it.
@@ -705,6 +971,9 @@ pub struct SnapshotReader<D: Disk> {
     /// The current section's end.
     section_end: u64,
     finished: bool,
+    /// The code of the first section of a kind this build does not know:
+    /// skipped, and reported once the whole snapshot's digest holds.
+    unknown: Option<u32>,
 }
 
 impl<D: Disk> SnapshotReader<D> {
@@ -733,6 +1002,7 @@ impl<D: Disk> SnapshotReader<D> {
             at: 0,
             section_end: 0,
             finished: false,
+            unknown: None,
         })
     }
 
@@ -770,45 +1040,57 @@ impl<D: Disk> SnapshotReader<D> {
             return Ok(None);
         }
         let mut skip = [0u8; SKIP_BUFFER];
-        while self.at < self.section_end {
-            let left = self
-                .section_end
-                .checked_sub(self.at)
-                .ok_or_else(|| self.damaged())?;
-            let take = usize::try_from(left).map_or(SKIP_BUFFER, |left| left.min(SKIP_BUFFER));
-            let chunk = skip.get_mut(..take).ok_or_else(|| self.damaged())?;
-            self.fill(chunk)?;
-        }
-        if self.at == self.length {
-            if self.digest.finish() != self.expected {
-                return Err(self.damaged());
+        loop {
+            while self.at < self.section_end {
+                let left = self
+                    .section_end
+                    .checked_sub(self.at)
+                    .ok_or_else(|| self.damaged())?;
+                let take = usize::try_from(left).map_or(SKIP_BUFFER, |left| left.min(SKIP_BUFFER));
+                let chunk = skip.get_mut(..take).ok_or_else(|| self.damaged())?;
+                self.fill(chunk)?;
             }
-            self.finished = true;
-            return Ok(None);
+            if self.at == self.length {
+                if self.digest.finish() != self.expected {
+                    return Err(self.damaged());
+                }
+                self.finished = true;
+                // A newer writer's section, told apart from damage only now
+                // that the whole snapshot's digest holds.
+                if let Some(code) = self.unknown {
+                    return Err(SnapshotError::UnknownSection { id: self.id, code });
+                }
+                return Ok(None);
+            }
+            let mut header = [0u8; SECTION_HEADER];
+            self.fill(&mut header)?;
+            let damaged = || SnapshotError::Damaged { id: self.id };
+            let (magic, fields) = header.split_first_chunk::<4>().ok_or_else(damaged)?;
+            let (kind, fields) = fields.split_first_chunk::<4>().ok_or_else(damaged)?;
+            let (version, fields) = fields.split_first_chunk::<8>().ok_or_else(damaged)?;
+            let (length, _) = fields.split_first_chunk::<8>().ok_or_else(damaged)?;
+            if *magic != SECTION_MAGIC {
+                return Err(damaged());
+            }
+            let code = u32::from_le_bytes(*kind);
+            let length = u64::from_le_bytes(*length);
+            let end = self
+                .at
+                .checked_add(length)
+                .filter(|end| *end <= self.length)
+                .ok_or_else(damaged)?;
+            self.section_end = end;
+            let Some(kind) = SectionKind::from_code(code) else {
+                // Framed whole: skipped, and the snapshot refused at its end.
+                self.unknown.get_or_insert(code);
+                continue;
+            };
+            return Ok(Some(SectionHeader {
+                kind,
+                version: u64::from_le_bytes(*version),
+                length,
+            }));
         }
-        let mut header = [0u8; SECTION_HEADER];
-        self.fill(&mut header)?;
-        let damaged = || SnapshotError::Damaged { id: self.id };
-        let (magic, fields) = header.split_first_chunk::<4>().ok_or_else(damaged)?;
-        let (kind, fields) = fields.split_first_chunk::<4>().ok_or_else(damaged)?;
-        let (version, fields) = fields.split_first_chunk::<8>().ok_or_else(damaged)?;
-        let (length, _) = fields.split_first_chunk::<8>().ok_or_else(damaged)?;
-        if *magic != SECTION_MAGIC {
-            return Err(damaged());
-        }
-        let kind = SectionKind::from_code(u32::from_le_bytes(*kind)).ok_or_else(damaged)?;
-        let length = u64::from_le_bytes(*length);
-        let end = self
-            .at
-            .checked_add(length)
-            .filter(|end| *end <= self.length)
-            .ok_or_else(damaged)?;
-        self.section_end = end;
-        Ok(Some(SectionHeader {
-            kind,
-            version: u64::from_le_bytes(*version),
-            length,
-        }))
     }
 
     /// Reads up to `buf.len()` bytes of the current section; 0 at its end.

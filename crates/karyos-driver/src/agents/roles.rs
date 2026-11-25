@@ -86,8 +86,8 @@ use karyos_sys::sizing::TermLength;
 
 use super::chain::{ImageChain, SessionCommand, SessionEnd, SessionEvent};
 use super::control::{
-    ControlItem, ControlRoutes, ControlSendError, ItemGuard, ReportGuard, ReportSlot, RouteSlot,
-    SendReport, SmGuard, SmSlot,
+    ControlItem, ControlRoutes, ControlSeal, ControlSendError, ItemGuard, ReportGuard, ReportSlot,
+    RouteSlot, SendReport, SharedSealer, SmGuard, SmSlot,
 };
 use super::data::Outbound;
 
@@ -269,6 +269,19 @@ pub struct ReceiverCounters {
     pub heartbeats_past_terminal: u64,
     /// DATA datagrams from no binding: dropped.
     pub data_unbound: u64,
+    /// Envelopes their image's key refused: a field, the tag or the replay
+    /// window (ADR-0086 sections 2 and 6). Dropped; nothing else changed.
+    pub auth_rejected: u64,
+    /// Envelopes for no authenticated binding: dropped before any key or
+    /// state is touched, with no SOLICIT.
+    pub auth_unbound: u64,
+    /// Bare DATA, heartbeats, PATH_HB, ERR, RTTM REPLY, SETUP ANNOUNCE or
+    /// SETUP ANSWER for an authenticated image (ADR-0086 section 2):
+    /// dropped.
+    pub auth_bare: u64,
+    /// Envelopes that opened but whose inner frames are not a domain 1
+    /// datagram of their own binding: dropped.
+    pub auth_inner_invalid: u64,
     /// DATA datagrams of a multi-path image that a full path queue dropped
     /// (redundant-paths.md section 5): that path's copy only. It also
     /// counts one longer than a slab slot (`MAX_DATAGRAM`), which no
@@ -424,6 +437,9 @@ pub struct ReceiverCounters {
 pub struct SenderCounters {
     /// Controls sent.
     pub sent: u64,
+    /// Controls of an authenticated image that could not be sealed: never
+    /// sent bare (ADR-0086 section 2).
+    pub seal_failures: u64,
     /// Idle heartbeats submitted: header-only DATA frames of established
     /// lanes that sent nothing for `sender_heartbeat_interval` (SPEC §6),
     /// one per route of a redundant-path lane, each counted.
@@ -911,6 +927,9 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     path_config: PathConfig,
     /// The path queues, allocated when the first later path is bound.
     path_intake: Option<Box<path_intake::PathIntake>>,
+    /// Refused envelopes no authenticated binding owns (unbound, or too
+    /// short to name one), by reason (ADR-0086 section 2).
+    auth_unattributed: AuthRejections,
     /// Each image's RTT probes' settings.
     rtt: RttConfig,
     /// A multicast image's NAK timing.
@@ -1336,6 +1355,7 @@ fn post_copies<T: StreamTerms>(
             destination: key.source,
             control: Control::Nak(nak),
             guard: Some(ItemGuard::Report(ReportGuard::take(&copy.slot))),
+            seal: image.auth.as_deref().map(ImageAuth::sealer),
         };
         match to_sender.try_post(item) {
             Ok(()) => {
@@ -1405,6 +1425,9 @@ struct Chain {
     initial_term_id: i32,
     /// The answer's join points: the first path's.
     joins: Lanes<u64>,
+    /// The establishment's challenge nonce: it salts the image's unicast
+    /// session keys (ADR-0086 section 4).
+    nonce: [u64; 2],
 }
 
 /// An installed image: its receive owner, binding, SM cadence and
@@ -1511,6 +1534,18 @@ struct Installed<T: StreamTerms = HeapTerms> {
     receiver_id: u64,
     /// The `group_tag` its SMs declare (0 without a configured identity).
     group_tag: u64,
+    /// The challenge nonce of the establishment that bound it: read when
+    /// its keys are made, which only tests do until an authenticated
+    /// channel can be opened.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no authenticated channel opens yet")
+    )]
+    nonce: [u64; 2],
+    /// Its wire authentication on an authenticated channel (ADR-0086):
+    /// its datagrams are opened before any inner frame is read and its
+    /// controls sealed; `None` on a trusted channel.
+    auth: Option<Box<ImageAuth>>,
 }
 
 /// One lane's NAK in flight: its report slot (the RTTM probe's contract:
@@ -2119,6 +2154,7 @@ pub(super) fn roles<T: StreamTerms>(
             idle_timeout: config.idle_image_timeout,
             path_config: receiver_path_config(config),
             path_intake: None,
+            auth_unattributed: AuthRejections::default(),
             rtt: config.rtt,
             multicast: config.multicast,
             unicast_retry_slack: config.unicast_retry_slack,
@@ -2635,6 +2671,25 @@ impl<T: StreamTerms> ReceiverRole<T> {
         self.sessions.boot_id()
     }
 
+    /// Refused envelopes no authenticated binding owns, by reason.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn unattributed_auth_rejections(&self) -> AuthRejections {
+        self.auth_unattributed
+    }
+
+    /// The refusals of the authenticated image at `slot`, by reason;
+    /// `None` for a trusted or unknown image.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn auth_rejections(&self, slot: SlotRef) -> Option<AuthRejections> {
+        self.images
+            .iter()
+            .find(|image| image.slot == slot)
+            .and_then(|image| image.auth.as_deref())
+            .map(|auth| auth.rejections)
+    }
+
     /// The session table's counters.
     #[must_use]
     pub fn session_counters(&self) -> crate::sessions::receive::SessionCounters {
@@ -2709,6 +2764,73 @@ impl<T: StreamTerms> ReceiverRole<T> {
             receiver_boot_id: self.sessions.boot_id(),
             receiver_id: named,
         }
+    }
+
+    /// Hands the receiver `bytes` as a unicast datagram from `source` on
+    /// `endpoint` at `now`, as the backend would (tests).
+    #[cfg(test)]
+    pub(super) fn inject_datagram(
+        &mut self,
+        sessions: &SessionEnd<T>,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        bytes: &[u8],
+        now: u64,
+    ) {
+        let mut intake = Intake {
+            endpoint,
+            now,
+            role: self,
+            sessions,
+            work: 0,
+        };
+        intake.bytes_in(source, bytes);
+    }
+
+    /// Hands `item` to the sender agent's ring (tests).
+    #[cfg(test)]
+    pub(super) fn post_to_sender(&mut self, item: ControlItem) {
+        assert!(self.to_sender.try_post(item).is_ok(), "the ring has room");
+    }
+
+    /// Makes the image at `slot` authenticated (tests): its sender's
+    /// datagrams verify under the channel key `channel` and its controls
+    /// are sealed under the pairwise key `pairwise`, both for this
+    /// establishment, read at the wall clock `wall`. Returns the sender's
+    /// and the receiver's parties. Nothing else makes an image
+    /// authenticated yet.
+    #[cfg(test)]
+    pub(super) fn authenticate_image(
+        &mut self,
+        slot: SlotRef,
+        channel: &crate::wire_keys::KeyFile,
+        pairwise: &crate::wire_keys::KeyFile,
+        wall: fn() -> i64,
+    ) -> Result<(crate::wire_auth::Party, crate::wire_auth::Party), crate::wire_auth::KeyError>
+    {
+        use crate::wire_auth::{KeyError, Party};
+
+        let receiver_boot_id = self.sessions.boot_id();
+        let image = self
+            .images
+            .iter_mut()
+            .find(|image| image.slot == slot)
+            .ok_or(KeyError::NoKey)?;
+        let sender = Party::Sender {
+            identity: image.identity,
+            lane_count: image.lane_count,
+            receiver_boot_id,
+            nonce: image.nonce,
+        };
+        let receiver = Party::Receiver {
+            identity: image.identity,
+            receiver_boot_id,
+            receiver_id: image.receiver_id,
+        };
+        let mut auth = ImageAuth::new([channel], pairwise, sender, receiver, image.key.alias)?;
+        auth.set_wall(wall);
+        image.auth = Some(Box::new(auth));
+        Ok((sender, receiver))
     }
 
     /// Hands the receiver `bytes` as a DATA datagram from `source` on
@@ -3353,6 +3475,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
             path_groups: vec![None; paths],
             receiver_id: named,
             group_tag,
+            nonce: chain.nonce,
+            auth: None,
         });
         Ok(link)
     }
@@ -3744,6 +3868,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 destination: image.key.source,
                 control: Control::Nak(nak),
                 guard: Some(ItemGuard::Report(ReportGuard::take(&report.slot))),
+                seal: image.auth.as_deref().map(ImageAuth::sealer),
             };
             // A dropped item drops its guard: reported not submitted, and
             // the NAK stays due.
@@ -3798,11 +3923,19 @@ impl<T: StreamTerms> ReceiverRole<T> {
                         if earlier {
                             continue;
                         }
+                        // An authenticated image sends no group copy: its
+                        // NAKs go sealed to the publisher only (unicast,
+                        // ADR-0086 open point 6).
+                        if image.auth.is_some() {
+                            tally(counters, |c| &mut c.group_nak_copies_skipped);
+                            continue;
+                        }
                         let copy = ControlItem::Outgoing {
                             endpoint: control,
                             destination: group,
                             control: Control::Nak(nak),
                             guard: None,
+                            seal: None,
                         };
                         match to_sender.try_post(copy) {
                             Ok(()) => tally(counters, |c| &mut c.group_nak_copies),
@@ -3917,6 +4050,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
                     kind: RttmKind::Request,
                 }),
                 guard: Some(ItemGuard::Report(ReportGuard::take(&probe.slot))),
+                seal: image.auth.as_deref().map(ImageAuth::sealer),
             };
             // A dropped item drops its guard: reported not submitted.
             match to_sender.try_post(item) {
@@ -4025,6 +4159,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 destination: image.key.source,
                 control: Control::Status(status),
                 guard: Some(ItemGuard::Sm(SmGuard::take(&image.sm))),
+                seal: image.auth.as_deref().map(ImageAuth::sealer),
             };
             // The sender gone: the driver is stopping. The SM is then
             // recorded as sent all the same: nothing will send another.
@@ -4042,6 +4177,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             return;
         };
         let (slot_ref, founding) = (image.slot, image.key);
+        let seal = image.auth.as_deref().map(ImageAuth::sealer);
         for path in 0..usize::from(self.path_config.max_paths) {
             let Some(key) = self.sessions.paths().key(slot_ref, path) else {
                 continue;
@@ -4054,6 +4190,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 destination: key.source,
                 control: Control::Status(status),
                 guard: None,
+                seal: seal.clone(),
             };
             match self.to_sender.try_post(copy) {
                 Ok(()) => self.count(|c| &mut c.sm_copies),
@@ -5054,6 +5191,7 @@ impl<T: StreamTerms> Intake<'_, T> {
             destination: source,
             control,
             guard: None,
+            seal: None,
         })
     }
 
@@ -5136,6 +5274,7 @@ impl<T: StreamTerms> Intake<'_, T> {
             destination: control,
             control: register,
             guard: None,
+            seal: None,
         })
     }
 
@@ -5245,6 +5384,16 @@ impl<T: StreamTerms> Intake<'_, T> {
         let now = self.now;
         match control {
             Control::SetupAnnounce(announce) => {
+                // A bare SETUP for an authenticated image is refused before
+                // any challenge is created or consumed: an unverified
+                // ANNOUNCE or ANSWER could otherwise bind a later path.
+                // Every further path of an authenticated image is refused
+                // until the SETUP proof (domain 5) is verified (slice 3b of
+                // karyos#648; ADR-0086 section 7a).
+                if self.names_authenticated(announce.alias, announce.identity) {
+                    self.role.count(|c| &mut c.auth_bare);
+                    return;
+                }
                 // §6.2 step 2: only a stream subscribed on this endpoint.
                 let Some(max_term_length) = self
                     .role
@@ -5297,6 +5446,16 @@ impl<T: StreamTerms> Intake<'_, T> {
                 }
             }
             Control::SetupAnswer(answer) => {
+                // A bare SETUP for an authenticated image is refused before
+                // any challenge is created or consumed: an unverified
+                // ANNOUNCE or ANSWER could otherwise bind a later path.
+                // Every further path of an authenticated image is refused
+                // until the SETUP proof (domain 5) is verified (slice 3b of
+                // karyos#648; ADR-0086 section 7a).
+                if self.names_authenticated(answer.alias, answer.identity) {
+                    self.role.count(|c| &mut c.auth_bare);
+                    return;
+                }
                 // A solicited answer brings its own term parameters: the
                 // subscription's term length bound applies here too (an
                 // answer to a challenge restates the announced ones).
@@ -5344,6 +5503,7 @@ impl<T: StreamTerms> Intake<'_, T> {
                         identity,
                         term,
                         joins,
+                        nonce,
                     },
                     Some((create, retire, chain)),
                 ) = (outcome, reserved)
@@ -5367,6 +5527,7 @@ impl<T: StreamTerms> Intake<'_, T> {
                         mtu: term.mtu,
                         initial_term_id: term.initial_term_id,
                         joins,
+                        nonce,
                     });
                     // The conductor gone: the driver is stopping.
                     let _ = sessions.events.post(create, event);
@@ -5519,28 +5680,191 @@ impl<T: StreamTerms> Intake<'_, T> {
     }
 }
 
-impl<T: StreamTerms> RxHandler for Intake<'_, T> {
-    fn datagram(&mut self, datagram: RxDatagram<'_>) -> ControlFlow<()> {
-        // At most the poll budget's datagrams: no overflow.
-        self.work += 1;
-        self.role.count(|c| &mut c.datagrams);
-        let source = datagram.source();
-        match classify(datagram.bytes()) {
+/// The alias of a frame a sender authenticates in domain 1 that names an
+/// image's binding (ADR-0086 section 7a): PATH_HB, ERR NAK_REPLY and RTTM
+/// REPLY; `None` for any other control.
+fn sender_frame_alias(control: &Control) -> Option<Alias> {
+    match control {
+        Control::PathHeartbeat(heartbeat) => Some(heartbeat.alias),
+        Control::NakReply(reply) => Some(reply.alias),
+        Control::Rttm(rttm) if matches!(rttm.kind, RttmKind::Reply { .. }) => Some(rttm.alias),
+        _ => None,
+    }
+}
+
+impl<T: StreamTerms> Intake<'_, T> {
+    /// One unicast datagram. An envelope is opened by its binding's key
+    /// before anything else (ADR-0086 section 2); a bare frame for a
+    /// binding whose image is authenticated is refused; anything else
+    /// takes the trusted path unchanged. A refusal changes nothing but its
+    /// counter: no SOLICIT, no path queue, no state.
+    fn bytes_in(&mut self, source: SocketAddr, bytes: &[u8]) {
+        if receive_auth::is_envelope(bytes) {
+            self.sealed(source, bytes);
+            return;
+        }
+        match classify(bytes) {
             Ok(Datagram::Control(control)) => {
+                if sender_frame_alias(&control)
+                    .is_some_and(|alias| self.authenticated(source, alias))
+                {
+                    self.role.count(|c| &mut c.auth_bare);
+                    return;
+                }
                 // The path's queued DATA first: a reply this control causes
                 // (an ERR) never overtakes it.
                 self.drain_own_queue();
                 self.control(source, control);
             }
             Ok(Datagram::DataBatch(data) | Datagram::Heartbeat(data)) => {
-                if !self.enqueue(source, data.alias(), data.bytes()) {
-                    self.data(source, data.alias(), data.bytes());
+                if self.authenticated(source, data.alias()) {
+                    self.role.count(|c| &mut c.auth_bare);
+                    return;
                 }
+                self.deliver(source, data.alias(), data.bytes());
             }
             // A datagram kind a later protocol version decodes: not served.
             Ok(_) => self.role.count(|c| &mut c.unhandled),
             Err(_) => self.role.count(|c| &mut c.decode_errors),
         }
+    }
+
+    /// A DATA datagram, through its path's queue when it has one.
+    fn deliver(&mut self, source: SocketAddr, alias: Alias, bytes: &[u8]) {
+        if !self.enqueue(source, alias, bytes) {
+            self.data(source, alias, bytes);
+        }
+    }
+
+    /// The installed image `source` and `alias` are bound to, by the
+    /// session table's admission rule; reads only.
+    fn bound_image(&self, source: SocketAddr, alias: Alias) -> Option<usize> {
+        let key = BindingKey {
+            endpoint: self.endpoint,
+            source,
+            alias,
+        };
+        let slot = self.role.sessions.lookup(&key)?;
+        self.role.images.iter().position(|image| image.slot == slot)
+    }
+
+    /// Whether `source` and `alias` are bound to an authenticated image.
+    fn authenticated(&self, source: SocketAddr, alias: Alias) -> bool {
+        self.bound_image(source, alias)
+            .and_then(|index| self.role.images.get(index))
+            .is_some_and(|image| image.auth.is_some())
+    }
+
+    /// An envelope: only its `session_id`, `stream_id` and source are read
+    /// to find the binding; its image's key checks the fields, the tag and
+    /// the replay window, and only then are the inner frames classified,
+    /// which must be a domain 1 datagram of that same binding.
+    fn sealed(&mut self, source: SocketAddr, bytes: &[u8]) {
+        let Some(alias) = receive_auth::envelope_alias(bytes) else {
+            self.role.auth_unattributed.bump(AuthReason::Short);
+            self.role.count(|c| &mut c.auth_unbound);
+            return;
+        };
+        let found = self.bound_image(source, alias).and_then(|index| {
+            let auth = self.role.images.get(index)?.auth.as_deref()?;
+            let now = auth.now();
+            Some((index, now, auth.check(bytes, now)))
+        });
+        let Some((index, now, checked)) = found else {
+            self.role.auth_unattributed.bump(AuthReason::Unbound);
+            self.role.count(|c| &mut c.auth_unbound);
+            return;
+        };
+        let checked = match checked {
+            Ok(checked) => checked,
+            Err(refusal) => {
+                self.reject(index, AuthReason::of(refusal));
+                self.role.count(|c| &mut c.auth_rejected);
+                return;
+            }
+        };
+        let opened = checked.opened();
+        let inner = bytes
+            .get(opened.start..)
+            .and_then(|rest| rest.get(..opened.frames));
+        // The inner class and alias are checked before the sequence is
+        // recorded or the epoch moves: a tagged datagram refused for its
+        // inner frames consumes nothing.
+        let accepted = match inner.map(classify) {
+            Some(Ok(Datagram::DataBatch(data) | Datagram::Heartbeat(data)))
+                if data.alias() == alias =>
+            {
+                Some(Ok(data.bytes()))
+            }
+            Some(Ok(Datagram::Control(control))) if sender_frame_alias(&control) == Some(alias) => {
+                Some(Err(control))
+            }
+            _ => None,
+        };
+        let Some(accepted) = accepted else {
+            self.reject(index, AuthReason::Inner);
+            self.role.count(|c| &mut c.auth_inner_invalid);
+            return;
+        };
+        let committed = self
+            .role
+            .images
+            .get_mut(index)
+            .and_then(|image| image.auth.as_deref_mut())
+            .map(|auth| auth.commit(checked, now));
+        match committed {
+            Some(Ok(_)) => {}
+            Some(Err(refusal)) => {
+                self.reject(index, AuthReason::of(refusal));
+                self.role.count(|c| &mut c.auth_rejected);
+                return;
+            }
+            None => {
+                self.role.auth_unattributed.bump(AuthReason::Unbound);
+                self.role.count(|c| &mut c.auth_unbound);
+                return;
+            }
+        }
+        match accepted {
+            Ok(data) => self.deliver(source, alias, data),
+            Err(control) => {
+                self.drain_own_queue();
+                self.control(source, control);
+            }
+        }
+    }
+
+    /// Counts a refusal by `reason` on the image at `index`, whose binding
+    /// is one key and one source.
+    fn reject(&mut self, index: usize, reason: AuthReason) {
+        if let Some(auth) = self
+            .role
+            .images
+            .get_mut(index)
+            .and_then(|image| image.auth.as_deref_mut())
+        {
+            auth.rejections.bump(reason);
+        }
+    }
+
+    /// Whether a bare SETUP ANNOUNCE or ANSWER names an authenticated
+    /// image: its identity, or its alias on this endpoint.
+    fn names_authenticated(&self, alias: Alias, identity: Identity) -> bool {
+        self.role.images.iter().any(|image| {
+            image.auth.is_some()
+                && (image.identity == identity
+                    || (image.key.endpoint == self.endpoint && image.key.alias == alias))
+        })
+    }
+}
+
+impl<T: StreamTerms> RxHandler for Intake<'_, T> {
+    fn datagram(&mut self, datagram: RxDatagram<'_>) -> ControlFlow<()> {
+        // At most the poll budget's datagrams: no overflow.
+        self.work += 1;
+        self.role.count(|c| &mut c.datagrams);
+        let source = datagram.source();
+        self.bytes_in(source, datagram.bytes());
         ControlFlow::Continue(())
     }
 
@@ -5562,6 +5886,12 @@ impl<T: StreamTerms> SenderRole<T> {
     #[must_use]
     pub fn counters(&self) -> SenderCounters {
         self.counters
+    }
+
+    /// Takes the next control the receiver handed over, unsent (tests).
+    #[cfg(test)]
+    pub(super) fn take_control(&mut self) -> Option<ControlItem> {
+        self.from_receiver.try_take().ok().flatten()
     }
 
     /// The SETUP side's counters.
@@ -6005,6 +6335,69 @@ impl<T: StreamTerms> SenderRole<T> {
         }
     }
 
+    /// Posts, through `post` (which says whether it was posted), each late
+    /// drop report of a publication on the `etf` route (ADR-0109 point 7);
+    /// one the ring refused is posted again next cycle. A publication with
+    /// no session identity reports nothing yet.
+    pub(super) fn report_etf_late<O: SocketOps>(
+        &mut self,
+        mut post: impl FnMut(AgentEvent<O, T>) -> bool,
+    ) {
+        for outbound in &mut self.publications {
+            let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
+            let Some(identity) = self.sessions.identity(endpoint, alias) else {
+                continue;
+            };
+            let mut refused = false;
+            outbound.post_etf_late(|report, count| {
+                let lane = report.and_then(|report| u8::try_from(report.lane).ok());
+                refused = !post(AgentEvent::EtfLateDropReport {
+                    endpoint,
+                    alias,
+                    registration: identity.registration_id,
+                    report: report.zip(lane).map(|(report, lane)| (lane, report.txtime)),
+                    count,
+                });
+                !refused
+            });
+            if refused {
+                return;
+            }
+        }
+    }
+
+    /// Posts, through `post` (which says whether it was posted), the
+    /// `DeadlineMissed` of each timed lane that missed its deadline under
+    /// cancel-on-deadline, once per lane (ADR-0109 point 8); one the ring
+    /// refused is posted again next cycle.
+    pub(super) fn report_deadlines<O: SocketOps>(
+        &mut self,
+        mut post: impl FnMut(AgentEvent<O, T>) -> bool,
+    ) {
+        for outbound in &mut self.publications {
+            while let Some(lane) = outbound.deadline_unreported() {
+                let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
+                let Some(identity) = self.sessions.identity(endpoint, alias) else {
+                    break;
+                };
+                let Ok(lane_index) = u8::try_from(lane) else {
+                    break;
+                };
+                let event = AgentEvent::DeadlineMissed {
+                    endpoint,
+                    alias,
+                    registration: identity.registration_id,
+                    incarnation: identity.incarnation,
+                    lane: lane_index,
+                };
+                if !post(event) {
+                    return;
+                }
+                outbound.deadline_reported(lane);
+            }
+        }
+    }
+
     /// Stops the publication `alias` on `endpoint`: its SETUP side, its
     /// bindings and its data path, which goes back to the conductor.
     fn remove<O: SocketOps>(
@@ -6416,7 +6809,30 @@ impl<T: StreamTerms> SenderRole<T> {
         destination: SocketAddr,
         control: &Control,
     ) -> Sent {
-        self.send_with(halves, endpoint, destination, control, Mode::Now)
+        self.send_with(halves, endpoint, destination, control, Mode::Now, None)
+    }
+
+    /// [`SenderRole::send`] of a receiver's control: sealed under `seal`
+    /// for an authenticated image, never bare; bare on a trusted channel.
+    fn send_item<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        endpoint: EndpointId,
+        destination: SocketAddr,
+        control: &Control,
+        seal: Option<SharedSealer>,
+    ) -> Sent {
+        match seal {
+            None => self.send(halves, endpoint, destination, control),
+            Some(mut seal) => self.send_with(
+                halves,
+                endpoint,
+                destination,
+                control,
+                Mode::Now,
+                Some(&mut seal),
+            ),
+        }
     }
 
     /// [`SenderRole::send`] of a reply to a REGISTER or a registrant's
@@ -6428,7 +6844,7 @@ impl<T: StreamTerms> SenderRole<T> {
         destination: SocketAddr,
         control: &Control,
     ) -> Sent {
-        self.send_with(halves, endpoint, destination, control, Mode::Reply)
+        self.send_with(halves, endpoint, destination, control, Mode::Reply, None)
     }
 
     /// [`SenderRole::send`] of a control that must reach its destination
@@ -6441,7 +6857,7 @@ impl<T: StreamTerms> SenderRole<T> {
         destination: SocketAddr,
         control: &Control,
     ) -> Sent {
-        self.send_with(halves, endpoint, destination, control, Mode::Wait)
+        self.send_with(halves, endpoint, destination, control, Mode::Wait, None)
     }
 
     fn send_with<O: SocketOps>(
@@ -6451,6 +6867,7 @@ impl<T: StreamTerms> SenderRole<T> {
         destination: SocketAddr,
         control: &Control,
         mode: Mode,
+        seal: Option<&mut dyn ControlSeal>,
     ) -> Sent {
         let tx = halves.iter_mut().find_map(|(held, half)| match half {
             Half::Tx(tx) if *held == endpoint => Some(tx),
@@ -6472,10 +6889,18 @@ impl<T: StreamTerms> SenderRole<T> {
             return Sent::NotSubmitted;
         };
         slot.endpoint = Some(endpoint);
-        let result = match mode {
-            Mode::Wait => slot.routes.send_or_wait(tx, destination, control),
-            Mode::Now => slot.routes.send(tx, destination, control).map(|()| true),
-            Mode::Reply => slot
+        let sealed = seal.is_some();
+        let result = match (mode, seal) {
+            (Mode::Now, Some(seal)) => slot
+                .routes
+                .send_sealed(tx, destination, control, seal)
+                .map(|()| true),
+            // Only a control sent now is ever sealed: anything else with a
+            // seal is refused rather than sent bare.
+            (_, Some(_)) => Err(ControlSendError::Encode),
+            (Mode::Wait, None) => slot.routes.send_or_wait(tx, destination, control),
+            (Mode::Now, None) => slot.routes.send(tx, destination, control).map(|()| true),
+            (Mode::Reply, None) => slot
                 .routes
                 .send_reply(tx, destination, control)
                 .map(|()| true),
@@ -6510,7 +6935,10 @@ impl<T: StreamTerms> SenderRole<T> {
                 }
                 Sent::NotSubmitted
             }
-            Err(_) => {
+            Err(error) => {
+                if sealed && error == ControlSendError::Encode {
+                    self.count(|c| &mut c.seal_failures);
+                }
                 self.count(|c| &mut c.send_failures);
                 Sent::NotSubmitted
             }
@@ -6586,10 +7014,11 @@ impl<T: StreamTerms> SenderRole<T> {
                     destination,
                     control,
                     guard: Some(ItemGuard::Report(guard)),
+                    seal,
                 } => {
                     let mut guard = guard;
                     guard.sending((self.clock)());
-                    match self.send(halves, endpoint, destination, &control) {
+                    match self.send_item(halves, endpoint, destination, &control, seal) {
                         Sent::Submitted => guard.submitted(),
                         Sent::Uncertain => guard.uncertain(),
                         // Dropped unsettled: not submitted.
@@ -6601,8 +7030,9 @@ impl<T: StreamTerms> SenderRole<T> {
                     destination,
                     control,
                     guard,
+                    seal,
                 } => {
-                    let sent = self.send(halves, endpoint, destination, &control);
+                    let sent = self.send_item(halves, endpoint, destination, &control, seal);
                     // A NAK without a report is a receiver's copy to its
                     // control group (RC-7): its unicast NAKs carry one.
                     if matches!(control, Control::Nak(_)) {
@@ -8653,6 +9083,9 @@ fn established<T: StreamTerms>(sessions: &SendSessions, outbound: &Outbound<T>) 
 }
 
 mod path_intake;
+pub(crate) mod receive_auth;
+
+use receive_auth::{AuthReason, AuthRejections, ImageAuth};
 
 /// The receiver's redundant path settings under `config`.
 pub(crate) fn receiver_path_config(config: &AgentConfig) -> PathConfig {
