@@ -1,0 +1,3 @@
+### Added
+
+- Backups of a Cluster node to remote storage and a rebuild from them (`karyos_cluster::backup`, karyos#717): `export` copies the latest snapshot and the committed log after it through the Archive's `ObjectStore`, each object read back and checked against its CRC-32C before it counts and the manifest last; `verify` checks an export without changing anything; `rebuild` checks every object first, refuses a damaged one naming its range (`BackupError::Damaged`), refuses through an Archive hold before opening anything (`LogError::ArchiveHeld`), then streams the snapshot into a fresh store and restarts the log after its base, committed to the export's top. Each reports the index and term it reaches and what it does not include.

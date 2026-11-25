@@ -19,6 +19,7 @@
 //! `karyos-client` and `karyos-archive`, and the C ABI of `karyos-ffi`
 //! under its own `0.y.z` rule.
 
+pub mod backup;
 pub mod consensus;
 pub mod dedup;
 mod file;

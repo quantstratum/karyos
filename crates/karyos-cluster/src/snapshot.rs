@@ -299,7 +299,7 @@ pub enum SectionKind {
 }
 
 impl SectionKind {
-    fn code(self) -> u32 {
+    pub(crate) fn code(self) -> u32 {
         match self {
             Self::Consensus => 1,
             Self::Sessions => 2,
@@ -309,7 +309,7 @@ impl SectionKind {
         }
     }
 
-    fn from_code(code: u32) -> Option<Self> {
+    pub(crate) fn from_code(code: u32) -> Option<Self> {
         Some(match code {
             1 => Self::Consensus,
             2 => Self::Sessions,
