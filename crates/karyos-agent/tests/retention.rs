@@ -197,3 +197,38 @@ fn every_role_verifies_and_gets_the_archives_outcomes() {
         "{answer}"
     );
 }
+
+/// `legal-hold journal` reaches the agent's own journal, never the
+/// Archive, with the same roles; `legal-hold 7` still reaches the Archive
+/// (ADR-0113, point 3).
+#[test]
+fn the_journal_is_held_locally_and_a_number_still_reaches_the_archive() {
+    let dir = dir("journal-hold");
+    let (mut agent, sent) = agent(&dir, true);
+    assert_eq!(
+        ask(&dir, Role::Viewer, &mut agent, "legal-hold journal audit"),
+        r#"{"error":"forbidden"}"#
+    );
+    let answer = ask(&dir, Role::Operator, &mut agent, "legal-hold journal audit");
+    assert!(answer.contains(r#""evidenced":true"#), "{answer}");
+    assert!(
+        sent.lock().unwrap().is_empty(),
+        "nothing reached the Archive"
+    );
+    // A purge the role does not allow is answered forbidden; one an
+    // administrator asks is refused for the hold.
+    assert_eq!(
+        ask(&dir, Role::Operator, &mut agent, "purge journal 65536"),
+        r#"{"error":"forbidden"}"#
+    );
+    let answer = ask(&dir, Role::Administrator, &mut agent, "purge journal 65536");
+    assert!(answer.contains(r#""reason":"legal_hold""#), "{answer}");
+    let answer = ask(&dir, Role::Viewer, &mut agent, "seal-verify journal");
+    assert!(answer.contains(r#""ranges":["#), "{answer}");
+    let answer = ask(&dir, Role::Operator, &mut agent, "legal-hold 7");
+    assert!(answer.contains(r#""evidenced":true"#), "{answer}");
+    assert_eq!(
+        *sent.lock().unwrap(),
+        vec![format!("hold 7 by {}", karyos_sys::ipc::own_uid())]
+    );
+}

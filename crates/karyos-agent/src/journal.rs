@@ -44,10 +44,19 @@
 //!   `verified`, and a damaged one is `inconsistent` with `corruption` (or
 //!   `shortened_index`), the range named. [`Journal::unsealed`] is true
 //!   while a part of the recording has no seal.
+//! - **Trust** (karyos#702). With `--journal-trust` ([`JournalTrust`]),
+//!   the verification reads the directory's key registry and signed heads
+//!   under that trust, as `karyos-catalog verify --trust` does: an intact
+//!   range covered by a trusted head is no longer `untrusted_evidence`.
+//! - **Retention** (ADR-0113). Legal holds and purges of the journal run
+//!   through the Archive library's engine over this directory
+//!   ([`retention`]); [`Integrity::purged`] lists each purged prefix with
+//!   its purge evidence.
 //! - **Encoding.** Sealing changed nothing in a record's layout
 //!   ([`JournalRecord::encode`]): a journal written before it decodes as it
 //!   did, and is sealed from its start at its next durable append.
 
+pub mod retention;
 #[cfg(test)]
 mod tests;
 
@@ -57,7 +66,7 @@ use karyos_archive::catalog::{
     Catalog, CatalogError, NewRecording, SourceIncarnation, StreamFormat,
 };
 use karyos_archive::disk::StdDisk;
-use karyos_archive::integrity::anchor::{Anchor, AnchorEvidence, Externality};
+use karyos_archive::integrity::anchor::{Anchor, AnchorEvidence};
 use karyos_archive::integrity::journal::{IntegrityJournal, read_records};
 use karyos_archive::integrity::verify::{Evidence, RangeBytes, RangeReport, verify};
 use karyos_archive::queue::{QueueConfig, QueueError, QueueSource};
@@ -66,6 +75,7 @@ use karyos_archive::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
 use karyos_sys::frame::{FRAME_ALIGNMENT, FrameType, HEADER_LENGTH, Lane, Word0};
 
 use crate::retention::RangeOutcome;
+pub use retention::{JournalPolicy, JournalRetention, JournalTrust, Purged};
 
 /// The journal recording's channel.
 pub const CHANNEL: &[u8] = b"karyos:operations-journal";
@@ -642,6 +652,11 @@ pub struct Journal {
     dir: PathBuf,
     /// The last verification that could run.
     verification: Option<Integrity>,
+    /// The retention settings (ADR-0113).
+    settings: JournalRetention,
+    /// The retention engine; `None` when its ledgers cannot be opened, the
+    /// hold state then unreadable.
+    retention: Option<retention::State>,
     /// The records the open read, for tests.
     #[cfg(test)]
     pub(crate) scanned: Vec<JournalRecord>,
@@ -671,16 +686,55 @@ impl Journal {
     /// [`JournalError`] when the directory's catalog or the recording
     /// cannot be opened, or the unknown interval cannot be recorded.
     pub fn open(dir: &Path, now: u64) -> Result<Self, JournalError> {
-        Self::open_chunked(dir, now, SEAL_CHUNK)
+        Self::open_with(dir, now, JournalRetention::default())
+    }
+
+    /// [`Journal::open`] with the retention `settings` (ADR-0113): the
+    /// engine is opened, the policy recorded and outstanding purges
+    /// recovered before the first verification.
+    ///
+    /// # Errors
+    ///
+    /// As [`Journal::open`].
+    pub fn open_with(
+        dir: &Path,
+        now: u64,
+        settings: JournalRetention,
+    ) -> Result<Self, JournalError> {
+        let geometry = Geometry::with_default_length(TERM_LENGTH)?;
+        Self::open_inner(dir, now, SEAL_CHUNK, geometry, settings)
     }
 
     /// [`Journal::open`] with seals of at most `seal_chunk` bytes.
+    #[cfg(test)]
     pub(crate) fn open_chunked(
         dir: &Path,
         now: u64,
         seal_chunk: u64,
     ) -> Result<Self, JournalError> {
         let geometry = Geometry::with_default_length(TERM_LENGTH)?;
+        Self::open_inner(dir, now, seal_chunk, geometry, JournalRetention::default())
+    }
+
+    /// Tests: [`Journal::open_with`] with segments of one term, so a test
+    /// fills several.
+    #[cfg(test)]
+    pub(crate) fn open_small(
+        dir: &Path,
+        now: u64,
+        settings: JournalRetention,
+    ) -> Result<Self, JournalError> {
+        let geometry = Geometry::new(TERM_LENGTH, u64::from(TERM_LENGTH))?;
+        Self::open_inner(dir, now, SEAL_CHUNK, geometry, settings)
+    }
+
+    fn open_inner(
+        dir: &Path,
+        now: u64,
+        seal_chunk: u64,
+        geometry: Geometry,
+        settings: JournalRetention,
+    ) -> Result<Self, JournalError> {
         std::fs::create_dir_all(dir).map_err(CatalogError::Io)?;
         let mut catalog = Catalog::open(StdDisk, dir)?.catalog;
         let open = catalog
@@ -729,6 +783,8 @@ impl Journal {
             seal_chunk,
             dir: dir.to_path_buf(),
             verification: None,
+            settings,
+            retention: None,
             #[cfg(test)]
             scanned: scan.all.clone(),
             operations: scan.operations,
@@ -761,6 +817,8 @@ impl Journal {
         // This run's first record: from here on, a run that does not end
         // with a clean stop is seen as one.
         let _ = journal.append_durable(&JournalRecord::new(Kind::AgentStarted, now), now)?;
+        // Recovery before the first verification (ADR-0113, point 8).
+        journal.open_retention(now);
         journal.verify(now);
         Ok(journal)
     }
@@ -840,17 +898,23 @@ impl Journal {
         let (records, journal_fault) = read_records(&mut StdDisk, &self.dir).ok()?;
         let id = self.recording;
         let written = recorder.store().written();
-        let externality = Externality::default();
+        let trust = self.settings.trust.as_ref();
+        let externality = trust
+            .map(|trust| trust.externality.clone())
+            .unwrap_or_default();
+        let (keys, heads) = retention::trust_files(&self.dir, trust);
+        let (anchors, anchor_stores, anchor_faults) =
+            retention::anchor_stores(&self.settings.anchors);
         let evidence = Evidence {
             records: &records,
             journal_fault,
-            journal_id: 0,
-            trust: None,
-            registry: &[],
-            heads: &[],
-            anchors: &[],
-            anchor_faults: 0,
-            stores: &NoAnchors,
+            journal_id: trust.map_or(0, |trust| trust.journal_id),
+            trust: trust.map(|trust| &trust.root),
+            registry: &keys,
+            heads: &heads,
+            anchors: &anchors,
+            anchor_faults,
+            stores: &anchor_stores,
             externality: &externality,
             written: &[(id, written)],
         };
@@ -870,13 +934,15 @@ impl Journal {
                 Err(_) => RangeBytes::Missing,
             }
         });
-        Some(Integrity::of(
+        let mut integrity = Integrity::of(
             now,
             verification
                 .ranges
                 .iter()
                 .filter(|report| report.recording == id),
-        ))
+        );
+        integrity.purged = retention::purged_of(&records, id);
+        Some(integrity)
     }
 
     /// Whether an append failed: the journal then refuses every append.
@@ -963,6 +1029,17 @@ impl Journal {
         now: u64,
         durable: bool,
     ) -> Result<u64, JournalError> {
+        if self.recorder.is_none() {
+            self.count_failure(now);
+            return Err(JournalError::Unavailable);
+        }
+        // A segment left is closed, its time recorded, before this record
+        // is written (ADR-0115, point 1).
+        if let Err(error) = self.close_before(record) {
+            self.recorder = None;
+            self.count_failure(now);
+            return Err(error);
+        }
         let Some(recorder) = self.recorder.as_mut() else {
             self.count_failure(now);
             return Err(JournalError::Unavailable);
@@ -984,8 +1061,11 @@ impl Journal {
         if result.is_err() {
             self.recorder = None;
             self.count_failure(now);
-        } else if durable {
-            self.seal();
+        } else {
+            self.after_write();
+            if durable {
+                self.seal();
+            }
         }
         result
     }
@@ -1002,11 +1082,17 @@ impl Journal {
         let end = recorder.store().durable();
         // At most `seal_chunk` bytes at a time: a journal from before
         // sealing is sealed in pieces, never read whole (karyos#1071).
+        // A seal never crosses a segment boundary, so a purge may cut at
+        // any boundary sealed (ADR-0113, point 7).
         let chunk = self.seal_chunk.max(1);
+        let geometry = recorder.store().geometry();
         let sealed = (|| {
             let mut from = start;
             while from < end {
-                let to = end.min(from.saturating_add(chunk));
+                let boundary = geometry
+                    .base_of(from)
+                    .saturating_add(geometry.segment_length());
+                let to = end.min(from.saturating_add(chunk)).min(boundary);
                 let length = usize::try_from(to.saturating_sub(from)).map_err(|_| ())?;
                 self.seal_buf.resize(length, 0);
                 recorder.read(from, &mut self.seal_buf).map_err(|_| ())?;
@@ -1042,6 +1128,15 @@ impl Journal {
     #[cfg(test)]
     pub(crate) fn seal_capacity(&self) -> usize {
         self.seal_buf.capacity()
+    }
+
+    /// Tests: the recorder's store, to crash a purge part way.
+    #[cfg(test)]
+    pub(crate) fn store_mut(&mut self) -> &mut SegmentStore<StdDisk> {
+        self.recorder
+            .as_mut()
+            .expect("an available journal")
+            .store_mut()
     }
 
     /// Tests: the journal as an append failure leaves it.
@@ -1092,6 +1187,10 @@ pub struct Integrity {
     pub ranges: Vec<RangeOutcome>,
     /// Whether ranges past [`MAX_INTEGRITY_RANGES`] were left out.
     pub truncated: bool,
+    /// Each purged prefix the integrity journal chains, with its purge
+    /// evidence (ADR-0113, point 8); the ranges above say whether that
+    /// evidence is authenticated.
+    pub purged: Vec<Purged>,
 }
 
 impl Integrity {
@@ -1128,6 +1227,7 @@ impl Integrity {
             at,
             ranges,
             truncated,
+            purged: Vec::new(),
         }
     }
 }

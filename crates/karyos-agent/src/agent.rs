@@ -64,6 +64,9 @@ pub struct AgentConfig {
     /// How long a marked operation waits for its approval
     /// (`--approval-wait`).
     pub approval_wait: Duration,
+    /// The operations journal's retention policy, copies and trust
+    /// (ADR-0113): no policy by default, so no purge.
+    pub journal_retention: crate::journal::JournalRetention,
 }
 
 impl AgentConfig {
@@ -82,7 +85,15 @@ impl AgentConfig {
             agent_id: None,
             two_person: Vec::new(),
             approval_wait: crate::two_person::DEFAULT_WAIT,
+            journal_retention: crate::journal::JournalRetention::default(),
         }
+    }
+
+    /// With the operations journal's retention `settings` (ADR-0113).
+    #[must_use]
+    pub fn with_journal_retention(mut self, settings: crate::journal::JournalRetention) -> Self {
+        self.journal_retention = settings;
+        self
     }
 
     /// With `classes` marked for two people (R-CORE-20, karyos#739).
@@ -296,7 +307,7 @@ impl Agent {
         let start = host_monotonic_ns();
         let (mut journal, journal_error) = match config.journal.as_deref() {
             None => (None, None),
-            Some(dir) => match Journal::open(dir, start) {
+            Some(dir) => match Journal::open_with(dir, start, config.journal_retention.clone()) {
                 Ok(journal) => (Some(journal), None),
                 Err(error) => (None, Some(error.to_string())),
             },
@@ -568,6 +579,34 @@ impl Agent {
             self.retention.as_ref(),
             &command,
             self.config.guard_timeout,
+            host_monotonic_ns,
+        )
+    }
+
+    /// Makes a retention `operation` on the agent's own operations journal
+    /// for `requester` with `reason` (ADR-0113): the reserved recording
+    /// name `journal`. `authorised` is false for a purge the requester's
+    /// role does not allow, which is refused and journalled.
+    pub fn journal_retention(
+        &mut self,
+        operation: crate::retention::Operation,
+        requester: Requester,
+        reason: &[u8],
+        authorised: bool,
+    ) -> crate::retention::RetentionAnswer {
+        let id = self.allocate_operation();
+        let command = crate::retention::Command {
+            operation,
+            recording: crate::retention::JOURNAL_SUBJECT,
+            id,
+            operator: requester.operator,
+            relay: requester.relay,
+            reason,
+        };
+        crate::retention::journal_command(
+            self.journal.as_mut(),
+            &command,
+            authorised,
             host_monotonic_ns,
         )
     }
@@ -1496,6 +1535,13 @@ impl Agent {
             integrity_truncated: journal
                 .and_then(Journal::integrity)
                 .is_some_and(|integrity| integrity.truncated),
+            hold: journal.map(Journal::hold),
+            policy: journal.and_then(Journal::policy),
+            purged: journal
+                .and_then(Journal::integrity)
+                .map(|integrity| integrity.purged.clone())
+                .unwrap_or_default(),
+            purge_pending: journal.is_some_and(Journal::purge_pending),
         })
     }
 
@@ -1509,7 +1555,10 @@ impl Agent {
         }
         // The journal's integrity, again once its last verification is
         // old (karyos#702).
+        // A journal hold in memory only becomes durable once it can
+        // (ADR-0113, point 6).
         if let Some(journal) = self.journal.as_mut() {
+            journal.retry_hold();
             journal.verify_if_due(host_monotonic_ns());
         }
         // The periodic sweep of the approvals past their deadline

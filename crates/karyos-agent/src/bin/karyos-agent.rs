@@ -101,6 +101,31 @@ fn serve(args: karyos_agent::cli::Args) -> ExitCode {
     if let Some(journal) = args.journal {
         config = config.with_journal(journal);
     }
+    // The journal's retention (ADR-0113): a trust file that cannot be read
+    // or parsed stops the start, never a journal verified without it.
+    let trust = match args.journal_trust.as_deref() {
+        None => None,
+        Some(path) => match karyos_agent::journal::JournalTrust::load(path) {
+            Ok(trust) => Some(trust),
+            Err(error) => {
+                let _ = writeln!(std::io::stderr(), "karyos-agent: --journal-trust {error}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let retention = args.journal_copies.into_iter().fold(
+        karyos_agent::journal::JournalRetention::default()
+            .with_policy(args.journal_policy)
+            .with_trust(trust),
+        |settings, (location, dir)| settings.with_copy(location, dir),
+    );
+    let retention = args
+        .journal_anchors
+        .into_iter()
+        .fold(retention, |settings, (location, dir)| {
+            settings.with_anchors(location, dir)
+        });
+    config = config.with_journal_retention(retention);
     if let Some(id) = args.agent_id {
         config = config.with_agent_id(id);
     }

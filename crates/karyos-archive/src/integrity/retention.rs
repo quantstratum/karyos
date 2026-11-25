@@ -556,6 +556,19 @@ pub enum Operation {
         /// The reason's code.
         reason: u8,
     },
+    /// A writer closed the segment `[base, end)` of `recording` at
+    /// `closed_ns` on the host's wall clock (ADR-0115): the agent's
+    /// operations journal's expiry clock. Holds and intents ignore it.
+    SegmentClosed {
+        /// The recording.
+        recording: u64,
+        /// The segment's base.
+        base: u64,
+        /// Its end, exclusive.
+        end: u64,
+        /// When it closed, in ns of the host's wall clock.
+        closed_ns: u64,
+    },
 }
 
 impl Operation {
@@ -586,6 +599,12 @@ impl Operation {
             } => (4, reason, [id, recording, 0, 0, 0, 0]),
             Self::PurgeDone { id } => (5, 0, [id, 0, 0, 0, 0, 0]),
             Self::PurgeCancelled { id, reason } => (6, reason, [id, 0, 0, 0, 0, 0]),
+            Self::SegmentClosed {
+                recording,
+                base,
+                end,
+                closed_ns,
+            } => (7, 0, [recording, base, end, closed_ns, 0, 0]),
         };
         let mut out = [0u8; OPERATION_LENGTH];
         let head = [kind, reason, 0, 0, 0, 0, 0, 0];
@@ -633,6 +652,12 @@ impl Operation {
             6 => Self::PurgeCancelled {
                 id: word(0),
                 reason,
+            },
+            7 => Self::SegmentClosed {
+                recording: word(0),
+                base: word(1),
+                end: word(2),
+                closed_ns: word(3),
             },
             _ => return None,
         })
@@ -1074,7 +1099,7 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
                     state.intents.remove(&id);
                     state.froms.remove(&id);
                 }
-                Some(Operation::PurgeRejected { .. }) => {}
+                Some(Operation::PurgeRejected { .. } | Operation::SegmentClosed { .. }) => {}
                 None => {
                     self.holds_unknown = true;
                     return false;
@@ -1166,6 +1191,28 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
     #[must_use]
     pub fn hold(&self, recording: u64) -> Option<Hold> {
         self.holds.get(&recording).copied()
+    }
+
+    /// Records in the operations journal that a writer closed segment
+    /// `[base, end)` of `recording` at `closed_ns` on the host's wall
+    /// clock (ADR-0115), durably; the record's digest.
+    ///
+    /// # Errors
+    ///
+    /// The operations journal's.
+    pub fn record_segment_close(
+        &mut self,
+        recording: u64,
+        base: u64,
+        end: u64,
+        closed_ns: u64,
+    ) -> io::Result<Digest> {
+        self.operations.append(&Operation::SegmentClosed {
+            recording,
+            base,
+            end,
+            closed_ns,
+        })
     }
 
     /// The purge intents outstanding.

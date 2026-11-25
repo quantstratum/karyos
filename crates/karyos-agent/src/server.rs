@@ -852,6 +852,7 @@ impl Server {
                 Request::Retention {
                     operation,
                     recording,
+                    journal,
                     reason,
                 },
             ) => {
@@ -861,7 +862,27 @@ impl Server {
                     Operation::Hold => role.may_hold(),
                     _ => role.may_release_or_purge(),
                 };
-                if allowed {
+                if journal {
+                    // The agent's own journal (ADR-0113): the same roles;
+                    // a purge the role does not allow is still journalled,
+                    // refused `not_authorised`, and answered as forbidden.
+                    let purge = matches!(operation, Operation::Purge { .. });
+                    if allowed || purge {
+                        let answer = agent.journal_retention(
+                            operation,
+                            requester,
+                            reason.as_bytes(),
+                            allowed,
+                        );
+                        if allowed {
+                            (json::retention_answer(&answer), Served::Operated)
+                        } else {
+                            forbidden()
+                        }
+                    } else {
+                        forbidden()
+                    }
+                } else if allowed {
                     let answer =
                         agent.retention(operation, recording, requester, reason.as_bytes());
                     (json::retention_answer(&answer), Served::Operated)
@@ -1240,6 +1261,10 @@ enum Request<'a> {
     Retention {
         operation: crate::retention::Operation,
         recording: u64,
+        /// The reserved recording name `journal`: the agent's own
+        /// operations journal, not an Archive recording (ADR-0113);
+        /// `recording` is then [`crate::retention::JOURNAL_SUBJECT`].
+        journal: bool,
         reason: &'a str,
     },
     Limits {
@@ -1548,6 +1573,16 @@ const fn clearance(role: Role) -> crate::cluster_admin::Clearance {
     }
 }
 
+/// A retention request's `RECORDING`: the reserved name `journal`, the
+/// agent's own operations journal (ADR-0113), recognised before any
+/// numeric conversion; else an Archive recording's number.
+fn target(word: &str) -> Option<(u64, bool)> {
+    if word == "journal" {
+        return Some((crate::retention::JOURNAL_SUBJECT, true));
+    }
+    word.parse::<u64>().ok().map(|recording| (recording, false))
+}
+
 fn request(rest: &str) -> Option<Request<'_>> {
     let (name, arguments) = rest.split_once(' ').unwrap_or((rest, ""));
     let number = |word: &str| word.parse::<u64>().ok();
@@ -1633,19 +1668,22 @@ fn request(rest: &str) -> Option<Request<'_>> {
                 _ if reason.is_empty() => crate::retention::Operation::Verify,
                 _ => return Some(Request::BadArguments("seal-verify")),
             };
+            let (recording, journal) = target(recording)?;
             Some(Request::Retention {
                 operation,
-                recording: number(recording)?,
+                recording,
+                journal,
                 reason,
             })
         }
         "purge" => {
             let mut fields = arguments.splitn(3, ' ');
-            let recording = number(fields.next()?)?;
+            let (recording, journal) = target(fields.next()?)?;
             let before = number(fields.next()?)?;
             Some(Request::Retention {
                 operation: crate::retention::Operation::Purge { before },
                 recording,
+                journal,
                 reason: fields.next().unwrap_or(""),
             })
         }
@@ -1736,6 +1774,50 @@ fn request(rest: &str) -> Option<Request<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reserved recording name `journal` (ADR-0113) parses in each of
+    /// the four retention requests, only in the recording position; a
+    /// numeric recording still names an Archive's.
+    #[test]
+    fn journal_is_a_recording_name_of_the_four_retention_requests() {
+        use crate::retention::{JOURNAL_SUBJECT, Operation};
+        let retention = |operation, recording, journal, reason| Request::Retention {
+            operation,
+            recording,
+            journal,
+            reason,
+        };
+        for (line, operation, reason) in [
+            ("legal-hold journal audit 12", Operation::Hold, "audit 12"),
+            ("hold-release journal closed", Operation::Release, "closed"),
+            (
+                "purge journal 65536 expired",
+                Operation::Purge { before: 65_536 },
+                "expired",
+            ),
+            ("seal-verify journal", Operation::Verify, ""),
+        ] {
+            assert_eq!(
+                parse(&format!("KARYOS-AGENT 1 {line}\n")),
+                retention(operation, JOURNAL_SUBJECT, true, reason),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            parse("KARYOS-AGENT 1 legal-hold 7\n"),
+            retention(Operation::Hold, 7, false, "")
+        );
+        assert_eq!(
+            parse("KARYOS-AGENT 1 legal-hold 7 journal\n"),
+            retention(Operation::Hold, 7, false, "journal")
+        );
+        assert_eq!(parse("KARYOS-AGENT 1 purge 7 journal\n"), Request::Bad);
+        assert_eq!(parse("KARYOS-AGENT 1 purge journals 64\n"), Request::Bad);
+        assert_eq!(
+            parse("KARYOS-AGENT 1 seal-verify journal now\n"),
+            Request::BadArguments("seal-verify")
+        );
+    }
 
     #[test]
     fn requests_parse_strictly() {

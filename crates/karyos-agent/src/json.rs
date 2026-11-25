@@ -254,7 +254,47 @@ fn journal_view(out: &mut Out<'_>, journal: &JournalView) {
         fields
             .key("integrity_truncated")
             .bool(journal.integrity_truncated);
+        // Retention (ADR-0113, point 9).
+        fields
+            .key("hold")
+            .option(journal.hold, |out, hold| out.string(hold));
+        fields.key("policy").option(journal.policy, |out, policy| {
+            out.object(|fields| {
+                fields.number("id", policy.policy);
+                fields.number("version", policy.version);
+                fields.number("retain_for_ns", policy.retain_for_ns);
+                fields.number("min_copies", u64::from(policy.min_copies.get()));
+                fields.string(
+                    "purge",
+                    match policy.purge {
+                        karyos_archive::integrity::retention::PurgeMode::AfterExpiry => {
+                            "after_expiry"
+                        }
+                        _ => "manual",
+                    },
+                );
+            });
+        });
+        fields.key("purged").array(&journal.purged, |out, purged| {
+            out.object(|fields| {
+                fields.number("start", purged.start);
+                fields.number("end", purged.end);
+                fields.number("counter", purged.counter);
+                fields.string("seals", &hex(&purged.seals));
+                fields.string("record", &hex(&purged.record));
+            });
+        });
+        fields.key("purge_pending").bool(journal.purge_pending);
     });
+}
+
+/// `bytes` as lowercase hex.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
 }
 
 /// One range's integrity outcome, the verifier's names.
@@ -443,6 +483,11 @@ pub fn retention_answer(answer: &crate::retention::RetentionAnswer) -> String {
         RetentionAnswer::JournalUnavailable => fields.string("error", "journal unavailable"),
         RetentionAnswer::NoArchive => fields.string("error", "no archive"),
         RetentionAnswer::Busy => fields.string("error", "busy"),
+        RetentionAnswer::HoldNotDurable { operation } => {
+            fields.string("error", "hold not durable");
+            fields.number("operation", operation);
+            fields.key("evidenced").bool(false);
+        }
     });
     text
 }

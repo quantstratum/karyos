@@ -15,6 +15,12 @@
 //! - A **seal verification** reads; its request is journalled without
 //!   waiting, like a hold.
 //!
+//! The reserved recording name `journal` (ADR-0113) names the agent's own
+//! operations journal instead: [`journal_command`] runs the same four
+//! operations, with the same roles, answers and journalling, through the
+//! Archive library's engine over the journal's directory
+//! ([`crate::journal::retention`]), never an Archive.
+//!
 //! The Archive is reached through [`RetentionBackend`]. The agent adds no
 //! verdict of its own: a refusal carries the Archive's code and reason, and
 //! a verification carries each range's outcome and reasons as the
@@ -32,6 +38,8 @@
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
+pub use crate::journal::retention::JOURNAL_SUBJECT;
+use crate::journal::retention::refusal_word;
 use crate::journal::{Journal, JournalRecord, Kind, MAX_REASON, UNKNOWN_OUTCOME};
 
 /// An Archive backend shared with the worker that calls it: every call
@@ -64,6 +72,9 @@ pub enum RetentionReply {
     },
     /// No answer: it may or may not have taken effect.
     NoAnswer,
+    /// A hold of the journal in force in this process only: neither its
+    /// marker nor its record could be written (ADR-0113, point 6).
+    HoldNotDurable,
 }
 
 /// One range's integrity outcome, as the Archive's verifier reported it.
@@ -177,6 +188,13 @@ pub enum RetentionAnswer {
     Busy,
     /// Sent, and no answer came.
     NoAnswer {
+        /// The operation id.
+        operation: u64,
+    },
+    /// A hold of the journal in force in this process only (ADR-0113):
+    /// it inhibits every purge of the journal until a later poll makes it
+    /// durable, and a restart would lose it.
+    HoldNotDurable {
         /// The operation id.
         operation: u64,
     },
@@ -308,17 +326,85 @@ pub fn retention_command(
         Some(Raw::Ranges(None)) | None => RetentionAnswer::NoAnswer { operation: id },
     };
     if let Some(journal) = journal {
-        let mut record = command.record(outcome, now());
-        match &answer {
-            RetentionAnswer::Done { evidenced, .. } => record.word = u64::from(*evidenced),
-            RetentionAnswer::Refused { code, .. } => record.code = *code,
-            RetentionAnswer::Verified { ranges, .. } => {
-                record.word = u64::try_from(ranges.len()).unwrap_or(u64::MAX);
-            }
-            _ => record.code = UNKNOWN_OUTCOME,
-        }
+        let record = outcome_record(command, outcome, &answer, now());
         let _ = journal.append(&record, record.time);
     }
+    answer
+}
+
+/// The outcome record of `command` that came to `answer`.
+fn outcome_record(
+    command: &Command<'_>,
+    outcome: Kind,
+    answer: &RetentionAnswer,
+    now: u64,
+) -> JournalRecord {
+    let mut record = command.record(outcome, now);
+    match answer {
+        RetentionAnswer::Done { evidenced, .. } => record.word = u64::from(*evidenced),
+        RetentionAnswer::Refused { code, .. } => record.code = *code,
+        RetentionAnswer::Verified { ranges, .. } => {
+            record.word = u64::try_from(ranges.len()).unwrap_or(u64::MAX);
+        }
+        _ => record.code = UNKNOWN_OUTCOME,
+    }
+    record
+}
+
+/// Makes `command` on the agent's own operations journal (ADR-0113),
+/// `command.recording` being [`JOURNAL_SUBJECT`]: journalled as
+/// [`retention_command`] journals an Archive's, a release and a purge
+/// only after their request is durable, and run through the journal's
+/// retention engine on this thread. `authorised` is false for a purge the
+/// requester's role does not allow: refused `not_authorised`, journalled.
+/// A refusal's outcome record keeps the reason's code in its `word`
+/// ([`refusal_word`]).
+pub fn journal_command(
+    journal: Option<&mut Journal>,
+    command: &Command<'_>,
+    authorised: bool,
+    mut now: impl FnMut() -> u64,
+) -> RetentionAnswer {
+    let Some(journal) = journal else {
+        return RetentionAnswer::JournalUnavailable;
+    };
+    let (request, outcome) = command.operation.kinds();
+    let record = command.record(request, now());
+    if command.operation.fails_closed() {
+        if journal.append_durable(&record, record.time).is_err() {
+            return RetentionAnswer::JournalUnavailable;
+        }
+    } else {
+        // Preserving or reading goes ahead: a failed append is counted.
+        let _ = journal.append(&record, record.time);
+    }
+    let id = command.id;
+    let answer = match command.operation {
+        Operation::Hold => reply(id, journal.hold_journal()),
+        Operation::Release => reply(id, journal.release_journal()),
+        Operation::Purge { before } => {
+            let authorisation = karyos_archive::integrity::retention::Authorisation {
+                operator: u64::from(command.operator),
+                authorised,
+            };
+            reply(id, journal.purge_journal(id, before, authorisation, now()))
+        }
+        Operation::Verify => {
+            journal.verify(now());
+            match journal.integrity() {
+                Some(integrity) => RetentionAnswer::Verified {
+                    operation: id,
+                    ranges: integrity.ranges.clone(),
+                },
+                None => RetentionAnswer::NoAnswer { operation: id },
+            }
+        }
+    };
+    let mut record = outcome_record(command, outcome, &answer, now());
+    if let RetentionAnswer::Refused { reason, .. } = &answer {
+        record.word = refusal_word(reason);
+    }
+    let _ = journal.append(&record, record.time);
     answer
 }
 
@@ -334,6 +420,7 @@ fn reply(operation: u64, reply: RetentionReply) -> RetentionAnswer {
             reason,
         },
         RetentionReply::NoAnswer => RetentionAnswer::NoAnswer { operation },
+        RetentionReply::HoldNotDurable => RetentionAnswer::HoldNotDurable { operation },
     }
 }
 

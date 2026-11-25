@@ -359,9 +359,11 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
         &mut self.source
     }
 
-    /// The store, to read it back: tests, and the sealing of its durable
-    /// ranges (A10).
-    pub(crate) fn store_mut(&mut self) -> &mut SegmentStore<D> {
+    /// The store, to read it back: tests, the sealing of its durable
+    /// ranges (A10), and the purges of the store's one writer (the agent's
+    /// operations journal, ADR-0113): the store's own primitives, never a
+    /// write of its bytes.
+    pub fn store_mut(&mut self) -> &mut SegmentStore<D> {
         &mut self.store
     }
 

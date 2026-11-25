@@ -12,7 +12,9 @@ usage: karyos-agent --api-dir DIR --driver DIR [--driver DIR]... \
 [--lag-refreshes N] [--loss-quiet N] [--archive DIR=REQ,RESP[,STATE]]... \
 [--journal DIR] [--agent-id NAME] [--relay UID=ID]... \
 [--principal NAME=OPERATOR:ROLE]... [--relay-group GID] [--stop-timeout-ms MS] \
-[--two-person CLASS[,CLASS...]]... [--approval-wait MS]
+[--two-person CLASS[,CLASS...]]... [--approval-wait MS] \
+[--journal-retention POLICY] [--journal-copy LOCATION=DIR]... [--journal-trust FILE] \\
+[--journal-anchors HEX=DIR]...
 
 Serves API v1 (JSON) on DIR/agent.sock to the uids given a role (viewer,
 operator, risk-officer, administrator, registrar), reading each driver's
@@ -48,7 +50,17 @@ close cannot be marked); a marked operation is answered pending_approval,
 performs nothing, and waits for approve OPID by another principal, or
 withdraw OPID by its requester, for --approval-wait MS milliseconds
 (default 600000, 10 minutes; at most 86400000, 24 hours); it needs the
-journal. Linux only.
+journal. --journal-retention retain_for=DURATION[,purge=manual|after_expiry]
+[,min_copies=N] is the journal's retention policy (ADR-0113; DURATION in
+ns, us, ms or s; min_copies 1 by default); without it no purge of the journal is allowed, and holds
+still apply. --journal-copy names a copy of the journal directory in DIR
+held at LOCATION, verified before each purge decision; a purge needs
+min_copies of them verified. --journal-trust FILE verifies the journal,
+and its copies, under the trust file karyos-catalog verify --trust reads.
+--journal-anchors HEX=DIR adds the operator export anchor store in DIR
+at location HEX to the journal's verification, as karyos-catalog verify
+--anchors: an anchored, trusted, intact range is verified. Each needs
+--journal. Linux only.
 
 A request is one line: KARYOS-AGENT 1 view, or
 KARYOS-AGENT 1 guard-close DIR GUARD [REASON] (operator, risk-officer),
@@ -67,7 +79,12 @@ or KARYOS-AGENT 1 guard-close-preview DIR GUARD [REASON] and
 guard-reopen-preview DIR GUARD [REASON], then submit OPID TOKEN
 guard-close|guard-reopen DIR GUARD [REASON] with the preview's token and
 the caller's operation id (the roles of the operation), or KARYOS-AGENT 1
-approve OPID and withdraw OPID for an operation pending approval.
+approve OPID and withdraw OPID for an operation pending approval, or
+the retention requests legal-hold RECORDING [REASON] (operator,
+risk-officer, administrator), hold-release RECORDING [REASON] and purge
+RECORDING BEFORE [REASON] (administrator) and seal-verify RECORDING, where
+RECORDING is an Archive recording's number or journal, the agent's own
+operations journal.
 ";
 
 /// The default bound of a signal stop (karyos#710).
@@ -110,6 +127,14 @@ pub struct Args {
     pub two_person: Vec<crate::two_person::TwoPersonClass>,
     /// How long a marked operation waits for its approval.
     pub approval_wait: Duration,
+    /// The journal's retention policy (ADR-0113).
+    pub journal_policy: Option<crate::journal::JournalPolicy>,
+    /// The journal's copies: each location's name and directory.
+    pub journal_copies: Vec<(String, PathBuf)>,
+    /// The journal's trust file.
+    pub journal_trust: Option<PathBuf>,
+    /// The journal's anchor stores: each location and directory.
+    pub journal_anchors: Vec<([u8; 32], PathBuf)>,
 }
 
 /// Parses `args` (without the program name); `None` for anything this
@@ -130,12 +155,40 @@ pub fn parse(args: &[String]) -> Option<Args> {
     let mut stop_timeout = None;
     let mut two_person: Vec<crate::two_person::TwoPersonClass> = Vec::new();
     let mut approval_wait = None;
+    let mut journal_policy = None;
+    let mut journal_copies: Vec<(String, PathBuf)> = Vec::new();
+    let mut journal_trust = None;
+    let mut journal_anchors: Vec<([u8; 32], PathBuf)> = Vec::new();
     let mut args = args.iter();
     while let Some(flag) = args.next() {
         let value = args.next()?;
         match flag.as_str() {
             "--api-dir" if api_dir.is_none() => api_dir = Some(PathBuf::from(value)),
             "--journal" if journal.is_none() => journal = Some(PathBuf::from(value)),
+            "--journal-retention" if journal_policy.is_none() => {
+                journal_policy = Some(crate::journal::JournalPolicy::parse(value)?);
+            }
+            "--journal-trust" if journal_trust.is_none() => {
+                journal_trust = Some(PathBuf::from(value));
+            }
+            "--journal-anchors" => {
+                let anchors = crate::journal::retention::parse_anchors(value)?;
+                if journal_anchors.iter().any(|(taken, _)| *taken == anchors.0) {
+                    return None;
+                }
+                journal_anchors.push(anchors);
+            }
+            "--journal-copy" => {
+                let (location, dir) = value.split_once('=')?;
+                // One copy per location, each a directory.
+                if location.is_empty()
+                    || dir.is_empty()
+                    || journal_copies.iter().any(|(taken, _)| taken == location)
+                {
+                    return None;
+                }
+                journal_copies.push((location.to_owned(), PathBuf::from(dir)));
+            }
             "--agent-id" if agent_id.is_none() => {
                 if !crate::api::valid_agent_id(value) {
                     return None;
@@ -259,6 +312,11 @@ pub fn parse(args: &[String]) -> Option<Args> {
             .any(|(_, operator, _)| roles.iter().any(|(uid, _)| uid == operator))
         || (relays.is_empty() != principals.is_empty())
         || (relay_group.is_some() && relays.is_empty())
+        || (journal.is_none()
+            && (journal_policy.is_some()
+                || !journal_copies.is_empty()
+                || journal_trust.is_some()
+                || !journal_anchors.is_empty()))
     {
         return None;
     }
@@ -277,6 +335,10 @@ pub fn parse(args: &[String]) -> Option<Args> {
         stop_timeout: stop_timeout.unwrap_or(DEFAULT_STOP_TIMEOUT),
         two_person,
         approval_wait: approval_wait.unwrap_or(crate::two_person::DEFAULT_WAIT),
+        journal_policy,
+        journal_copies,
+        journal_trust,
+        journal_anchors,
     })
 }
 
@@ -291,6 +353,73 @@ mod tests {
     }
 
     /// karyos#739: `--two-person` takes the classes, a guard close never;
+    /// The journal's retention options (ADR-0113) parse, each needs
+    /// `--journal`, and a malformed or repeated one is refused.
+    #[test]
+    fn the_journal_retention_options_parse() {
+        let base = "--api-dir /run/agent --driver /run/a --role 1000=viewer --journal /j";
+        let parsed = parse(&args(&format!(
+            "{base} --journal-retention retain_for=604800s,purge=after_expiry,min_copies=2 \
+             --journal-copy vault=/mnt/vault --journal-copy tape=/mnt/tape \
+             --journal-trust /etc/karyos/trust --journal-anchors {}=/mnt/anchors",
+            "ab".repeat(32)
+        )))
+        .unwrap();
+        let policy = parsed.journal_policy.unwrap();
+        assert_eq!(policy.retain_for_ns, 7 * 86_400_000_000_000);
+        assert_eq!(policy.min_copies.get(), 2);
+        assert_eq!(
+            policy.purge,
+            karyos_archive::integrity::retention::PurgeMode::AfterExpiry
+        );
+        assert_eq!(parsed.journal_copies.len(), 2);
+        assert_eq!(
+            parsed.journal_trust,
+            Some(PathBuf::from("/etc/karyos/trust"))
+        );
+        assert_eq!(
+            parsed.journal_anchors,
+            vec![([0xab; 32], PathBuf::from("/mnt/anchors"))]
+        );
+        let policy = parse(&args(&format!(
+            "{base} --journal-retention retain_for=3600s"
+        )))
+        .unwrap()
+        .journal_policy
+        .unwrap();
+        assert_eq!(policy.min_copies.get(), 1);
+        assert_eq!(
+            policy.purge,
+            karyos_archive::integrity::retention::PurgeMode::Manual
+        );
+        for bad in [
+            "--journal-retention purge=manual",
+            "--journal-retention retain_for=0s",
+            "--journal-retention retain_for=3600s,min_copies=0",
+            "--journal-retention retain_for=3600s,keep=1",
+            "--journal-retention retain_for=3600s,retain_for=7200s",
+            "--journal-copy vault",
+            "--journal-copy vault=/a --journal-copy vault=/b",
+            "--journal-trust /a --journal-trust /b",
+            "--journal-anchors ab=/a",
+            "--journal-anchors /a",
+        ] {
+            assert!(parse(&args(&format!("{base} {bad}"))).is_none(), "{bad}");
+        }
+        let without = "--api-dir /run/agent --driver /run/a --role 1000=viewer";
+        for option in [
+            "--journal-retention retain_for=3600s",
+            "--journal-copy vault=/a",
+            "--journal-trust /a",
+            "--journal-anchors 0000000000000000000000000000000000000000000000000000000000000000=/a",
+        ] {
+            assert!(
+                parse(&args(&format!("{without} {option}"))).is_none(),
+                "{option}"
+            );
+        }
+    }
+
     /// `--approval-wait` defaults to 10 minutes and takes at most 24 hours.
     #[test]
     fn two_person_classes_and_the_wait_parse_within_their_bounds() {

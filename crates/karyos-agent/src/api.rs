@@ -312,6 +312,20 @@ pub struct JournalView {
     pub integrity: Option<Vec<crate::retention::RangeOutcome>>,
     /// Whether ranges past that bound were left out.
     pub integrity_truncated: bool,
+    /// The journal's legal hold (ADR-0113): `none`, `pending`, `held`,
+    /// `unknown` (its state cannot be read: every purge is refused) or
+    /// `not_durable` (in force in memory only); `None` when the journal
+    /// could not be opened.
+    pub hold: Option<&'static str>,
+    /// The journal's retention policy in force; `None` for none, when
+    /// every purge is refused.
+    pub policy: Option<karyos_archive::integrity::retention::RetentionPolicy>,
+    /// Each purged prefix, with its purge evidence, from the last
+    /// verification.
+    pub purged: Vec<crate::journal::Purged>,
+    /// Whether a purge intent is outstanding: every further purge is
+    /// refused until it is reconciled.
+    pub purge_pending: bool,
 }
 
 /// An unknown interval in the journal: operations may have taken effect

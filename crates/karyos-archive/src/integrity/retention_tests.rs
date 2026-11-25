@@ -657,6 +657,12 @@ fn operations_round_trip_through_their_bytes() {
         },
         Operation::PurgeDone { id: 1 },
         Operation::PurgeCancelled { id: 1, reason: 5 },
+        Operation::SegmentClosed {
+            recording: 3,
+            base: 65_536,
+            end: 131_072,
+            closed_ns: 9,
+        },
     ] {
         assert_eq!(Operation::decode(&operation.encode()), Some(operation));
     }
