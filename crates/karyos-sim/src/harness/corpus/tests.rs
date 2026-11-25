@@ -309,3 +309,56 @@ fn a_minimisation_cut_by_its_budget_is_marked_not_minimal() {
     assert!(full.minimal);
     assert!(full.case.schedule.len() <= cut.case.schedule.len());
 }
+
+/// With a trace directory, a named seed's trace goes to its own file, one
+/// JSON string per trace line, and its line names the file, the count and
+/// the digest of its bytes; a seed not named writes no file.
+#[test]
+fn a_named_seed_writes_its_trace_to_a_file_its_line_names() {
+    let cases = W1::skeleton().cases();
+    let one = |_seed: u64| cases[..1].to_vec();
+    let dir = std::env::temp_dir().join(format!("karyos-corpus-traces-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut out = Vec::new();
+    let _ = run_corpus_with_traces::<Reference>(
+        "reference",
+        Evidence::HarnessValidation,
+        &[("W1", &one)],
+        (10..=11, 1),
+        &mut out,
+        &dir,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), 2);
+    let outcome = run::<Reference>(&cases[0], 10).unwrap();
+    let relative = format!("W1/{}/10.trace", slug(&cases[0].name));
+    let written = std::fs::read_to_string(dir.join(&relative)).unwrap();
+    let expected: String = outcome
+        .trace
+        .iter()
+        .map(|line| format!("{}\n", string(line)))
+        .collect();
+    assert_eq!(written, expected);
+    let named = lines[0];
+    assert!(
+        named.contains(&format!(
+            "\"trace\":{{\"file\":{},\"lines\":{},\"digest\":{}}}",
+            string(&relative),
+            outcome.trace.len(),
+            fnv1a(written.as_bytes())
+        )),
+        "{named}"
+    );
+    assert_eq!(field(lines[1], "trace"), "null");
+    assert!(
+        !dir.join(format!("W1/{}/11.trace", slug(&cases[0].name)))
+            .exists()
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(
+        slug("W2 n=3 clients=32 window=8"),
+        "W2-n-3-clients-32-window-8"
+    );
+}

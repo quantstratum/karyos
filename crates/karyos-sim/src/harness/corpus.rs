@@ -23,8 +23,14 @@
 //!   its last ([`Phase`]); the [`Summary`] counts the seeds of each fault
 //!   kind per workload in each phase.
 //! - **Named seeds** ([`NAMED_SEEDS`], 1 to 10 of the CI corpus) carry
-//!   their run's full trace in their line, so the same schedules can be
-//!   compared across variants and rerun by anyone.
+//!   their run's full trace, so the same schedules can be compared across
+//!   variants and rerun by anyone. [`run_corpus`] puts it in the line;
+//!   [`run_corpus_with_traces`], the C5 runner's form, writes it to a file
+//!   of its own and puts the file in the line (a W2 or W5 trace runs to
+//!   tens of megabytes): `"trace":{"file":...,"lines":...,"digest":...}`,
+//!   the path relative to the trace directory, the count of trace lines,
+//!   and FNV-1a 64 over the file's bytes. A trace file holds one JSON
+//!   string per line, one per trace line, in order.
 //! - **Minimised traces.** A failing run's line carries its case shrunk
 //!   ([`minimise`]): the schedule's faults removed one at a time, and then
 //!   its steps halved, while the run still fails the same check under the
@@ -33,6 +39,7 @@
 
 use std::io::Write;
 use std::ops::RangeInclusive;
+use std::path::{Path, PathBuf};
 
 use std::collections::BTreeMap;
 
@@ -248,6 +255,74 @@ fn minimise_within<C: ConsensusCore>(
     })
 }
 
+/// Where a run's traces go: into its line, or into files of their own
+/// under a directory.
+#[derive(Clone, Copy)]
+enum Traces<'a> {
+    Inline,
+    Files(&'a Path),
+}
+
+impl Traces<'_> {
+    /// `lines` as the line's JSON value: the array itself, or the file it
+    /// was written to, `name` under `workload` and the case's directory.
+    fn put(
+        self,
+        workload: &str,
+        case: &Case,
+        name: &str,
+        lines: &[String],
+    ) -> std::io::Result<String> {
+        let Traces::Files(dir) = self else {
+            return Ok(trace(lines));
+        };
+        let relative = PathBuf::from(slug(workload))
+            .join(slug(&case.name))
+            .join(name);
+        let mut text = String::new();
+        for line in lines {
+            text.push_str(&string(line));
+            text.push('\n');
+        }
+        let path = dir.join(&relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, text.as_bytes())?;
+        Ok(format!(
+            "{{\"file\":{},\"lines\":{},\"digest\":{}}}",
+            string(&relative.to_string_lossy()),
+            lines.len(),
+            fnv1a(text.as_bytes())
+        ))
+    }
+}
+
+/// A name as a path component: ASCII letters and digits kept, every other
+/// run of characters one `-`.
+fn slug(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_owned()
+}
+
+/// FNV-1a 64 over `bytes`.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        // FNV's multiplication wraps by the hash's definition.
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
 /// One workload: its name and its cases under a seed (W4's survival modes
 /// are seeded).
 pub type Workload<'a> = (&'a str, &'a dyn Fn(u64) -> Vec<Case>);
@@ -266,8 +341,38 @@ pub fn run_corpus<C: ConsensusCore>(
     core: &str,
     evidence: Evidence,
     workloads: &[Workload<'_>],
+    range: (RangeInclusive<u64>, u32),
+    out: &mut impl Write,
+) -> std::io::Result<Summary> {
+    corpus::<C>(core, evidence, workloads, range, out, Traces::Inline)
+}
+
+/// [`run_corpus`], with each named seed's trace and each minimised trace
+/// written to a file of its own under `traces` and referenced from its
+/// line: `<workload>/<case>/<seed>.trace` and
+/// `<workload>/<case>/<seed>.minimised.trace`, names as path slugs.
+///
+/// # Errors
+///
+/// The writer's error, or a trace file's.
+pub fn run_corpus_with_traces<C: ConsensusCore>(
+    core: &str,
+    evidence: Evidence,
+    workloads: &[Workload<'_>],
+    range: (RangeInclusive<u64>, u32),
+    out: &mut impl Write,
+    traces: &Path,
+) -> std::io::Result<Summary> {
+    corpus::<C>(core, evidence, workloads, range, out, Traces::Files(traces))
+}
+
+fn corpus<C: ConsensusCore>(
+    core: &str,
+    evidence: Evidence,
+    workloads: &[Workload<'_>],
     (seeds, repetitions): (RangeInclusive<u64>, u32),
     out: &mut impl Write,
+    traces: Traces<'_>,
 ) -> std::io::Result<Summary> {
     let mut summary = Summary::default();
     for seed in seeds {
@@ -343,6 +448,21 @@ pub fn run_corpus<C: ConsensusCore>(
                     }
                     _ => None,
                 };
+                let trace = trace
+                    .map(|lines| traces.put(workload, case, &format!("{seed}.trace"), &lines))
+                    .transpose()?;
+                let minimised = minimised
+                    .map(|shrunk| {
+                        traces
+                            .put(
+                                workload,
+                                case,
+                                &format!("{seed}.minimised.trace"),
+                                &shrunk.trace,
+                            )
+                            .map(|trace| (shrunk, trace))
+                    })
+                    .transpose()?;
                 let line = Line {
                     evidence,
                     core,
@@ -356,7 +476,9 @@ pub fn run_corpus<C: ConsensusCore>(
                     error: error.as_deref(),
                     faults: &faults,
                     trace: trace.as_deref(),
-                    minimised: minimised.as_ref(),
+                    minimised: minimised
+                        .as_ref()
+                        .map(|(shrunk, trace)| (shrunk, trace.as_str())),
                 };
                 writeln!(out, "{}", line.json())?;
             }
@@ -378,8 +500,10 @@ struct Line<'a> {
     digest: Option<u64>,
     error: Option<&'a str>,
     faults: &'a [super::workloads::FaultPhase],
-    trace: Option<&'a [String]>,
-    minimised: Option<&'a Minimised>,
+    /// The trace's JSON value: inline or its file.
+    trace: Option<&'a str>,
+    /// The shrunk case and its trace's JSON value.
+    minimised: Option<(&'a Minimised, &'a str)>,
 }
 
 /// A schedule as JSON strings, `step:action`.
@@ -421,13 +545,13 @@ impl Line<'_> {
             .collect();
         let minimised = self.minimised.map_or_else(
             || "null".to_owned(),
-            |shrunk| {
+            |(shrunk, trace)| {
                 format!(
                     "{{\"minimal\":{},\"steps\":{},\"schedule\":[{}],\"trace\":{}}}",
                     shrunk.minimal,
                     shrunk.case.steps,
                     schedule_json(&shrunk.case),
-                    trace(&shrunk.trace)
+                    trace
                 )
             },
         );
@@ -460,7 +584,7 @@ impl Line<'_> {
                 .map_or_else(|| "null".to_owned(), |digest| digest.to_string()),
             self.error.map_or_else(|| "null".to_owned(), string),
             coverage.join(","),
-            self.trace.map_or_else(|| "null".to_owned(), trace),
+            self.trace.unwrap_or("null"),
             minimised,
         )
     }

@@ -31,7 +31,9 @@
 //! to 101,000, split by range across processes), `KARYOS_C5_CORES` a
 //! comma-separated subset of `raft,openraft,custom`, and `KARYOS_C5_OUT`
 //! the directory the files go in (default: Cargo's `CARGO_TARGET_TMPDIR`
-//! for this test), named `c5-v2-<core>-<first>-<last>.jsonl`. A gate's
+//! for this test), named `c5-v2-<core>-<first>-<last>.jsonl`, with the
+//! named seeds' and minimised traces under `c5-v2-<core>-<first>-<last>.traces/`,
+//! each referenced from its line (`harness::corpus::run_corpus_with_traces`). A gate's
 //! failure is a result in the lines, never a failed test; the test fails
 //! only when the runner cannot run or write them.
 
@@ -49,7 +51,7 @@ use karyos_raft_eval::openraft_core::{self, OpenRaft};
 use karyos_raft_eval::raft_rs::{self, RaftRs};
 use karyos_raft_eval::variant::{CUSTOM, Variant};
 use karyos_sim::harness::core::ConsensusCore;
-use karyos_sim::harness::corpus::{Evidence, Summary, Workload, run_corpus};
+use karyos_sim::harness::corpus::{Evidence, Summary, Workload, run_corpus_with_traces};
 use karyos_sim::harness::custom::Custom;
 use karyos_sim::harness::workloads::{Case, W1, W2, W3, W4, W5, W6};
 
@@ -163,11 +165,13 @@ fn corpus(
     out: &Path,
 ) -> Summary {
     let file = std::fs::File::create(out).unwrap();
+    let traces = out.with_extension("traces");
+    let _ = std::fs::remove_dir_all(&traces);
     let mut writer = BufWriter::new(file);
     let summary = match name {
-        "raft" => run::<RaftRs>(core, workloads, range, &mut writer),
-        "openraft" => run::<OpenRaft>(core, workloads, range, &mut writer),
-        "custom" => run::<Custom>(core, workloads, range, &mut writer),
+        "raft" => run::<RaftRs>(core, workloads, range, &mut writer, &traces),
+        "openraft" => run::<OpenRaft>(core, workloads, range, &mut writer, &traces),
+        "custom" => run::<Custom>(core, workloads, range, &mut writer, &traces),
         _ => panic!("unknown core {name}: raft, openraft or custom"),
     };
     writer.flush().unwrap();
@@ -180,8 +184,10 @@ fn run<C: ConsensusCore>(
     workloads: &[Workload<'_>],
     range: (RangeInclusive<u64>, u32),
     out: &mut impl std::io::Write,
+    traces: &Path,
 ) -> Summary {
-    run_corpus::<C>(core, Evidence::C5Version2, workloads, range, out).unwrap()
+    run_corpus_with_traces::<C>(core, Evidence::C5Version2, workloads, range, out, traces)
+        .unwrap()
 }
 
 /// A core's build by name.
