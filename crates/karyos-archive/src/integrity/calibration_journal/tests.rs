@@ -325,6 +325,23 @@ fn one_writer_at_a_time() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A lock a spawned child holds for a moment (a copy of the lock until its
+/// exec, karyos_sys::spawn_window) is waited for, not answered `Locked`.
+#[test]
+fn a_lock_held_for_a_moment_is_waited_for() {
+    let dir = temp_dir("lock-moment");
+    let journal = CalibrationJournal::open(StdDisk, &dir).unwrap();
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(journal);
+    });
+    let reopened = CalibrationJournal::open(StdDisk, &dir);
+    holder.join().unwrap();
+    assert!(reopened.is_ok(), "{:?}", reopened.err());
+    drop(reopened);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// A torn tail past the committed position is never read, by a reader
 /// nor by the writer that recovers it.
 #[test]
