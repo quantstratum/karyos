@@ -4,8 +4,8 @@
 //! karyos/design/management-agent-gap-analysis.md, M10 and its new owner
 //! item 7, decided as item 51(7) of the 2026-10-21 owner decisions,
 //! interim; not item 7 of those decisions): an Archive recording in the agent's journal directory, written
-//! through the Archive's [`Recorder`] from a [`QueueSource`], and shown as
-//! unsealed until A10 seals it.
+//! through the Archive's [`Recorder`] from a [`QueueSource`], and sealed by
+//! the Archive's integrity journal (**Sealing**, below).
 //!
 //! - **One recording.** The directory's catalog holds the journal as one
 //!   `required` recording on channel [`CHANNEL`]. The agent resumes the open
@@ -34,21 +34,56 @@
 //!   the directory reports its ranges. A seal that fails stops the sealing
 //!   until the agent restarts, and counts in [`Journal::failed_seals`]; the
 //!   journal itself goes on, its later ranges shown unsealed.
+//! - **Verification** (karyos#702). [`Journal::verify`] runs the Archive's
+//!   verifier over the directory's integrity journal and the recording, as
+//!   `karyos-catalog verify` does without a trust file, and keeps each
+//!   range's outcome and reasons under the verifier's own names, adjacent
+//!   ranges with the same outcome and reasons merged into one. The agent
+//!   holds no trust root for the journal: an intact sealed range is
+//!   `inconsistent` with `untrusted_evidence` and `missing_evidence`, never
+//!   `verified`, and a damaged one is `inconsistent` with `corruption` (or
+//!   `shortened_index`), the range named. [`Journal::unsealed`] is true
+//!   while a part of the recording has no seal.
+//! - **Trust** (karyos#702). With `--journal-trust` ([`JournalTrust`]),
+//!   the verification reads the directory's key registry and signed heads
+//!   under that trust, as `karyos-catalog verify --trust` does: an intact
+//!   range covered by a trusted head is no longer `untrusted_evidence`.
+//! - **Retention** (ADR-0113). Legal holds and purges of the journal run
+//!   through the Archive library's engine over this directory
+//!   ([`retention`]); [`Integrity::purged`] lists each purged prefix with
+//!   its purge evidence.
+//! - **History** (R-CORE-14; karyos#725). [`Journal::history`] serves
+//!   the durable records in pages, with a cursor a reader keeps across
+//!   restarts, the retention floor, unknown intervals in place and a
+//!   sequence a reader checks for gaps ([`history`]).
+//! - **Encoding.** Sealing changed nothing in a record's layout
+//!   ([`JournalRecord::encode`]): a journal written before it decodes as it
+//!   did, and is sealed from its start at its next durable append.
 
+pub mod history;
+pub mod retention;
 #[cfg(test)]
 mod tests;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use karyos_archive::catalog::{
     Catalog, CatalogError, NewRecording, SourceIncarnation, StreamFormat,
 };
 use karyos_archive::disk::StdDisk;
-use karyos_archive::integrity::journal::IntegrityJournal;
+use karyos_archive::integrity::anchor::{Anchor, AnchorEvidence};
+use karyos_archive::integrity::journal::{IntegrityJournal, read_records};
+use karyos_archive::integrity::verify::{Evidence, RangeBytes, RangeReport, verify};
 use karyos_archive::queue::{QueueConfig, QueueError, QueueSource};
 use karyos_archive::recorder::{Mode, Recorder, RecorderError};
 use karyos_archive::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
 use karyos_sys::frame::{FRAME_ALIGNMENT, FrameType, HEADER_LENGTH, Lane, Word0};
+
+use crate::retention::RangeOutcome;
+pub use history::{
+    HISTORY_DEFAULT, HISTORY_MAX, HistoryCursor, HistoryPage, HistoryRecord, HistoryRefusal,
+};
+pub use retention::{JournalPolicy, JournalRetention, JournalTrust, Purged};
 
 /// The journal recording's channel.
 pub const CHANNEL: &[u8] = b"karyos:operations-journal";
@@ -62,6 +97,12 @@ const VERSION: u64 = 1;
 const WORDS: usize = 11;
 /// The most bytes one seal reads (karyos#1071).
 const SEAL_CHUNK: u64 = 1 << 20;
+/// How long a verification of the journal stands before the agent runs
+/// the next (karyos#702): a minute.
+pub const VERIFY_PERIOD_NS: u64 = 60_000_000_000;
+/// The most ranges a verification keeps, adjacent ones with the same
+/// outcome and reasons merged first.
+pub const MAX_INTEGRITY_RANGES: usize = 16;
 /// Bytes queued at most before the recorder takes them.
 const MAX_QUEUED: u64 = 1 << 20;
 /// The journal's largest frame: a term.
@@ -148,6 +189,30 @@ pub enum Kind {
     /// An admin command the agent refused before sending it: its
     /// [`crate::cluster_admin::RefusalCode`] in `code`.
     ClusterRefused,
+    /// A marked operation entered the two-person flow (R-CORE-20,
+    /// karyos#739, ADR-0112), durable before it is answered
+    /// `pending_approval`: the operation id, the requester (`operator`,
+    /// `relay`), the reason, the class in `parameters` (1 a guard reopen,
+    /// 2 a Cluster command), the guard and the epoch it acts at
+    /// (`guard`, `expected`) and the wait in nanoseconds (`word`); after
+    /// the relay word the target (the driver's directory or the Cluster's
+    /// name), the command's name, this host's boot, the parameter bytes
+    /// and the target's instance ([`JournalRecord::bytes`],
+    /// [`JournalRecord::instance`]). It consumes the preview's token and
+    /// reserves the id.
+    ApprovalRequested,
+    /// A distinct principal approved the pending operation (`operator`
+    /// and `relay` the approver's), durable before it is dispatched.
+    ApprovalGranted,
+    /// The requester withdrew the pending operation.
+    ApprovalWithdrawn,
+    /// The operation ended without being sent, its
+    /// `approval::EndCode` in `code` and its text in `reason`:
+    /// its deadline passed, the agent restarted while it was pending or
+    /// before its dispatch, or at approval its target had changed, its
+    /// Cluster was busy, its dispatch record could not be made durable or
+    /// its driver was unavailable.
+    ApprovalExpired,
 }
 
 impl Kind {
@@ -175,6 +240,43 @@ impl Kind {
             Self::ClusterRequest => 20,
             Self::ClusterOutcome => 21,
             Self::ClusterRefused => 22,
+            Self::ApprovalRequested => 23,
+            Self::ApprovalGranted => 24,
+            Self::ApprovalWithdrawn => 25,
+            Self::ApprovalExpired => 26,
+        }
+    }
+
+    /// Its name in the journal's history (R-CORE-14; karyos#725).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::CloseRequest => "close_request",
+            Self::CloseOutcome => "close_outcome",
+            Self::ReopenRequest => "reopen_request",
+            Self::ReopenOutcome => "reopen_outcome",
+            Self::UnknownInterval => "unknown_interval",
+            Self::GapAcknowledged => "gap_acknowledged",
+            Self::AgentStopped => "agent_stopped",
+            Self::AgentStarted => "agent_started",
+            Self::HoldRequest => "hold_request",
+            Self::HoldOutcome => "hold_outcome",
+            Self::ReleaseRequest => "release_request",
+            Self::ReleaseOutcome => "release_outcome",
+            Self::PurgeRequest => "purge_request",
+            Self::PurgeOutcome => "purge_outcome",
+            Self::VerifyRequest => "verify_request",
+            Self::VerifyOutcome => "verify_outcome",
+            Self::RateRequest => "rate_request",
+            Self::RateOutcome => "rate_outcome",
+            Self::Submitted => "submitted",
+            Self::ClusterRequest => "cluster_request",
+            Self::ClusterOutcome => "cluster_outcome",
+            Self::ClusterRefused => "cluster_refused",
+            Self::ApprovalRequested => "approval_requested",
+            Self::ApprovalGranted => "approval_granted",
+            Self::ApprovalWithdrawn => "approval_withdrawn",
+            Self::ApprovalExpired => "approval_expired",
         }
     }
 
@@ -202,6 +304,10 @@ impl Kind {
             20 => Self::ClusterRequest,
             21 => Self::ClusterOutcome,
             22 => Self::ClusterRefused,
+            23 => Self::ApprovalRequested,
+            24 => Self::ApprovalGranted,
+            25 => Self::ApprovalWithdrawn,
+            26 => Self::ApprovalExpired,
             _ => return None,
         })
     }
@@ -226,6 +332,28 @@ impl Kind {
         matches!(
             self,
             Self::ClusterRequest | Self::ClusterOutcome | Self::ClusterRefused
+        )
+    }
+
+    /// Whether its record establishes an operation id the agent rebuilds
+    /// at start (karyos#738, karyos#739, karyos#772): a purge never
+    /// removes one whose id is still retained.
+    pub(crate) const fn establishes_id(self) -> bool {
+        matches!(
+            self,
+            Self::ApprovalRequested | Self::Submitted | Self::ClusterRequest
+        )
+    }
+
+    /// Whether it is one of the two-person flow's records (karyos#739),
+    /// which carry the approval fields after the relay word.
+    pub(crate) const fn is_approval(self) -> bool {
+        matches!(
+            self,
+            Self::ApprovalRequested
+                | Self::ApprovalGranted
+                | Self::ApprovalWithdrawn
+                | Self::ApprovalExpired
         )
     }
 }
@@ -276,6 +404,13 @@ pub struct JournalRecord {
     /// `<algorithm>:<hex digest>`; empty when none was attached, and for
     /// every other kind.
     pub evidence: Vec<u8>,
+    /// An approval record's parameter bytes, a Cluster command's
+    /// (karyos#739); empty for every other kind.
+    pub bytes: Vec<u8>,
+    /// An approval record's target instance (karyos#739): the driver's, or
+    /// the attach instance of the gateway that registered the Cluster; 0
+    /// for every other kind.
+    pub instance: u128,
 }
 
 impl JournalRecord {
@@ -298,6 +433,8 @@ impl JournalRecord {
             boot: Vec::new(),
             command: Vec::new(),
             evidence: Vec::new(),
+            bytes: Vec::new(),
+            instance: 0,
         }
     }
 
@@ -308,7 +445,9 @@ impl JournalRecord {
     /// word (karyos#708). A [`Kind::Submitted`] record always has the relay
     /// word, then its target and boot, each after its length word; a
     /// Cluster record (karyos#772) the relay word, then its target, command
-    /// and evidence the same way. A record no relay carried is byte for byte what
+    /// and evidence the same way; an approval record (karyos#739) the relay
+    /// word, then its target, command, boot, parameter bytes and instance
+    /// (16 little-endian bytes) the same way. A record no relay carried is byte for byte what
     /// it was before relays, and a reader of the layout that stops at the
     /// reason reads either.
     #[must_use]
@@ -329,12 +468,21 @@ impl JournalRecord {
         ];
         let mut out: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
         out.extend_from_slice(reason);
+        let instance = self.instance.to_le_bytes().to_vec();
         let fields: &[&Vec<u8>] = if self.kind == Kind::Submitted {
             // The relay word always, then the target and the boot, each
             // after its length word (karyos#738).
             &[&self.target, &self.boot]
         } else if self.kind.is_cluster() {
             &[&self.target, &self.command, &self.evidence]
+        } else if self.kind.is_approval() {
+            &[
+                &self.target,
+                &self.command,
+                &self.boot,
+                &self.bytes,
+                &instance,
+            ]
         } else {
             &[]
         };
@@ -371,7 +519,9 @@ impl JournalRecord {
         let mut boot = Vec::new();
         let mut command = Vec::new();
         let mut evidence = Vec::new();
-        let relay = if kind == Kind::Submitted || kind.is_cluster() {
+        let mut bytes = Vec::new();
+        let mut instance = 0;
+        let relay = if kind == Kind::Submitted || kind.is_cluster() || kind.is_approval() {
             // The relay word, then the fields by length.
             let (relay, mut rest) = tail.split_first_chunk::<8>()?;
             let mut field = || -> Option<Vec<u8>> {
@@ -384,6 +534,11 @@ impl JournalRecord {
             target = field()?;
             if kind == Kind::Submitted {
                 boot = field()?;
+            } else if kind.is_approval() {
+                command = field()?;
+                boot = field()?;
+                bytes = field()?;
+                instance = u128::from_le_bytes(field()?.try_into().ok()?);
             } else {
                 command = field()?;
                 evidence = field()?;
@@ -415,6 +570,8 @@ impl JournalRecord {
             boot,
             command,
             evidence,
+            bytes,
+            instance,
         })
     }
 }
@@ -459,6 +616,18 @@ impl GapReason {
             Self::UncleanStop => 3,
             Self::JournalReplaced => 4,
             Self::JournalUnavailableAtStart => 5,
+        }
+    }
+
+    /// Its name, as the view and the history show it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::RequestWithoutOutcome => "request_without_outcome",
+            Self::TornTail => "torn_tail",
+            Self::UncleanStop => "unclean_stop",
+            Self::JournalReplaced => "journal_replaced",
+            Self::JournalUnavailableAtStart => "journal_unavailable_at_start",
         }
     }
 
@@ -514,6 +683,11 @@ pub enum JournalError {
     /// The record was written but did not become durable.
     #[error("the journal record is not durable")]
     NotDurable,
+    /// The segment the record would leave could not be closed first: its
+    /// seal, the wall clock or its close entry failed (ADR-0115, point 1).
+    /// Nothing was written; the next append tries the close again.
+    #[error("the journal segment could not be closed")]
+    NotClosed,
     /// No unknown interval is open, or another one is.
     #[error("no such unknown interval")]
     NoGap,
@@ -528,7 +702,7 @@ pub enum JournalError {
 /// The operations journal (see the module).
 #[derive(Debug)]
 pub struct Journal {
-    recorder: Option<Recorder<StdDisk, QueueSource>>,
+    recorder: Option<JournalRecorder>,
     recording: u64,
     failed_appends: u64,
     /// Host time of the first failed append.
@@ -542,17 +716,39 @@ pub struct Journal {
     seal_buf: Vec<u8>,
     /// The most bytes one seal reads.
     seal_chunk: u64,
+    /// The journal's directory, which a verification reads.
+    dir: PathBuf,
+    /// The last verification that could run.
+    verification: Option<Integrity>,
+    /// The retention settings (ADR-0113).
+    settings: JournalRetention,
+    /// The retention engine; `None` when its ledgers cannot be opened, the
+    /// hold state then unreadable.
+    retention: Option<retention::State>,
+    /// A close entry failed: the retention ledger is poisoned until it is
+    /// reopened, which the next rollover does first (ADR-0115, point 1).
+    reopen_retention: bool,
     /// The records the open read, for tests.
     #[cfg(test)]
     pub(crate) scanned: Vec<JournalRecord>,
-    /// The [`Kind::Submitted`] records the open read, until taken.
+    /// The records the agent rebuilds its operation ids from, until taken
+    /// ([`Journal::take_operations`]).
     operations: Vec<JournalRecord>,
+    /// Where each record that establishes an operation id is, with that
+    /// id, oldest first ([`Kind::establishes_id`]).
+    id_records: Vec<(u64, u64)>,
 }
+
+/// The journal's recorder.
+pub(crate) type JournalRecorder = Recorder<StdDisk, QueueSource>;
 
 impl Journal {
     /// The [`Kind::Submitted`] and [`Kind::ClusterRequest`] records the
     /// open read, oldest first, taken once (karyos#738, karyos#772): the
-    /// agent rebuilds its retained outcomes and caller ids from them.
+    /// agent rebuilds its retained outcomes and caller ids from them. With
+    /// them, the two-person flow's records and the dispatch records it
+    /// follows (karyos#739): [`Kind::ReopenRequest`],
+    /// [`Kind::ClusterOutcome`] and the four approval kinds.
     pub fn take_operations(&mut self) -> Vec<JournalRecord> {
         std::mem::take(&mut self.operations)
     }
@@ -567,16 +763,55 @@ impl Journal {
     /// [`JournalError`] when the directory's catalog or the recording
     /// cannot be opened, or the unknown interval cannot be recorded.
     pub fn open(dir: &Path, now: u64) -> Result<Self, JournalError> {
-        Self::open_chunked(dir, now, SEAL_CHUNK)
+        Self::open_with(dir, now, JournalRetention::default())
+    }
+
+    /// [`Journal::open`] with the retention `settings` (ADR-0113): the
+    /// engine is opened, the policy recorded and outstanding purges
+    /// recovered before the first verification.
+    ///
+    /// # Errors
+    ///
+    /// As [`Journal::open`].
+    pub fn open_with(
+        dir: &Path,
+        now: u64,
+        settings: JournalRetention,
+    ) -> Result<Self, JournalError> {
+        let geometry = Geometry::with_default_length(TERM_LENGTH)?;
+        Self::open_inner(dir, now, SEAL_CHUNK, geometry, settings)
     }
 
     /// [`Journal::open`] with seals of at most `seal_chunk` bytes.
+    #[cfg(test)]
     pub(crate) fn open_chunked(
         dir: &Path,
         now: u64,
         seal_chunk: u64,
     ) -> Result<Self, JournalError> {
         let geometry = Geometry::with_default_length(TERM_LENGTH)?;
+        Self::open_inner(dir, now, seal_chunk, geometry, JournalRetention::default())
+    }
+
+    /// Tests: [`Journal::open_with`] with segments of one term, so a test
+    /// fills several.
+    #[cfg(test)]
+    pub(crate) fn open_small(
+        dir: &Path,
+        now: u64,
+        settings: JournalRetention,
+    ) -> Result<Self, JournalError> {
+        let geometry = Geometry::new(TERM_LENGTH, u64::from(TERM_LENGTH))?;
+        Self::open_inner(dir, now, SEAL_CHUNK, geometry, settings)
+    }
+
+    fn open_inner(
+        dir: &Path,
+        now: u64,
+        seal_chunk: u64,
+        geometry: Geometry,
+        settings: JournalRetention,
+    ) -> Result<Self, JournalError> {
         std::fs::create_dir_all(dir).map_err(CatalogError::Io)?;
         let mut catalog = Catalog::open(StdDisk, dir)?.catalog;
         let open = catalog
@@ -623,10 +858,19 @@ impl Journal {
             integrity,
             seal_buf: Vec::new(),
             seal_chunk,
+            dir: dir.to_path_buf(),
+            verification: None,
+            settings,
+            retention: None,
+            reopen_retention: false,
             #[cfg(test)]
             scanned: scan.all.clone(),
             operations: scan.operations,
+            id_records: scan.id_records,
         };
+        // The close times first: this start's records never land in a
+        // segment already closed (ADR-0115, point 1).
+        journal.open_retention();
         let last = scan.last.as_ref().map(|last| last.kind);
         let reason = if cut {
             Some(GapReason::TornTail)
@@ -655,6 +899,9 @@ impl Journal {
         // This run's first record: from here on, a run that does not end
         // with a clean stop is seen as one.
         let _ = journal.append_durable(&JournalRecord::new(Kind::AgentStarted, now), now)?;
+        // Recovery before the first verification (ADR-0113, point 8).
+        journal.recover_purges(now);
+        journal.verify(now);
         Ok(journal)
     }
 
@@ -682,6 +929,102 @@ impl Journal {
     #[must_use]
     pub const fn failed_seals(&self) -> u64 {
         self.failed_seals
+    }
+
+    /// Whether a part of the recording has no seal (karyos#702): a seal
+    /// failed, or the integrity journal could not be opened; records were
+    /// written past the sealed end, until the next durable append seals
+    /// them; or an append failed, and that end is no longer known.
+    #[must_use]
+    pub fn unsealed(&self) -> bool {
+        let (Some(recorder), Some(integrity)) = (self.recorder.as_ref(), self.integrity.as_ref())
+        else {
+            return true;
+        };
+        let store = recorder.store();
+        self.failed_seals > 0
+            || integrity
+                .sealed_end(self.recording)
+                .unwrap_or(store.start())
+                < store.written()
+    }
+
+    /// The last verification that could run (see the module).
+    #[must_use]
+    pub const fn integrity(&self) -> Option<&Integrity> {
+        self.verification.as_ref()
+    }
+
+    /// Verifies the journal at host time `now` when the last verification
+    /// is [`VERIFY_PERIOD_NS`] old, or none ran.
+    pub fn verify_if_due(&mut self, now: u64) {
+        let due = self
+            .verification
+            .as_ref()
+            .is_none_or(|last| now.saturating_sub(last.at) >= VERIFY_PERIOD_NS);
+        if due {
+            self.verify(now);
+        }
+    }
+
+    /// Verifies the journal's recording at host time `now` with the
+    /// Archive's verifier (see the module); [`Journal::integrity`] then
+    /// reports it. Nothing is kept when the journal is unavailable or its
+    /// integrity journal cannot be read.
+    pub fn verify(&mut self, now: u64) {
+        self.verification = self.verified(now);
+    }
+
+    fn verified(&mut self, now: u64) -> Option<Integrity> {
+        let recorder = self.recorder.as_mut()?;
+        let (records, journal_fault) = read_records(&mut StdDisk, &self.dir).ok()?;
+        let id = self.recording;
+        let written = recorder.store().written();
+        let trust = self.settings.trust.as_ref();
+        let externality = trust
+            .map(|trust| trust.externality.clone())
+            .unwrap_or_default();
+        let (keys, heads) = retention::trust_files(&self.dir, trust);
+        let (anchors, anchor_stores, anchor_faults) =
+            retention::anchor_stores(&self.settings.anchors);
+        let evidence = Evidence {
+            records: &records,
+            journal_fault,
+            journal_id: trust.map_or(0, |trust| trust.journal_id),
+            trust: trust.map(|trust| &trust.root),
+            registry: &keys,
+            heads: &heads,
+            anchors: &anchors,
+            anchor_faults,
+            stores: &anchor_stores,
+            externality: &externality,
+            written: &[(id, written)],
+        };
+        let verification = verify(&evidence, |recording, start, end| {
+            // The journal's own ranges only, within what it wrote: a seal
+            // is corrupt input, checked before anything is allocated.
+            let Some(length) = end
+                .checked_sub(start)
+                .filter(|_| recording == id && end <= written)
+                .and_then(|length| usize::try_from(length).ok())
+            else {
+                return RangeBytes::Missing;
+            };
+            let mut bytes = vec![0; length];
+            match recorder.read(start, &mut bytes) {
+                Ok(()) => RangeBytes::Bytes(bytes),
+                Err(_) => RangeBytes::Missing,
+            }
+        });
+        let mut integrity = Integrity::of(
+            now,
+            verification
+                .ranges
+                .iter()
+                .filter(|report| report.recording == id),
+        );
+        integrity.purged = retention::purged_of(&records, id);
+        Some(integrity)
     }
 
     /// Whether an append failed: the journal then refuses every append.
@@ -768,6 +1111,20 @@ impl Journal {
         now: u64,
         durable: bool,
     ) -> Result<u64, JournalError> {
+        if self.recorder.is_none() {
+            self.count_failure(now);
+            return Err(JournalError::Unavailable);
+        }
+        // A segment left is closed, its time recorded, before this record
+        // is written (ADR-0115, point 1). A close that could not be made
+        // writes nothing and is tried again at the next append.
+        if let Err(error) = self.close_before(record, now) {
+            if !matches!(error, JournalError::NotClosed) {
+                self.recorder = None;
+            }
+            self.count_failure(now);
+            return Err(error);
+        }
         let Some(recorder) = self.recorder.as_mut() else {
             self.count_failure(now);
             return Err(JournalError::Unavailable);
@@ -789,8 +1146,16 @@ impl Journal {
         if result.is_err() {
             self.recorder = None;
             self.count_failure(now);
-        } else if durable {
-            self.seal();
+        } else {
+            if let Ok(position) = result
+                && record.kind.establishes_id()
+            {
+                self.id_records.push((position, record.operation));
+            }
+            self.after_write();
+            if durable {
+                self.seal();
+            }
         }
         result
     }
@@ -807,11 +1172,17 @@ impl Journal {
         let end = recorder.store().durable();
         // At most `seal_chunk` bytes at a time: a journal from before
         // sealing is sealed in pieces, never read whole (karyos#1071).
+        // A seal never crosses a segment boundary, so a purge may cut at
+        // any boundary sealed (ADR-0113, point 7).
         let chunk = self.seal_chunk.max(1);
+        let geometry = recorder.store().geometry();
         let sealed = (|| {
             let mut from = start;
             while from < end {
-                let to = end.min(from.saturating_add(chunk));
+                let boundary = geometry
+                    .base_of(from)
+                    .saturating_add(geometry.segment_length());
+                let to = end.min(from.saturating_add(chunk)).min(boundary);
                 let length = usize::try_from(to.saturating_sub(from)).map_err(|_| ())?;
                 self.seal_buf.resize(length, 0);
                 recorder.read(from, &mut self.seal_buf).map_err(|_| ())?;
@@ -849,10 +1220,40 @@ impl Journal {
         self.seal_buf.capacity()
     }
 
+    /// Tests: the recorder's store, to crash a purge part way.
+    #[cfg(test)]
+    pub(crate) fn store_mut(&mut self) -> &mut SegmentStore<StdDisk> {
+        self.recorder
+            .as_mut()
+            .expect("an available journal")
+            .store_mut()
+    }
+
     /// Tests: the journal as an append failure leaves it.
     #[cfg(test)]
     pub(crate) fn break_recorder(&mut self) {
         self.recorder = None;
+    }
+
+    /// Tests: flips the byte at `position` of the recording's first
+    /// segment on disk, as media damage would.
+    #[cfg(test)]
+    pub(crate) fn damage(&self, position: u64) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let recorder = self.recorder.as_ref().expect("an available journal");
+        let (data, _) = recorder.store().segment_paths(0);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(data)
+            .expect("the segment opens");
+        let mut byte = [0u8; 1];
+        file.seek(SeekFrom::Start(position)).expect("seek");
+        file.read_exact(&mut byte).expect("read");
+        file.seek(SeekFrom::Start(position)).expect("seek");
+        file.write_all(&[byte[0] ^ 0xff]).expect("write");
+        file.sync_all().expect("sync");
     }
 
     fn count_failure(&mut self, now: u64) {
@@ -861,6 +1262,73 @@ impl Journal {
         if let Some(next) = self.failed_appends.checked_add(1) {
             self.failed_appends = next;
         }
+    }
+}
+
+/// A verification of the journal's recording (karyos#702).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Integrity {
+    /// When it ran: host `CLOCK_MONOTONIC` nanoseconds.
+    pub at: u64,
+    /// Each range's outcome and reasons, the verifier's names, in order;
+    /// adjacent ranges with the same outcome and reasons are one, and at
+    /// most [`MAX_INTEGRITY_RANGES`] are kept.
+    pub ranges: Vec<RangeOutcome>,
+    /// Whether ranges past [`MAX_INTEGRITY_RANGES`] were left out.
+    pub truncated: bool,
+    /// Each purged prefix the integrity journal chains, with its purge
+    /// evidence (ADR-0113, point 8); the ranges above say whether that
+    /// evidence is authenticated.
+    pub purged: Vec<Purged>,
+}
+
+impl Integrity {
+    fn of<'a>(at: u64, reports: impl Iterator<Item = &'a RangeReport>) -> Self {
+        let mut ranges: Vec<RangeOutcome> = Vec::new();
+        let mut truncated = false;
+        for report in reports {
+            let outcome = report.outcome.name();
+            let reasons: Vec<String> = report
+                .reasons
+                .iter()
+                .map(|reason| reason.name().to_owned())
+                .collect();
+            if let Some(last) = ranges.last_mut()
+                && last.end == report.start
+                && last.outcome == outcome
+                && last.reasons == reasons
+            {
+                last.end = report.end;
+                continue;
+            }
+            if ranges.len() == MAX_INTEGRITY_RANGES {
+                truncated = true;
+                break;
+            }
+            ranges.push(RangeOutcome {
+                start: report.start,
+                end: report.end,
+                outcome: outcome.to_owned(),
+                reasons,
+            });
+        }
+        Self {
+            at,
+            ranges,
+            truncated,
+            purged: Vec::new(),
+        }
+    }
+}
+
+/// The anchor stores a verification of the journal reads: none.
+#[derive(Debug)]
+struct NoAnchors;
+
+impl AnchorEvidence for NoAnchors {
+    fn confirms(&self, _anchor: &Anchor) -> bool {
+        false
     }
 }
 
@@ -911,6 +1379,9 @@ struct Scan {
     /// first: the agent's retained outcomes and caller ids are rebuilt from
     /// them (karyos#738, karyos#772).
     operations: Vec<JournalRecord>,
+    /// Where each record that establishes an operation id is, with that
+    /// id ([`Kind::establishes_id`]).
+    id_records: Vec<(u64, u64)>,
 }
 
 /// Reads every frame of `store`, oldest first.
@@ -966,8 +1437,18 @@ fn scan(store: &mut SegmentStore<StdDisk>) -> Result<Scan, JournalError> {
                 }
                 #[cfg(test)]
                 found.all.push(record.clone());
-                if matches!(record.kind, Kind::Submitted | Kind::ClusterRequest) {
+                if matches!(
+                    record.kind,
+                    Kind::Submitted
+                        | Kind::ClusterRequest
+                        | Kind::ClusterOutcome
+                        | Kind::ReopenRequest
+                ) || record.kind.is_approval()
+                {
                     found.operations.push(record.clone());
+                }
+                if record.kind.establishes_id() {
+                    found.id_records.push((position, record.operation));
                 }
                 found.last = Some(record);
             }

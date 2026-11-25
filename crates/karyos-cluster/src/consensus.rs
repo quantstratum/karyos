@@ -112,7 +112,8 @@ pub trait Effects {
     /// `index`; durable before any [`Effects::send_after_persist`]
     /// message of this call is sent.
     fn write(&mut self, index: u64, skip: u64);
-    /// Append a leader's no-op entry of `term` at `index`.
+    /// Append a leader's no-op entry of `term` at `index`, its
+    /// `event_time` stamped by [`crate::log::stamp`] (ADR-0111).
     fn append(&mut self, index: u64, term: u64);
     /// Send `message` to `to` now.
     fn send(&mut self, to: u64, message: Message);
@@ -837,7 +838,10 @@ impl Core {
 
     /// The leader's next entry, of `size` bytes: the driver writes it at
     /// the returned index with the returned term, then calls
-    /// [`Core::replicate`].
+    /// [`Core::replicate`]. The driver stamps its `event_time`, as that of
+    /// the no-op [`Effects::append`] asks for, with [`crate::log::stamp`]
+    /// against its log's watermark (contract C-TIME, ADR-0111): the core
+    /// keeps no time of its own.
     ///
     /// # Errors
     ///

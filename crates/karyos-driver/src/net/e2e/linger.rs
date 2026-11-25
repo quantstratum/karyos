@@ -689,6 +689,7 @@ fn a_removed_two_path_publication_ends_at_its_eos_on_both_paths() {
         reliable: true,
         flow_control: None,
         security: Security::Trusted,
+        etf: None,
     };
     let (mut a, mut b) = (lingering(200 * MS), lingering(200 * MS));
     for side in [&mut a, &mut b] {

@@ -281,6 +281,21 @@ struct Timed {
     /// Per lane, whether its consumer's violation was reported to the
     /// conductor (`AgentEvent::ScheduleViolated`, posted once).
     reported: Vec<bool>,
+    /// Per lane, whether its missed deadline was reported to the conductor
+    /// (`AgentEvent::DeadlineMissed`, posted once).
+    missed_reported: Vec<bool>,
+}
+
+/// The etf route's drop handling of one publication (ADR-0109 points 6
+/// to 8), allocated at [`Outbound::set_etf`].
+#[derive(Debug)]
+struct EtfDrops {
+    ledger: etf::EtfLedger,
+    /// One drain's reports.
+    reports: Vec<karyos_io::sockets::errqueue::ErrEntry>,
+    /// Per lane, the catch-up job repairing a dropped range, and the range
+    /// it was given.
+    jobs: [Option<(crate::repair::jobs::JobRef, (u64, u64))>; MAX_LANES],
 }
 
 /// The counters of one outbound publication; checked, sticky on overflow.
@@ -468,6 +483,24 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     removal: Option<Box<removal::Removal>>,
     /// A timed publication's schedule ([`Outbound::set_timed`]).
     timed: Option<Box<Timed>>,
+    /// The etf queue of a timed publication on the `etf` route
+    /// ([`Outbound::set_etf`], ADR-0109): its lane queues are opened with
+    /// it, and each timed head is committed with its send time.
+    etf: Option<karyos_io::backend::EtfQueue>,
+    /// On the `etf` route, `CLOCK_TAI` less the sender's clock at this
+    /// cycle, read once a cycle from the endpoint: a head's time plus it is
+    /// its send time. `None` while the clock cannot be read, and then a
+    /// timed lane stages nothing.
+    tai_offset: Option<i128>,
+    /// The host monotonic clock the TAI offset pairs with `CLOCK_TAI`,
+    /// read next to it (tests replace it).
+    monotonic: fn() -> u64,
+    /// `CLOCK_TAI` at this cycle's sample, on the etf route.
+    tai_now: Option<u64>,
+    /// On the etf route, its drop ledger ([`etf::EtfLedger`], ADR-0109
+    /// points 6 to 8), its error queue reports' storage, and per lane the
+    /// catch-up job repairing its first dropped range.
+    etf_drops: Option<Box<EtfDrops>>,
     /// Its counters' CnC cells (M2b), when the region had room for them:
     /// the sender agent is their only writer.
     cells: Option<crate::agents::AgentCells>,
@@ -704,6 +737,11 @@ impl<T: StreamTerms> Outbound<T> {
             path_sent: None,
             removal: None,
             timed: None,
+            etf: None,
+            tai_offset: None,
+            monotonic: karyos_sys::host_clock::host_monotonic_ns,
+            tai_now: None,
+            etf_drops: None,
             cells: None,
             admission: 0,
             admission_slot: None,
@@ -1052,6 +1090,48 @@ impl<T: StreamTerms> Outbound<T> {
             return false;
         }
         true
+    }
+
+    /// Returns, through the timed gate, the heads still queued on each lane
+    /// that missed its deadline under cancel-on-deadline (ADR-0109 point
+    /// 8): they will never be sent, so their TX slots and their schedule
+    /// entries are freed, each counted dropped. A lane its guard aborts is
+    /// [`Self::cancel_aborted`]'s.
+    fn cancel_missed<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) {
+        let Self {
+            guard,
+            sender,
+            tracks,
+            readers,
+            counters,
+            timed: Some(timed),
+            ..
+        } = self
+        else {
+            return;
+        };
+        for lane in 0..readers.len() {
+            let guarded = guard
+                .as_deref()
+                .is_some_and(|guard| LaneGate::aborting(guard, lane));
+            if guarded
+                || !timed.state.deadline_missed(lane)
+                || sender.pending(lane).unwrap_or(0) == 0
+            {
+                continue;
+            }
+            let mut gate = DataGate {
+                lanes: tracks,
+                held: false,
+                guard: guard.as_deref_mut(),
+            };
+            if sender
+                .cancel(tx, lane, &mut timed.state.view(&mut gate))
+                .is_err()
+            {
+                counters.bump(|c| &mut c.queue_failures, 1);
+            }
+        }
     }
 
     /// The guard's between gates step at `now`, for a publication not
@@ -1406,7 +1486,7 @@ impl<T: StreamTerms> Outbound<T> {
                 authority: Authority::FIRST,
                 route,
                 max_pending: NonZeroU16::new(STAGED_PER_LANE).unwrap_or(NonZeroU16::MIN),
-                etf: None,
+                etf: self.etf,
             });
             let opened = match opened {
                 Ok(opened) => opened,
@@ -1430,8 +1510,15 @@ impl<T: StreamTerms> Outbound<T> {
                 *queue = opened;
             }
         }
-        // A reliable lane reads again what the reset returned (below).
+        // A reliable lane reads again what the reset returned (below), so
+        // the etf ledger forgets what the old queues held.
         let rewound = self.opened.is_some() && self.reliable;
+        if let Some(drops) = self.etf_drops.as_deref_mut() {
+            for lane in 0..self.queues.len() {
+                drops.ledger.forget(lane);
+            }
+            drops.jobs = [None; MAX_LANES];
+        }
         for (lane, queue) in self.queues.iter().enumerate() {
             // A guarded lane reopens through its gate, which refunds what
             // the old queue held.
@@ -1577,6 +1664,28 @@ impl<T: StreamTerms> Outbound<T> {
             })
     }
 
+    /// The first timed lane that missed a deadline under cancel-on-deadline
+    /// and is not reported yet (ADR-0109 point 8): the sender cannot seal
+    /// its buffer, so it reports it (`AgentEvent::DeadlineMissed`) for the
+    /// conductor to seal with `SealReason::DeadlineMissed`.
+    pub(crate) fn deadline_unreported(&self) -> Option<usize> {
+        let timed = self.timed.as_deref()?;
+        (0..timed.missed_reported.len()).find(|lane| {
+            timed.missed_reported.get(*lane) == Some(&false) && timed.state.deadline_missed(*lane)
+        })
+    }
+
+    /// `lane`'s missed deadline was reported: it is not reported again.
+    pub(crate) fn deadline_reported(&mut self, lane: usize) {
+        if let Some(reported) = self
+            .timed
+            .as_deref_mut()
+            .and_then(|timed| timed.missed_reported.get_mut(lane))
+        {
+            *reported = true;
+        }
+    }
+
     /// `lane`'s violation was reported: it is not reported again.
     pub(crate) fn violation_reported(&mut self, lane: usize) {
         if let Some(reported) = self
@@ -1632,13 +1741,169 @@ impl<T: StreamTerms> Outbound<T> {
             unacknowledged.push(VecDeque::with_capacity(capacity));
         }
         let reported = vec![false; consumers.len()];
+        let missed_reported = vec![false; consumers.len()];
         self.timed = Some(Box::new(Timed {
             state,
             consumers,
             unacknowledged,
             reported,
+            missed_reported,
         }));
         Ok(())
+    }
+
+    /// Puts the timed publication on the `etf` route (ADR-0109): its lane
+    /// queues are opened as etf queues of `etf` from the next open, and
+    /// each timed head is committed with its time in `CLOCK_TAI`, so the
+    /// kernel's `etf` leaf releases it then. Its timed gate's policies
+    /// carry the declared advance ([`LatePolicy::advance`]) by which a
+    /// head is handed over early. Its repair queue stays immediate.
+    pub(crate) fn set_etf(
+        &mut self,
+        etf: karyos_io::backend::EtfQueue,
+        advance: u64,
+        cancel_on_deadline: bool,
+    ) {
+        self.etf = Some(etf);
+        let bound = self
+            .readers
+            .first()
+            .map(|reader| reader.subscription().buffer().config().schedule_capacity)
+            .and_then(|capacity| usize::try_from(capacity).ok())
+            .unwrap_or(0);
+        self.etf_drops = Some(Box::new(EtfDrops {
+            ledger: etf::EtfLedger::new(
+                self.readers.len(),
+                bound,
+                (self.reliable, cancel_on_deadline),
+                advance,
+            ),
+            reports: vec![karyos_io::sockets::errqueue::ErrEntry::Truncated; etf::DRAIN_BATCH],
+            jobs: [None; MAX_LANES],
+        }));
+    }
+
+    /// What its etf drop ledger counted, on the etf route (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn etf_counts(&self) -> Option<etf::EtfCounts> {
+        self.etf_drops.as_deref().map(|drops| drops.ledger.counts())
+    }
+
+    /// Hands its late drop reports, oldest first, to `post` (which says
+    /// whether it took one) for the driver's diagnostic ring, each with the
+    /// count it stands for, then those the ledger could only count, as one
+    /// count with no report (`None`); one `post` refused is offered again
+    /// at the next call.
+    pub(crate) fn post_etf_late(
+        &mut self,
+        mut post: impl FnMut(Option<etf::LateReport>, u64) -> bool,
+    ) {
+        let Some(drops) = self.etf_drops.as_deref_mut() else {
+            return;
+        };
+        while let Some(report) = drops.ledger.peek_late() {
+            if !post(Some(report), report.unrecorded.saturating_add(1)) {
+                return;
+            }
+            drops.ledger.pop_late();
+        }
+        let unrecorded = drops.ledger.take_unrecorded();
+        if unrecorded > 0 && !post(None, unrecorded) {
+            drops.ledger.restore_unrecorded(unrecorded);
+        }
+    }
+
+    /// The etf route's step of a sender duty (ADR-0109 points 6 to 8),
+    /// after the cycle's `CLOCK_TAI` sample: drains every lane's error
+    /// queue, then retires the expired entries as sent, then queues the
+    /// catch-up of each reliable lane's first dropped range on its repair
+    /// path, one job at a time per lane, in position order.
+    fn etf_duty<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) {
+        use karyos_io::sockets::errqueue::ErrEntry;
+
+        let Some(drops) = self.etf_drops.as_deref_mut() else {
+            return;
+        };
+        for (lane, queue) in self.queues.iter().enumerate() {
+            while let Ok(drained) = tx.drain_etf(*queue, &mut drops.reports) {
+                for entry in drops.reports.iter().take(drained) {
+                    match *entry {
+                        ErrEntry::Txtime { txtime_ns, .. } => {
+                            let _ = drops.ledger.drained(lane, txtime_ns);
+                            // Under cancel-on-deadline every drop report is
+                            // a miss the sender saw, a late one too (its
+                            // entry expired, but the qdisc did drop it): the
+                            // lane aborts (ADR-0109 point 8). On any other
+                            // lane `miss` changes nothing.
+                            if let Some(timed) = self.timed.as_deref_mut() {
+                                let aborting = self
+                                    .guard
+                                    .as_deref()
+                                    .is_some_and(|guard| LaneGate::aborting(guard, lane));
+                                let _ = timed.state.miss(lane, aborting);
+                            }
+                        }
+                        _ => drops.ledger.other_report(),
+                    }
+                }
+                if drained < drops.reports.len() {
+                    break;
+                }
+            }
+        }
+        if let Some(tai) = self.tai_now {
+            let _ = drops.ledger.expire(tai);
+        }
+        let Some(repair) = self.repair.as_deref_mut() else {
+            return;
+        };
+        for (lane, reader) in self.readers.iter().enumerate() {
+            let (Ok(lane8), Some(job)) = (u8::try_from(lane), drops.jobs.get_mut(lane)) else {
+                continue;
+            };
+            // The job's own progress: the lane's watermark restarted at its
+            // start, and only it runs on the lane. What it did not send goes
+            // back to the ranges, in position order with any newer drops.
+            if let Some((current, (from, to))) = *job {
+                if repair.catch_up_pending(current) {
+                    continue;
+                }
+                *job = None;
+                let through = repair.catch_up_through(lane8).max(from);
+                drops.ledger.give_back(lane, (through, to));
+            }
+            let Some((from, to)) = drops.ledger.take_catch_up(lane) else {
+                continue;
+            };
+            repair.restart_catch_up(lane8, from);
+            match repair.catch_up(lane8, (from, to), reader.floor()) {
+                super::repair::CatchUp::Queued {
+                    job: queued,
+                    from: start,
+                    ..
+                } => *job = Some((queued, (start, to))),
+                // A full share tries again next duty.
+                super::repair::CatchUp::Full { .. } => drops.ledger.give_back(lane, (from, to)),
+                // Below the retention floor, counted lost by the repair
+                // path: nothing more to send.
+                super::repair::CatchUp::Done => {}
+            }
+        }
+    }
+
+    /// Replaces the monotonic clock the TAI offset pairs with (tests).
+    #[cfg(test)]
+    pub(crate) fn set_monotonic(&mut self, monotonic: fn() -> u64) {
+        self.monotonic = monotonic;
+    }
+
+    /// The send time of a head requested at `time` on the sender's clock,
+    /// in `CLOCK_TAI` (this cycle's offset), saturated at the ends of
+    /// `u64`; `None` without an offset.
+    fn txtime(time: u64, tai_offset: Option<i128>) -> Option<u64> {
+        let tai = i128::from(time).checked_add(tai_offset?)?;
+        Some(u64::try_from(tai.max(0)).unwrap_or(u64::MAX))
     }
 
     /// What its timed gate counted, if it is timed (tests).
@@ -1701,6 +1966,18 @@ impl<T: StreamTerms> Outbound<T> {
                 consumer.set_now(now);
             }
         }
+        // On the etf route, the cycle's TAI offset (ADR-0109): `CLOCK_TAI`
+        // and the monotonic clock sampled together, not against the
+        // cycle's `now`, which an open or a pause may have made stale.
+        if self.etf.is_some() {
+            let tai = tx.tai_now_ns();
+            let monotonic = (self.monotonic)();
+            self.tai_now = tai;
+            self.tai_offset =
+                tai.and_then(|tai| i128::from(tai).checked_sub(i128::from(monotonic)));
+            // Drops are drained before the duty expires or stages anything.
+            self.etf_duty(tx);
+        }
         let mut work = 0u32;
         for lane in 0..self.readers.len() {
             let limit = limits.get(lane).copied().unwrap_or(Limit::Held);
@@ -1732,6 +2009,7 @@ impl<T: StreamTerms> Outbound<T> {
             guard.between_gates();
         }
         self.cancel_aborted(tx);
+        self.cancel_missed(tx);
         // After the cancel, whose returned heads end their messages too.
         self.release_ended();
         self.handle_failure(tx, report.failure);
@@ -2100,6 +2378,7 @@ impl<T: StreamTerms> Outbound<T> {
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         let mut staged = 0u32;
+        let tai_offset = self.tai_offset;
         let (Some(queue), Some(reader)) =
             (self.queues.get(lane).copied(), self.readers.get_mut(lane))
         else {
@@ -2119,6 +2398,16 @@ impl<T: StreamTerms> Outbound<T> {
             {
                 break;
             }
+            // Nor does a timed lane that missed its deadline under
+            // cancel-on-deadline: its incarnation is aborted (ADR-0109
+            // point 8).
+            if self
+                .timed
+                .as_deref()
+                .is_some_and(|timed| timed.state.deadline_missed(lane))
+            {
+                break;
+            }
             // Nor does a timed lane whose publisher breached the schedule
             // ring's protocol, counted once in `schedule_faults` when it was
             // found; the sender reports it (`ScheduleViolated`), and the
@@ -2130,6 +2419,17 @@ impl<T: StreamTerms> Outbound<T> {
                 .and_then(|timed| timed.consumers.get(lane))
                 .and_then(Option::as_ref)
                 .is_some_and(ScheduleConsumer::violated)
+            {
+                break;
+            }
+            // On the etf route a timed head needs its send time, so no
+            // read is made while `CLOCK_TAI` cannot be read, nor while the
+            // lane's in-flight list is full (ADR-0109 point 6).
+            if self.etf.is_some() && self.tai_offset.is_none() {
+                break;
+            }
+            if let Some(drops) = self.etf_drops.as_deref_mut()
+                && !drops.ledger.has_room(lane)
             {
                 break;
             }
@@ -2273,10 +2573,19 @@ impl<T: StreamTerms> Outbound<T> {
             };
             let token = SenderToken::new(self.next_token);
             self.next_token = self.next_token.checked_add(1).ok_or(overflow.clone())?;
+            // On the etf route a timed head carries its send time; one sent
+            // again after a reset (no time) and padding go at once.
+            let options = match (self.etf, schedule) {
+                (Some(_), Some((Some(time), _))) => {
+                    Self::txtime(time, tai_offset).map_or(TxOptions::none(), TxOptions::txtime)
+                }
+                _ => TxOptions::none(),
+            };
+            let txtime = options.txtime_ns();
             let Ok(ticket) = frame.commit(Commit {
                 len,
                 token,
-                options: TxOptions::none(),
+                options,
             }) else {
                 // The cursor moved past a read that was not staged: a gap
                 // the receiver closes by repair or by its gap policy. A
@@ -2342,6 +2651,12 @@ impl<T: StreamTerms> Outbound<T> {
                 }
                 self.counters.bump(|c| &mut c.staged_refused, 1);
                 break;
+            }
+            // On the etf route a timed head handed to the etf queue holds an
+            // entry until it is dropped or expires (ADR-0109 point 6); the
+            // room was checked before the read.
+            if let (Some(txtime), Some(drops)) = (txtime, self.etf_drops.as_deref_mut()) {
+                let _ = drops.ledger.reserve(lane, txtime, (from, next));
             }
             if let Some(track) = self.tracks.get_mut(lane) {
                 track.staged.push_back((ticket, next));
@@ -2787,6 +3102,7 @@ pub(crate) struct Opened {
 
 pub(super) mod fanout;
 pub(crate) use fanout::destination_share;
+pub(crate) mod etf;
 mod heartbeat;
 mod removal;
 mod routed;

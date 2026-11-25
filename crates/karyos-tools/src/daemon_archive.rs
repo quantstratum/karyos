@@ -113,8 +113,9 @@ impl std::fmt::Display for ArchiveStartError {
 
 impl std::error::Error for ArchiveStartError {}
 
-/// The agent's calibration source for `--archive-calibration-journal
-/// <dir>` (ADR-0098 items 3 and 5; karyos#1137): the journal on disk,
+/// The agent's calibration source for
+/// `--archive-calibration-journal <dir>` (ADR-0098 items 3 and 5;
+/// karyos#1137): the journal on disk,
 /// read again at each snapshot, so records `karyos-tools calibrate
 /// append` adds while the daemon runs are seen. A missing journal reads
 /// as empty until its producer makes it.

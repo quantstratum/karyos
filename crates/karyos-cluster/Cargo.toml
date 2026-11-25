@@ -18,5 +18,9 @@ karyos-archive.workspace = true
 karyos-codec.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# The calibration and UTC reference records of tests/c_time_evidence.rs.
+karyos-trace.workspace = true
+
 [lints]
 workspace = true

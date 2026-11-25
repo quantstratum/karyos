@@ -398,6 +398,15 @@ pub enum SnapshotError {
         /// Its id.
         id: u64,
     },
+    /// A section of a kind this build does not know: written by a newer
+    /// version, told apart from damage. The snapshot is not used.
+    #[error("snapshot {id} has a section of unknown kind {code}")]
+    UnknownSection {
+        /// Its id.
+        id: u64,
+        /// The kind's code.
+        code: u32,
+    },
     /// An earlier failure: reopen the store.
     #[error("the snapshot store failed; reopen it")]
     Failed,
@@ -427,6 +436,10 @@ pub struct Opened<D: Disk + Clone> {
     pub removed: Vec<u64>,
     /// Published snapshots that no longer read whole: not used.
     pub damaged: Vec<SnapshotInfo>,
+    /// Published snapshots that read whole but hold a section of a kind
+    /// this build does not know (a newer writer's): not used, and told
+    /// apart from damage.
+    pub unknown: Vec<SnapshotInfo>,
 }
 
 /// A node's snapshot directory.
@@ -475,10 +488,12 @@ impl<D: Disk + Clone> SnapshotStore<D> {
         }
         let mut kept = Vec::new();
         let mut damaged = Vec::new();
+        let mut unknown = Vec::new();
         for info in &named {
             match verify_snapshot(disk.clone(), dir, geometry, info) {
                 Ok(()) => kept.push(*info),
                 Err(SnapshotError::Io(error)) => return Err(SnapshotError::Io(error)),
+                Err(SnapshotError::UnknownSection { .. }) => unknown.push(*info),
                 Err(_) => damaged.push(*info),
             }
         }
@@ -501,6 +516,7 @@ impl<D: Disk + Clone> SnapshotStore<D> {
             },
             removed,
             damaged,
+            unknown,
         })
     }
 
@@ -841,10 +857,33 @@ impl<D: Disk> PendingSnapshot<D> {
         version: u64,
         length: u64,
     ) -> Result<(), SnapshotError> {
+        self.open_coded(header_of(kind, version, length), length)
+    }
+
+    /// A section of kind `code`, which need not be one this build knows
+    /// (tests: a newer writer's section).
+    #[cfg(test)]
+    fn section_of_code(
+        &mut self,
+        code: u32,
+        version: u64,
+        length: u64,
+    ) -> Result<(), SnapshotError> {
+        let mut header = header_of(SectionKind::Service, version, length);
+        if let Some(kind) = header.get_mut(4..8) {
+            kind.copy_from_slice(&code.to_le_bytes());
+        }
+        self.open_coded(header, length)
+    }
+
+    fn open_coded(
+        &mut self,
+        header: [u8; SECTION_HEADER],
+        length: u64,
+    ) -> Result<(), SnapshotError> {
         if self.broken || self.left > 0 {
             return Err(SnapshotError::Incomplete);
         }
-        let header = header_of(kind, version, length);
         let store = self.store.as_mut().ok_or(SnapshotError::Incomplete)?;
         self.digest.update(&header);
         self.at = store.append(self.at, &header)?;
@@ -932,6 +971,9 @@ pub struct SnapshotReader<D: Disk> {
     /// The current section's end.
     section_end: u64,
     finished: bool,
+    /// The code of the first section of a kind this build does not know:
+    /// skipped, and reported once the whole snapshot's digest holds.
+    unknown: Option<u32>,
 }
 
 impl<D: Disk> SnapshotReader<D> {
@@ -960,6 +1002,7 @@ impl<D: Disk> SnapshotReader<D> {
             at: 0,
             section_end: 0,
             finished: false,
+            unknown: None,
         })
     }
 
@@ -997,45 +1040,57 @@ impl<D: Disk> SnapshotReader<D> {
             return Ok(None);
         }
         let mut skip = [0u8; SKIP_BUFFER];
-        while self.at < self.section_end {
-            let left = self
-                .section_end
-                .checked_sub(self.at)
-                .ok_or_else(|| self.damaged())?;
-            let take = usize::try_from(left).map_or(SKIP_BUFFER, |left| left.min(SKIP_BUFFER));
-            let chunk = skip.get_mut(..take).ok_or_else(|| self.damaged())?;
-            self.fill(chunk)?;
-        }
-        if self.at == self.length {
-            if self.digest.finish() != self.expected {
-                return Err(self.damaged());
+        loop {
+            while self.at < self.section_end {
+                let left = self
+                    .section_end
+                    .checked_sub(self.at)
+                    .ok_or_else(|| self.damaged())?;
+                let take = usize::try_from(left).map_or(SKIP_BUFFER, |left| left.min(SKIP_BUFFER));
+                let chunk = skip.get_mut(..take).ok_or_else(|| self.damaged())?;
+                self.fill(chunk)?;
             }
-            self.finished = true;
-            return Ok(None);
+            if self.at == self.length {
+                if self.digest.finish() != self.expected {
+                    return Err(self.damaged());
+                }
+                self.finished = true;
+                // A newer writer's section, told apart from damage only now
+                // that the whole snapshot's digest holds.
+                if let Some(code) = self.unknown {
+                    return Err(SnapshotError::UnknownSection { id: self.id, code });
+                }
+                return Ok(None);
+            }
+            let mut header = [0u8; SECTION_HEADER];
+            self.fill(&mut header)?;
+            let damaged = || SnapshotError::Damaged { id: self.id };
+            let (magic, fields) = header.split_first_chunk::<4>().ok_or_else(damaged)?;
+            let (kind, fields) = fields.split_first_chunk::<4>().ok_or_else(damaged)?;
+            let (version, fields) = fields.split_first_chunk::<8>().ok_or_else(damaged)?;
+            let (length, _) = fields.split_first_chunk::<8>().ok_or_else(damaged)?;
+            if *magic != SECTION_MAGIC {
+                return Err(damaged());
+            }
+            let code = u32::from_le_bytes(*kind);
+            let length = u64::from_le_bytes(*length);
+            let end = self
+                .at
+                .checked_add(length)
+                .filter(|end| *end <= self.length)
+                .ok_or_else(damaged)?;
+            self.section_end = end;
+            let Some(kind) = SectionKind::from_code(code) else {
+                // Framed whole: skipped, and the snapshot refused at its end.
+                self.unknown.get_or_insert(code);
+                continue;
+            };
+            return Ok(Some(SectionHeader {
+                kind,
+                version: u64::from_le_bytes(*version),
+                length,
+            }));
         }
-        let mut header = [0u8; SECTION_HEADER];
-        self.fill(&mut header)?;
-        let damaged = || SnapshotError::Damaged { id: self.id };
-        let (magic, fields) = header.split_first_chunk::<4>().ok_or_else(damaged)?;
-        let (kind, fields) = fields.split_first_chunk::<4>().ok_or_else(damaged)?;
-        let (version, fields) = fields.split_first_chunk::<8>().ok_or_else(damaged)?;
-        let (length, _) = fields.split_first_chunk::<8>().ok_or_else(damaged)?;
-        if *magic != SECTION_MAGIC {
-            return Err(damaged());
-        }
-        let kind = SectionKind::from_code(u32::from_le_bytes(*kind)).ok_or_else(damaged)?;
-        let length = u64::from_le_bytes(*length);
-        let end = self
-            .at
-            .checked_add(length)
-            .filter(|end| *end <= self.length)
-            .ok_or_else(damaged)?;
-        self.section_end = end;
-        Ok(Some(SectionHeader {
-            kind,
-            version: u64::from_le_bytes(*version),
-            length,
-        }))
     }
 
     /// Reads up to `buf.len()` bytes of the current section; 0 at its end.

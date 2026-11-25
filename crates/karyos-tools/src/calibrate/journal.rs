@@ -3,14 +3,15 @@
 //! `karyos-tools calibrate append --journal <dir>` (karyos#1137): appends
 //! records to a calibration journal
 //! (`karyos_archive::integrity::calibration_journal`), durable before it
-//! returns, making the journal if it is absent. `karyosd
-//! --archive-calibration-journal <dir>` reads it.
+//! returns, making the journal if it is absent.
+//! `karyosd --archive-calibration-journal <dir>` reads it.
 //!
 //! The records are given as words after the options (18 words each), or,
 //! with none, read from standard input: each line that starts with
-//! `record` is one record of exactly 18 words, which is what `calibrate
-//! phc` prints, so `karyos-tools calibrate phc | karyos-tools calibrate
-//! append --journal <dir>` journals a calibration. A word is hexadecimal
+//! `record` is one record of exactly 18 words, which is what
+//! `calibrate phc` prints, so
+//! `karyos-tools calibrate phc | karyos-tools calibrate append --journal <dir>`
+//! journals a calibration. A word is hexadecimal
 //! with `0x`, or decimal. The batch is all or none (ADR-0110): a known
 //! type that does not decode, or a `valid_from` not after the last of its
 //! type and clock, is reported per record and nothing is appended; a

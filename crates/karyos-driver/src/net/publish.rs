@@ -541,10 +541,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// once, outside the late policy, and counted as rewound, not late.
     /// NAK repairs go through the repair path, never the timed gate.
     ///
+    /// Under cancel-on-deadline (G7, ADR-0109 point 8) a head whose time
+    /// plus its tolerance passes before it is exposed, or on the `etf`
+    /// route a datagram the qdisc dropped, aborts the lane's incarnation:
+    /// the sender sends nothing more of it and reports it, and the
+    /// conductor seals it with `SealReason::DeadlineMissed`. A drop whose
+    /// report the kernel lost is not seen, so it is repaired or a gap, not
+    /// an abort.
+    ///
     /// # Errors
     ///
     /// [`DriverError::TimedNetworkUnsupported`] for a channel with paths,
-    /// the `Tai` domain, cancel-on-deadline or a `max_horizon` that, with
+    /// the `Tai` domain, the etf route's refusals, or a `max_horizon` that, with
     /// one `sender_heartbeat_interval`, reaches
     /// `image_liveness_timeout`;
     /// [`DriverError::InvalidConfig`] for lanes with no schedule ring; the
@@ -635,6 +643,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // (karyos#648; ADR-0086 open point 6, ADR-0076 clause 4).
         let auth = super::wire::authenticated(channel.security)?;
         if let Some(auth) = &auth {
+            // The etf route under the authenticated class is not designed
+            // yet: refused, typed and counted (karyos#648).
+            if channel.etf.is_some() {
+                if let Some(wire) = net.wire_keys_mut() {
+                    wire.count_etf_refused();
+                }
+                return Err(DriverError::AuthenticatedRefused {
+                    reason: crate::error::AuthRefusal::Etf,
+                });
+            }
             let single = matches!(channel.destination, Destination::Unicast(_))
                 && channel.paths.is_empty()
                 && required_destinations.is_empty()
@@ -679,6 +697,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // route does not support yet is refused before anything exists.
         let (options, clock) = schedule.unwrap_or_default();
         let timed = (config.stream.buffer.schedule_capacity > 0).then_some(options);
+        // An etf declaration serves the etf route only (ADR-0109 point 2).
+        if channel.etf.is_some() && !timed.is_some_and(|options| options.route.etf_advance() > 0) {
+            return Err(DriverError::TimedNetworkUnsupported {
+                reason: crate::error::TimedNetworkUnsupported::EtfWithoutRoute,
+            });
+        }
         if let Some(options) = timed {
             let liveness = self.config.network.map(|network| {
                 (
@@ -819,6 +843,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             path_skew,
             registration,
             auth,
+            etf: etf_queue(channel).filter(|_| timed.is_some()),
         };
         let added = self.attach_sender(&handle, channel, FIRST_INCARNATION, false);
         if let Err(error) = added {
@@ -839,8 +864,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     ) -> Result<(), DriverError> {
         for stream in handle.streams() {
             match &clock {
-                Some(clock) => self.schedule_stream_with_clock(stream, options, clock.clone())?,
-                None => self.schedule_stream(stream, options)?,
+                Some(clock) => {
+                    self.schedule_network_stream_with_clock(stream, options, clock.clone())?;
+                }
+                None => self.schedule_network_stream(stream, options)?,
             }
             self.ensure_timed_counters(stream)?;
             self.stream(stream)?.fix_schedule()?;
@@ -1146,6 +1173,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             path_skew,
             registration,
             auth,
+            etf,
         } = channel;
         let mut readers = Vec::with_capacity(usize::from(handle.lanes()));
         let mut term = None;
@@ -1238,8 +1266,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             let options = found.schedule.unwrap_or_default();
             policies.push(crate::timed_gate::LatePolicy {
                 tolerance: options.lateness_tolerance,
-                cancel_on_deadline: false,
+                cancel_on_deadline: options.cancel_on_deadline,
                 max_horizon: options.max_horizon,
+                advance: options.route.etf_advance(),
             });
             counters.push(cells);
         }
@@ -1253,8 +1282,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // path's interface address that this host does not have is
         // refused, typed (karyos#1043).
         let mut held: Vec<(EndpointId, SocketAddr)> = Vec::with_capacity(binds.len());
+        // A publication on the etf route sends from an endpoint of its own,
+        // which its etf socket joins (ADR-0109 point 5).
+        let etf = etf.filter(|_| timed.is_some());
         for &(bind, to) in &binds {
-            let opened = if paired {
+            let opened = if let Some(etf) = etf {
+                net.hold_etf_endpoint(bind, etf)
+            } else if paired {
                 net.hold_path_endpoint(bind)
             } else {
                 net.hold_send_endpoint(bind)
@@ -1308,6 +1342,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 if let Some((policies, counters)) = timed {
                     let now = karyos_sys::host_clock::host_monotonic_ns();
                     outbound.set_timed(&policies, counters, now)?;
+                    if let Some(etf) = etf {
+                        let first = policies.first().copied().unwrap_or_default();
+                        outbound.set_etf(etf, first.advance, first.cancel_on_deadline);
+                    }
                 }
                 // Its counters' cells (M2b), dropped with the outbound if
                 // it is refused (a dropped cell is reused).
@@ -1396,10 +1434,10 @@ fn timed_supported(
 
     let reason = if !channel.paths.is_empty() {
         Some(Unsupported::Routed)
+    } else if let Some(reason) = etf_refused(channel, options) {
+        Some(reason)
     } else if options.domain == karyos_client::schedule::ClockDomain::Tai {
         Some(Unsupported::TaiDomain)
-    } else if options.cancel_on_deadline {
-        Some(Unsupported::CancelOnDeadline)
     } else if liveness.is_some_and(|(liveness, heartbeat)| {
         // A lane's last heartbeat can come one interval before its held
         // head: the silence is up to the horizon plus that interval.
@@ -1414,6 +1452,63 @@ fn timed_supported(
     };
     reason.map_or(Ok(()), |reason| {
         Err(DriverError::TimedNetworkUnsupported { reason })
+    })
+}
+
+/// What refuses the `etf` route of `options` on `channel` (ADR-0109
+/// points 2 and 5), if anything: a declaration and the route go together,
+/// on a unicast destination of a Linux driver, with the leaf's `delta` at
+/// most the declared advance. The priority's isolation is checked against
+/// the driver's other etf publications when the endpoint is held.
+fn etf_refused(
+    channel: &UdpConfig,
+    options: karyos_client::schedule::ScheduleOptions,
+) -> Option<crate::error::TimedNetworkUnsupported> {
+    use crate::error::TimedNetworkUnsupported as Unsupported;
+
+    let advance = options.route.etf_advance();
+    match (advance, channel.etf) {
+        (0, None) => None,
+        (0, Some(_)) => Some(Unsupported::EtfWithoutRoute),
+        (_, None) => Some(Unsupported::EtfUndeclared),
+        (_, Some(_))
+            if !cfg!(target_os = "linux")
+                || !matches!(channel.destination, Destination::Unicast(_)) =>
+        {
+            Some(Unsupported::EtfUnavailable)
+        }
+        (advance, Some(etf)) => {
+            let delta = u64::try_from(etf.delta.as_nanos()).unwrap_or(u64::MAX);
+            if etf_queue(channel).is_none() {
+                Some(Unsupported::EtfDeclarationInvalid)
+            } else if delta > advance {
+                Some(Unsupported::EtfDeltaAboveAdvance)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// The etf queue of a publication on the `etf` route (ADR-0109 point 2):
+/// the channel's declaration, with the index of the interface that owns
+/// the channel's `interface` address. `None` for a declaration a URI could
+/// not give (a zero `delta` or one of 2^32 ns or more, no interface
+/// address) or an address no interface of this host owns; [`etf_refused`]
+/// refuses those. The declaration is recorded; only the priority reaches
+/// the kernel.
+fn etf_queue(channel: &UdpConfig) -> Option<karyos_io::backend::EtfQueue> {
+    let etf = channel.etf?;
+    let Some(Interface::Address(address)) = channel.interface else {
+        return None;
+    };
+    let delta_ns = u32::try_from(etf.delta.as_nanos())
+        .ok()
+        .filter(|delta| *delta > 0)?;
+    Some(karyos_io::backend::EtfQueue {
+        interface: karyos_io::sockets::path_interface::interface_index(address)?,
+        priority: etf.priority,
+        delta_ns,
     })
 }
 

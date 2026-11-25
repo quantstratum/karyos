@@ -731,6 +731,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let auth = match super::wire::authenticated(channel.security)? {
             None => None,
             Some(auth) => {
+                // As at the publisher: no etf declaration (karyos#648).
+                if channel.etf.is_some() {
+                    if let Some(wire) = net.wire_keys_mut() {
+                        wire.count_etf_refused();
+                    }
+                    return Err(DriverError::AuthenticatedRefused {
+                        reason: crate::error::AuthRefusal::Etf,
+                    });
+                }
                 let single = matches!(channel.destination, Destination::Unicast(_))
                     && channel.paths.is_empty()
                     && !dynamic

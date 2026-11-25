@@ -3626,6 +3626,29 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Ok(())
     }
 
+    /// [`Self::schedule_stream_with_clock`] for a lane of a network
+    /// publication, which alone may take the `etf` route (its creation
+    /// checked the route).
+    pub(crate) fn schedule_network_stream_with_clock(
+        &mut self,
+        stream: StreamHandle,
+        options: karyos_client::schedule::ScheduleOptions,
+        clock: karyos_client::schedule::ScheduleClock,
+    ) -> Result<(), DriverError> {
+        self.schedule_lane(stream, options, true)?;
+        self.active_stream(stream)?.schedule_clock = Some(clock);
+        Ok(())
+    }
+
+    /// [`Self::schedule_stream`] for a lane of a network publication.
+    pub(crate) fn schedule_network_stream(
+        &mut self,
+        stream: StreamHandle,
+        options: karyos_client::schedule::ScheduleOptions,
+    ) -> Result<(), DriverError> {
+        self.schedule_lane(stream, options, true)
+    }
+
     /// Sets a timed lane's settings (`quantstratum-docs:
     /// karyos/design/timed-tx.md`, TT-2 and TT-3) on the control path,
     /// before any publication handle is issued: its clock domain, horizon,
@@ -3644,18 +3667,44 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// [`DriverError::NotTimed`] for a stream whose buffer has no schedule
     /// ring (`schedule_capacity` 0); [`DriverError::InvalidConfig`] once a
     /// handle of the incarnation was issued, also if it was dropped since;
-    /// [`DriverError::Client`] with `InvalidSchedule` for a zero horizon and
-    /// for the `Tai` domain off Linux; the stream lookup errors.
+    /// [`DriverError::Client`] with `InvalidSchedule` for a zero horizon,
+    /// the `etf` route (a network publication's alone, set at its creation)
+    /// and the `Tai` domain off Linux; the stream lookup errors.
     pub fn schedule_stream(
         &mut self,
         stream: StreamHandle,
         options: karyos_client::schedule::ScheduleOptions,
     ) -> Result<(), DriverError> {
+        self.schedule_lane(stream, options, false)
+    }
+
+    /// [`Self::schedule_stream`]; `network` for a lane of a network
+    /// publication, which may take the `etf` route.
+    fn schedule_lane(
+        &mut self,
+        stream: StreamHandle,
+        options: karyos_client::schedule::ScheduleOptions,
+        network: bool,
+    ) -> Result<(), DriverError> {
         let _ = options.domain.clock()?;
+        if !network && options.route != karyos_client::schedule::TimedRoute::Software {
+            return Err(DriverError::Client(
+                karyos_client::ClientError::InvalidSchedule {
+                    reason: "the etf route outside a network publication",
+                },
+            ));
+        }
         if options.max_horizon == 0 {
             return Err(DriverError::Client(
                 karyos_client::ClientError::InvalidSchedule {
                     reason: "a zero horizon",
+                },
+            ));
+        }
+        if options.route == (karyos_client::schedule::TimedRoute::Etf { advance: 0 }) {
+            return Err(DriverError::Client(
+                karyos_client::ClientError::InvalidSchedule {
+                    reason: "a zero etf advance",
                 },
             ));
         }
@@ -5299,6 +5348,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // gates are gone, so their senders leave the close acknowledgement.
         self.deregister_released_guards();
         self.apply_schedule_violations();
+        self.record_etf_late_reports();
         served
     }
 
@@ -5927,6 +5977,41 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Some(shutdown)
     }
 
+    /// Records each late etf drop report the senders posted (ADR-0109
+    /// point 7) in the error log, one event per report, keyed by the
+    /// aggregate registration and the report's time; the publication's
+    /// `etf_late_drop_reports` already counted it.
+    fn record_etf_late_reports(&mut self) {
+        while let Some(report) = self
+            .net
+            .as_mut()
+            .and_then(crate::net::Network::pop_etf_late_report)
+        {
+            let message = format!(
+                "a late etf drop report on lane {} at TAI {}: retired as sent, nothing resubmitted \
+                 ({} earlier late reports counted, not logged)",
+                report.lane, report.txtime, report.unlogged
+            );
+            self.diagnostics.error(
+                &mut self.counters,
+                crate::diagnostics::ErrorCode::EtfLateDropReport,
+                [report.registration, report.txtime],
+                &message,
+            );
+        }
+    }
+
+    /// The late etf drop reports of the network publication `aggregate`
+    /// (ADR-0109 point 7): drop reports its sender received after their
+    /// entries were retired as sent; `None` when it is not a network
+    /// publication.
+    #[must_use]
+    pub fn etf_late_drop_reports(&self, aggregate: &AggregateHandle) -> Option<u64> {
+        self.net
+            .as_ref()?
+            .etf_late_drop_reports(aggregate.registration())
+    }
+
     /// Applies the schedule violations the senders reported
     /// (`quantstratum-docs: karyos/design/timed-tx.md`, section 11, TT-6):
     /// each lane still in the incarnation its sender served is sealed with
@@ -5934,8 +6019,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// first reason), counted, and logged with its holder; a remote holder
     /// is retired as faulty, an in-process one gets only the seal. A report
     /// for a lane gone or reincarnated since is dropped, and every dropped
-    /// report counts in `schedule violations dropped`. Returns how many
-    /// lanes it sealed.
+    /// report counts in `schedule violations dropped`. A missed deadline
+    /// under cancel-on-deadline (ADR-0109 point 8) comes the same way and
+    /// is sealed with `SealReason::DeadlineMissed` instead (a lane already
+    /// sealed keeps its first reason), with no fault and no log record.
+    /// Returns how many lanes it sealed for a violation.
     fn apply_schedule_violations(&mut self) -> usize {
         let mut sealed = 0usize;
         while let Some(violation) = self
@@ -5958,6 +6046,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 continue;
             };
             let id = found.id;
+            // A missed deadline under cancel-on-deadline aborts the
+            // incarnation (G7, ADR-0109 point 8): sealed `DeadlineMissed`,
+            // and nobody breached anything.
+            // The sender counted the abort in the lane's `deadline aborts`.
+            if violation.deadline {
+                let _ = crate::timed_gate::seal_deadline_missed(&mut found.conductor);
+                continue;
+            }
             if found.conductor.seal_state() == karyos_sys::log_buffer::SealState::Active
                 && found
                     .conductor

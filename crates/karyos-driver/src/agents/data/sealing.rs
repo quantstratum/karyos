@@ -253,7 +253,7 @@ impl<T: StreamTerms> Outbound<T> {
     }
 
     /// Makes the publication encrypted (ADR-0114): from now on it sends
-    /// nothing until [`Outbound::install_enc_sealer`] gives it the
+    /// nothing until `Outbound::install_enc_sealer` gives it the
     /// session's domain 1 key. Its log must be sized for the encrypted
     /// inner budget, the channel MTU (at most 1408) less the 84-byte
     /// envelope.

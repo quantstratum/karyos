@@ -6,7 +6,7 @@
 //!
 //! This module parses one key file's bytes into a [`KeyFile`] and derives
 //! the per-purpose MAC keys with HKDF-SHA-256 (RFC 5869), written over
-//! [`HmacKey`] so that the PRK, every padded key and every MAC output are
+//! `HmacKey` so that the PRK, every padded key and every MAC output are
 //! erased. [`store`] loads
 //! and reloads the key directory against the durable key state of
 //! [`state`] (design sections 2.1, 2.4 and 2.6).

@@ -5,7 +5,7 @@
 //! karyos/adr/0086-wire-authentication-profile-v1.md` sections 4, 6 and 7,
 //! ADR-0107, ADR-0118; design `wire-key-files.md` sections 2.3 and 2.4).
 //!
-//! [`WireKeys`] owns the driver's [`KeyStore`], started once from the
+//! `WireKeys` owns the driver's [`KeyStore`], started once from the
 //! configured key and state directories. The conductor reloads it every
 //! [`RELOAD_INTERVAL_S`] seconds (the manifest's revocation bound) and
 //! re-reads its key set every [`TICK_S`] for expiry; each change is one
@@ -220,6 +220,8 @@ pub struct WireKeyCounters {
     /// Bindings (an unbind or unfollow) a full ring deferred to a later
     /// duty, never dropped.
     pub bindings_deferred: u64,
+    /// Authenticated admissions refused for an `etf` declaration.
+    pub etf_refused: u64,
 }
 
 /// The driver's durable guard marks, shared by every follow binding that
@@ -607,6 +609,11 @@ impl WireKeys {
     /// The deferred bindings, oldest first, to post again.
     pub(crate) fn take_deferred(&mut self) -> Vec<Box<crate::agents::roles::AuthBinding>> {
         core::mem::take(&mut self.deferred)
+    }
+
+    /// Counts an authenticated admission refused for an etf declaration.
+    pub(crate) fn count_etf_refused(&mut self) {
+        self.counters.etf_refused = self.counters.etf_refused.saturating_add(1);
     }
 
     /// Counts an authenticated admission a full ring refused.

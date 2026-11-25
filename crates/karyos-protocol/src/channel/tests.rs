@@ -486,6 +486,14 @@ fn published_keys_keep_their_meaning() {
                 udp("karyos:udp?endpoint=10.0.0.5:1|path-skew=250us").path_skew,
                 Some(Duration::from_micros(250))
             ),
+            Key::EtfPriority | Key::EtfDelta => assert_eq!(
+                udp("karyos:udp?endpoint=10.0.0.5:1|interface=10.0.0.1|etf-priority=3|etf-delta=100us")
+                    .etf,
+                Some(EtfDeclaration {
+                    priority: 3,
+                    delta: Duration::from_micros(100),
+                })
+            ),
         }
         assert_eq!(key.name(), name);
     }
@@ -1225,4 +1233,60 @@ fn an_encrypted_channel_takes_mtu_at_most_1408() {
         ChannelConfig::parse("karyos:udp?endpoint=10.0.0.5:1|security=trusted|mtu=8192").is_ok()
     );
     assert_eq!(MAX_ENCRYPTED_MTU, 1408);
+}
+
+/// ADR-0109 (#625): `etf-priority` and `etf-delta` go together, on a
+/// unicast `endpoint` with an `interface` address; the delta is positive
+/// and below 2^32 ns; a channel without them has no declaration.
+#[test]
+fn the_etf_declaration_is_checked() {
+    assert_eq!(udp("karyos:udp?endpoint=10.0.0.5:1").etf, None);
+    let base = "karyos:udp?endpoint=10.0.0.5:1|interface=10.0.0.1";
+    for (rest, key) in [
+        ("|etf-priority=3", "etf-priority"),
+        ("|etf-delta=1us", "etf-delta"),
+        ("|etf-priority=-1|etf-delta=1us", "etf-priority"),
+        ("|etf-priority=03|etf-delta=1us", "etf-priority"),
+        ("|etf-priority=4294967296|etf-delta=1us", "etf-priority"),
+        ("|etf-priority=3|etf-delta=0ns", "etf-delta"),
+        ("|etf-priority=3|etf-delta=5s", "etf-delta"),
+    ] {
+        assert!(
+            matches!(
+                refused(&format!("{base}{rest}")),
+                ChannelError::InvalidValue { key: k, .. } if k == key
+            ),
+            "{rest}"
+        );
+    }
+    assert!(matches!(
+        refused("karyos:udp?endpoint=10.0.0.5:1|etf-priority=3|etf-delta=1us"),
+        ChannelError::InvalidValue {
+            key: "etf-priority",
+            ..
+        }
+    ));
+    assert!(matches!(
+        refused(&format!("{base}|etf-priority=3|etf-delta=1")),
+        ChannelError::InvalidDuration {
+            key: "etf-delta",
+            ..
+        }
+    ));
+    assert_eq!(
+        refused("karyos:udp?group=239.1.1.1:4000|interface=10.0.0.1|etf-priority=3|etf-delta=1us"),
+        ChannelError::NotApplicable {
+            key: "etf-priority"
+        }
+    );
+    assert_eq!(
+        udp(&format!(
+            "{base}|etf-priority=4294967295|etf-delta=4294967295ns"
+        ))
+        .etf,
+        Some(EtfDeclaration {
+            priority: u32::MAX,
+            delta: Duration::from_nanos(u64::from(u32::MAX)),
+        })
+    );
 }

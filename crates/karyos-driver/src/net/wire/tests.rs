@@ -210,6 +210,7 @@ fn udp(destination: Destination, security: Security) -> UdpConfig {
         reliable: true,
         flow_control: None,
         security,
+        etf: None,
     }
 }
 
@@ -947,4 +948,45 @@ fn a_full_ring_at_admission_refuses_and_counts() {
     subscriber
         .add_network_subscription_as(STREAM, &channel, identity(RECEIVER))
         .unwrap();
+}
+
+/// An etf declaration (ADR-0109) on an authenticated channel is refused,
+/// typed and counted, on both roles, until that combination is designed;
+/// nothing is created.
+#[test]
+fn an_etf_declaration_is_refused_on_an_authenticated_channel() {
+    use karyos_protocol::channel::EtfDeclaration;
+
+    let declared = |destination, security| UdpConfig {
+        etf: Some(EtfDeclaration {
+            priority: 3,
+            delta: Duration::from_nanos(100_000),
+        }),
+        ..udp(destination, security)
+    };
+    let security = Security::Authenticated(auth(None));
+    let (mut publisher, _) = keyed(&borrowed(&publisher_files()));
+    let to = Destination::Unicast(SocketAddr::new(LOOPBACK, 9));
+    assert_eq!(
+        publisher
+            .add_network_publication(aggregate(STREAM), &declared(to, security))
+            .unwrap_err(),
+        refused(AuthRefusal::Etf)
+    );
+    let (mut subscriber, _) = keyed(&borrowed(&subscriber_files()));
+    assert_eq!(
+        subscriber
+            .add_network_subscription_as(
+                STREAM,
+                &declared(Destination::Unicast(ANY_PORT), security),
+                identity(RECEIVER),
+            )
+            .unwrap_err(),
+        refused(AuthRefusal::Etf)
+    );
+    for driver in [&publisher, &subscriber] {
+        assert_eq!(driver.wire_key_counters().unwrap().etf_refused, 1);
+        let net = driver.net.as_ref().unwrap();
+        assert_eq!((net.publication_count(), net.subscription_count()), (0, 0));
+    }
 }

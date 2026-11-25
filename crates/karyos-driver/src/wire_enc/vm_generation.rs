@@ -14,7 +14,7 @@
 //! updates", 2023-11-30) was reverted by 3aadf100f93d (2024-04-18, Cc
 //! stable), so no kernel series to rely on emits it. A platform signal
 //! implements [`GenerationSignal`] and is returned by [`platform_signal`];
-//! nothing else changes. Tests inject the signal ([`InjectedSignal`]).
+//! nothing else changes. Tests inject the signal (`InjectedSignal`).
 //! The trigger is the signal, never a timer: a [`VmGenerationWatch`] only
 //! limits how often it reads it.
 //!
@@ -359,7 +359,7 @@ impl VmGenerationWatch {
         self.signal.state()
     }
 
-    /// Reads the signal, at most once per [`POLL_INTERVAL_NS`] of `now_ns`,
+    /// Reads the signal, at most once per `POLL_INTERVAL_NS` of `now_ns`,
     /// moves the fence on a change, and returns the current generation (a
     /// change seen by this watch or any other).
     pub fn poll(&mut self, now_ns: u64) -> u64 {

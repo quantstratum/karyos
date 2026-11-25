@@ -67,7 +67,7 @@
 
 use std::collections::BTreeMap;
 
-use karyos_cluster::{Entry, HardState};
+use karyos_cluster::{Entry, HardState, stamp};
 
 use super::core::{
     Change, ChangeRefused, Configuration, ConsensusCore, InstallRefused, Limit, Limits, LogView,
@@ -204,8 +204,11 @@ pub struct Reference {
     /// The last index, written or not, after the last call.
     received: Option<u64>,
     /// Its clock at its last tick: the event time of the entries it
-    /// proposes (karyos#686, decision E1).
+    /// proposes (karyos#686, decision E1), before C-TIME's clamp.
     now: u64,
+    /// The C-TIME watermark (ADR-0111): the event time of its log's last
+    /// entry, written or not, or its snapshot's log time.
+    watermark: u64,
     /// The limits it was started with, if any.
     limits: Option<Limits>,
     /// Followers to send the node's snapshot to (W5).
@@ -305,13 +308,21 @@ impl Reference {
             }
         }
         if let Some(index) = self.next(log) {
+            let event_time = self.stamp();
             self.unpersisted.push(Entry {
                 index,
                 term,
-                event_time: self.now,
+                event_time,
                 payload: Vec::new(),
             });
         }
+    }
+
+    /// The event time of the entry it appends now, under C-TIME: its
+    /// clock, clamped to the watermark, which then moves to it.
+    fn stamp(&mut self) -> u64 {
+        self.watermark = stamp(self.now, self.watermark);
+        self.watermark
     }
 
     fn settle(&mut self, log: &LogView<'_>) {
@@ -333,6 +344,10 @@ impl ConsensusCore for Reference {
             .filter(|end| first < *end)
             .and_then(|end| log.entries(first..end, u64::MAX).ok())
             .unwrap_or_default();
+        // C-TIME's watermark: the largest event time of the recovered
+        // log's entries and the snapshot's log time, never the last
+        // entry's alone (a tail from before C-TIME need not be ordered).
+        let watermark = super::core::max_event_time(&entries, log.base_time());
         let configs: Vec<Logged> = entries
             .iter()
             .filter_map(|entry| {
@@ -378,6 +393,7 @@ impl ConsensusCore for Reference {
             // Until its first tick; the log time never goes back, as it
             // is the highest event time applied.
             now: 0,
+            watermark,
             limits: None,
             snapshot_to: Vec::new(),
         }
@@ -427,10 +443,11 @@ impl ConsensusCore for Reference {
         {
             return Err(Refused::Backpressure(Limit::Queue));
         }
+        let event_time = self.stamp();
         self.unpersisted.push(Entry {
             index,
             term: self.term,
-            event_time: self.now,
+            event_time,
             payload: command,
         });
         self.settle(log);
@@ -479,9 +496,11 @@ impl ConsensusCore for Reference {
                                 Some(self.truncate.map_or(entry.index, |t| t.min(entry.index)));
                         }
                         self.note(&entry);
+                        self.watermark = entry.event_time;
                         self.unpersisted.push(entry);
                     } else if entry.index == next {
                         self.note(&entry);
+                        self.watermark = entry.event_time;
                         self.unpersisted.push(entry);
                     } else {
                         break;
@@ -750,8 +769,12 @@ impl ConsensusCore for Reference {
         if self.commit.is_some_and(|commit| base.index <= commit) {
             return Err(InstallRefused::Stale);
         }
-        // Its log restarted after the base, which the node made durable.
+        // Its log restarted after the base, which the node made durable:
+        // the watermark is the snapshot's log time.
         self.unpersisted.clear();
+        if let Some(log_time) = log.base_time() {
+            self.watermark = log_time;
+        }
         self.truncate = None;
         self.commit = Some(base.index);
         self.handed = Some(base.index);
@@ -829,10 +852,11 @@ impl ConsensusCore for Reference {
         for member in voters.iter().chain(&learners) {
             let _ = self.acked.entry(*member).or_insert(None);
         }
+        let event_time = self.stamp();
         self.unpersisted.push(Entry {
             index,
             term: self.term,
-            event_time: self.now,
+            event_time,
             payload: encode_configuration(&voters, &learners),
         });
         self.configs.push((index, voters, learners));

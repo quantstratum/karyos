@@ -31,10 +31,6 @@ pub enum TimedNetworkUnsupported {
     /// The `Tai` clock domain: the sender runs on the monotonic clock.
     #[error("the Tai clock domain")]
     TaiDomain,
-    /// Cancel-on-deadline: the sealing it needs is the conductor's, which
-    /// the sender agent does not hold.
-    #[error("cancel-on-deadline")]
-    CancelOnDeadline,
     /// A horizon that, with one heartbeat interval, reaches the image
     /// liveness timeout: a lane holding only a head that far ahead sends
     /// nothing (no DATA, and no idle heartbeat while a head is staged),
@@ -43,6 +39,34 @@ pub enum TimedNetworkUnsupported {
     /// assumed to use this driver's `image_liveness_timeout`.
     #[error("a horizon that, with a heartbeat interval, reaches the image liveness timeout")]
     HorizonPastLiveness,
+    /// The `etf` route (ADR-0109) on a channel without an `etf`
+    /// declaration (`etf-priority` and `etf-delta`).
+    #[error("the etf route without the channel's etf declaration")]
+    EtfUndeclared,
+    /// An `etf` declaration on a channel whose publication is not timed on
+    /// the `etf` route: nothing would use the leaf it names.
+    #[error("an etf declaration without the etf route")]
+    EtfWithoutRoute,
+    /// The declared leaf's `delta` exceeds the publication's declared
+    /// tolerated advance (ADR-0109 point 2): a datagram handed to the
+    /// kernel at the advance could reach the leaf too late and be dropped.
+    #[error("the etf leaf's delta exceeds the declared advance")]
+    EtfDeltaAboveAdvance,
+    /// Another `etf` publication of this driver declares the same priority
+    /// on the same interface (ADR-0109 point 2, isolation): one could
+    /// advance the shared leaf's clock and get the other's datagrams
+    /// dropped.
+    #[error("another etf publication declares this priority on this interface")]
+    EtfPriorityShared,
+    /// The `etf` route anywhere but on a unicast destination of a Linux
+    /// driver (ADR-0109 point 5).
+    #[error("the etf route off Linux or off a unicast destination")]
+    EtfUnavailable,
+    /// An `etf` declaration a URI could not give: a zero `delta` or one of
+    /// 2^32 ns or more, no `interface` address, or an interface address
+    /// this host cannot resolve to an interface (ADR-0109 point 2).
+    #[error("an etf declaration with no valid delta or resolvable interface")]
+    EtfDeclarationInvalid,
 }
 
 /// Why an authenticated channel is refused at admission, before anything
@@ -81,6 +105,10 @@ pub enum AuthRefusal {
     /// publication names both a local and a remote guard.
     #[error("no durable guard state")]
     GuardState,
+    /// An `etf` declaration (ADR-0109): the authenticated class over the
+    /// etf route is not designed yet, so it is refused, never run.
+    #[error("an etf declaration on an authenticated channel")]
+    Etf,
 }
 
 /// Errors returned by the embedded driver.
