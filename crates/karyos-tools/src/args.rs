@@ -200,6 +200,11 @@ Archive:
                                     namespace (a literal epoch is refused); needs
                                     --archive-trace-record, --archive-time-evidence and
                                     --archive-calibration-journal
+  --archive-calibration-wait <duration>
+                                    how long a sealed range of the trace recording waits for
+                                    the calibration journal to publish past it, at a stop too;
+                                    past it the range is no_evidence (ADR-0117 point 7);
+                                    needs --archive-trace-clock [10s]
   --trace-network                   set the driver's network trace hooks, so network trace
                                     journals are mirrored (and recorded); needs --network on
 
@@ -736,6 +741,18 @@ where
             }
             continue;
         }
+        if option == "--archive-calibration-wait" {
+            // Zero is a valid wait: the snapshot at the seal decides.
+            let parsed = karyos_protocol::channel::parse_duration(&value).map_err(|error| {
+                ArgsError::InvalidDuration {
+                    option,
+                    value: value.clone(),
+                    error,
+                }
+            })?;
+            archive.calibration_wait = Some(parsed);
+            continue;
+        }
         if option == "--idle-image-timeout" {
             let parsed = karyos_protocol::channel::parse_duration(&value).map_err(|error| {
                 ArgsError::InvalidDuration {
@@ -984,6 +1001,7 @@ const OPTIONS: &[&str] = &[
     "--archive-calibration-journal",
     "--archive-trace-record",
     "--archive-trace-clock",
+    "--archive-calibration-wait",
     "--archive-retain-for",
     "--archive-purge",
     "--archive-min-copies",
@@ -1408,6 +1426,7 @@ struct Archive {
     trusted_network: bool,
     trace: Option<TraceRecordOption>,
     trace_clock: Option<TraceClockOption>,
+    calibration_wait: Option<Duration>,
 }
 
 impl Archive {
@@ -1443,6 +1462,10 @@ impl Archive {
                 (self.trusted_network, "--replication-trusted-network"),
                 (self.trace.is_some(), "--archive-trace-record"),
                 (self.trace_clock.is_some(), "--archive-trace-clock"),
+                (
+                    self.calibration_wait.is_some(),
+                    "--archive-calibration-wait",
+                ),
             ] {
                 if given {
                     return Err(ArgsError::Needs {
@@ -1507,8 +1530,19 @@ impl Archive {
                 }
             }
         }
+        // The wait applies to the trace recording's evidence (ADR-0117,
+        // point 7): without a declared clock it would wait for nothing.
+        if self.calibration_wait.is_some() && self.trace_clock.is_none() {
+            return Err(ArgsError::Needs {
+                option: "--archive-calibration-wait",
+                needs: "--archive-trace-clock",
+            });
+        }
         let trace = self.trace.map(|trace| TraceRecordOption {
             clock: self.trace_clock,
+            calibration_wait: self
+                .calibration_wait
+                .unwrap_or(DEFAULT_ARCHIVE_CALIBRATION_WAIT),
             ..trace
         });
         let (requests, responses, retention_responses) = self.control.ok_or(ArgsError::Needs {
@@ -1850,6 +1884,58 @@ mod tests {
                 needs: "--archive",
             })
         );
+        // ADR-0117 point 7: the wait, zero included, with the clock only.
+        for (value, wait) in [
+            ("250ms", Duration::from_millis(250)),
+            ("0s", Duration::ZERO),
+        ] {
+            let parsed = options(
+                &[
+                    &archive[..],
+                    &evidence[..],
+                    &[
+                        "--archive-trace-clock",
+                        "5:boot:1000",
+                        "--archive-calibration-wait",
+                        value,
+                    ],
+                ]
+                .concat(),
+            );
+            assert_eq!(
+                parsed.archive.unwrap().trace.unwrap().calibration_wait,
+                wait
+            );
+        }
+        assert_eq!(
+            run(&[
+                &archive[..],
+                &evidence[..],
+                &["--archive-calibration-wait", "1s"]
+            ]
+            .concat()),
+            Err(ArgsError::Needs {
+                option: "--archive-calibration-wait",
+                needs: "--archive-trace-clock",
+            })
+        );
+        assert!(matches!(
+            run(&[
+                &archive[..],
+                &evidence[..],
+                &[
+                    "--archive-trace-clock",
+                    "5:boot:1",
+                    "--archive-calibration-wait",
+                    "soon"
+                ],
+            ]
+            .concat()),
+            Err(ArgsError::InvalidDuration {
+                option: "--archive-calibration-wait",
+                ..
+            })
+        ));
         assert_eq!(options(&archive).archive.unwrap().trace, None);
         for value in ["40", "40:x", "x:3"] {
             assert_eq!(

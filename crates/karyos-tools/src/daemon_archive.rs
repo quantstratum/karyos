@@ -527,6 +527,10 @@ pub struct DaemonArchive {
     signing_alarm: bool,
     /// The trace mirror's publisher (`--archive-trace-record`, ADR-0117).
     trace: Option<DaemonTrace>,
+    /// How long the trace recording's stop may wait for the calibration
+    /// journal (`--archive-calibration-wait`, ADR-0117 point 7); zero
+    /// without a declared clock.
+    trace_wait: std::time::Duration,
 }
 
 impl std::fmt::Debug for DaemonArchive {
@@ -696,6 +700,10 @@ impl DaemonArchive {
             audits_dropped: 0,
             signing_alarm: false,
             trace,
+            trace_wait: options
+                .trace
+                .filter(|trace| trace.clock.is_some())
+                .map_or(std::time::Duration::ZERO, |trace| trace.calibration_wait),
         };
         for record in &options.records {
             archive.requester.ask(Asked::Start(*record), "karyos:ipc");
@@ -789,6 +797,14 @@ impl DaemonArchive {
                 "signed coverage is within the anchor interval again"
             );
         }
+    }
+
+    /// How much longer than its linger the stop of the boot recordings may
+    /// take: the trace recording's calibration wait, which its stop
+    /// applies to its last ranges (ADR-0117, point 7).
+    #[must_use]
+    pub fn stop_wait(&self) -> std::time::Duration {
+        self.trace_wait
     }
 
     /// Runs cycles until the trace publisher has published everything the

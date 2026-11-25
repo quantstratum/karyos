@@ -513,7 +513,10 @@ impl Daemon {
             return self;
         };
         // What the trace mirror holds is published before the trace
-        // recording is asked to stop (ADR-0117).
+        // recording is asked to stop (ADR-0117); its stop may then wait
+        // for the calibration journal (point 7), past which its last
+        // ranges are `no_evidence` and the daemon stops.
+        let within = within.saturating_add(archive.stop_wait());
         let deadline = Instant::now().checked_add(within);
         archive.drain_trace(deadline);
         archive.stop_recordings();
