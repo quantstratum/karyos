@@ -325,20 +325,111 @@ fn one_writer_at_a_time() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A disk whose lock answers `WouldBlock` for the first `busy` tries, as
+/// a lock that a spawned child still holds a copy of looks, then takes the
+/// real lock.
+#[derive(Debug, Clone)]
+struct BusyLock {
+    busy: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl BusyLock {
+    fn new(busy: u32) -> Self {
+        Self {
+            busy: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(busy)),
+        }
+    }
+}
+
+impl crate::disk::Disk for BusyLock {
+    type File = std::fs::File;
+
+    fn create(&mut self, path: &std::path::Path) -> std::io::Result<Self::File> {
+        StdDisk.create(path)
+    }
+
+    fn open(&mut self, path: &std::path::Path) -> std::io::Result<Self::File> {
+        StdDisk.open(path)
+    }
+
+    fn open_read(&mut self, path: &std::path::Path) -> std::io::Result<Self::File> {
+        StdDisk.open_read(path)
+    }
+
+    fn write_at(&mut self, file: &Self::File, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+        StdDisk.write_at(file, offset, bytes)
+    }
+
+    fn read_at(&mut self, file: &Self::File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        StdDisk.read_at(file, offset, buf)
+    }
+
+    fn len(&mut self, file: &Self::File) -> std::io::Result<u64> {
+        StdDisk.len(file)
+    }
+
+    fn set_len(&mut self, file: &Self::File, len: u64) -> std::io::Result<()> {
+        StdDisk.set_len(file, len)
+    }
+
+    fn sync(&mut self, file: &Self::File) -> std::io::Result<()> {
+        StdDisk.sync(file)
+    }
+
+    fn sync_dir(&mut self, dir: &std::path::Path) -> std::io::Result<()> {
+        StdDisk.sync_dir(dir)
+    }
+
+    fn list(&mut self, dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+        StdDisk.list(dir)
+    }
+
+    fn remove(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        StdDisk.remove(path)
+    }
+
+    fn rename(&mut self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+        StdDisk.rename(from, to)
+    }
+
+    fn lock(&mut self, file: &Self::File) -> std::io::Result<()> {
+        let left = self.busy.load(std::sync::atomic::Ordering::SeqCst);
+        if left > 0 {
+            self.busy
+                .store(left - 1, std::sync::atomic::Ordering::SeqCst);
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        }
+        StdDisk.lock(file)
+    }
+}
+
 /// A lock a spawned child holds for a moment (a copy of the lock until its
-/// exec, karyos_sys::spawn_window) is waited for, not answered `Locked`.
+/// exec, karyos_sys::spawn_window) is tried again, not answered `Locked`:
+/// the first tries are refused, deterministically, and the open succeeds.
 #[test]
 fn a_lock_held_for_a_moment_is_waited_for() {
     let dir = temp_dir("lock-moment");
-    let journal = CalibrationJournal::open(StdDisk, &dir).unwrap();
-    let holder = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        drop(journal);
-    });
-    let reopened = CalibrationJournal::open(StdDisk, &dir);
-    holder.join().unwrap();
-    assert!(reopened.is_ok(), "{:?}", reopened.err());
-    drop(reopened);
+    let disk = BusyLock::new(3);
+    let opened = CalibrationJournal::open(disk.clone(), &dir);
+    assert!(opened.is_ok(), "{:?}", opened.err());
+    assert_eq!(
+        disk.busy.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "it was retried"
+    );
+    drop(opened);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A lock still held after the spawn window is another writer's: `Locked`.
+#[test]
+fn a_lock_held_past_the_window_is_locked() {
+    let dir = temp_dir("lock-past");
+    let disk = BusyLock::new(u32::MAX);
+    assert!(matches!(
+        CalibrationJournal::open(disk, &dir),
+        Err(JournalError::Locked)
+    ));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
