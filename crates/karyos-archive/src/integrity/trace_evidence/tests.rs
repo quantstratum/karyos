@@ -189,6 +189,29 @@ fn a_lost_facts_change_never_lets_earlier_facts_apply() {
     assert!(!in_session(observe(&mut session, &record(7, 3, 8000, 0))));
 }
 
+/// karyos#1128: the session keeps the first requirement of each domain the
+/// recording carries.
+#[test]
+fn the_session_keeps_the_requirements_the_recording_carries() {
+    use karyos_trace::stream::TimeRequirement;
+    let first = TimeRequirement {
+        domain: 5,
+        max_divergence_ns: 1000,
+        max_granularity_ns: 10,
+    };
+    let session = session_with(&[
+        StreamMessage::DriverSelf(OWN),
+        StreamMessage::Requirement(first),
+        StreamMessage::Requirement(TimeRequirement {
+            max_divergence_ns: 1,
+            ..first
+        }),
+        StreamMessage::Requirement(TimeRequirement { domain: 6, ..first }),
+    ]);
+    assert_eq!(session.requirements().len(), 2);
+    assert_eq!(session.requirements()[&5], first);
+}
+
 /// The self message must come first and declare the recording's clock.
 #[test]
 fn the_self_message_must_come_first_and_declare_the_clock() {

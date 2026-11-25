@@ -30,6 +30,7 @@ use karyos_sys::trace_mirror::{EntryRead, TraceMirrorReader};
 use karyos_trace::RECORD_WORDS;
 use karyos_trace::stream::{
     DriverSelf, JournalFacts, MAX_MESSAGE_BYTES, StreamLoss, StreamMessage, StreamRecord,
+    TimeRequirement,
 };
 
 /// Ring records the publisher reads in one cycle at most.
@@ -134,8 +135,22 @@ impl<S: TraceSink, M: MirrorSource> TracePublisher<S, M> {
     /// first.
     #[must_use]
     pub fn new(sink: S, mirror: M, own: DriverSelf) -> Self {
+        Self::with_requirements(sink, mirror, own, &[])
+    }
+
+    /// [`TracePublisher::new`], its self message followed by the
+    /// operator's time `requirements`, one per clock domain, which the
+    /// recording so carries.
+    #[must_use]
+    pub fn with_requirements(
+        sink: S,
+        mirror: M,
+        own: DriverSelf,
+        requirements: &[TimeRequirement],
+    ) -> Self {
         let mut queue = VecDeque::new();
         queue.push_back(StreamMessage::DriverSelf(own));
+        queue.extend(requirements.iter().copied().map(StreamMessage::Requirement));
         Self {
             sink,
             mirror,

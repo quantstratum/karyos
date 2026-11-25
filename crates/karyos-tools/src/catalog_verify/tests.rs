@@ -1062,6 +1062,100 @@ fn verify_reports_a_trace_recordings_losses_and_one_recording_alone() {
     }
 }
 
+/// karyos#1128: the requirement a trace recording carries (karyosd
+/// --archive-time-requirement) judges its entries when verify is given no
+/// --time-requirement: recording 7 carries 1000:1 (met), recording 8
+/// 100:1 (not_met). A --time-requirement is the verifier's own and
+/// overrides what the recordings carry, reported as such.
+#[test]
+fn verify_judges_entries_against_the_requirement_their_recording_carries() {
+    use karyos_archive::integrity::time::{Source, SyncState};
+    use karyos_archive::integrity::time_evidence::{Entry, EntryStore, entries_dir};
+    use karyos_trace::stream::{DriverSelf, StreamMessage, TimeRequirement};
+
+    let root = std::env::temp_dir().join(format!("karyos-verify-carried-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let archive = Archive { root };
+    let dir = archive.dir();
+    std::fs::create_dir_all(entries_dir(&dir)).unwrap();
+    std::fs::create_dir_all(archive.anchors()).unwrap();
+    let mut journal = open_journal(&dir);
+    let mut store_entries = Vec::new();
+    for (recording, divergence) in [(7u64, 1000u64), (8, 100)] {
+        let mut bytes = trace_frame(&StreamMessage::DriverSelf(DriverSelf {
+            namespace: 1,
+            namespace_inode: 9,
+            clock: [0, 0, 0, 5, 77],
+            granularity: 1000,
+        }));
+        bytes.extend(trace_frame(&StreamMessage::Requirement(TimeRequirement {
+            domain: 5,
+            max_divergence_ns: divergence,
+            max_granularity_ns: 1,
+        })));
+        let length = bytes.len() as u64;
+        let mut store = SegmentStore::create(
+            StdDisk,
+            &dir,
+            recording,
+            Geometry::new(4096, 8192).unwrap(),
+            SyncPolicy::None,
+            0,
+        )
+        .unwrap();
+        store.append(0, &bytes).unwrap();
+        store.sync().unwrap();
+        drop(store);
+        journal.seal_segment(recording, 0, &bytes, false).unwrap();
+        store_entries.push(Entry {
+            source: Source::Gnss,
+            sync_state: SyncState::Synchronised,
+            clock: [0, 0, 0, 5, 77],
+            recording,
+            start: 0,
+            end: length,
+            min_time: 1000,
+            max_time: 2000,
+            granularity: 1,
+            bound_min_ns: 150,
+            bound_max_ns: 160,
+            calibration: [0xAA; 32],
+            utc_reference: [0xBB; 32],
+            tick_fs: 1_000_000,
+        });
+    }
+    drop(journal);
+    let mut store = EntryStore::open(StdDisk, &dir).unwrap();
+    for entry in &store_entries {
+        store.append(entry).unwrap();
+    }
+    drop(store);
+    sign_time_evidence(&archive, &entries_dir(&dir), 1);
+    let (_, out, err) = time_run(&archive, &[]);
+    assert_eq!(err, "", "{out}");
+    assert!(out.contains("time recording 7 [0, "), "{out}");
+    assert!(out.contains("clock 5:77 met\n"), "{out}");
+    assert!(out.contains("clock 5:77 not_met\n"), "{out}");
+    assert!(
+        out.contains("time requirement of recording 7 clock domain 5: 1000:1 (recorded)"),
+        "{out}"
+    );
+    assert!(out.ends_with("time verdict: not_met\n"), "{out}");
+    // Recording 7 alone: its own requirement, met.
+    let (_, out, _) = time_run(&archive, &["--recording", "7"]);
+    assert!(out.ends_with("time verdict: met\n"), "{out}");
+    // A flag that agrees with recording 7, alone.
+    // The flag is the verifier's own requirement: it overrides both, and
+    // says so.
+    let (status, out, _) = time_run(&archive, &["--time-requirement", "1000:1"]);
+    assert_eq!(status, 1, "{out}");
+    assert!(
+        out.contains("time requirement of recording 8 clock domain 5: 100:1 (recorded, overridden by --time-requirement)"),
+        "{out}"
+    );
+    assert!(!out.contains("not_met"), "{out}");
+}
+
 fn time_run(archive: &Archive, extra: &[&str]) -> (u8, String, String) {
     let mut argv: Vec<OsString> = vec![
         archive.dir().into(),

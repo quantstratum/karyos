@@ -28,7 +28,7 @@
 use std::collections::BTreeMap;
 
 use karyos_sys::frame::{FRAME_ALIGNMENT, FrameType, Word0};
-use karyos_trace::stream::{DriverSelf, JournalFacts, StreamLoss, StreamMessage};
+use karyos_trace::stream::{DriverSelf, JournalFacts, StreamLoss, StreamMessage, TimeRequirement};
 use karyos_trace::{ClockProvenance, decode_record};
 
 use super::time_producer::{Event, EventClock};
@@ -113,6 +113,9 @@ pub struct TraceSession {
     started: bool,
     /// Each journal's facts, by journal and generation.
     facts: BTreeMap<(u64, u64), JournalFacts>,
+    /// The time requirement the recording carries for each clock domain:
+    /// the first of each domain.
+    requirements: BTreeMap<u64, TimeRequirement>,
 }
 
 impl TraceSession {
@@ -126,6 +129,12 @@ impl TraceSession {
     #[must_use]
     pub fn own(&self) -> Option<&DriverSelf> {
         self.own.as_ref()
+    }
+
+    /// The time requirements the recording carries, by clock domain.
+    #[must_use]
+    pub fn requirements(&self) -> &BTreeMap<u64, TimeRequirement> {
+        &self.requirements
     }
 
     /// Reads one frame's payload (`None` for a frame that carries no whole
@@ -148,6 +157,13 @@ impl TraceSession {
                 Observation::Untimed
             }
             StreamMessage::Loss(loss) => Observation::Loss(loss),
+            StreamMessage::Requirement(requirement) => {
+                let _ = self
+                    .requirements
+                    .entry(requirement.domain)
+                    .or_insert(requirement);
+                Observation::Untimed
+            }
             StreamMessage::Record(record) => {
                 let Ok((observation, _)) = decode_record(&record.words) else {
                     return Observation::Unreadable;

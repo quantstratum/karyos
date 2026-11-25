@@ -89,6 +89,28 @@ fn facts_record_and_loss_match_their_golden_vectors() {
     }
 }
 
+/// The requirement message (kind 5), byte for byte.
+#[test]
+fn the_requirement_message_matches_its_golden_vector() {
+    let requirement = StreamMessage::Requirement(TimeRequirement {
+        domain: 5,
+        max_divergence_ns: 1_000_000,
+        max_granularity_ns: 1000,
+    });
+    assert_eq!(
+        encoded(&requirement),
+        bytes(&[0x0000_0501_5352_544B, 5, 1_000_000, 1000])
+    );
+    assert_eq!(
+        StreamMessage::decode(&encoded(&requirement)).unwrap(),
+        requirement
+    );
+    assert_eq!(
+        StreamMessage::decode(&bytes(&[0x0000_0501_5352_544B, 5, 1])),
+        Err(StreamError::Length { length: 24 })
+    );
+}
+
 #[test]
 fn a_malformed_message_is_refused() {
     let good = encoded(&self_message());

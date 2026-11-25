@@ -16,6 +16,7 @@
 //! | 2 facts | 6 | journal, facts generation (nonzero), kind, time namespace word, provenance word |
 //! | 3 record | 29 | journal, facts generation in force when read (0: none known), the record's journal sequence, its 25 words |
 //! | 4 loss | 4 | journal (0: ring records whose journal is unknown), first and last lost sequence |
+//! | 5 requirement | 4 | clock domain, maximum divergence from UTC in ns, coarsest granularity in ns |
 //!
 //! - **Self** comes first: the namespace word the driver writes for a
 //!   journal in its own namespace (T2's `1`), so a reader compares a
@@ -31,6 +32,11 @@
 //!   read: by journal and journal sequence when a gap in a journal's
 //!   sequences shows them, or with journal 0 by ring sequence when the
 //!   ring's boundary does.
+//!
+//! - A **requirement** is the operator's time requirement for the clocks
+//!   of one domain (`karyosd --archive-time-requirement`), published right
+//!   after the self message, one per domain: the recording carries it, so
+//!   `karyos-catalog verify` judges the recording's entries against it.
 //!
 //! The layout is pinned by golden vectors (the module's tests). The codec
 //! allocates nothing: encoding writes into the caller's buffer.
@@ -49,6 +55,8 @@ pub const FACTS_WORDS: usize = 6;
 pub const RECORD_MESSAGE_WORDS: usize = 4 + RECORD_WORDS;
 /// Words of a loss message.
 pub const LOSS_WORDS: usize = 4;
+/// Words of a requirement message.
+pub const REQUIREMENT_WORDS: usize = 4;
 /// The longest message, in bytes.
 pub const MAX_MESSAGE_BYTES: usize = RECORD_MESSAGE_WORDS * 8;
 
@@ -56,6 +64,7 @@ const KIND_SELF: u64 = 1;
 const KIND_FACTS: u64 = 2;
 const KIND_RECORD: u64 = 3;
 const KIND_LOSS: u64 = 4;
+const KIND_REQUIREMENT: u64 = 5;
 
 /// The first message of a trace stream: the driver's own time namespace
 /// and the recording's declared clock.
@@ -116,6 +125,18 @@ pub struct StreamLoss {
     pub last: u64,
 }
 
+/// The operator's time requirement for the clocks of one domain (SPEC.md
+/// 8.4), as the recording carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TimeRequirement {
+    /// The clock domain the requirement applies to.
+    pub domain: u64,
+    /// The maximum divergence from UTC, in ns.
+    pub max_divergence_ns: u64,
+    /// The coarsest granularity allowed, in ns.
+    pub max_granularity_ns: u64,
+}
+
 /// One message of the trace stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(
@@ -131,6 +152,8 @@ pub enum StreamMessage {
     Record(StreamRecord),
     /// A loss.
     Loss(StreamLoss),
+    /// The operator's time requirement for one clock domain.
+    Requirement(TimeRequirement),
 }
 
 /// Why a message does not encode or decode.
@@ -180,6 +203,7 @@ impl StreamMessage {
             Self::Facts(_) => FACTS_WORDS,
             Self::Record(_) => RECORD_MESSAGE_WORDS,
             Self::Loss(_) => LOSS_WORDS,
+            Self::Requirement(_) => REQUIREMENT_WORDS,
         }
     }
 
@@ -189,6 +213,7 @@ impl StreamMessage {
             Self::Facts(facts) => facts.journal != 0 && facts.generation != 0,
             Self::Record(record) => record.journal != 0,
             Self::Loss(loss) => loss.first <= loss.last,
+            Self::Requirement(_) => true,
         };
         if valid {
             Ok(())
@@ -238,6 +263,13 @@ impl StreamMessage {
             ]
             .into_iter()
             .chain(record.words)),
+            Self::Requirement(requirement) => put(&mut [
+                header(KIND_REQUIREMENT),
+                requirement.domain,
+                requirement.max_divergence_ns,
+                requirement.max_granularity_ns,
+            ]
+            .into_iter()),
             Self::Loss(loss) => {
                 put(&mut [header(KIND_LOSS), loss.journal, loss.first, loss.last].into_iter())
             }
@@ -276,6 +308,7 @@ impl StreamMessage {
             KIND_FACTS => FACTS_WORDS,
             KIND_RECORD => RECORD_MESSAGE_WORDS,
             KIND_LOSS => LOSS_WORDS,
+            KIND_REQUIREMENT => REQUIREMENT_WORDS,
             kind => return Err(StreamError::Kind { kind }),
         };
         if chunks.len() != words {
@@ -309,6 +342,11 @@ impl StreamMessage {
                     words,
                 })
             }
+            KIND_REQUIREMENT => Self::Requirement(TimeRequirement {
+                domain: word(1),
+                max_divergence_ns: word(2),
+                max_granularity_ns: word(3),
+            }),
             _ => Self::Loss(StreamLoss {
                 journal: word(1),
                 first: word(2),

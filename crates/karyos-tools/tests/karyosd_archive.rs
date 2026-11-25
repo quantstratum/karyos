@@ -1259,6 +1259,8 @@ fn karyosd_records_its_trace_journal_with_time_evidence() {
         "50:1",
         "--archive-trace-clock",
         "5:boot:1000",
+        "--archive-time-requirement",
+        "5:1000000000:1000",
         "--archive-calibration-wait",
         "10s",
         "--archive-seal-interval",
@@ -1335,7 +1337,7 @@ fn karyosd_records_its_trace_journal_with_time_evidence() {
     digests.dedup();
     assert!(digests.len() >= 2, "{entries:#?}");
 
-    let verify = |requirement: &str| {
+    let verify = |requirement: Option<&str>| {
         let output = Command::new(env!("CARGO_BIN_EXE_karyos-catalog"))
             .arg("verify")
             .arg(&archive)
@@ -1343,7 +1345,13 @@ fn karyosd_records_its_trace_journal_with_time_evidence() {
             .arg(&trust)
             .arg("--anchors")
             .arg(format!("{}={}", hex(&OPERATOR), anchors.display()))
-            .args(["--time-requirement", requirement, "--time-anchors"])
+            .args(
+                requirement
+                    .map(|requirement| ["--time-requirement", requirement])
+                    .into_iter()
+                    .flatten(),
+            )
+            .arg("--time-anchors")
             .arg(format!("{}={}", hex(&OPERATOR), time_anchors.display()))
             .output()
             .unwrap();
@@ -1356,7 +1364,13 @@ fn karyosd_records_its_trace_journal_with_time_evidence() {
             ),
         )
     };
-    let (code, shown) = verify("1000000000:1000");
+    // No --time-requirement: the recording carries the operator's
+    // requirement for clock domain 5 (karyos#1128).
+    let (code, shown) = verify(None);
+    assert!(
+        shown.contains("clock domain 5: 1000000000:1000 (recorded)"),
+        "{shown}"
+    );
     assert_eq!(code, Some(0), "{shown}");
     for entry in &bounded {
         let [.., domain, epoch] = entry.clock;
@@ -1370,8 +1384,13 @@ fn karyosd_records_its_trace_journal_with_time_evidence() {
     assert!(!shown.contains(" loss "), "{shown}");
     assert!(shown.ends_with("time verdict: met\n"), "{shown}");
     // A stricter requirement: 1 ns of divergence.
-    let (code, shown) = verify("1:1000");
+    // The verifier's own, stricter requirement overrides it.
+    let (code, shown) = verify(Some("1:1000"));
     assert_eq!(code, Some(0), "{shown}");
+    assert!(
+        shown.contains("overridden by --time-requirement"),
+        "{shown}"
+    );
     assert!(shown.ends_with("time verdict: not_met\n"), "{shown}");
 
     let _ = std::fs::remove_dir_all(&root);

@@ -167,6 +167,36 @@ fn a_refusing_stream_blocks_and_an_overwrite_is_a_loss() {
     assert_eq!(publisher.counts().losses, 3);
 }
 
+/// karyos#1128: the requirements follow the self message, before anything
+/// the mirror holds.
+#[test]
+fn the_requirements_follow_the_self_message() {
+    let requirement = karyos_trace::stream::TimeRequirement {
+        domain: 5,
+        max_divergence_ns: 1_000_000,
+        max_granularity_ns: 1000,
+    };
+    let mirror = Mirror {
+        oldest: 0,
+        ring: vec![(7, 0, words(0))],
+        table: vec![(7, [2, 1, 2])],
+    };
+    let stream = Stream {
+        open: true,
+        taken: Vec::new(),
+    };
+    let mut publisher = TracePublisher::with_requirements(stream, mirror, OWN, &[requirement]);
+    assert!(publisher.publish());
+    assert_eq!(
+        publisher.sink.taken[..3],
+        [
+            StreamMessage::DriverSelf(OWN),
+            StreamMessage::Requirement(requirement),
+            facts(7, 1, [2, 1, 2]),
+        ]
+    );
+}
+
 /// A record whose journal's facts were never read is published with
 /// generation 0, which no facts message names.
 #[test]

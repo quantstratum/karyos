@@ -205,6 +205,13 @@ Archive:
                                     the calibration journal to publish past it, at a stop too;
                                     past it the range is no_evidence (ADR-0117 point 7);
                                     needs --archive-trace-clock [10s]
+  --archive-time-requirement <domain>:<divergence-ns>:<granularity-ns>
+                                    the operator's time requirement for the clocks of this
+                                    domain (SPEC 8.4): the trace recording carries it, and
+                                    karyos-catalog verify judges its entries against it
+                                    (a --time-requirement given to verify overrides it);
+                                    once per domain; repeatable; needs
+                                    --archive-trace-record
   --trace-network                   set the driver's network trace hooks, so network trace
                                     journals are mirrored (and recorded); needs --network on
 
@@ -430,6 +437,10 @@ pub struct ArchiveOptions {
     /// The trace recording (`--archive-trace-record`, ADR-0117), when
     /// asked for.
     pub trace: Option<TraceRecordOption>,
+    /// The operator's time requirements, one per clock domain
+    /// (`--archive-time-requirement`): the trace recording carries them,
+    /// and verify judges its entries against them (karyos#1128).
+    pub time_requirements: Vec<karyos_trace::stream::TimeRequirement>,
 }
 
 /// The daemon's trace recording (`--archive-trace-record`, ADR-0117): the
@@ -778,6 +789,15 @@ where
             "--archive-trace-record" => trace_record(&value).map(|trace| {
                 archive.trace = Some(trace);
             }),
+            "--archive-time-requirement" => time_requirement(&value)
+                .filter(|requirement| {
+                    // Once per domain: two would leave the verdict open.
+                    archive
+                        .time_requirements
+                        .iter()
+                        .all(|given| given.domain != requirement.domain)
+                })
+                .map(|requirement| archive.time_requirements.push(requirement)),
             "--archive-trace-clock" => trace_clock(&value).map(|clock| {
                 archive.trace_clock = Some(clock);
             }),
@@ -1002,6 +1022,7 @@ const OPTIONS: &[&str] = &[
     "--archive-trace-record",
     "--archive-trace-clock",
     "--archive-calibration-wait",
+    "--archive-time-requirement",
     "--archive-retain-for",
     "--archive-purge",
     "--archive-min-copies",
@@ -1427,6 +1448,7 @@ struct Archive {
     trace: Option<TraceRecordOption>,
     trace_clock: Option<TraceClockOption>,
     calibration_wait: Option<Duration>,
+    time_requirements: Vec<karyos_trace::stream::TimeRequirement>,
 }
 
 impl Archive {
@@ -1465,6 +1487,10 @@ impl Archive {
                 (
                     self.calibration_wait.is_some(),
                     "--archive-calibration-wait",
+                ),
+                (
+                    !self.time_requirements.is_empty(),
+                    "--archive-time-requirement",
                 ),
             ] {
                 if given {
@@ -1538,6 +1564,14 @@ impl Archive {
                 needs: "--archive-trace-clock",
             });
         }
+        // The trace recording carries the requirements: without it they
+        // would reach no recording.
+        if !self.time_requirements.is_empty() && self.trace.is_none() {
+            return Err(ArgsError::Needs {
+                option: "--archive-time-requirement",
+                needs: "--archive-trace-record",
+            });
+        }
         let trace = self.trace.map(|trace| TraceRecordOption {
             clock: self.trace_clock,
             calibration_wait: self
@@ -1607,6 +1641,7 @@ impl Archive {
             replicas: self.replicas,
             trusted_network: self.trusted_network,
             trace,
+            time_requirements: self.time_requirements,
         }))
     }
 }
@@ -1620,6 +1655,17 @@ fn trace_record(value: &str) -> Option<TraceRecordOption> {
         clock: None,
         calibration_wait: DEFAULT_ARCHIVE_CALIBRATION_WAIT,
     })
+}
+
+/// `<domain>:<divergence-ns>:<granularity-ns>`: a time requirement.
+fn time_requirement(value: &str) -> Option<karyos_trace::stream::TimeRequirement> {
+    let mut parts = value.split(':');
+    let requirement = karyos_trace::stream::TimeRequirement {
+        domain: parts.next()?.parse().ok()?,
+        max_divergence_ns: parts.next()?.parse().ok()?,
+        max_granularity_ns: parts.next()?.parse().ok()?,
+    };
+    parts.next().is_none().then_some(requirement)
 }
 
 /// `<domain>:boot:<granularity-ns>`: the trace clock. The epoch is always
@@ -1960,6 +2006,78 @@ mod tests {
             Err(ArgsError::Needs {
                 option: "--trace-network",
                 needs: "--network on",
+            })
+        );
+    }
+
+    /// karyos#1128: `--archive-time-requirement` declares one requirement
+    /// per clock domain, carried by the trace recording.
+    #[test]
+    fn the_time_requirements_parse_once_per_domain() {
+        let archive = [
+            "--dir",
+            "d",
+            "--archive",
+            "a",
+            "--archive-control",
+            "100,101",
+            "--archive-anchor-interval",
+            "1s",
+            "--archive-trace-record",
+            "40:3",
+        ];
+        let parsed = options(
+            &[
+                &archive[..],
+                &[
+                    "--archive-time-requirement",
+                    "5:1000000:1000",
+                    "--archive-time-requirement",
+                    "6:10:1",
+                ],
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            parsed.archive.unwrap().time_requirements,
+            [
+                karyos_trace::stream::TimeRequirement {
+                    domain: 5,
+                    max_divergence_ns: 1_000_000,
+                    max_granularity_ns: 1000,
+                },
+                karyos_trace::stream::TimeRequirement {
+                    domain: 6,
+                    max_divergence_ns: 10,
+                    max_granularity_ns: 1,
+                },
+            ]
+        );
+        for value in ["5:1", "5:1:2:3", "x:1:2"] {
+            assert!(matches!(
+                run(&[&archive[..], &["--archive-time-requirement", value]].concat()),
+                Err(ArgsError::InvalidValue { .. })
+            ));
+        }
+        // Twice for one domain.
+        assert!(matches!(
+            run(&[
+                &archive[..],
+                &[
+                    "--archive-time-requirement",
+                    "5:1:1",
+                    "--archive-time-requirement",
+                    "5:2:2"
+                ]
+            ]
+            .concat()),
+            Err(ArgsError::InvalidValue { .. })
+        ));
+        assert_eq!(
+            run(&[&archive[..8], &["--archive-time-requirement", "5:1:1"]].concat()),
+            Err(ArgsError::Needs {
+                option: "--archive-time-requirement",
+                needs: "--archive-trace-record",
             })
         );
     }
@@ -2473,6 +2591,7 @@ mod tests {
                 time_evidence: false,
                 calibration_journal: None,
                 trace: None,
+                time_requirements: Vec::new(),
                 replications: Vec::new(),
                 replicas: Vec::new(),
                 trusted_network: false,

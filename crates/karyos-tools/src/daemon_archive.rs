@@ -642,7 +642,12 @@ impl DaemonArchive {
                 control.push(stream);
                 let own = trace_self(options, declared.as_ref())?;
                 let publication = driver.publication(stream).map_err(handle)?;
-                Some(TracePublisher::new(publication, driver.trace_mirror(), own))
+                Some(TracePublisher::with_requirements(
+                    publication,
+                    driver.trace_mirror(),
+                    own,
+                    &options.time_requirements,
+                ))
             }
             None => None,
         };
@@ -1085,6 +1090,7 @@ mod tests {
             replicas: Vec::new(),
             trusted_network: false,
             trace: None,
+            time_requirements: Vec::new(),
         };
         let unreadable = || Err(std::io::ErrorKind::NotFound.into());
         assert_eq!(declared_trace_clock_of(&archive, unreadable()), Ok(None));

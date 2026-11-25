@@ -90,9 +90,16 @@ Usage: karyos-catalog verify <dir> [--trust FILE] [--anchors HEX=DIR]...
                  no time verdict is reported. A trace recording's losses
                  (ADR-0117) are reported beside it, each sealed range
                  with the lost journal and sequences, and the verdict is
-                 then never met: no_evidence, capture incomplete
+                 then never met: no_evidence, capture incomplete.
+                 Without it, a trace recording's entries are judged
+                 against the requirement the recording carries for
+                 their clock domain (karyosd --archive-time-requirement),
+                 when --time-anchors is given; with it, the flag is the
+                 verifier's own requirement and overrides what the
+                 recordings carry, each override reported
   --recording ID the time verdict of recording ID alone: its entries,
                  uncovered ranges and losses; needs --time-requirement
+                 or --time-anchors
   --time-anchors HEX=DIR
                  an operator export store of the anchors of
                  <dir>/time-evidence's own journal, as --anchors;
@@ -169,9 +176,9 @@ pub enum UsageError {
     /// A `--recording` that is not a recording id.
     #[error("--recording needs a recording id")]
     Recording,
-    /// `--recording` without `--time-requirement`: it selects a time
-    /// verdict.
-    #[error("--recording needs --time-requirement")]
+    /// `--recording` without `--time-requirement` or `--time-anchors`: it
+    /// selects a time verdict.
+    #[error("--recording needs --time-requirement or --time-anchors")]
     RecordingNeedsRequirement,
 }
 
@@ -435,7 +442,7 @@ pub fn parse_verify(
     if time_requirement.is_some() && time_anchors.is_empty() {
         return Err(UsageError::TimeAnchorsRequired);
     }
-    if recording.is_some() && time_requirement.is_none() {
+    if recording.is_some() && time_requirement.is_none() && time_anchors.is_empty() {
         return Err(UsageError::RecordingNeedsRequirement);
     }
     Ok(Some(VerifyArgs {
@@ -462,6 +469,11 @@ pub struct TimeReport {
     /// its sealed range. Each makes the verdict `no_evidence` for
     /// capture, never `met`.
     pub losses: Vec<RangeLoss>,
+    /// The requirements the recordings carry, by recording (karyos#1128):
+    /// they decide the verdicts unless `--time-requirement` overrides them.
+    pub recorded: Vec<(u64, karyos_trace::stream::TimeRequirement)>,
+    /// Whether `--time-requirement` overrode them.
+    pub overridden: bool,
     /// The combined verdict: `not_met` over `no_evidence` over `met`.
     pub verdict: Verdict,
 }
@@ -490,9 +502,11 @@ pub struct RangeLoss {
 ///
 /// As [`run_checks`], for the entries' directory, and a malformed entry.
 pub fn time_report(args: &VerifyArgs) -> Result<Option<TimeReport>, VerifyError> {
-    let Some(requirement) = args.time_requirement else {
+    // A requirement is declared by the flag, or carried by a recording
+    // (read below); without the flag the entries' anchors still decide.
+    if args.time_requirement.is_none() && args.time_anchors.is_empty() {
         return Ok(None);
-    };
+    }
     let dir = time_evidence::entries_dir(&args.dir);
     let entries = time_evidence::read_sealed(StdDisk, &args.dir).map_err(|source| {
         VerifyError::TimeEvidence {
@@ -525,7 +539,41 @@ pub fn time_report(args: &VerifyArgs) -> Result<Option<TimeReport>, VerifyError>
             .collect()
     };
     let mut gaps = coverage(&args.dir, &dir, &entries)?;
-    let mut losses = trace_losses(&args.dir, &entries)?;
+    let (mut losses, carried) = trace_reading(&args.dir, &entries)?;
+    // Each entry's requirement: the flag's, or what its recording carries
+    // for its clock domain.
+    let requirement_of = |entry: &time_evidence::Entry| {
+        args.time_requirement.or_else(|| {
+            carried
+                .get(&entry.recording)
+                .and_then(|requirements| requirements.get(&entry.clock[3]))
+                .map(|recorded| Requirement {
+                    max_divergence_ns: recorded.max_divergence_ns,
+                    max_granularity_ns: recorded.max_granularity_ns,
+                })
+        })
+    };
+    let mut recorded: Vec<(u64, karyos_trace::stream::TimeRequirement)> = carried
+        .iter()
+        .flat_map(|(recording, requirements)| {
+            requirements
+                .values()
+                .map(move |requirement| (*recording, *requirement))
+        })
+        .collect();
+    if let Some(recording) = args.recording {
+        recorded.retain(|(subject, _)| *subject == recording);
+    }
+    // No requirement declared anywhere: no verdict (a report with none is
+    // refused).
+    let Some(declared) = args.time_requirement.or_else(|| {
+        recorded.first().map(|(_, recorded)| Requirement {
+            max_divergence_ns: recorded.max_divergence_ns,
+            max_granularity_ns: recorded.max_granularity_ns,
+        })
+    }) else {
+        return Ok(None);
+    };
     if let Some(recording) = args.recording {
         gaps.retain(|(subject, _, _)| *subject == recording);
         losses.retain(|loss| loss.recording == recording);
@@ -549,10 +597,10 @@ pub fn time_report(args: &VerifyArgs) -> Result<Option<TimeReport>, VerifyError>
             .any(|&(start, stop)| start <= at && end <= stop);
         // The zero identity is "provenance unknown", never a clock to look
         // up (quantstratum-docs: karyos/design/trace-clocks.md).
-        let verdict = if covered && entry.clock != [0; 5] {
-            entry.verdict(&requirement)
-        } else {
-            Verdict::NoEvidence
+        let verdict = match requirement_of(&entry) {
+            Some(requirement) if covered && entry.clock != [0; 5] => entry.verdict(&requirement),
+            // Not verified, of no clock, or with no requirement to judge.
+            _ => Verdict::NoEvidence,
         };
         out.push((entry, verdict));
         at = end;
@@ -561,19 +609,22 @@ pub fn time_report(args: &VerifyArgs) -> Result<Option<TimeReport>, VerifyError>
     verdicts.extend(gaps.iter().map(|_| Verdict::NoEvidence));
     // A loss leaves its capture incomplete: never an unqualified `met`.
     verdicts.extend(losses.iter().map(|_| Verdict::NoEvidence));
-    let verdict = time::reduce(&verdicts, Some(&requirement))
+    let verdict = time::reduce(&verdicts, Some(&declared))
         .map(|combined| combined.verdict)
         .unwrap_or(Verdict::NoEvidence);
     Ok(Some(TimeReport {
         entries: out,
         gaps,
         losses,
+        recorded,
+        overridden: args.time_requirement.is_some(),
         verdict,
     }))
 }
 
 /// The loss messages of each trace recording among the subjects of
-/// `entries` (ADR-0117, point 5), each in the sealed range that holds it.
+/// `entries` (ADR-0117, point 5), each in the sealed range that holds it,
+/// and the time requirements each carries (karyos#1128).
 /// A recording is a trace recording when its first message is the trace
 /// stream's self message; its sealed bytes are read in position order and
 /// walked as [`karyos_archive::integrity::trace_evidence::fold`] walks
@@ -583,15 +634,16 @@ pub fn time_report(args: &VerifyArgs) -> Result<Option<TimeReport>, VerifyError>
 /// # Errors
 ///
 /// The journal's read error, and a store that cannot be opened.
-fn trace_losses(
+fn trace_reading(
     archive: &std::path::Path,
     entries: &[time_evidence::Entry],
-) -> Result<Vec<RangeLoss>, VerifyError> {
+) -> Result<(Vec<RangeLoss>, Carried), VerifyError> {
     use karyos_archive::integrity::time_producer::EventClock;
     use karyos_archive::integrity::trace_evidence::{TraceSession, fold};
     let subjects: BTreeSet<u64> = entries.iter().map(|entry| entry.recording).collect();
+    let mut carried = Carried::new();
     if subjects.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), carried));
     }
     let (records, _) =
         read_records(&mut StdDisk, archive).map_err(|source| VerifyError::TimeEvidence {
@@ -645,12 +697,19 @@ fn trace_losses(
             }));
             at = folded.end;
         }
+        if !session.requirements().is_empty() {
+            let _ = carried.insert(subject, session.requirements().clone());
+        }
     }
     match stores.error {
         Some(error) => Err(error),
-        None => Ok(losses),
+        None => Ok((losses, carried)),
     }
 }
+
+/// The time requirements each trace recording carries, by recording and
+/// clock domain.
+type Carried = BTreeMap<u64, BTreeMap<u64, karyos_trace::stream::TimeRequirement>>;
 
 /// Checks `entries` against what `archive`'s own integrity journal seals
 /// for their subjects (ADR-0098 item 2; docs#975), and returns the sealed
@@ -778,6 +837,20 @@ pub fn time_text(report: &TimeReport) -> String {
         let _ = writeln!(
             out,
             "time recording {subject} [{start}, {end}) uncovered no_evidence"
+        );
+    }
+    for (recording, requirement) in &report.recorded {
+        let _ = writeln!(
+            out,
+            "time requirement of recording {recording} clock domain {}: {}:{} ({})",
+            requirement.domain,
+            requirement.max_divergence_ns,
+            requirement.max_granularity_ns,
+            if report.overridden {
+                "recorded, overridden by --time-requirement"
+            } else {
+                "recorded"
+            }
         );
     }
     for loss in &report.losses {
