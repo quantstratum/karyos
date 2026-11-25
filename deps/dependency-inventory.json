@@ -1,16 +1,24 @@
 {
   "evaluated": {
     "aarch64-apple-darwin": [
+      "aead v0.6.1",
+      "aes v0.9.4",
+      "aes-gcm-siv v0.12.1",
       "anyhow v1.0.105",
       "async-trait v0.1.92",
       "atomic-waker v1.1.2",
       "block-buffer v0.12.1",
       "bytes v1.12.2",
       "cfg-if v1.0.5",
+      "cipher v0.5.2",
+      "cmov v0.5.4",
+      "cpubits v0.1.1",
       "cpufeatures v0.3.1",
       "crossbeam-queue v0.3.14",
       "crossbeam-utils v0.8.23",
       "crypto-common v0.2.2",
+      "ctr v0.10.1",
+      "ctutils v0.4.8",
       "curve25519-dalek v5.0.0",
       "digest v0.11.3",
       "displaydoc v0.2.7",
@@ -46,6 +54,7 @@
       "icu_provider v2.4.0",
       "idna v1.1.0",
       "idna_adapter v1.2.2",
+      "inout v0.2.6",
       "ironsbe-codegen v0.9.1",
       "ironsbe-core v0.9.1",
       "ironsbe-schema v0.9.1",
@@ -66,6 +75,7 @@
       "opentelemetry_sdk v0.33.1",
       "percent-encoding v2.3.2",
       "pin-project-lite v0.2.17",
+      "polyval v0.7.3",
       "potential_utf v0.1.6",
       "ppv-lite86 v0.2.21",
       "proc-macro2 v1.0.107",
@@ -116,6 +126,7 @@
       "try-lock v0.2.5",
       "typenum v1.20.1",
       "unicode-ident v1.0.26",
+      "universal-hash v0.6.1",
       "untrusted v0.9.0",
       "url v2.5.9",
       "utf8_iter v1.1.0",
@@ -135,6 +146,9 @@
       "zmij v1.0.23"
     ],
     "aarch64-unknown-linux-gnu": [
+      "aead v0.6.1",
+      "aes v0.9.4",
+      "aes-gcm-siv v0.12.1",
       "anyhow v1.0.105",
       "async-trait v0.1.92",
       "atomic-waker v1.1.2",
@@ -142,10 +156,15 @@
       "block-buffer v0.12.1",
       "bytes v1.12.2",
       "cfg-if v1.0.5",
+      "cipher v0.5.2",
+      "cmov v0.5.4",
+      "cpubits v0.1.1",
       "cpufeatures v0.3.1",
       "crossbeam-queue v0.3.14",
       "crossbeam-utils v0.8.23",
       "crypto-common v0.2.2",
+      "ctr v0.10.1",
+      "ctutils v0.4.8",
       "curve25519-dalek v5.0.0",
       "digest v0.11.3",
       "displaydoc v0.2.7",
@@ -181,6 +200,7 @@
       "icu_provider v2.4.0",
       "idna v1.1.0",
       "idna_adapter v1.2.2",
+      "inout v0.2.6",
       "ironsbe-codegen v0.9.1",
       "ironsbe-core v0.9.1",
       "ironsbe-schema v0.9.1",
@@ -202,6 +222,7 @@
       "opentelemetry_sdk v0.33.1",
       "percent-encoding v2.3.2",
       "pin-project-lite v0.2.17",
+      "polyval v0.7.3",
       "potential_utf v0.1.6",
       "ppv-lite86 v0.2.21",
       "proc-macro2 v1.0.107",
@@ -253,6 +274,7 @@
       "try-lock v0.2.5",
       "typenum v1.20.1",
       "unicode-ident v1.0.26",
+      "universal-hash v0.6.1",
       "untrusted v0.9.0",
       "url v2.5.9",
       "utf8_iter v1.1.0",
@@ -272,6 +294,9 @@
       "zmij v1.0.23"
     ],
     "x86_64-unknown-linux-gnu": [
+      "aead v0.6.1",
+      "aes v0.9.4",
+      "aes-gcm-siv v0.12.1",
       "anyhow v1.0.105",
       "async-trait v0.1.92",
       "atomic-waker v1.1.2",
@@ -279,10 +304,15 @@
       "block-buffer v0.12.1",
       "bytes v1.12.2",
       "cfg-if v1.0.5",
+      "cipher v0.5.2",
+      "cmov v0.5.4",
+      "cpubits v0.1.1",
       "cpufeatures v0.3.1",
       "crossbeam-queue v0.3.14",
       "crossbeam-utils v0.8.23",
       "crypto-common v0.2.2",
+      "ctr v0.10.1",
+      "ctutils v0.4.8",
       "curve25519-dalek v5.0.0",
       "curve25519-dalek-derive v0.1.1",
       "digest v0.11.3",
@@ -319,6 +349,7 @@
       "icu_provider v2.4.0",
       "idna v1.1.0",
       "idna_adapter v1.2.2",
+      "inout v0.2.6",
       "ironsbe-codegen v0.9.1",
       "ironsbe-core v0.9.1",
       "ironsbe-schema v0.9.1",
@@ -340,6 +371,7 @@
       "opentelemetry_sdk v0.33.1",
       "percent-encoding v2.3.2",
       "pin-project-lite v0.2.17",
+      "polyval v0.7.3",
       "potential_utf v0.1.6",
       "ppv-lite86 v0.2.21",
       "proc-macro2 v1.0.107",
@@ -391,6 +423,7 @@
       "try-lock v0.2.5",
       "typenum v1.20.1",
       "unicode-ident v1.0.26",
+      "universal-hash v0.6.1",
       "untrusted v0.9.0",
       "url v2.5.9",
       "utf8_iter v1.1.0",
@@ -412,6 +445,95 @@
   },
   "generated_by": "scripts/dependency-inventory.py",
   "packages": [
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#aes-gcm-siv@0.12.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#aead@0.6.1",
+      "license": "MIT OR Apache-2.0",
+      "name": "aead",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.6.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "zeroize"
+          ],
+          "from": "workspace:karyos-protocol@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#aes-gcm-siv@0.12.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "zeroize"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#aes@0.9.4",
+      "license": "MIT OR Apache-2.0",
+      "name": "aes",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.9.4"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "aes",
+            "zeroize"
+          ],
+          "from": "workspace:karyos-protocol@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "aes",
+        "zeroize"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#aes-gcm-siv@0.12.1",
+      "license": "MIT OR Apache-2.0",
+      "name": "aes-gcm-siv",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.12.1"
+    },
     {
       "build_script": false,
       "edges": [
@@ -657,6 +779,13 @@
     {
       "build_script": false,
       "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#cipher@0.5.2",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
         {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#digest@0.11.3",
@@ -1069,6 +1198,49 @@
       "edges": [
         {
           "features": [
+            "stream-wrapper"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ctr@0.10.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#aes-gcm-siv@0.12.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#aes@0.9.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "block-buffer",
+        "stream-wrapper"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#cipher@0.5.2",
+      "license": "MIT OR Apache-2.0",
+      "name": "cipher",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.5.2"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
             "help",
             "std"
           ],
@@ -1177,9 +1349,54 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#aes@0.9.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#polyval@0.7.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#cpubits@0.1.1",
+      "license": "MIT OR Apache-2.0",
+      "name": "cpubits",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.1.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#aes@0.9.4",
+          "kind": "normal",
+          "target": "cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\", target_arch = \"x86\"))",
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek@5.0.0",
           "kind": "normal",
           "target": "cfg(target_arch = \"x86_64\")",
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#polyval@0.7.3",
+          "kind": "normal",
+          "target": "cfg(any(target_arch = \"aarch64\", target_arch = \"x86\", target_arch = \"x86_64\"))",
           "uses_default_features": true
         },
         {
@@ -1196,6 +1413,9 @@
       "name": "cpufeatures",
       "paths": {
         "runtime": [
+          [
+            "cfg(any(target_arch = \"aarch64\", target_arch = \"x86\", target_arch = \"x86_64\"))"
+          ],
           [
             "cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\", target_arch = \"x86\"))"
           ],
@@ -1354,7 +1574,28 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#aead@0.6.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#cipher@0.5.2",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#digest@0.11.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#universal-hash@0.6.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -1381,7 +1622,45 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#aes-gcm-siv@0.12.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#ctr@0.10.1",
+      "license": "MIT OR Apache-2.0",
+      "name": "ctr",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.10.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#aes-gcm-siv@0.12.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#digest@0.11.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#universal-hash@0.6.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -2314,6 +2593,30 @@
       "build_script": false,
       "edges": [
         {
+          "features": [],
+          "from": "workspace:karyos-protocol@0.1.0-alpha.4",
+          "kind": "dev",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#hkdf@0.13.0",
+      "license": "MIT OR Apache-2.0",
+      "name": "hkdf",
+      "paths": {
+        "dev": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.13.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
           "features": [
             "zeroize"
           ],
@@ -2321,6 +2624,13 @@
           "kind": "dev",
           "target": null,
           "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#hkdf@0.13.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
         }
       ],
       "features": [
@@ -2549,6 +2859,13 @@
         {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#crypto-common@0.2.2",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#inout@0.2.6",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -2990,6 +3307,37 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "2.14.2"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#aead@0.6.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#cipher@0.5.2",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#inout@0.2.6",
+      "license": "MIT OR Apache-2.0",
+      "name": "inout",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.6"
     },
     {
       "build_script": false,
@@ -4452,6 +4800,41 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "0.2.17"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "zeroize"
+          ],
+          "from": "workspace:karyos-protocol@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#aes-gcm-siv@0.12.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "zeroize"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#polyval@0.7.3",
+      "license": "Apache-2.0 OR MIT",
+      "name": "polyval",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.7.3"
     },
     {
       "build_script": true,
@@ -7666,6 +8049,30 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#polyval@0.7.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#universal-hash@0.6.1",
+      "license": "MIT OR Apache-2.0",
+      "name": "universal-hash",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.6.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#ring@0.17.14",
           "kind": "normal",
           "target": null,
@@ -8998,6 +9405,20 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#aes-gcm-siv@0.12.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#aes@0.9.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#block-buffer@0.12.1",
           "kind": "normal",
           "target": null,
@@ -9020,6 +9441,13 @@
         {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#ed25519-dalek@3.0.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#polyval@0.7.3",
           "kind": "normal",
           "target": null,
           "uses_default_features": false

@@ -93,6 +93,17 @@ ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zer
 # karyos/reviews/dependency-admission-wire-auth-hmac.md).
 hmac = { version = "=0.13.0", default-features = false, features = ["zeroize"] }
 zeroize = { version = "=1.9.2", default-features = false }
+# The encrypted protection profile (owner decision D53; quantstratum-docs:
+# karyos/reviews/dependency-admission-aead-gcm-siv.md). Only the detached
+# in-place API: no alloc, no getrandom, no random nonce.
+aes-gcm-siv = { version = "=0.12.1", default-features = false, features = ["aes", "zeroize"] }
+# The AES-256 and POLYVAL instances `aes-gcm-siv` uses, declared only to
+# enable `zeroize` so their key schedules are erased on drop.
+aes = { version = "=0.9.4", default-features = false, features = ["zeroize"] }
+polyval = { version = "=0.7.3", default-features = false, features = ["zeroize"] }
+# HKDF-SHA-256 (owner decision D51): the cross-check of the erasing HKDF
+# of karyos-protocol, a dev-dependency there.
+hkdf = { version = "=0.13.0", default-features = false }
 serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
 tracing = { version = "0.1.44", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }

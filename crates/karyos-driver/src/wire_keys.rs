@@ -18,7 +18,6 @@ pub mod state;
 pub mod store;
 
 use karyos_protocol::network::Identity;
-use karyos_protocol::protection::hmac_key::HmacKey;
 use karyos_protocol::protection::hmac_sha256::LABEL;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -684,22 +683,17 @@ impl Context {
     /// nothing; the result is erased on drop.
     #[must_use]
     pub fn derive(&self, secret: &[u8; KEY_LEN]) -> Zeroizing<[u8; KEY_LEN]> {
-        // HKDF-SHA-256 (RFC 5869) for one 32-byte block, over `HmacKey`
-        // so every intermediate is erased: the padded salt and PRK, the PRK
-        // itself and each MAC output, whose `Zeroizing` buffers erase on
-        // drop, as do the SHA-256 states (`sha2` feature `zeroize`).
+        // HKDF-SHA-256 (RFC 5869) for one 32-byte block, through the
+        // workspace's one erasing HKDF over `HmacKey`
+        // (`karyos_protocol::protection::hkdf`): every intermediate is
+        // erased. A context without a salt uses 32 zero bytes, the RFC's
+        // default for SHA-256.
         let info = self.info();
-        let salt = info.salt.unwrap_or([0_u8; 32]);
-        let mut extract = HmacKey::new(&salt).mac();
-        extract.update(secret);
-        let prk = extract.finalize();
-        let mut expand = HmacKey::new(prk.as_slice()).mac();
-        expand.update(info.bytes());
-        expand.update(&[1]);
-        let out = expand.finalize();
-        let mut okm = Zeroizing::new([0_u8; KEY_LEN]);
-        okm.copy_from_slice(out.as_slice());
-        okm
+        karyos_protocol::protection::hkdf::hkdf_sha256::<KEY_LEN>(
+            info.salt.as_ref().map(|salt| salt.as_slice()),
+            secret,
+            &[info.bytes()],
+        )
     }
 }
 
