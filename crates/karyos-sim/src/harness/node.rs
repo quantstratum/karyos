@@ -46,7 +46,8 @@ use std::rc::Rc;
 
 use karyos_archive::segment::Geometry;
 use karyos_cluster::snapshot::{
-    PendingSnapshot, Section, SectionKind, SnapshotConfig, SnapshotStore, WRITE_CHUNK,
+    PendingSnapshot, Section, SectionKind, SnapshotConfig, SnapshotError, SnapshotReader,
+    SnapshotStore, WRITE_CHUNK,
 };
 use karyos_cluster::{Entry, LogError, RaftLog};
 
@@ -77,6 +78,12 @@ pub const SEAL_TICKS: u64 = 10;
 pub const SNAPSHOT_DIR: &str = "/snap";
 /// The version of the service section a snapshot holds.
 pub const SERVICE_SECTION_VERSION: u64 = 2;
+/// A snapshot transfer's window: the pieces a leader has sent a follower
+/// and not had acknowledged, at most (karyos#682).
+pub const SNAPSHOT_WINDOW: u64 = 4;
+/// Ticks a follower's transfer may go without a piece before it is
+/// dropped: its leader asks again, and a stale one goes.
+pub const SNAPSHOT_STALL: u64 = 2_000;
 
 /// A case's log compaction (W5), driven by the snapshot store's own
 /// policy ([`SnapshotConfig`]; karyos#682): a snapshot is due after
@@ -95,6 +102,8 @@ pub struct Compaction {
     /// The log bytes of one of the case's entries (its frame), which turns
     /// `keep` into the allowance's bytes.
     pub frame: u64,
+    /// The byte trigger, when not item 37's default.
+    pub every_bytes: Option<u64>,
 }
 
 impl Compaction {
@@ -103,10 +112,55 @@ impl Compaction {
     /// frames.
     #[must_use]
     pub fn config(&self) -> SnapshotConfig {
-        SnapshotConfig::default()
+        let config = SnapshotConfig::default()
             .with_every_entries(self.every.max(1))
-            .with_allowance(self.keep.saturating_mul(self.frame))
+            .with_allowance(self.keep.saturating_mul(self.frame));
+        match self.every_bytes {
+            Some(bytes) => config.with_every_bytes(bytes.max(1)),
+            None => config,
+        }
     }
+}
+
+/// One piece of a snapshot transfer, as [`Wire::Snapshot`] carries it.
+#[derive(Debug)]
+struct Piece {
+    base: SnapshotBase,
+    transfer: u64,
+    digest: u32,
+    length: u64,
+    offset: u64,
+    bytes: Vec<u8>,
+}
+
+/// A snapshot a follower receives: its sender's transfer, the frozen
+/// metadata every piece must repeat, and the bytes so far, streamed into
+/// its store (karyos#682).
+#[derive(Debug)]
+struct Incoming {
+    from: NodeId,
+    transfer: u64,
+    base: SnapshotBase,
+    digest: u32,
+    length: u64,
+    pending: PendingSnapshot<SimDisk>,
+    /// When the last piece arrived.
+    last: u64,
+}
+
+/// A snapshot a leader sends: read from its store as the follower
+/// acknowledges, at most [`SNAPSHOT_WINDOW`] pieces ahead.
+#[derive(Debug)]
+struct Outgoing {
+    transfer: u64,
+    base: SnapshotBase,
+    digest: u32,
+    length: u64,
+    reader: SnapshotReader<SimDisk>,
+    sent: u64,
+    acked: u64,
+    /// When it started, or last saw its window move.
+    moved: u64,
 }
 
 /// A client's operation on the test service.
@@ -1133,6 +1187,8 @@ pub enum Observation {
         node: NodeId,
         /// The snapshot's base.
         base: SnapshotBase,
+        /// The sender's transfer.
+        transfer: u64,
         /// Where the piece starts.
         offset: u64,
         /// Its bytes.
@@ -1140,14 +1196,40 @@ pub enum Observation {
         /// The section's length.
         total: u64,
     },
-    /// A server dropped a snapshot piece by [`Case::lose_snapshot_piece`].
+    /// A server dropped a snapshot piece by [`Case::lose_snapshot_piece`](super::workloads::Case::lose_snapshot_piece).
     SnapshotPieceLost {
         /// The server.
         node: NodeId,
         /// The snapshot's base.
         base: SnapshotBase,
+        /// The sender's transfer.
+        transfer: u64,
         /// The piece's offset.
         offset: u64,
+    },
+    /// A leader sent a piece of a snapshot transfer.
+    SnapshotSent {
+        /// The leader.
+        node: NodeId,
+        /// The follower.
+        to: NodeId,
+        /// The transfer.
+        transfer: u64,
+        /// The piece's offset.
+        offset: u64,
+    },
+    /// A server dropped a snapshot transfer it was receiving: `"gap"`,
+    /// `"superseded"`, `"overtaken"`, `"stalled"`, `"metadata changed"` or
+    /// `"write failed"`.
+    SnapshotAbandoned {
+        /// The server.
+        node: NodeId,
+        /// The snapshot's base.
+        base: SnapshotBase,
+        /// The transfer.
+        transfer: u64,
+        /// Why.
+        reason: &'static str,
     },
     /// A server refused a snapshot it was sent.
     SnapshotRefused {
@@ -1287,21 +1369,37 @@ pub enum Wire<M> {
     /// An operator's leadership handover to a server, which the core takes
     /// or refuses ([`Observation::Transfer`]); nothing answers it (W5).
     Transfer(NodeId),
-    /// One piece of a leader's snapshot (W5; karyos#682): its base, its
-    /// service section's length, and `bytes` at `offset` in it. The
-    /// leader streams the section from its store through a
-    /// `SnapshotReader`, in pieces of at most `WRITE_CHUNK`, and the
-    /// follower streams each into its own store as it arrives; neither
-    /// holds the section whole.
+    /// One piece of a leader's snapshot (W5; karyos#682): `bytes` at
+    /// `offset` of the service section of the snapshot at `base`, whose
+    /// section is `length` bytes and whose whole snapshot's CRC-32C is
+    /// `digest`, in transfer `transfer` of its sender. The leader streams
+    /// the section from its store through a `SnapshotReader`, at most
+    /// [`SNAPSHOT_WINDOW`] pieces of `WRITE_CHUNK` unacknowledged, and the
+    /// follower writes each into its own store as it arrives.
     Snapshot {
         /// The snapshot's base.
         base: SnapshotBase,
+        /// The sender's transfer.
+        transfer: u64,
+        /// The whole snapshot's CRC-32C, as the sender's store holds it.
+        digest: u32,
         /// The service section's length.
         length: u64,
         /// Where `bytes` start in it.
         offset: u64,
         /// The piece.
         bytes: Vec<u8>,
+    },
+    /// A follower's acknowledgement of a transfer: it holds the section's
+    /// bytes before `next`, and the whole snapshot once `next` is its
+    /// length.
+    SnapshotAck {
+        /// The snapshot's base.
+        base: SnapshotBase,
+        /// The transfer.
+        transfer: u64,
+        /// The bytes it holds.
+        next: u64,
     },
     /// The primary's committed entries after the standby's verified
     /// position, and its commit.
@@ -1397,7 +1495,11 @@ pub struct ServerNode<C: ConsensusCore> {
     snapshots: Option<SnapshotStore<SimDisk>>,
     /// A leader's snapshot being received: its base and the bytes so far,
     /// streamed into the store as they arrive.
-    incoming: Option<(SnapshotBase, PendingSnapshot<SimDisk>)>,
+    incoming: Option<Incoming>,
+    /// The snapshot transfers it sends, by follower.
+    outgoing: BTreeMap<NodeId, Outgoing>,
+    /// Its next transfer's number.
+    next_transfer: u64,
     /// The piece of its first received transfer it drops, and the pieces
     /// of that transfer seen so far; `None` once dropped, or never.
     lose_piece: Option<(u64, u64)>,
@@ -1558,6 +1660,8 @@ impl<C: ConsensusCore> ServerNode<C> {
             compaction: None,
             snapshots: None,
             incoming: None,
+            outgoing: BTreeMap::new(),
+            next_transfer: 1,
             lose_piece: None,
             since_bytes: (0, 0),
             base: None,
@@ -1611,6 +1715,8 @@ impl<C: ConsensusCore> ServerNode<C> {
             compaction: None,
             snapshots: None,
             incoming: None,
+            outgoing: BTreeMap::new(),
+            next_transfer: 1,
             lose_piece: None,
             since_bytes: (0, 0),
             base: None,
@@ -1625,7 +1731,7 @@ impl<C: ConsensusCore> ServerNode<C> {
     }
 
     /// Drops piece `piece` (from 0) of the first snapshot transfer it
-    /// receives, as if the network lost it ([`Case::lose_snapshot_piece`]).
+    /// receives, as if the network lost it ([`Case::lose_snapshot_piece`](super::workloads::Case::lose_snapshot_piece)).
     #[must_use]
     pub const fn losing_snapshot_piece(mut self, piece: u64) -> Self {
         self.lose_piece = Some((piece, 0));
@@ -1719,8 +1825,21 @@ impl<C: ConsensusCore> ServerNode<C> {
         if start != counted_to {
             bytes = 0;
         }
+        let held = log.first_index();
         for index in start.saturating_add(1)..=applied {
-            bytes = bytes.saturating_add(log.frame_span(index).unwrap_or(0));
+            match log.frame_span(index) {
+                Some(span) => bytes = bytes.saturating_add(span),
+                // Below the log's first index after an install: not this
+                // node's bytes to count.
+                None if index < held => {}
+                None => {
+                    return self.observe(Observation::SnapshotRefused {
+                        node: self.id,
+                        base: SnapshotBase { index, term: 0 },
+                        reason: "an applied entry's frame is missing".to_owned(),
+                    });
+                }
+            }
         }
         self.since_bytes = (applied, bytes);
         if !config.due(entries, bytes) {
@@ -1770,7 +1889,15 @@ impl<C: ConsensusCore> ServerNode<C> {
                 .and_then(|offset| usize::try_from(offset).ok())
                 .and_then(|offset| starts.get(offset).copied())
         });
-        let _ = log.purge_prefix(floor);
+        if let Err(error) = log.purge_prefix(floor) {
+            // The snapshot is published: the core is told of it, and the
+            // log keeps what the purge did not remove.
+            self.observe(Observation::SnapshotRefused {
+                node: self.id,
+                base,
+                reason: format!("purge: {error}"),
+            });
+        }
         let first = log.first_index();
         // The duty's budget holds for the hook's reads too.
         let budget = self.limits.map(|_| self.budget.clone());
@@ -1795,21 +1922,24 @@ impl<C: ConsensusCore> ServerNode<C> {
         });
     }
 
-    /// Sends its latest snapshot to `to`, which needs entries its log no
-    /// longer holds.
-    fn send_snapshot(&self, to: NodeId, out: &mut Outbox<Wire<C::Message>>) {
+    /// Sends `to`, which needs entries its log no longer holds, its latest
+    /// snapshot, streamed from its store as `to` acknowledges it. A
+    /// transfer of that snapshot already moving goes on, however often the
+    /// core asks; a new one starts only for a newer snapshot, or when the
+    /// last has gone [`SNAPSHOT_STALL`] ticks without an acknowledgement.
+    fn send_snapshot(&mut self, to: NodeId, out: &mut Outbox<Wire<C::Message>>) {
         let Some(store) = self.snapshots.as_ref() else {
             return;
         };
         let Some(info) = store.latest() else {
             return;
         };
-        let base = SnapshotBase {
-            index: info.index,
-            term: info.term,
-        };
-        // Streamed from the store, never read whole: a damaged snapshot
-        // sends what it read, and the follower's store refuses the rest.
+        if self.outgoing.get(&to).is_some_and(|outgoing| {
+            outgoing.base.index == info.index
+                && self.now.saturating_sub(outgoing.moved) <= SNAPSHOT_STALL
+        }) {
+            return;
+        }
         let Ok(mut reader) = store.reader(&info) else {
             return;
         };
@@ -1820,132 +1950,376 @@ impl<C: ConsensusCore> ServerNode<C> {
                 Ok(None) | Err(_) => return,
             }
         };
-        let mut offset = 0u64;
-        loop {
-            let mut bytes = vec![0u8; WRITE_CHUNK];
-            let Ok(read) = reader.read(&mut bytes) else {
-                return;
+        let transfer = self.next_transfer;
+        self.next_transfer = transfer.saturating_add(1);
+        let outgoing = Outgoing {
+            transfer,
+            base: SnapshotBase {
+                index: info.index,
+                term: info.term,
+            },
+            digest: info.digest,
+            length,
+            reader,
+            sent: 0,
+            acked: 0,
+            moved: self.now,
+        };
+        let _ = self.outgoing.insert(to, outgoing);
+        self.pump_snapshot(to, out);
+    }
+
+    /// Sends `to` the next pieces of its transfer that fit the window. The
+    /// last is sent only once the reader has checked the snapshot's end:
+    /// a snapshot that does not verify is not sent whole.
+    fn pump_snapshot(&mut self, to: NodeId, out: &mut Outbox<Wire<C::Message>>) {
+        let Some(outgoing) = self.outgoing.get_mut(&to) else {
+            return;
+        };
+        let window = SNAPSHOT_WINDOW.saturating_mul(WRITE_CHUNK as u64);
+        let mut broken = false;
+        while outgoing.sent < outgoing.length
+            && outgoing.sent.saturating_sub(outgoing.acked) < window
+        {
+            let left = outgoing.length - outgoing.sent;
+            let take = usize::try_from(left)
+                .unwrap_or(WRITE_CHUNK)
+                .min(WRITE_CHUNK);
+            let mut bytes = vec![0u8; take];
+            let read = match outgoing.reader.read(&mut bytes) {
+                Ok(read) if read > 0 => read,
+                _ => {
+                    broken = true;
+                    break;
+                }
             };
             bytes.truncate(read);
-            let last = read == 0 || offset.saturating_add(read as u64) >= length;
-            if read > 0 || length == 0 {
-                out.push((
+            let read = read as u64;
+            // The last piece waits for the end's check: the digest over the
+            // whole snapshot.
+            if outgoing.sent.saturating_add(read) >= outgoing.length
+                && !matches!(outgoing.reader.next_section(), Ok(None))
+            {
+                broken = true;
+                break;
+            }
+            self.recorder
+                .borrow_mut()
+                .observations
+                .push(Observation::SnapshotSent {
+                    node: self.id,
                     to,
-                    Wire::Snapshot {
-                        base,
-                        length,
-                        offset,
-                        bytes,
-                    },
-                ));
-            }
-            offset = offset.saturating_add(read as u64);
-            if last {
-                return;
-            }
+                    transfer: outgoing.transfer,
+                    offset: outgoing.sent,
+                });
+            out.push((
+                to,
+                Wire::Snapshot {
+                    base: outgoing.base,
+                    transfer: outgoing.transfer,
+                    digest: outgoing.digest,
+                    length: outgoing.length,
+                    offset: outgoing.sent,
+                    bytes,
+                },
+            ));
+            outgoing.sent = outgoing.sent.saturating_add(read);
+        }
+        if broken {
+            let _ = self.outgoing.remove(&to);
         }
     }
 
-    /// Takes one piece of a leader's snapshot: the first starts a
-    /// streamed write (an older one being received is abandoned), each
-    /// next one in order is written, a gap or a duplicate drops the
-    /// transfer (the leader asks again), and the last publishes it and
-    /// installs it. A snapshot already staged at that base is installed
+    /// A follower's acknowledgement: the window moves, and a transfer
+    /// acknowledged whole ends.
+    fn snapshot_acked(
+        &mut self,
+        from: NodeId,
+        (base, transfer, next): (SnapshotBase, u64, u64),
+        out: &mut Outbox<Wire<C::Message>>,
+    ) {
+        let Some(outgoing) = self.outgoing.get_mut(&from) else {
+            return;
+        };
+        if outgoing.transfer != transfer || outgoing.base != base {
+            return;
+        }
+        let acked = next.min(outgoing.sent);
+        if acked > outgoing.acked {
+            outgoing.acked = acked;
+            outgoing.moved = self.now;
+        }
+        if outgoing.acked >= outgoing.length {
+            let _ = self.outgoing.remove(&from);
+            return;
+        }
+        self.pump_snapshot(from, out);
+    }
+
+    /// Drops the transfer it receives, with `reason`.
+    fn abandon_incoming(&mut self, reason: &'static str) {
+        let Some(incoming) = self.incoming.take() else {
+            return;
+        };
+        if let Some(store) = self.snapshots.as_mut() {
+            let _ = store.abandon(incoming.pending);
+        }
+        self.observe(Observation::SnapshotAbandoned {
+            node: self.id,
+            base: incoming.base,
+            transfer: incoming.transfer,
+            reason,
+        });
+    }
+
+    /// Drops a transfer its service has overtaken, or that has gone
+    /// [`SNAPSHOT_STALL`] ticks without a piece.
+    fn expire_incoming(&mut self) {
+        let Some(incoming) = self.incoming.as_ref() else {
+            return;
+        };
+        let overtaken = self
+            .service
+            .applied()
+            .is_some_and(|applied| incoming.base.index <= applied);
+        let stalled = self.now.saturating_sub(incoming.last) > SNAPSHOT_STALL;
+        if overtaken {
+            self.abandon_incoming("overtaken");
+        } else if stalled {
+            self.abandon_incoming("stalled");
+        }
+    }
+
+    /// Reopens its snapshot store after a failure that leaves it refusing
+    /// writes: what was published stays, what was not is removed.
+    fn reopen_snapshots(&mut self) {
+        let Some(compaction) = self.compaction else {
+            return;
+        };
+        match Self::open_snapshots(&self.disk, self.geometry, compaction.config()) {
+            Ok(store) => self.snapshots = Some(store),
+            Err(error) => self.lost = Some(error),
+        }
+    }
+
+    /// Takes one piece of a leader's snapshot. The first piece of a
+    /// transfer starts it, superseding an older one and ignored for an
+    /// older base; every next piece must repeat the transfer's metadata
+    /// and continue it exactly: a duplicate is acknowledged again and
+    /// changes nothing, a gap drops the transfer (its leader asks again),
+    /// and a piece of another transfer is ignored. Each piece is written
+    /// into the store as it arrives and acknowledged; the last seals the
+    /// snapshot, which is read back and checked before it is published and
+    /// installed. A snapshot already staged at that base is installed
     /// without being received again.
     fn receive_snapshot(
         &mut self,
         core: &mut C,
         log: &mut RaftLog<SimDisk>,
-        (base, length, offset, bytes): (SnapshotBase, u64, u64, Vec<u8>),
+        (from, piece): (NodeId, Piece),
+        out: &mut Outbox<Wire<C::Message>>,
     ) {
         let node = self.id;
+        self.expire_incoming();
         if self
             .service
             .applied()
-            .is_some_and(|applied| base.index <= applied)
+            .is_some_and(|applied| piece.base.index <= applied)
         {
             return;
         }
         if let Some((lose, seen)) = self.lose_piece.as_mut() {
             if *seen == *lose {
                 self.lose_piece = None;
-                return self.observe(Observation::SnapshotPieceLost { node, base, offset });
+                return self.observe(Observation::SnapshotPieceLost {
+                    node,
+                    base: piece.base,
+                    transfer: piece.transfer,
+                    offset: piece.offset,
+                });
             }
             *seen += 1;
         }
-        let Some(store) = self.snapshots.as_mut() else {
-            return self.observe(Observation::SnapshotRefused {
-                node,
-                base,
-                reason: "no snapshot store".to_owned(),
-            });
+        let ack = |out: &mut Outbox<Wire<C::Message>>, next: u64| {
+            out.push((
+                from,
+                Wire::SnapshotAck {
+                    base: piece.base,
+                    transfer: piece.transfer,
+                    next,
+                },
+            ));
         };
-        if offset == 0 {
-            if let Some((_, old)) = self.incoming.take() {
-                let _ = store.abandon(old);
+        let current = self
+            .incoming
+            .as_ref()
+            .is_some_and(|incoming| incoming.from == from && incoming.transfer == piece.transfer);
+        if !current {
+            if piece.offset != 0 {
+                // A piece of a transfer it is not receiving: stale.
+                return;
             }
+            if let Some(incoming) = self.incoming.as_ref() {
+                if piece.base.index < incoming.base.index {
+                    return;
+                }
+                self.abandon_incoming("superseded");
+            }
+            let Some(store) = self.snapshots.as_mut() else {
+                return self.observe(Observation::SnapshotRefused {
+                    node,
+                    base: piece.base,
+                    reason: "no snapshot store".to_owned(),
+                });
+            };
             // A retry of an install a refusal or a crash cut short finds
             // the snapshot staged: verified, it is reused, not received
             // again.
             let staged = store.latest().is_some_and(|info| {
-                info.index == base.index && info.term == base.term && store.verify(&info).is_ok()
+                info.index == piece.base.index
+                    && info.term == piece.base.term
+                    && info.digest == piece.digest
+                    && store.verify(&info).is_ok()
             });
             if staged {
-                return self.install_snapshot(core, log, base);
+                ack(out, piece.length);
+                return self.install_snapshot(core, log, piece.base);
             }
-            let started = store.begin(base.index, base.term).and_then(|mut pending| {
-                pending.section(SectionKind::Service, SERVICE_SECTION_VERSION, length)?;
-                Ok(pending)
-            });
-            match started {
-                Ok(pending) => self.incoming = Some((base, pending)),
+            let mut pending = match store.begin(piece.base.index, piece.base.term) {
+                Ok(pending) => pending,
                 Err(error) => {
                     return self.observe(Observation::SnapshotRefused {
                         node,
-                        base,
+                        base: piece.base,
                         reason: format!("begin: {error}"),
                     });
                 }
+            };
+            if let Err(error) =
+                pending.section(SectionKind::Service, SERVICE_SECTION_VERSION, piece.length)
+            {
+                let _ = store.abandon(pending);
+                return self.observe(Observation::SnapshotRefused {
+                    node,
+                    base: piece.base,
+                    reason: format!("section: {error}"),
+                });
             }
+            self.incoming = Some(Incoming {
+                from,
+                transfer: piece.transfer,
+                base: piece.base,
+                digest: piece.digest,
+                length: piece.length,
+                pending,
+                last: self.now,
+            });
         }
-        let Some((receiving, mut pending)) = self.incoming.take() else {
+        let Some(incoming) = self.incoming.as_mut() else {
             return;
         };
-        let expected = length.saturating_sub(pending.left());
-        if receiving != base || offset != expected {
-            // Not the next piece: the transfer is dropped, and the leader's
-            // core asks again.
-            let _ = store.abandon(pending);
-            return;
+        if piece.base != incoming.base
+            || piece.digest != incoming.digest
+            || piece.length != incoming.length
+        {
+            return self.abandon_incoming("metadata changed");
         }
-        if let Err(error) = pending.write(&bytes) {
-            let _ = store.abandon(pending);
+        let expected = incoming.length - incoming.pending.left();
+        let pieced = u64::try_from(piece.bytes.len()).unwrap_or(u64::MAX);
+        if piece.offset < expected {
+            // A duplicate: it holds it already.
+            return ack(out, expected);
+        }
+        if piece.offset > expected || pieced > incoming.pending.left() {
+            return self.abandon_incoming("gap");
+        }
+        if let Err(error) = incoming.pending.write(&piece.bytes) {
+            self.abandon_incoming("write failed");
             return self.observe(Observation::SnapshotRefused {
                 node,
-                base,
+                base: piece.base,
                 reason: format!("write: {error}"),
             });
         }
+        incoming.last = self.now;
+        let next = expected.saturating_add(pieced);
         self.observe(Observation::SnapshotPiece {
             node,
-            base,
-            offset,
-            length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            total: length,
+            base: piece.base,
+            transfer: piece.transfer,
+            offset: piece.offset,
+            length: pieced,
+            total: piece.length,
         });
-        if pending.left() > 0 {
-            self.incoming = Some((base, pending));
+        ack(out, next);
+        if next < piece.length {
             return;
         }
-        let Some(store) = self.snapshots.as_mut() else {
+        let Some(incoming) = self.incoming.take() else {
             return;
         };
-        if let Err(error) = store.publish(pending) {
-            return self.observe(Observation::SnapshotRefused {
-                node,
-                base,
-                reason: format!("publish: {error}"),
-            });
+        self.finish_snapshot(core, log, incoming);
+    }
+
+    /// Seals a received snapshot, reads it back and checks it (its digest
+    /// is the sender's, its service decodes at its base) before publishing
+    /// it, keeping the snapshot the node stands on from the purge, then
+    /// installs it.
+    fn finish_snapshot(&mut self, core: &mut C, log: &mut RaftLog<SimDisk>, incoming: Incoming) {
+        let node = self.id;
+        let base = incoming.base;
+        let refuse = |this: &Self, reason: String| {
+            this.observe(Observation::SnapshotRefused { node, base, reason });
+        };
+        let Some(store) = self.snapshots.as_mut() else {
+            return refuse(self, "no snapshot store".to_owned());
+        };
+        let sealed = match store.seal(incoming.pending) {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                let failed = matches!(error, SnapshotError::Failed);
+                refuse(self, format!("seal: {error}"));
+                if failed {
+                    self.reopen_snapshots();
+                }
+                return;
+            }
+        };
+        let info = sealed.info();
+        let service = store.read(&info).ok().and_then(|sections| {
+            sections
+                .into_iter()
+                .find(|section| section.kind == SectionKind::Service)
+                .and_then(|section| TestService::decode(&section.bytes))
+        });
+        let valid = info.digest == incoming.digest
+            && service
+                .as_ref()
+                .is_some_and(|service| service.applied() == Some(base.index));
+        if !valid {
+            let _ = store.abandon_sealed(sealed);
+            return refuse(
+                self,
+                "a snapshot not its sender's, or not at its base".to_owned(),
+            );
+        }
+        let pin = self.base.and_then(|active| {
+            store
+                .snapshots()
+                .iter()
+                .find(|kept| kept.index == active.index && kept.term == active.term)
+                .map(|kept| kept.id)
+        });
+        if let Err(error) = store.publish_sealed(sealed, pin) {
+            let failed = matches!(
+                error,
+                SnapshotError::Failed | SnapshotError::Store(_) | SnapshotError::Io(_)
+            );
+            refuse(self, format!("publish: {error}"));
+            if failed {
+                self.reopen_snapshots();
+            }
+            return;
         }
         self.install_snapshot(core, log, base);
     }
@@ -2305,6 +2679,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             self.commit = committed;
         }
         self.compact(&mut core, &mut log);
+        self.expire_incoming();
         for to in snapshot_to {
             self.send_snapshot(to, out);
         }
@@ -2352,6 +2727,7 @@ impl<C: ConsensusCore> ServerNode<C> {
         // A transfer a crash cut short is gone: the store's reopen removes
         // what it wrote, unpublished.
         self.incoming = None;
+        self.outgoing.clear();
         self.since_bytes = (0, 0);
         if let Some(compaction) = self.compaction {
             match Self::open_snapshots(&self.disk, self.geometry, compaction.config()) {
@@ -2491,8 +2867,19 @@ impl<C: ConsensusCore> ServerNode<C> {
         out: &mut Outbox<Wire<C::Message>>,
     ) {
         self.now = now;
+        if let Wire::SnapshotAck {
+            base,
+            transfer,
+            next,
+        } = message
+        {
+            self.snapshot_acked(from, (base, transfer, next), out);
+            return;
+        }
         if let Wire::Snapshot {
             base,
+            transfer,
+            digest,
             length,
             offset,
             bytes,
@@ -2501,7 +2888,15 @@ impl<C: ConsensusCore> ServerNode<C> {
             // A delivery is a duty: its budget refills.
             let _ = self.refill();
             if let Some((mut core, mut log)) = self.running.take() {
-                self.receive_snapshot(&mut core, &mut log, (base, length, offset, bytes));
+                let piece = Piece {
+                    base,
+                    transfer,
+                    digest,
+                    length,
+                    offset,
+                    bytes,
+                };
+                self.receive_snapshot(&mut core, &mut log, (from, piece), out);
                 self.running = Some((core, log));
             }
             self.duty(out);
@@ -2640,6 +3035,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             }
             Wire::Response { .. }
             | Wire::Snapshot { .. }
+            | Wire::SnapshotAck { .. }
             | Wire::Refused { .. }
             | Wire::Busy { .. }
             | Wire::Redirect { .. } => {}
@@ -2666,6 +3062,10 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
     fn crash(&mut self) {
         self.running = None;
         self.pending.clear();
+        // Its transfers die with it: the restart's store reopen removes
+        // what a receive wrote, unpublished.
+        self.incoming = None;
+        self.outgoing.clear();
         self.observe(Observation::Crashed { node: self.id });
         match self.disk.after_crash(self.survives) {
             Ok(disk) => self.disk = disk,

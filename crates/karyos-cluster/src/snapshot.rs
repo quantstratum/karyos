@@ -43,11 +43,16 @@
 //!   snapshot whose sections arrive in pieces, as a leader's install
 //!   does: [`PendingSnapshot::section`] opens each with its length and
 //!   [`PendingSnapshot::write`] takes its bytes in any pieces, appended in
-//!   writes of at most [`WRITE_CHUNK`]; [`SnapshotStore::publish`] then
-//!   closes, syncs and publishes it as [`SnapshotStore::write`] does, or
-//!   [`SnapshotStore::abandon`] removes it. The bytes on disk are the
-//!   same as [`SnapshotStore::write`]'s; an unpublished snapshot is what a
-//!   crash leaves, which recovery removes.
+//!   writes of at most [`WRITE_CHUNK`]; [`SnapshotStore::seal`] closes and
+//!   syncs it, durable and unpublished, so its owner can read it back, and
+//!   [`SnapshotStore::publish_sealed`] then publishes it as
+//!   [`SnapshotStore::write`] does, keeping a pinned snapshot from the
+//!   purge; [`SnapshotStore::abandon`] removes it. The snapshot stream
+//!   (sections, headers, bytes, length and digest) is the same as
+//!   [`SnapshotStore::write`]'s; A2's segment index may record other
+//!   append boundaries. An unpublished snapshot is what a crash leaves,
+//!   which recovery removes. A handle is taken only by the store that
+//!   began it ([`SnapshotError::Foreign`]).
 //! - **Reads.** [`SnapshotStore::reader`] streams a snapshot section by
 //!   section into the caller's buffer, and [`SnapshotStore::open`] and
 //!   [`SnapshotStore::verify`] check one the same way: a section's bytes
@@ -401,6 +406,10 @@ pub enum SnapshotError {
     /// An earlier failure: reopen the store.
     #[error("the snapshot store failed; reopen it")]
     Failed,
+    /// A streamed snapshot begun by another store, or by this one before a
+    /// reopen: it is not taken, and no file is touched.
+    #[error("the streamed snapshot belongs to another store")]
+    Foreign,
     /// A streamed snapshot published before its sections were whole, or
     /// written past a section's length, or after one of its writes
     /// failed: it is not published.
@@ -440,7 +449,13 @@ pub struct SnapshotStore<D: Disk + Clone> {
     kept: Vec<SnapshotInfo>,
     next_id: u64,
     failed: bool,
+    /// This store's identity in the process: a [`PendingSnapshot`] or a
+    /// [`SealedSnapshot`] is taken only by the store that began it.
+    instance: u64,
 }
+
+/// The identities given to opened stores.
+static INSTANCES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl<D: Disk + Clone> SnapshotStore<D> {
     /// Opens the snapshots in `dir`, an empty directory included, with
@@ -498,6 +513,7 @@ impl<D: Disk + Clone> SnapshotStore<D> {
                 kept,
                 next_id,
                 failed: false,
+                instance: INSTANCES.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             },
             removed,
             damaged,
@@ -562,20 +578,31 @@ impl<D: Disk + Clone> SnapshotStore<D> {
             length,
             digest,
         };
-        self.publish_info(info)
+        self.publish_info(info, None)
     }
 
     /// Publishes `info`, whose bytes are durable, and purges what the
-    /// manifest no longer keeps; `failed` is set while it runs.
-    fn publish_info(&mut self, info: SnapshotInfo) -> Result<SnapshotInfo, SnapshotError> {
+    /// manifest no longer keeps, oldest first but never snapshot `pin`;
+    /// `failed` is set while it runs.
+    fn publish_info(
+        &mut self,
+        info: SnapshotInfo,
+        pin: Option<u64>,
+    ) -> Result<SnapshotInfo, SnapshotError> {
         self.failed = true;
         let mut kept = self.kept.clone();
         kept.push(info);
         let keep = usize::try_from(self.config.keep).unwrap_or(usize::MAX);
-        let purged: Vec<SnapshotInfo> = match kept.len().checked_sub(keep) {
-            Some(excess) if excess > 0 => kept.drain(..excess).collect(),
-            _ => Vec::new(),
-        };
+        let mut purged: Vec<SnapshotInfo> = Vec::new();
+        while kept.len() > keep {
+            let Some(at) = kept
+                .iter()
+                .position(|old| Some(old.id) != pin && old.id != info.id)
+            else {
+                break;
+            };
+            purged.push(kept.remove(at));
+        }
         file::replace(
             &mut self.disk,
             &self.dir,
@@ -614,15 +641,24 @@ impl<D: Disk + Clone> SnapshotStore<D> {
         }
         let id = self.next_id;
         self.next_id = id.checked_add(1).ok_or(SnapshotError::Exhausted)?;
-        let store = SegmentStore::create(
+        let store = match SegmentStore::create(
             self.disk.clone(),
             &self.dir,
             id,
             self.geometry,
             SyncPolicy::None,
             0,
-        )?;
+        ) {
+            Ok(store) => store,
+            Err(error) => {
+                // What the create left goes now, or at the next open,
+                // which removes every store the manifest does not name.
+                let _ = remove_recording(&mut self.disk, &self.dir, id);
+                return Err(error.into());
+            }
+        };
         Ok(PendingSnapshot {
+            owner: self.instance,
             id,
             index,
             term,
@@ -635,20 +671,26 @@ impl<D: Disk + Clone> SnapshotStore<D> {
         })
     }
 
-    /// Publishes a streamed snapshot whose sections are whole, as
-    /// [`SnapshotStore::write`] does: closed and synced, then published,
-    /// then what the manifest no longer keeps purged.
+    /// Seals a streamed snapshot whose sections are whole: its bytes are
+    /// closed and synced, durable but not published, so its owner can read
+    /// it back ([`SnapshotStore::reader`] over [`SealedSnapshot::info`])
+    /// before it decides.
     ///
     /// # Errors
     ///
-    /// [`SnapshotError::Incomplete`] for one not whole, and
+    /// [`SnapshotError::Foreign`], touching nothing;
+    /// [`SnapshotError::Incomplete`] for one not whole and
     /// [`SnapshotError::NotNewer`] when a newer snapshot was published
-    /// meanwhile, both removing it and changing nothing else; then as
-    /// [`SnapshotStore::write`].
-    pub fn publish(
+    /// meanwhile, both removing it; [`SnapshotError::Failed`]; the store's
+    /// and the disk's errors of the close, which remove it: a staging
+    /// failure publishes nothing and does not fail the store.
+    pub fn seal(
         &mut self,
         mut pending: PendingSnapshot<D>,
-    ) -> Result<SnapshotInfo, SnapshotError> {
+    ) -> Result<SealedSnapshot, SnapshotError> {
+        if pending.owner != self.instance {
+            return Err(SnapshotError::Foreign);
+        }
         if self.failed {
             return Err(SnapshotError::Failed);
         }
@@ -666,17 +708,66 @@ impl<D: Disk + Clone> SnapshotStore<D> {
         let Some(store) = pending.store.take() else {
             return Err(SnapshotError::Incomplete);
         };
-        self.failed = true;
-        let _ = store.close_synced()?;
-        self.failed = false;
-        let info = SnapshotInfo {
-            id: pending.id,
-            index: pending.index,
-            term: pending.term,
-            length: pending.at,
-            digest: pending.digest.finish(),
-        };
-        self.publish_info(info)
+        if let Err(error) = store.close_synced() {
+            let _ = remove_recording(&mut self.disk, &self.dir, pending.id);
+            return Err(error.into());
+        }
+        Ok(SealedSnapshot {
+            owner: self.instance,
+            info: SnapshotInfo {
+                id: pending.id,
+                index: pending.index,
+                term: pending.term,
+                length: pending.at,
+                digest: pending.digest.finish(),
+            },
+        })
+    }
+
+    /// Publishes a sealed snapshot as [`SnapshotStore::write`] does, then
+    /// purges what the manifest no longer keeps, oldest first but never
+    /// the kept snapshot `pin` (the one its node stands on until the new
+    /// one is installed).
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError::Foreign`], touching nothing;
+    /// [`SnapshotError::NotNewer`] when a newer one was published since the
+    /// seal, removing it; then as [`SnapshotStore::write`].
+    pub fn publish_sealed(
+        &mut self,
+        sealed: SealedSnapshot,
+        pin: Option<u64>,
+    ) -> Result<SnapshotInfo, SnapshotError> {
+        if sealed.owner != self.instance {
+            return Err(SnapshotError::Foreign);
+        }
+        if self.failed {
+            return Err(SnapshotError::Failed);
+        }
+        if let Some(newest) = self
+            .latest()
+            .filter(|newest| sealed.info.index <= newest.index)
+        {
+            let index = sealed.info.index;
+            self.abandon_sealed(sealed)?;
+            return Err(SnapshotError::NotNewer {
+                index,
+                newest: newest.index,
+            });
+        }
+        self.publish_info(sealed.info, pin)
+    }
+
+    /// Seals a streamed snapshot and publishes it, as
+    /// [`SnapshotStore::write`] does.
+    ///
+    /// # Errors
+    ///
+    /// As [`SnapshotStore::seal`] and [`SnapshotStore::publish_sealed`].
+    pub fn publish(&mut self, pending: PendingSnapshot<D>) -> Result<SnapshotInfo, SnapshotError> {
+        let sealed = self.seal(pending)?;
+        self.publish_sealed(sealed, None)
     }
 
     /// Removes a streamed snapshot that will not be published: an
@@ -684,11 +775,30 @@ impl<D: Disk + Clone> SnapshotStore<D> {
     ///
     /// # Errors
     ///
-    /// The disk's errors; the files left are an unpublished snapshot,
-    /// which the next open removes.
+    /// [`SnapshotError::Foreign`], touching nothing; the disk's errors,
+    /// after which the files left are an unpublished snapshot the next open
+    /// removes.
     pub fn abandon(&mut self, mut pending: PendingSnapshot<D>) -> Result<(), SnapshotError> {
+        if pending.owner != self.instance {
+            return Err(SnapshotError::Foreign);
+        }
         drop(pending.store.take());
         remove_recording(&mut self.disk, &self.dir, pending.id)?;
+        self.disk.sync_dir(&self.dir)?;
+        Ok(())
+    }
+
+    /// Removes a sealed snapshot that will not be published: one its owner
+    /// read back and refused.
+    ///
+    /// # Errors
+    ///
+    /// As [`SnapshotStore::abandon`].
+    pub fn abandon_sealed(&mut self, sealed: SealedSnapshot) -> Result<(), SnapshotError> {
+        if sealed.owner != self.instance {
+            return Err(SnapshotError::Foreign);
+        }
+        remove_recording(&mut self.disk, &self.dir, sealed.info.id)?;
         self.disk.sync_dir(&self.dir)?;
         Ok(())
     }
@@ -784,6 +894,8 @@ impl<D: Disk + Clone> SnapshotStore<D> {
 /// published.
 #[derive(Debug)]
 pub struct PendingSnapshot<D: Disk> {
+    /// The store that began it.
+    owner: u64,
     id: u64,
     index: u64,
     term: u64,
@@ -878,6 +990,23 @@ impl<D: Disk> PendingSnapshot<D> {
         }
         self.left -= length;
         Ok(())
+    }
+}
+
+/// A streamed snapshot sealed ([`SnapshotStore::seal`]): durable, not
+/// published.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SealedSnapshot {
+    owner: u64,
+    info: SnapshotInfo,
+}
+
+impl SealedSnapshot {
+    /// What it will be published as: read it back through
+    /// [`SnapshotStore::reader`] before publishing.
+    #[must_use]
+    pub const fn info(&self) -> SnapshotInfo {
+        self.info
     }
 }
 
