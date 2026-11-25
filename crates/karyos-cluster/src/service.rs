@@ -713,6 +713,13 @@ pub enum Applied<'a> {
     Guard {
         /// The entry's own outcome.
         outcome: GuardOutcome,
+        /// The operator operation it carries (`Close`, `Reopen`), for
+        /// correlation even when it changed nothing.
+        operation: Option<u64>,
+        /// The entry's log index.
+        index: u64,
+        /// The log time it applied at.
+        log_time: u64,
         /// Its effects: a lapse's first, then its own, then the lease's.
         effects: &'a [GuardEffect],
     },
@@ -776,6 +783,9 @@ pub struct ServiceContainer<S> {
     session_budget: u64,
     /// The guard table.
     guards: GuardTable,
+    /// When this node last proposed a renewal while leading; local, not
+    /// replicated.
+    renewed_at: Option<u64>,
 }
 
 impl<S: ClusteredService> ServiceContainer<S> {
@@ -799,6 +809,7 @@ impl<S: ClusteredService> ServiceContainer<S> {
             bounds_logged: false,
             session_budget: config.session_budget,
             guards: GuardTable::new(config.guards),
+            renewed_at: None,
         })
     }
 
@@ -850,21 +861,40 @@ impl<S: ClusteredService> ServiceContainer<S> {
         Ok(true)
     }
 
-    /// Proposes a lease renewal issued at `now`, the leader's clock: the
-    /// host does this every [`GuardBounds::renew_every`] while it leads.
+    /// Proposes a lease renewal issued at `now` when one is due: `true` if
+    /// it proposed. The host calls this at every tick with the core's
+    /// clock, the one it stamps entries' event times with, so a renewal's
+    /// `issued` is its entry's event time; the container proposes on the
+    /// first call after the node starts to lead, then every
+    /// [`GuardBounds::renew_every`]. A node that does not lead forgets its
+    /// last renewal, so it renews at once when it leads again.
     ///
     /// # Errors
     ///
     /// [`NotLeader`] when the core does not lead. A `now` of 0 proposes
-    /// nothing and is not an error.
-    pub fn propose_renew<P: Propose>(&self, core: &mut P, now: u64) -> Result<(), NotLeader> {
+    /// nothing.
+    pub fn propose_renew<P: Propose>(&mut self, core: &mut P, now: u64) -> Result<bool, NotLeader> {
+        if !core.leads() {
+            self.renewed_at = None;
+            return Err(NotLeader::new(None));
+        }
+        let every = self.guards.bounds().renew_every;
+        if self
+            .renewed_at
+            .is_some_and(|at| now.saturating_sub(at) < every)
+        {
+            return Ok(false);
+        }
         let Ok(payload) = (GuardEntry::Renew { issued: now }).to_vec() else {
-            return Ok(());
+            return Ok(false);
         };
         core.propose(payload)
+            .inspect_err(|_| self.renewed_at = None)?;
+        self.renewed_at = Some(now);
+        Ok(true)
     }
 
-    /// Replaces the guard table with a snapshot section's, for a snapshot
+    /// Replaces the guard table with a snapshot section's (of `version`), for a snapshot
     /// at `index` whose log time is `log_time`: validated whole first.
     ///
     /// # Errors
@@ -872,11 +902,12 @@ impl<S: ClusteredService> ServiceContainer<S> {
     /// [`SectionError`]: the table is unchanged.
     pub fn restore_guards(
         &mut self,
+        version: u64,
         section: &[u8],
         index: u64,
         log_time: u64,
     ) -> Result<(), SectionError> {
-        self.guards = GuardTable::restore(section, self.guards.bounds(), index, log_time)?;
+        self.guards = GuardTable::restore(version, section, self.guards.bounds(), index, log_time)?;
         Ok(())
     }
 
@@ -1033,8 +1064,17 @@ impl<S: ClusteredService> ServiceContainer<S> {
             .map_err(ApplyError::Guard)?;
         self.applied = Some(entry.index);
         self.sessions.observe(entry.event_time);
+        let operation = match guard {
+            GuardEntry::Close { operation, .. } | GuardEntry::Reopen { operation, .. } => {
+                Some(operation)
+            }
+            _ => None,
+        };
         Ok(Applied::Guard {
             outcome,
+            operation,
+            index: entry.index,
+            log_time,
             effects: self.guards.effects(),
         })
     }

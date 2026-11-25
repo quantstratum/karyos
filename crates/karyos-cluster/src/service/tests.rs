@@ -971,7 +971,8 @@ fn test_container_guard_entries_go_to_the_guard_table_with_their_effects() {
         container.apply(&guard_entry(1, 1, GuardEntry::Bounds(bounds))),
         Ok(Applied::Guard {
             outcome: GuardOutcome::Bounds,
-            effects: []
+            effects: [],
+            ..
         })
     ));
     assert!(matches!(
@@ -985,7 +986,8 @@ fn test_container_guard_entries_go_to_the_guard_table_with_their_effects() {
         )),
         Ok(Applied::Guard {
             outcome: GuardOutcome::Accepted,
-            effects: [GuardEffect::Guard { .. }]
+            effects: [GuardEffect::Guard { .. }],
+            ..
         })
     ));
     assert!(matches!(
@@ -995,7 +997,8 @@ fn test_container_guard_entries_go_to_the_guard_table_with_their_effects() {
             effects: [GuardEffect::Lease {
                 lease: Lease::Active { .. },
                 ..
-            }]
+            }],
+            ..
         })
     ));
     let reopen = GuardEntry::Reopen {
@@ -1062,14 +1065,100 @@ fn test_container_a_guard_section_restores_or_is_refused_whole() {
             },
         ))
         .unwrap();
-    let section = source.guards().section();
+    let section = source.guards().section().unwrap();
     let mut replica = container();
     assert!(
         replica
-            .restore_guards(&section[..section.len() - 1], 2, 2)
+            .restore_guards(
+                crate::guards::SECTION_VERSION,
+                &section[..section.len() - 1],
+                2,
+                2
+            )
             .is_err()
     );
     assert!(replica.guards().guards().is_empty());
-    replica.restore_guards(&section, 2, 2).unwrap();
+    replica
+        .restore_guards(crate::guards::SECTION_VERSION, &section, 2, 2)
+        .unwrap();
     assert_eq!(replica.guards().guards(), source.guards().guards());
+}
+
+/// Every guard result carries its operation, index and log time, a
+/// refusal with no effect included, for correlation.
+#[test]
+fn test_container_a_guard_result_carries_its_operation_index_and_log_time() {
+    use crate::guards::{GuardEntry, GuardOutcome, Refusal};
+    let mut container = container();
+    let bounds = container.guards().bounds();
+    container
+        .apply(&guard_entry(1, 1, GuardEntry::Bounds(bounds)))
+        .unwrap();
+    // An older event time after the log time moved on: the log time stays.
+    container
+        .apply(&guard_entry(
+            2,
+            50,
+            GuardEntry::Define {
+                guard: 9,
+                policy: 1,
+            },
+        ))
+        .unwrap();
+    let close = GuardEntry::Close {
+        guard: 8,
+        operation: 41,
+        requester: 2,
+        reason: 3,
+    };
+    assert!(matches!(
+        container.apply(&guard_entry(3, 10, close)),
+        Ok(Applied::Guard {
+            outcome: GuardOutcome::Refused(Refusal::Undefined),
+            operation: Some(41),
+            index: 3,
+            log_time: 50,
+            effects: [],
+        })
+    ));
+}
+
+/// The container proposes a renewal at once when its node leads, then
+/// every `renew_every`, and again at once after a loss of leadership.
+#[test]
+fn test_container_renewals_follow_leadership_and_the_interval() {
+    use crate::guards::GuardEntry;
+    let mut container = container();
+    let every = container.guards().bounds().renew_every;
+    let mut core = Recorder {
+        leads: true,
+        ..Recorder::default()
+    };
+    assert_eq!(container.propose_renew(&mut core, 1_000), Ok(true));
+    assert_eq!(
+        container.propose_renew(&mut core, 1_000 + every - 1),
+        Ok(false)
+    );
+    assert_eq!(container.propose_renew(&mut core, 1_000 + every), Ok(true));
+    core.leads = false;
+    assert!(
+        container
+            .propose_renew(&mut core, 1_000 + every + 1)
+            .is_err()
+    );
+    core.leads = true;
+    assert_eq!(
+        container.propose_renew(&mut core, 1_000 + every + 2),
+        Ok(true),
+        "a new leadership renews at once"
+    );
+    let issued: Vec<u64> = core
+        .proposed
+        .iter()
+        .map(|payload| match GuardEntry::decode(payload).unwrap() {
+            GuardEntry::Renew { issued } => issued,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(issued, vec![1_000, 1_000 + every, 1_000 + every + 2]);
 }

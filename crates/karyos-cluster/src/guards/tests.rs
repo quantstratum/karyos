@@ -79,7 +79,7 @@ fn every_entry_round_trips_at_its_length() {
         (
             GuardEntry::Define {
                 guard: 1,
-                policy: 0,
+                policy: 1,
             },
             24,
         ),
@@ -94,6 +94,14 @@ fn every_entry_round_trips_at_its_length() {
     // A zero, the lapse's reserved reason and a lifetime past the maximum
     // are out of range.
     assert!(close(0, 1).to_vec().is_err());
+    assert!(
+        GuardEntry::Define {
+            guard: 1,
+            policy: 0
+        }
+        .to_vec()
+        .is_err()
+    );
     assert!(
         GuardEntry::Close {
             guard: 1,
@@ -264,7 +272,7 @@ fn a_replica_with_other_bounds_stops_the_profile_included() {
         t.apply(
             GuardEntry::Define {
                 guard: 1,
-                policy: 0
+                policy: 1
             },
             2,
             0
@@ -278,7 +286,7 @@ fn a_full_table_refuses_a_definition() {
     let mut t = table(Profile::Durable);
     for guard in 1..=4 {
         assert_eq!(
-            t.apply(GuardEntry::Define { guard, policy: 0 }, guard + 1, 0),
+            t.apply(GuardEntry::Define { guard, policy: 1 }, guard + 1, 0),
             Ok(GuardOutcome::Accepted)
         );
     }
@@ -286,7 +294,7 @@ fn a_full_table_refuses_a_definition() {
         t.apply(
             GuardEntry::Define {
                 guard: 5,
-                policy: 0
+                policy: 1
             },
             6,
             0
@@ -304,7 +312,7 @@ fn a_lapse_closes_every_open_guard_before_the_entry_and_the_lease() {
     let mut t = table(Profile::Durable);
     for guard in [3, 5] {
         assert_eq!(
-            t.apply(GuardEntry::Define { guard, policy: 0 }, guard, 0),
+            t.apply(GuardEntry::Define { guard, policy: 1 }, guard, 0),
             Ok(GuardOutcome::Accepted)
         );
     }
@@ -386,8 +394,8 @@ fn a_section_restores_the_table_and_every_unreachable_one_is_refused() {
     let mut t = open_table();
     assert_eq!(t.apply(close(9, 101), 5, 12), Ok(GuardOutcome::Accepted));
     let b = bounds(Profile::Durable);
-    let bytes = t.section();
-    let restored = GuardTable::restore(&bytes, b, 5, 12).unwrap();
+    let bytes = t.section().unwrap();
+    let restored = GuardTable::restore(SECTION_VERSION, &bytes, b, 5, 12).unwrap();
     assert_eq!(
         (
             restored.guards(),
@@ -448,7 +456,7 @@ fn a_section_restores_the_table_and_every_unreachable_one_is_refused() {
     ];
     for (name, bytes, error) in cases {
         assert_eq!(
-            GuardTable::restore(&bytes, b, 5, 12).err(),
+            GuardTable::restore(SECTION_VERSION, &bytes, b, 5, 12).err(),
             Some(error),
             "{name}"
         );
@@ -462,8 +470,202 @@ fn a_section_restores_the_table_and_every_unreachable_one_is_refused() {
     );
     assert!(matches!(l.lease(), Lease::Lapsed { until: 110, .. }));
     assert_eq!(
-        GuardTable::restore(&l.section(), b, 6, 109).err(),
+        GuardTable::restore(SECTION_VERSION, &l.section().unwrap(), b, 6, 109).err(),
         Some(SectionError::Lease)
     );
-    assert!(GuardTable::restore(&l.section(), b, 6, 110).is_ok());
+    assert!(GuardTable::restore(SECTION_VERSION, &l.section().unwrap(), b, 6, 110).is_ok());
+}
+
+#[test]
+fn an_overflowing_renewal_stops_and_changes_nothing() {
+    let mut t = open_table();
+    let before = t.clone();
+    // Expired (until 110), so a lapse would run; the overflow stops first.
+    assert_eq!(
+        t.apply(GuardEntry::Renew { issued: u64::MAX }, 5, 200),
+        Err(GuardStop::Overflow)
+    );
+    assert_eq!(t, before, "a stop applies nothing, effects included");
+}
+
+#[test]
+fn every_guard_entry_at_expiry_runs_the_lapse_and_ends_with_one_lease_effect() {
+    let lapsed = |effects: &[GuardEffect]| -> Vec<&'static str> {
+        effects
+            .iter()
+            .map(|effect| match effect {
+                GuardEffect::Guard { guard, .. } if guard.last.reason == LAPSE_REASON => "lapse",
+                GuardEffect::Guard { .. } => "own",
+                GuardEffect::Lease {
+                    lease: Lease::Lapsed { .. },
+                    ..
+                } => "lapsed",
+                GuardEffect::Lease { .. } => "granted",
+            })
+            .collect()
+    };
+    // A matching bounds entry.
+    let mut t = open_table();
+    assert_eq!(
+        t.apply(GuardEntry::Bounds(bounds(Profile::Durable)), 5, 110),
+        Ok(GuardOutcome::Bounds)
+    );
+    assert_eq!(lapsed(t.effects()), ["lapse", "lapsed"]);
+    assert!(!t.guard(9).unwrap().open());
+    // A close: the lapse's change, its own, then the lease.
+    let mut t = open_table();
+    assert_eq!(t.apply(close(9, 101), 5, 110), Ok(GuardOutcome::Accepted));
+    assert_eq!(lapsed(t.effects()), ["lapse", "own", "lapsed"]);
+    // A renewal that lapses and grants: one lease effect, the grant.
+    let mut t = open_table();
+    assert_eq!(
+        t.apply(GuardEntry::Renew { issued: 110 }, 5, 110),
+        Ok(GuardOutcome::Accepted)
+    );
+    assert_eq!(lapsed(t.effects()), ["lapse", "granted"]);
+}
+
+#[test]
+fn no_section_before_the_bounds_and_an_unread_version_is_refused() {
+    let t = GuardTable::new(bounds(Profile::Durable));
+    assert_eq!(t.section(), None);
+    let bytes = open_table().section().unwrap();
+    assert_eq!(
+        GuardTable::restore(SECTION_VERSION + 1, &bytes, bounds(Profile::Durable), 4, 11).err(),
+        Some(SectionError::Version(SECTION_VERSION + 1))
+    );
+}
+
+/// Two guards, for the snapshot matrix: guard 3 open, guard 5 closed by a
+/// lapse later.
+fn two_guards() -> GuardTable {
+    let mut t = table(Profile::Durable);
+    assert_eq!(
+        t.apply(
+            GuardEntry::Define {
+                guard: 3,
+                policy: 1
+            },
+            2,
+            0
+        ),
+        Ok(GuardOutcome::Accepted)
+    );
+    assert_eq!(
+        t.apply(
+            GuardEntry::Define {
+                guard: 5,
+                policy: 1
+            },
+            3,
+            0
+        ),
+        Ok(GuardOutcome::Accepted)
+    );
+    assert_eq!(
+        t.apply(GuardEntry::Renew { issued: 10 }, 4, 10),
+        Ok(GuardOutcome::Accepted)
+    );
+    assert_eq!(t.apply(reopen(3, 1, 1), 5, 11), Ok(GuardOutcome::Accepted));
+    t
+}
+
+#[test]
+fn every_unreachable_section_is_refused_whole() {
+    let b = bounds(Profile::Durable);
+    let bytes = two_guards().section().unwrap();
+    let record = |n: usize| HEAD + n * RECORD;
+    let mutate = |at: usize, value: &[u8]| {
+        let mut b = bytes.clone();
+        b[at..at + value.len()].copy_from_slice(value);
+        b
+    };
+    assert!(GuardTable::restore(SECTION_VERSION, &bytes, b, 5, 11).is_ok());
+    let cases: Vec<(&str, Vec<u8>, SectionError)> = vec![
+        (
+            "duplicate id",
+            mutate(record(1), &3u64.to_le_bytes()),
+            SectionError::Guard(1),
+        ),
+        (
+            "descending ids",
+            mutate(record(1), &2u64.to_le_bytes()),
+            SectionError::Guard(1),
+        ),
+        (
+            "count above capacity",
+            {
+                let mut b = mutate(HEAD - 4, &5u32.to_le_bytes());
+                b.resize(HEAD + 5 * RECORD, 0);
+                b
+            },
+            SectionError::Length,
+        ),
+        (
+            "epoch above the maximum",
+            mutate(record(1) + 8, &(MAX_EPOCH + 1).to_le_bytes()),
+            SectionError::Guard(1),
+        ),
+        (
+            "open while never granted",
+            mutate(21, &[0; 17]),
+            SectionError::Guard(0),
+        ),
+        (
+            "open at a saturated fence",
+            mutate(record(0) + 16, &u64::MAX.to_le_bytes()),
+            SectionError::Guard(0),
+        ),
+        (
+            "a lapse record with an operation",
+            {
+                let mut b = mutate(record(0) + 52, &LAPSE_REASON.to_le_bytes());
+                b[record(0) + 36..record(0) + 44].copy_from_slice(&1u64.to_le_bytes());
+                b
+            },
+            SectionError::Guard(0),
+        ),
+    ];
+    for (name, bytes, error) in cases {
+        assert_eq!(
+            GuardTable::restore(SECTION_VERSION, &bytes, b, 5, 11).err(),
+            Some(error),
+            "{name}"
+        );
+    }
+    // An open guard under a lapsed lease.
+    let mut lapsed = two_guards();
+    lapsed.lease = Lease::Lapsed {
+        issued: 10,
+        until: 110,
+    };
+    assert_eq!(
+        GuardTable::restore(SECTION_VERSION, &lapsed.section().unwrap(), b, 5, 200).err(),
+        Some(SectionError::Guard(0))
+    );
+}
+
+/// A stale reopen replayed on a live replica and on one restored from a
+/// snapshot gives the same outcome and the same effects.
+#[test]
+fn a_live_and_a_restored_replica_agree_on_a_stale_reopen() {
+    let mut live = open_table();
+    assert_eq!(live.apply(close(9, 101), 5, 12), Ok(GuardOutcome::Accepted));
+    assert_eq!(live.apply(close(9, 102), 6, 13), Ok(GuardOutcome::Accepted));
+    let mut restored = GuardTable::restore(
+        SECTION_VERSION,
+        &live.section().unwrap(),
+        bounds(Profile::Durable),
+        6,
+        13,
+    )
+    .unwrap();
+    for t in [&mut live, &mut restored] {
+        assert_eq!(
+            t.apply(reopen(9, 2, 103), 7, 14),
+            Ok(GuardOutcome::Refused(Refusal::Stale))
+        );
+    }
+    assert_eq!(live.effects(), restored.effects());
+    assert_eq!(live.guards(), restored.guards());
 }

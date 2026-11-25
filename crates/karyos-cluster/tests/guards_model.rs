@@ -483,6 +483,18 @@ fn successors(world: &World, flaw: Flaw, bounds: Bounds) -> Vec<(String, Result<
     };
     if world.entries < bounds.entries {
         let op = world.next_op;
+        // A retry of the last operation, close or reopen, across whatever
+        // happened since (a lapse included).
+        if op > 1 {
+            let last = op - 1;
+            push(format!("retry close op{last}"), &|w| {
+                w.apply(Entry::Close { op: last }, w.now, flaw)
+            });
+            let (_, fence, _) = world.table.guard();
+            push(format!("retry reopen fence{fence} op{last}"), &|w| {
+                w.apply(Entry::Reopen { fence, op: last }, w.now, flaw)
+            });
+        }
         push(format!("close op{op}"), &|w| {
             w.next_op += 1;
             w.apply(Entry::Close { op }, w.now, flaw)

@@ -210,6 +210,14 @@ fn nonzero(field: &'static str, value: u64) -> Result<u64, CodecError> {
     }
 }
 
+fn nonzero32(field: &'static str, value: u32) -> Result<u32, CodecError> {
+    if value == 0 {
+        Err(CodecError::ValueOutOfRange { field })
+    } else {
+        Ok(value)
+    }
+}
+
 fn reason(value: u32) -> Result<u32, CodecError> {
     if value == 0 || value == LAPSE_REASON {
         Err(CodecError::ValueOutOfRange { field: "reason" })
@@ -239,7 +247,7 @@ impl GuardEntry {
             Self::Define { guard, policy } => {
                 let mut e = Encoder::new(out, &DEFINE)?;
                 e.u64(0, nonzero("guard", guard)?)?;
-                e.u32(8, policy)?;
+                e.u32(8, nonzero32("policy", policy)?)?;
                 e.finish()
             }
             Self::Close {
@@ -329,7 +337,7 @@ impl GuardEntry {
             }
             2 => Self::Define {
                 guard: nonzero("guard", b.u64(0)?)?,
-                policy: b.u32(8)?,
+                policy: nonzero32("policy", b.u32(8)?)?,
             },
             3 => Self::Close {
                 guard: nonzero("guard", b.u64(0)?)?,
@@ -580,23 +588,32 @@ impl GuardTable {
         index: u64,
         log_time: u64,
     ) -> Result<GuardOutcome, GuardStop> {
-        self.effects.clear();
-        if let GuardEntry::Bounds(logged) = entry {
-            if logged != self.configured {
-                return Err(GuardStop::BoundsDiffer {
-                    logged,
-                    configured: self.configured,
-                });
-            }
-            self.logged = true;
-            return Ok(GuardOutcome::Bounds);
+        // Every check that can stop, before any change: a stop applies
+        // nothing, effects included.
+        if let GuardEntry::Bounds(logged) = entry
+            && logged != self.configured
+        {
+            return Err(GuardStop::BoundsDiffer {
+                logged,
+                configured: self.configured,
+            });
         }
-        if !self.logged {
+        if let GuardEntry::Renew { issued } = entry {
+            let _ = issued
+                .checked_add(self.configured.lifetime)
+                .ok_or(GuardStop::Overflow)?;
+        }
+        self.effects.clear();
+        if !self.logged && !matches!(entry, GuardEntry::Bounds(_)) {
             return Ok(GuardOutcome::Refused(Refusal::NoBounds));
         }
+        let lease_before = self.lease;
         self.lapse(index, log_time);
         let outcome = match entry {
-            GuardEntry::Bounds(_) => GuardOutcome::Bounds,
+            GuardEntry::Bounds(_) => {
+                self.logged = true;
+                GuardOutcome::Bounds
+            }
             GuardEntry::Define { guard, policy } => match self.slot(guard) {
                 Ok(_) => GuardOutcome::Retry,
                 Err(_)
@@ -704,23 +721,27 @@ impl GuardTable {
                         issued,
                         until: grant,
                     };
-                    self.effects.push(GuardEffect::Lease {
-                        lease: self.lease,
-                        index,
-                        log_time,
-                    });
                     GuardOutcome::Accepted
                 } else {
                     GuardOutcome::NotGranted
                 }
             }
         };
+        // One final lease effect, after the lapse's guard changes and the
+        // entry's own, when the lease changed (design §7).
+        if self.lease != lease_before {
+            self.effects.push(GuardEffect::Lease {
+                lease: self.lease,
+                index,
+                log_time,
+            });
+        }
         Ok(outcome)
     }
 
     /// The lapse rule: an active lease at or past its `until` lapses,
     /// closing every open guard and raising every fence, one effect per
-    /// guard in order, then the lease's.
+    /// guard in order; the lease's effect is the entry's final one.
     fn lapse(&mut self, index: u64, log_time: u64) {
         let Lease::Active { issued, until } = self.lease else {
             return;
@@ -744,11 +765,6 @@ impl GuardTable {
             }
             self.effect_of(at, index, log_time);
         }
-        self.effects.push(GuardEffect::Lease {
-            lease: self.lease,
-            index,
-            log_time,
-        });
     }
 }
 
@@ -761,6 +777,9 @@ const RECORD: usize = 8 + 8 + 8 + 4 + 8 + 8 + 8 + 4 + 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SectionError {
+    /// A section version this replica does not read.
+    #[error("guard section version {0} is not read")]
+    Version(u64),
     /// Its length is not its count's.
     #[error("the section's length does not match its count")]
     Length,
@@ -781,9 +800,14 @@ fn put(out: &mut Vec<u8>, bytes: &[u8]) {
 
 impl GuardTable {
     /// The table as a snapshot section's bytes (`SectionKind::Guards`,
-    /// version [`SECTION_VERSION`]).
+    /// version [`SECTION_VERSION`]); `None` before the log's bounds apply.
     #[must_use]
-    pub fn section(&self) -> Vec<u8> {
+    pub fn section(&self) -> Option<Vec<u8>> {
+        // No section before the log's bounds: a restored table would take
+        // guard entries the log has not bounded yet.
+        if !self.logged {
+            return None;
+        }
         let mut out = Vec::with_capacity(HEAD + RECORD * self.guards.len());
         let b = self.configured;
         put(&mut out, &b.guards.to_le_bytes());
@@ -815,22 +839,27 @@ impl GuardTable {
             put(&mut out, &g.last.reason.to_le_bytes());
             put(&mut out, &g.last.index.to_le_bytes());
         }
-        out
+        Some(out)
     }
 
-    /// A table restored from a section's `bytes`, for this replica's
-    /// `bounds`, in a snapshot at `index` whose log time is `log_time`:
+    /// A table restored from a section of `version` and `bytes`, for this
+    /// replica's `bounds`, in a snapshot at `index` whose log time is
+    /// `log_time`:
     /// validated whole, then built in one step.
     ///
     /// # Errors
     ///
     /// [`SectionError`]: nothing is restored.
     pub fn restore(
+        version: u64,
         bytes: &[u8],
         bounds: GuardBounds,
         index: u64,
         log_time: u64,
     ) -> Result<Self, SectionError> {
+        if version != SECTION_VERSION {
+            return Err(SectionError::Version(version));
+        }
         let mut at = 0usize;
         let mut take = |n: usize| -> Result<&[u8], SectionError> {
             let end = at.checked_add(n).ok_or(SectionError::Length)?;
@@ -899,7 +928,11 @@ impl GuardTable {
                 g.last.reason != 0
                     && g.last.index != 0
                     && g.last.index <= index
-                    && (lapse || (g.last.operation != 0 && g.last.requester != 0))
+                    && if lapse {
+                        g.last.operation == 0 && g.last.requester == 0
+                    } else {
+                        g.last.operation != 0 && g.last.requester != 0
+                    }
             };
             let reachable = g.guard > previous
                 && (1..=MAX_EPOCH).contains(&g.epoch)
