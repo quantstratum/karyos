@@ -126,6 +126,7 @@ impl Compaction {
 #[derive(Debug)]
 struct Piece {
     base: SnapshotBase,
+    term: u64,
     transfer: u64,
     digest: u32,
     length: u64,
@@ -139,6 +140,8 @@ struct Piece {
 #[derive(Debug)]
 struct Incoming {
     from: NodeId,
+    /// Its sender's term when it started the transfer.
+    term: u64,
     transfer: u64,
     base: SnapshotBase,
     digest: u32,
@@ -152,6 +155,8 @@ struct Incoming {
 /// acknowledges, at most [`SNAPSHOT_WINDOW`] pieces ahead.
 #[derive(Debug)]
 struct Outgoing {
+    /// Its term when it started the transfer.
+    term: u64,
     transfer: u64,
     base: SnapshotBase,
     digest: u32,
@@ -1379,6 +1384,9 @@ pub enum Wire<M> {
     Snapshot {
         /// The snapshot's base.
         base: SnapshotBase,
+        /// The sender's term when it started the transfer: with the base
+        /// and the transfer, what orders two transfers' starts.
+        term: u64,
         /// The sender's transfer.
         transfer: u64,
         /// The whole snapshot's CRC-32C, as the sender's store holds it.
@@ -1391,8 +1399,9 @@ pub enum Wire<M> {
         bytes: Vec<u8>,
     },
     /// A follower's acknowledgement of a transfer: it holds the section's
-    /// bytes before `next`, and the whole snapshot once `next` is its
-    /// length.
+    /// bytes before `next`; once `installed`, it has checked, published and
+    /// installed the snapshot (or holds state past it), and only that ends
+    /// the sender's transfer.
     SnapshotAck {
         /// The snapshot's base.
         base: SnapshotBase,
@@ -1400,6 +1409,8 @@ pub enum Wire<M> {
         transfer: u64,
         /// The bytes it holds.
         next: u64,
+        /// Whether the snapshot is installed.
+        installed: bool,
     },
     /// The primary's committed entries after the standby's verified
     /// position, and its commit.
@@ -1927,7 +1938,7 @@ impl<C: ConsensusCore> ServerNode<C> {
     /// transfer of that snapshot already moving goes on, however often the
     /// core asks; a new one starts only for a newer snapshot, or when the
     /// last has gone [`SNAPSHOT_STALL`] ticks without an acknowledgement.
-    fn send_snapshot(&mut self, to: NodeId, out: &mut Outbox<Wire<C::Message>>) {
+    fn send_snapshot(&mut self, to: NodeId, term: u64, out: &mut Outbox<Wire<C::Message>>) {
         let Some(store) = self.snapshots.as_ref() else {
             return;
         };
@@ -1953,6 +1964,7 @@ impl<C: ConsensusCore> ServerNode<C> {
         let transfer = self.next_transfer;
         self.next_transfer = transfer.saturating_add(1);
         let outgoing = Outgoing {
+            term,
             transfer,
             base: SnapshotBase {
                 index: info.index,
@@ -2016,6 +2028,7 @@ impl<C: ConsensusCore> ServerNode<C> {
                 to,
                 Wire::Snapshot {
                     base: outgoing.base,
+                    term: outgoing.term,
                     transfer: outgoing.transfer,
                     digest: outgoing.digest,
                     length: outgoing.length,
@@ -2030,12 +2043,15 @@ impl<C: ConsensusCore> ServerNode<C> {
         }
     }
 
-    /// A follower's acknowledgement: the window moves, and a transfer
-    /// acknowledged whole ends.
+    /// A follower's acknowledgement: the window moves, and a transfer ends
+    /// only once the follower has installed it. One received whole but not
+    /// installed (its check or its install failed) waits, and once it has
+    /// gone [`SNAPSHOT_STALL`] ticks without moving the core's next ask
+    /// starts it again.
     fn snapshot_acked(
         &mut self,
         from: NodeId,
-        (base, transfer, next): (SnapshotBase, u64, u64),
+        (base, transfer, next, installed): (SnapshotBase, u64, u64, bool),
         out: &mut Outbox<Wire<C::Message>>,
     ) {
         let Some(outgoing) = self.outgoing.get_mut(&from) else {
@@ -2044,14 +2060,14 @@ impl<C: ConsensusCore> ServerNode<C> {
         if outgoing.transfer != transfer || outgoing.base != base {
             return;
         }
+        if installed {
+            let _ = self.outgoing.remove(&from);
+            return;
+        }
         let acked = next.min(outgoing.sent);
         if acked > outgoing.acked {
             outgoing.acked = acked;
             outgoing.moved = self.now;
-        }
-        if outgoing.acked >= outgoing.length {
-            let _ = self.outgoing.remove(&from);
-            return;
         }
         self.pump_snapshot(from, out);
     }
@@ -2103,15 +2119,17 @@ impl<C: ConsensusCore> ServerNode<C> {
     }
 
     /// Takes one piece of a leader's snapshot. The first piece of a
-    /// transfer starts it, superseding an older one and ignored for an
-    /// older base; every next piece must repeat the transfer's metadata
+    /// transfer starts it, superseding the one it receives only when it is
+    /// newer: a later base, a later sender's term at the same base, or a
+    /// later transfer of the same sender and term; every next piece must repeat the transfer's metadata
     /// and continue it exactly: a duplicate is acknowledged again and
     /// changes nothing, a gap drops the transfer (its leader asks again),
     /// and a piece of another transfer is ignored. Each piece is written
     /// into the store as it arrives and acknowledged; the last seals the
     /// snapshot, which is read back and checked before it is published and
-    /// installed. A snapshot already staged at that base is installed
-    /// without being received again.
+    /// installed, and only then acknowledged installed. A snapshot already
+    /// staged at that base is installed without being received again; a
+    /// piece of a base its state has reached is acknowledged installed.
     fn receive_snapshot(
         &mut self,
         core: &mut C,
@@ -2121,12 +2139,25 @@ impl<C: ConsensusCore> ServerNode<C> {
     ) {
         let node = self.id;
         self.expire_incoming();
+        let ack = |out: &mut Outbox<Wire<C::Message>>, next: u64, installed: bool| {
+            out.push((
+                from,
+                Wire::SnapshotAck {
+                    base: piece.base,
+                    transfer: piece.transfer,
+                    next,
+                    installed,
+                },
+            ));
+        };
         if self
             .service
             .applied()
             .is_some_and(|applied| piece.base.index <= applied)
         {
-            return;
+            // It holds that state already: an installed acknowledgement
+            // lost, or a transfer it no longer needs.
+            return ack(out, piece.length, true);
         }
         if let Some((lose, seen)) = self.lose_piece.as_mut() {
             if *seen == *lose {
@@ -2140,16 +2171,6 @@ impl<C: ConsensusCore> ServerNode<C> {
             }
             *seen += 1;
         }
-        let ack = |out: &mut Outbox<Wire<C::Message>>, next: u64| {
-            out.push((
-                from,
-                Wire::SnapshotAck {
-                    base: piece.base,
-                    transfer: piece.transfer,
-                    next,
-                },
-            ));
-        };
         let current = self
             .incoming
             .as_ref()
@@ -2160,7 +2181,13 @@ impl<C: ConsensusCore> ServerNode<C> {
                 return;
             }
             if let Some(incoming) = self.incoming.as_ref() {
-                if piece.base.index < incoming.base.index {
+                let start = (piece.base.index, piece.term);
+                let held = (incoming.base.index, incoming.term);
+                let newer = start > held
+                    || (start == held
+                        && from == incoming.from
+                        && piece.transfer > incoming.transfer);
+                if !newer {
                     return;
                 }
                 self.abandon_incoming("superseded");
@@ -2182,8 +2209,10 @@ impl<C: ConsensusCore> ServerNode<C> {
                     && store.verify(&info).is_ok()
             });
             if staged {
-                ack(out, piece.length);
-                return self.install_snapshot(core, log, piece.base);
+                if self.install_snapshot(core, log, piece.base) {
+                    ack(out, piece.length, true);
+                }
+                return;
             }
             let mut pending = match store.begin(piece.base.index, piece.base.term) {
                 Ok(pending) => pending,
@@ -2207,6 +2236,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             }
             self.incoming = Some(Incoming {
                 from,
+                term: piece.term,
                 transfer: piece.transfer,
                 base: piece.base,
                 digest: piece.digest,
@@ -2228,7 +2258,7 @@ impl<C: ConsensusCore> ServerNode<C> {
         let pieced = u64::try_from(piece.bytes.len()).unwrap_or(u64::MAX);
         if piece.offset < expected {
             // A duplicate: it holds it already.
-            return ack(out, expected);
+            return ack(out, expected, false);
         }
         if piece.offset > expected || pieced > incoming.pending.left() {
             return self.abandon_incoming("gap");
@@ -2251,25 +2281,33 @@ impl<C: ConsensusCore> ServerNode<C> {
             length: pieced,
             total: piece.length,
         });
-        ack(out, next);
         if next < piece.length {
-            return;
+            return ack(out, next, false);
         }
+        // The last piece: acknowledged only once the snapshot is installed.
         let Some(incoming) = self.incoming.take() else {
             return;
         };
-        self.finish_snapshot(core, log, incoming);
+        if self.finish_snapshot(core, log, incoming) {
+            ack(out, next, true);
+        }
     }
 
     /// Seals a received snapshot, reads it back and checks it (its digest
     /// is the sender's, its service decodes at its base) before publishing
     /// it, keeping the snapshot the node stands on from the purge, then
-    /// installs it.
-    fn finish_snapshot(&mut self, core: &mut C, log: &mut RaftLog<SimDisk>, incoming: Incoming) {
+    /// installs it: whether it did.
+    fn finish_snapshot(
+        &mut self,
+        core: &mut C,
+        log: &mut RaftLog<SimDisk>,
+        incoming: Incoming,
+    ) -> bool {
         let node = self.id;
         let base = incoming.base;
         let refuse = |this: &Self, reason: String| {
             this.observe(Observation::SnapshotRefused { node, base, reason });
+            false
         };
         let Some(store) = self.snapshots.as_mut() else {
             return refuse(self, "no snapshot store".to_owned());
@@ -2278,11 +2316,11 @@ impl<C: ConsensusCore> ServerNode<C> {
             Ok(sealed) => sealed,
             Err(error) => {
                 let failed = matches!(error, SnapshotError::Failed);
-                refuse(self, format!("seal: {error}"));
+                let refused = refuse(self, format!("seal: {error}"));
                 if failed {
                     self.reopen_snapshots();
                 }
-                return;
+                return refused;
             }
         };
         let info = sealed.info();
@@ -2315,22 +2353,29 @@ impl<C: ConsensusCore> ServerNode<C> {
                 error,
                 SnapshotError::Failed | SnapshotError::Store(_) | SnapshotError::Io(_)
             );
-            refuse(self, format!("publish: {error}"));
+            let refused = refuse(self, format!("publish: {error}"));
             if failed {
                 self.reopen_snapshots();
             }
-            return;
+            return refused;
         }
-        self.install_snapshot(core, log, base);
+        self.install_snapshot(core, log, base)
     }
 
     /// Installs a leader's snapshot its store holds published at `base`:
     /// the log restarts after it, the service restores it, and the core is
-    /// told; any refusal is recorded and changes nothing further.
-    fn install_snapshot(&mut self, core: &mut C, log: &mut RaftLog<SimDisk>, base: SnapshotBase) {
+    /// told; any refusal is recorded and changes nothing further. Whether
+    /// its log and service now stand on it.
+    fn install_snapshot(
+        &mut self,
+        core: &mut C,
+        log: &mut RaftLog<SimDisk>,
+        base: SnapshotBase,
+    ) -> bool {
         let node = self.id;
         let refuse = |this: &Self, reason: String| {
             this.observe(Observation::SnapshotRefused { node, base, reason });
+            false
         };
         let Some(store) = self.snapshots.as_mut() else {
             return refuse(self, "no snapshot store".to_owned());
@@ -2368,10 +2413,11 @@ impl<C: ConsensusCore> ServerNode<C> {
                     });
                 }
                 super::core::InstallRefused::Stale => {
-                    refuse(self, "the core holds the base already".to_owned());
+                    let _ = refuse(self, "the core holds the base already".to_owned());
                 }
             }
         }
+        true
     }
 
     /// Feeds its committed entries to the standby servers `to` while its
@@ -2681,7 +2727,7 @@ impl<C: ConsensusCore> ServerNode<C> {
         self.compact(&mut core, &mut log);
         self.expire_incoming();
         for to in snapshot_to {
-            self.send_snapshot(to, out);
+            self.send_snapshot(to, core.term(), out);
         }
         self.positions(&core, &log);
         self.running = Some((core, log));
@@ -2871,13 +2917,15 @@ impl<C: ConsensusCore> ServerNode<C> {
             base,
             transfer,
             next,
+            installed,
         } = message
         {
-            self.snapshot_acked(from, (base, transfer, next), out);
+            self.snapshot_acked(from, (base, transfer, next, installed), out);
             return;
         }
         if let Wire::Snapshot {
             base,
+            term,
             transfer,
             digest,
             length,
@@ -2890,6 +2938,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             if let Some((mut core, mut log)) = self.running.take() {
                 let piece = Piece {
                     base,
+                    term,
                     transfer,
                     digest,
                     length,

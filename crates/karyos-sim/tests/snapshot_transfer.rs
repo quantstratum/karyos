@@ -109,12 +109,24 @@ fn digest(base: SnapshotBase, bytes: &[u8]) -> u32 {
 
 /// A transfer's pieces of `PIECE` bytes.
 fn pieces(base: SnapshotBase, transfer: u64, bytes: &[u8], digest: u32) -> Vec<Wire<Message>> {
+    pieces_in(1, base, transfer, bytes, digest)
+}
+
+/// A transfer's pieces, its sender in `term`.
+fn pieces_in(
+    term: u64,
+    base: SnapshotBase,
+    transfer: u64,
+    bytes: &[u8],
+    digest: u32,
+) -> Vec<Wire<Message>> {
     let length = u64::try_from(bytes.len()).unwrap();
     bytes
         .chunks(PIECE)
         .enumerate()
         .map(|(at, chunk)| Wire::Snapshot {
             base,
+            term,
             transfer,
             digest,
             length,
@@ -136,6 +148,20 @@ fn acks(out: &Out) -> Vec<(u64, u64)> {
     out.iter()
         .filter_map(|(to, wire)| match wire {
             Wire::SnapshotAck { transfer, next, .. } if *to == LEADER => Some((*transfer, *next)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The installed acknowledgements in `out`, by transfer.
+fn installed(out: &Out) -> Vec<u64> {
+    out.iter()
+        .filter_map(|(to, wire)| match wire {
+            Wire::SnapshotAck {
+                transfer,
+                installed: true,
+                ..
+            } if *to == LEADER => Some(*transfer),
             _ => None,
         })
         .collect()
@@ -233,6 +259,7 @@ fn a_piece_whose_metadata_differs_drops_the_transfer() {
         let _ = deliver(&mut server, all[0].clone(), 1);
         let Wire::Snapshot {
             base,
+            term,
             transfer,
             digest,
             length,
@@ -245,6 +272,7 @@ fn a_piece_whose_metadata_differs_drops_the_transfer() {
         let altered = match change {
             0 => Wire::Snapshot {
                 base,
+                term,
                 transfer,
                 digest,
                 length: length + 10,
@@ -253,6 +281,7 @@ fn a_piece_whose_metadata_differs_drops_the_transfer() {
             },
             1 => Wire::Snapshot {
                 base,
+                term,
                 transfer,
                 digest: digest ^ 1,
                 length,
@@ -261,6 +290,7 @@ fn a_piece_whose_metadata_differs_drops_the_transfer() {
             },
             _ => Wire::Snapshot {
                 base,
+                term,
                 transfer,
                 digest,
                 length,
@@ -289,16 +319,34 @@ fn a_snapshot_not_its_senders_or_not_at_its_base_is_refused() {
     ];
     for (base, bytes, digest) in cases {
         let (mut server, recorder) = follower();
+        // Every piece written, then the check fails: the sender is never
+        // told it was installed, so its transfer is not taken for done.
+        let mut last = Out::new();
         for piece in pieces(base, 5, &bytes, digest) {
-            let _ = deliver(&mut server, piece, 1);
+            last = deliver(&mut server, piece, 1);
         }
         assert!(installs(&recorder).is_empty(), "{base:?}");
         assert_eq!(refusals(&recorder), 1, "{base:?}");
-        // Refused, it was never published: a right one installs after it.
+        assert!(
+            last.is_empty(),
+            "the last piece of a refused snapshot is not acknowledged"
+        );
+        // Refused, it was never published: a right one installs after it,
+        // and only then is acknowledged installed.
         let right = service(base.index, 100);
-        for piece in pieces(base, 6, &right, self::digest(base, &right)) {
-            let _ = deliver(&mut server, piece, 2);
+        let all = pieces(base, 6, &right, self::digest(base, &right));
+        let count = all.len();
+        for (at, piece) in all.into_iter().enumerate() {
+            let out = deliver(&mut server, piece, 2);
+            let expected: Vec<u64> = if at + 1 == count { vec![6] } else { vec![] };
+            assert_eq!(installed(&out), expected, "{base:?} piece {at}");
         }
+        assert_eq!(installs(&recorder), vec![base]);
+        // A piece of a base it stands on: acknowledged installed again, so
+        // a sender whose acknowledgement was lost ends its transfer.
+        let again = pieces(base, 7, &right, self::digest(base, &right));
+        let out = deliver(&mut server, again[0].clone(), 3);
+        assert_eq!(installed(&out), vec![7]);
         assert_eq!(installs(&recorder), vec![base]);
     }
 }
@@ -325,5 +373,40 @@ fn a_stalled_transfer_is_dropped_and_a_crashed_one_starts_again() {
     for piece in pieces(at(40), 8, &bytes, digest(at(40), &bytes)) {
         let _ = deliver(&mut server, piece, SNAPSHOT_STALL + 6);
     }
+    assert_eq!(installs(&recorder), vec![at(40)]);
+}
+
+/// Two starts at the same base, reordered: a retry's transfer is not
+/// replaced by the earlier transfer's delayed first piece, and a later
+/// sender's term at that base supersedes while an earlier one does not.
+#[test]
+fn a_delayed_start_at_the_same_base_does_not_replace_a_newer_transfer() {
+    let (mut server, recorder) = follower();
+    let bytes = service(40, 100);
+    let good = digest(at(40), &bytes);
+    let first = pieces_in(2, at(40), 1, &bytes, good);
+    let retry = pieces_in(2, at(40), 2, &bytes, good);
+    let _ = deliver(&mut server, first[0].clone(), 1);
+    let _ = deliver(&mut server, retry[0].clone(), 2);
+    assert_eq!(abandoned(&recorder), vec![(1, "superseded")]);
+    // The first transfer's start, delayed: ignored.
+    let out = deliver(&mut server, first[0].clone(), 3);
+    assert!(out.is_empty());
+    // A start of an earlier term at the same base: ignored too.
+    let stale = pieces_in(1, at(40), 9, &bytes, good);
+    assert!(deliver(&mut server, stale[0].clone(), 4).is_empty());
+    assert_eq!(abandoned(&recorder), vec![(1, "superseded")]);
+    // A later term's start at the same base supersedes the retry.
+    let later = pieces_in(3, at(40), 1, &bytes, good);
+    let _ = deliver(&mut server, later[0].clone(), 5);
+    assert_eq!(
+        abandoned(&recorder),
+        vec![(1, "superseded"), (2, "superseded")]
+    );
+    let mut last = Out::new();
+    for piece in &later[1..] {
+        last = deliver(&mut server, piece.clone(), 6);
+    }
+    assert_eq!(installed(&last), vec![1]);
     assert_eq!(installs(&recorder), vec![at(40)]);
 }
