@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use karyos_archive::disk::StdDisk;
 use karyos_cluster::{Entry, LogError, RaftLog};
 use karyos_sim::harness::core::{ConsensusCore, DriveError, LogView, drive};
+use karyos_sim::harness::probe::{self, Probed};
 use karyos_sim::harness::workloads;
 use karyos_sim::net::NodeId;
 
@@ -35,6 +36,18 @@ pub trait Wire: ConsensusCore {
 
     /// The message in `bytes`; `None` when they are not one.
     fn decode(bytes: &[u8]) -> Option<Self::Message>;
+}
+
+/// A probed core's messages are its inner core's. [`run_node`] counts
+/// their encoding and decoding itself, so this delegates only.
+impl<C: Wire> Wire for Probed<C> {
+    fn encode(message: &Self::Message) -> Option<Vec<u8>> {
+        C::encode(message)
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self::Message> {
+        C::decode(bytes)
+    }
 }
 
 /// The largest datagram a node sends or reads.
@@ -211,7 +224,11 @@ pub fn run_node<C: Wire>(config: &NodeConfig) -> Result<Report, ProcessError> {
                     let Ok(from) = <[u8; 4]>::try_from(header).map(NodeId::from_le_bytes) else {
                         continue;
                     };
-                    if let Some(message) = C::decode(body) {
+                    // Decoding is the declared path's encoding stage once a
+                    // probed core is past its warm-up (C5 v2,
+                    // "Processes"); outside a measurement it counts
+                    // nothing.
+                    if let Some(message) = probe::encoding(|| C::decode(body)) {
                         core.step(from, message, &mut LogView::new(&mut log));
                     }
                 }
@@ -247,7 +264,12 @@ pub fn run_node<C: Wire>(config: &NodeConfig) -> Result<Report, ProcessError> {
             &mut log,
             &mut |to, message, _| outbox.push((to, message)),
             &mut |entry: &Entry, _| {
-                if let Some(number) = number_of(&entry.payload) {
+                // The application, the command read from the entry, is the
+                // declared path's apply stage once a probed core is past
+                // its warm-up (version 1's allocation gate counts
+                // "application"); what follows is the run's report on
+                // itself, kept outside the count.
+                if let Some(number) = probe::application(|| number_of(&entry.payload)) {
                     report.sequence.push((entry.index, number));
                     report.digest = mix(mix(report.digest, entry.index), number);
                     if seen.insert(number) {
@@ -274,15 +296,26 @@ pub fn run_node<C: Wire>(config: &NodeConfig) -> Result<Report, ProcessError> {
             else {
                 continue;
             };
-            let Some(body) = C::encode(&message) else {
-                continue;
-            };
-            let mut datagram = config.id.to_le_bytes().to_vec();
-            datagram.extend_from_slice(&body);
-            if datagram.len() <= MAX_DATAGRAM {
-                // A lost datagram is the network's to lose.
-                let _ = socket.send_to(&datagram, address);
-            }
+            // The message's encoding, its datagram and their frees, after
+            // the send, are one encoding step of the declared path once a
+            // probed core is past its warm-up (C5 v2, "Processes";
+            // version 1's allocation gate counts "adapters and encoding
+            // included"), so neither an allocation nor its free escapes
+            // the count; outside a measurement it counts nothing. The
+            // message itself is freed here too, as the outbox hands it
+            // over.
+            probe::encoding(|| {
+                let Some(body) = C::encode(&message) else {
+                    return;
+                };
+                let mut datagram = config.id.to_le_bytes().to_vec();
+                datagram.extend_from_slice(&body);
+                if datagram.len() <= MAX_DATAGRAM {
+                    // A lost datagram is the network's to lose.
+                    let _ = socket.send_to(&datagram, address);
+                }
+                drop(message);
+            });
         }
     }
 }
