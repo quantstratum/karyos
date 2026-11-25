@@ -1342,6 +1342,19 @@ impl<T: StreamTerms> Network<T> {
         self.hold_endpoint(bind, None)
     }
 
+    /// Lets the publisher's `endpoint` move to a new ephemeral port when a
+    /// reset cannot bind its port again
+    /// ([`crate::agents::endpoints::Endpoints::allow_move`]).
+    pub(crate) fn allow_endpoint_move(&mut self, endpoint: EndpointId) {
+        self.endpoints.allow_move(endpoint);
+    }
+
+    /// Keeps `endpoint` at its address for good
+    /// ([`crate::agents::endpoints::Endpoints::pin`]).
+    pub(crate) fn pin_endpoint(&mut self, endpoint: EndpointId) {
+        self.endpoints.pin(endpoint);
+    }
+
     /// [`Self::hold_send_endpoint`] for a path of a paired unicast paths
     /// channel (karyos#1043): an address no interface of this host has
     /// (`EADDRNOTAVAIL` at the bind) is [`DriverError::UnknownInterface`],
@@ -1534,6 +1547,8 @@ impl<T: StreamTerms> Network<T> {
         // keep sharing a bind address's endpoint, port 0 included.
         let ephemeral = own_port && bind.port() == 0 && multicast.is_none();
         let endpoint = self.hold_for(bind, multicast, EndpointPurpose::Data, !ephemeral)?;
+        // Publishers send to its address: a reset never moves it.
+        self.endpoints.pin(endpoint);
         let handle = NetworkSubscription {
             endpoint,
             stream_id,
@@ -1763,6 +1778,7 @@ impl<T: StreamTerms> Network<T> {
                 self.count_path_failure();
                 continue;
             };
+            self.endpoints.pin(path);
             // A later path on an endpoint another subscription of the
             // stream already uses would merge their receiver entries, and
             // removing one would remove the other's: skipped, counted
@@ -2217,17 +2233,40 @@ impl<T: StreamTerms> Network<T> {
     }
 
     /// Tests: every later IPv4 loopback data endpoint on port 0 binds a
-    /// port outside the ephemeral range ([`crate::test_ports`]), for the
-    /// tests that reset a publisher's endpoint. A reset closes the socket
-    /// and binds the same port again (`Endpoints::reset`, which keeps the
-    /// port so receivers' bindings stay valid). An ephemeral port is free
-    /// in between, and on a busy host another test's bind to port 0 can
-    /// take it: the reopen fails with `EADDRINUSE` and the endpoint fails
-    /// for good, so the test waits out its deadline. No bind to port 0
-    /// takes a port of the test range.
+    /// fixed port instead, from outside the ephemeral range
+    /// ([`crate::test_ports`]): a publisher of this driver is then a fixed
+    /// port one, which a reset whose port is taken fails rather than moves
+    /// (`Endpoints::allow_move`).
     #[cfg(test)]
     pub(crate) fn pin_data_ports(&mut self) {
         self.pin_data_ports = true;
+    }
+
+    /// Tests: every later endpoint reset finds its address taken by
+    /// another socket between its close and its rebind
+    /// ([`crate::agents::endpoints::Endpoints::occupy_on_reset`]).
+    #[cfg(test)]
+    pub(crate) fn occupy_ports_on_reset(&mut self) {
+        self.endpoints.occupy_on_reset();
+    }
+
+    /// Endpoint resets that moved a publisher to a new port, for tests.
+    #[cfg(test)]
+    pub(crate) fn ports_moved(&self) -> u64 {
+        self.endpoints.counters().ports_moved
+    }
+
+    /// Endpoints that failed, for tests.
+    #[cfg(test)]
+    pub(crate) fn endpoints_failed(&self) -> u64 {
+        self.endpoints.counters().failed
+    }
+
+    /// Tests: the sockets that took reset endpoints' addresses
+    /// ([`Self::occupy_ports_on_reset`]), handed over.
+    #[cfg(test)]
+    pub(crate) fn take_occupied(&mut self) -> Vec<std::net::UdpSocket> {
+        self.endpoints.take_occupied()
     }
 
     /// Tests: makes every later control endpoint creation fail (its e2e

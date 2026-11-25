@@ -1304,7 +1304,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 net.hold_send_endpoint(bind)
             };
             match opened {
-                Ok(endpoint) => held.push((endpoint, to)),
+                Ok(endpoint) => {
+                    // A trusted publisher on port 0 may move to a new port
+                    // when a reset finds its port taken: its receivers
+                    // bind the new source through its ANNOUNCE. An
+                    // authenticated one may not: a receiver's challenge
+                    // from the new source would rebind its boot id under a
+                    // new nonce, which the publisher rule refuses
+                    // (ADR-0086 section 7), so it fails closed as before;
+                    // its shared endpoint never moves either. An etf
+                    // socket joins its endpoint's port: never moved.
+                    if auth.is_none() && etf.is_none() {
+                        net.allow_endpoint_move(endpoint);
+                    } else {
+                        net.pin_endpoint(endpoint);
+                    }
+                    held.push((endpoint, to));
+                }
                 Err(error) => {
                     for (endpoint, _) in held {
                         net.release_send_endpoint(endpoint);

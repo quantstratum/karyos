@@ -13,7 +13,7 @@ use karyos_client::schedule::ScheduleOptions;
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{Role, SkipReason};
 
-use super::{ANY_PORT, BUDGET, aggregate, bound, channel, driver, pump, resettable, shared};
+use super::{ANY_PORT, BUDGET, aggregate, bound, channel, driver, pump, shared};
 use crate::embedded::{AggregateHandle, EmbeddedDriver};
 
 /// A timed publication of one lane with a ring of `capacity` and the
@@ -48,7 +48,7 @@ fn timed_pair_with(
 ) {
     let (mut a, mut b) = (
         driver(crate::agents::ThreadingMode::Shared),
-        resettable(crate::agents::ThreadingMode::Shared),
+        driver(crate::agents::ThreadingMode::Shared),
     );
     let identity = crate::membership::ReceiverIdentity {
         receiver_id: core::num::NonZeroU64::new(77).unwrap(),

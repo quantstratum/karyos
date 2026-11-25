@@ -19,9 +19,7 @@ use karyos_protocol::channel::{
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{Role, SealReason};
 
-use super::{
-    ANY_PORT, BUDGET, LOOPBACK, aggregate, bound, channel, driver, driver_with, pump, resettable,
-};
+use super::{ANY_PORT, BUDGET, LOOPBACK, aggregate, bound, channel, driver, driver_with, pump};
 use crate::agents::ThreadingMode;
 use crate::embedded::EmbeddedDriver;
 use crate::error::DriverError;
@@ -1149,7 +1147,7 @@ fn an_addition_after_every_destination_removed_is_still_taken() {
 /// of traffic, remove no optional destination, the idle one included.
 #[test]
 fn endpoint_resets_remove_no_optional_destination() {
-    let mut a = resettable(ThreadingMode::Shared);
+    let mut a = driver(ThreadingMode::Shared);
     let (mut receivers, addresses) = receivers(1);
     let reserved = Reserved::new(1);
     let idle = reserved.at(0);
@@ -1217,7 +1215,7 @@ fn endpoint_resets_remove_no_optional_destination() {
 /// destination is removed.
 #[test]
 fn a_reliable_reset_catches_each_destination_up_in_order() {
-    let mut a = resettable(ThreadingMode::Shared);
+    let mut a = driver(ThreadingMode::Shared);
     let (mut receivers, addresses) = receivers_on(2, true);
     let (publication, images) = connect(
         &mut a,

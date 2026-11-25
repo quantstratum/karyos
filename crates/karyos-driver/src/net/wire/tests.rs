@@ -506,6 +506,18 @@ fn a_full_control_budget_refuses_admission() {
 /// pumped until established: both roles hold their bindings and the
 /// session sealer is installed.
 fn established() -> (EmbeddedDriver, Mem, EmbeddedDriver, Mem) {
+    let (publisher, pub_keys, subscriber, sub_keys, _) = established_publication();
+    (publisher, pub_keys, subscriber, sub_keys)
+}
+
+/// [`established`], with the publication's handle.
+fn established_publication() -> (
+    EmbeddedDriver,
+    Mem,
+    EmbeddedDriver,
+    Mem,
+    crate::embedded::AggregateHandle,
+) {
     let (mut subscriber, sub_keys) = keyed(&borrowed(&subscriber_files()));
     let security = Security::Authenticated(auth(Some(authority(control()))));
     subscriber
@@ -534,7 +546,105 @@ fn established() -> (EmbeddedDriver, Mem, EmbeddedDriver, Mem) {
         roles(&publisher),
         roles(&subscriber)
     );
-    (publisher, pub_keys, subscriber, sub_keys)
+    (publisher, pub_keys, subscriber, sub_keys, handle)
+}
+
+/// An authenticated publisher on port 0 whose port another socket takes
+/// while a reset has it closed does not move, unlike a trusted one: a
+/// receiver's challenge from a new source would rebind its boot id under a
+/// new nonce, which the publisher rule refuses (ADR-0086 section 7). The
+/// endpoint fails closed, as a fixed port publisher's does, and what the
+/// socket now holding the old port sends to the receiver is not accepted:
+/// it is not sealed with the session's keys.
+#[test]
+fn an_authenticated_publisher_whose_port_is_taken_across_a_reset_fails_closed() {
+    use karyos_client::OfferOutcome;
+    use karyos_protocol::lanes::drr::Budget;
+    use karyos_sys::log_buffer::Role;
+
+    const BUDGET: Budget = Budget {
+        work: 256,
+        bytes: 1 << 22,
+    };
+    let (mut publisher, _pub_keys, mut subscriber, _sub_keys, handle) = established_publication();
+    let (image, _) = subscriber.network_images(STREAM)[0];
+    let mut reader = subscriber
+        .subscribe_aggregate(&image, Role::Required)
+        .unwrap();
+    let mut lane = publisher
+        .publication(handle.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let (mut sent, mut seen) = (0u32, 0u32);
+    let delivered = pump(&mut [&mut publisher, &mut subscriber], |_| {
+        while sent < 8 {
+            match lane.offer(&sent.to_le_bytes()).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        let _ = reader.poll(
+            |bytes, _, _| {
+                assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), seen);
+                seen += 1;
+            },
+            BUDGET,
+        );
+        seen >= 8
+    });
+    assert!(delivered, "seen {seen} of 8 before the reset");
+    let (endpoint, alias) = publisher
+        .net
+        .as_ref()
+        .unwrap()
+        .publication_route(handle.registration())
+        .unwrap();
+    let before = publisher
+        .net
+        .as_ref()
+        .unwrap()
+        .endpoint_address(endpoint)
+        .unwrap();
+    publisher.net.as_mut().unwrap().occupy_ports_on_reset();
+    publisher
+        .net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|_reply| crate::agents::AgentCommand::ForceReset { endpoint, alias })
+        .unwrap();
+    let failed = pump(&mut [&mut publisher, &mut subscriber], |drivers| {
+        drivers[0].net.as_ref().unwrap().endpoints_failed() >= 1
+    });
+    assert!(failed, "the endpoint failed closed");
+    let net = publisher.net.as_mut().unwrap();
+    assert_eq!(
+        net.ports_moved(),
+        0,
+        "an authenticated publisher never moves"
+    );
+    assert_eq!(net.endpoint_address(endpoint), None);
+    // What the old port's holder sends from there is not accepted.
+    let occupied = net.take_occupied();
+    let old = occupied.first().unwrap();
+    assert_eq!(old.local_addr().unwrap(), before);
+    let to = subscriber.network_subscription_address(STREAM).unwrap();
+    let counters =
+        |driver: &EmbeddedDriver| driver.net.as_ref().unwrap().receiver_counters().unwrap();
+    let (received, committed) = {
+        let now = counters(&subscriber);
+        (now.datagrams, now.data_committed)
+    };
+    for bytes in [&[0u8; 64][..], &[0xffu8; 128][..], &[1u8; 32][..]] {
+        old.send_to(bytes, to).unwrap();
+    }
+    let arrived = pump(&mut [&mut subscriber], |drivers| {
+        counters(drivers[0]).datagrams >= received + 3
+    });
+    assert!(arrived, "the old port's datagrams reached the receiver");
+    let _ = reader.poll(|_, _, _| seen += 1, BUDGET);
+    assert_eq!(seen, 8, "nothing more delivered");
+    assert_eq!(counters(&subscriber).data_committed, committed);
 }
 
 /// Item 1, end to end: the admitted keys establish the session through

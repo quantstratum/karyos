@@ -711,6 +711,10 @@ pub struct SenderCounters {
     /// Publications whose receivers' status messages became live or
     /// lapsed: their connection changed (SPEC.md §4).
     pub connection_changes: u64,
+    /// Endpoints a reset reopened at another local address (a port 0
+    /// publisher whose port another socket took): each publication on it
+    /// announces again at once, so its receivers bind the new source.
+    pub endpoints_moved: u64,
     /// REGISTERs naming no `control-mode=dynamic` publication of their
     /// stream on their endpoint, or one being removed: dropped, no reply
     /// (design 3.2 step 1). The other drops are the driver's
@@ -1998,6 +2002,10 @@ impl Sent {
 #[derive(Debug)]
 pub struct SenderRole<T: StreamTerms = HeapTerms> {
     sessions: SendSessions,
+    /// The local address each held endpoint was last seen at, one entry
+    /// per endpoint the agent can hold (allocated at creation): a reset
+    /// that reopens one at another address is noticed here.
+    locals: Vec<(EndpointId, SocketAddr)>,
     from_receiver: RingReceiver<ControlItem>,
     /// Each publication's data path: readers, channel destination, lane
     /// queues (at most `publications`, allocated at creation).
@@ -2215,6 +2223,7 @@ pub(super) fn roles<T: StreamTerms>(
         SenderRole {
             key_generation: Arc::clone(&key_generation),
             sessions: send,
+            locals: Vec::with_capacity(config.max_endpoints),
             from_receiver,
             publications: Vec::with_capacity(config.publications),
             routes,
@@ -8009,6 +8018,46 @@ impl<T: StreamTerms> SenderRole<T> {
 
     /// Frees the route slots of endpoints the agent no longer holds: their
     /// cached ids belong to a half that was handed back.
+    /// Notes each held endpoint's local address. One a reset reopened at
+    /// another address (a port 0 publisher whose port another socket took
+    /// while it was closed) is counted, and each publication on it is no
+    /// longer established, so it announces again at once: its receivers
+    /// bind the new source through the ANNOUNCE's challenge, as a new path
+    /// of their image, instead of waiting for the old binding to lapse
+    /// (sealed DATA from an unbound source asks for nothing).
+    fn note_moves<O: SocketOps>(&mut self, halves: &[(EndpointId, Half<O>)]) {
+        for (endpoint, half) in halves {
+            let Half::Tx(tx) = half else {
+                continue;
+            };
+            let local = tx.capabilities().local;
+            let known = self.locals.iter_mut().find(|(held, _)| held == endpoint);
+            match known {
+                Some((_, seen)) if *seen == local => {}
+                Some((_, seen)) => {
+                    *seen = local;
+                    self.count(|c| &mut c.endpoints_moved);
+                    for outbound in &self.publications {
+                        if outbound.serves(*endpoint) {
+                            let _ = self.sessions.disconnected(*endpoint, outbound.alias());
+                        }
+                    }
+                }
+                None => {
+                    // An endpoint no longer held makes room: the table holds
+                    // at most `max_endpoints`, as the agent does.
+                    if self.locals.len() == self.locals.capacity() {
+                        self.locals
+                            .retain(|(seen, _)| halves.iter().any(|(held, _)| held == seen));
+                    }
+                    if self.locals.len() < self.locals.capacity() {
+                        self.locals.push((*endpoint, local));
+                    }
+                }
+            }
+        }
+    }
+
     fn prune<O: SocketOps>(&mut self, halves: &[(EndpointId, Half<O>)]) {
         for slot in &mut self.routes {
             if let Some(endpoint) = slot.endpoint
@@ -8940,6 +8989,7 @@ impl<T: StreamTerms> SenderRole<T> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         self.cycle = self.cycle.checked_add(1).ok_or(overflow.clone())?;
         self.prune(halves);
+        self.note_moves(halves);
         let mut unrecorded = 0u64;
         for outbound in &mut self.publications {
             unrecorded = unrecorded.saturating_add(outbound.drain_retired(&mut self.closing));
