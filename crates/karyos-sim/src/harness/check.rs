@@ -940,7 +940,8 @@ fn server_of(observation: &Observation) -> Option<NodeId> {
         | Observation::PromotionRefused { .. }
         | Observation::Expired { .. }
         | Observation::Healed
-        | Observation::Triggered { .. } => None,
+        | Observation::Triggered { .. }
+        | Observation::Leading { .. } => None,
     }
 }
 
