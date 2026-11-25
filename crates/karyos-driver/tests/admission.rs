@@ -69,6 +69,7 @@ fn ipc_config(dir: &Path, timeout: u64) -> IpcConfig {
         max_regions_per_fetch: 4,
         max_fetch_bytes: 1 << 30,
         max_tools: karyos_driver::DEFAULT_MAX_TOOLS,
+        client_send_buffer: None,
     }
 }
 
@@ -668,7 +669,18 @@ fn child_attaches_and_exits() {
 #[test]
 fn a_client_that_stops_reading_is_retired() {
     let dir = dir("flood");
-    let mut driver = system_driver(&dir);
+    // A small send buffer, so the driver's socket fills soon whatever the
+    // host's `wmem_default` (karyos#1067: 128 MiB on one host never
+    // filled within the deadline).
+    let mut driver = EmbeddedDriver::with_ipc(
+        DriverConfig::default(),
+        IpcConfig {
+            client_send_buffer: Some(4096),
+            ..ipc_config(&dir, 5_000_000_000)
+        },
+        Box::new(SystemClock::new()),
+    )
+    .unwrap();
     let socket = ipc::connect(&dir, Duration::from_millis(20)).unwrap();
     let own = own_pidfd();
     let hello = encode(&Message::Hello { version: VERSION });

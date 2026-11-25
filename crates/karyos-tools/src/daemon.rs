@@ -333,6 +333,7 @@ pub fn ipc_config(admission: &AdmissionOptions) -> IpcConfig {
         max_regions_per_fetch: admission.max_regions_per_fetch,
         max_fetch_bytes: admission.max_fetch_bytes,
         max_tools: admission.max_tools,
+        client_send_buffer: None,
     }
 }
 

@@ -1,0 +1,4 @@
+### Fixed
+
+- `a_prepared_replay_never_attached_expires` no longer fails on a loaded host (karyos#1067): it reads its clock before posting the replay that expires, so the agent stamps that replay after the read on the same monotonic clock, and it checks that the slot comes back no earlier than the 200 ms timeout. It used to read the clock after two round trips to the agent and check for 100 ms, which a slow test thread could eat.
+- A required subscriber revoked under the `abort` loss policy is reported revoked, not closed, when the revocation lands during its poll (karyos#1067). The poll read the revocation flag in its loan attempt and the seal only afterwards, so a driver that revoked it and sealed in between made it report `Closed` with `RequiredParticipantLost`; `Subscription::poll` and the frame reader now check the flag again once they see the seal. This made `test_ipc_loss_a_stopped_required_subscriber_under_abort` fail on a loaded host.

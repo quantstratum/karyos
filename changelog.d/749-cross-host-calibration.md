@@ -1,0 +1,3 @@
+### Added
+
+- Cross-host clock calibration (part of #749): `karyos_trace::calibrate::chain::link` calibrates a PTP link from its client's samples (offset from master and mean path delay), bounded by the largest offset plus the whole path delay and valid over the samples only; `chain::compose` joins calibrations into the single direct one `latency` requires, containing every value the parts allow together. `karyos-tools calibrate link` and `calibrate compose` print them as records, and `calibrate phc --reverse` (`karyos_sys::host_clock::phc_paired_read_reversed`) fits a PHC to the raw clock on the receiving host.
