@@ -84,6 +84,29 @@ pub fn phc_paired_read_reversed(phc: std::os::fd::BorrowedFd<'_>) -> Option<(u64
     Some((ns(before)?, ns(raw)?, ns(after)?))
 }
 
+/// One bracketed read of `CLOCK_REALTIME` against the host's raw
+/// monotonic clock (karyos#749): `CLOCK_MONOTONIC_RAW`, then
+/// `CLOCK_REALTIME`, then `CLOCK_MONOTONIC_RAW` again, in nanoseconds
+/// (the middle one since the Unix epoch), like [`phc_paired_read`]. NTP
+/// slews and may step `CLOCK_REALTIME`, so a fit of these reads holds only
+/// over a short run. `None` when a reading is negative or overflows. A
+/// control-path call.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn realtime_paired_read() -> Option<(u64, u64, u64)> {
+    fn ns(time: rustix::time::Timespec) -> Option<u64> {
+        let seconds = u64::try_from(time.tv_sec).ok()?;
+        let nanos = u64::try_from(time.tv_nsec).ok()?;
+        seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|ns| ns.checked_add(nanos))
+    }
+    let before = rustix::time::clock_gettime(rustix::time::ClockId::MonotonicRaw);
+    let realtime = rustix::time::clock_gettime(rustix::time::ClockId::Realtime);
+    let after = rustix::time::clock_gettime(rustix::time::ClockId::MonotonicRaw);
+    Some((ns(before)?, ns(realtime)?, ns(after)?))
+}
+
 /// Nanoseconds of this process's monotonic clock: on a host without
 /// cross-process IPC, one process is the whole scale. The scale starts at
 /// 1 ns, not 0: the first reading of a process is taken at its origin, and
@@ -141,6 +164,16 @@ mod tests {
         let file = std::fs::File::open("/dev/null").unwrap();
         assert_eq!(phc_paired_read(file.as_fd()), None);
         assert_eq!(phc_paired_read_reversed(file.as_fd()), None);
+    }
+
+    /// A realtime read is bracketed by the raw clock and is a plausible
+    /// Unix time (after 2020-01-01) (karyos#749).
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn a_realtime_read_is_bracketed() {
+        let (before, realtime, after) = realtime_paired_read().unwrap();
+        assert!(before <= after, "{before} {after}");
+        assert!(realtime > 1_577_836_800_000_000_000, "{realtime}");
     }
 
     #[test]

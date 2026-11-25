@@ -21,6 +21,8 @@ thiserror.workspace = true
 [dev-dependencies]
 # The counting allocator of the client's allocation test (karyos#720).
 karyos-sys = { workspace = true, features = ["alloc-count"] }
+# The calibration and UTC reference records of tests/c_time_evidence.rs.
+karyos-trace.workspace = true
 
 [lints]
 workspace = true

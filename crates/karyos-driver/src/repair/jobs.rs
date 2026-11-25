@@ -480,6 +480,16 @@ impl Jobs {
         }
     }
 
+    /// Restarts `lane`'s catch-up watermark at `at`, so it measures the
+    /// next catch-up job alone: a sender that runs one catch-up at a time
+    /// per lane, over ranges in any order (the `etf` route's drops,
+    /// ADR-0109 point 8), reads that job's progress from it.
+    pub fn restart_catch_up(&mut self, lane: u8, at: u64) {
+        if let Some(slot) = self.catch_up_through.get_mut(usize::from(lane)) {
+            *slot = at;
+        }
+    }
+
     /// The end of what catch-up jobs have submitted on `lane`, 0 for none
     /// (MD-20): only a backend submission moves it, never a job's creation.
     #[must_use]

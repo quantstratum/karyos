@@ -633,3 +633,45 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     drop(agent);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// karyos#702: the view reports the journal's integrity under the
+/// verifier's names, a damaged range named rather than a clean trail, and
+/// `unsealed` computed from the seals.
+#[test]
+fn the_view_reports_the_journals_integrity_and_a_damaged_range() {
+    use crate::journal::{JournalRecord, Kind};
+
+    let dir = std::env::temp_dir().join(format!("karyos-agent-integrity-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut agent = Agent::new(AgentConfig::new(Vec::new()).with_journal(dir.join("journal")));
+    let view = agent.view().journal.unwrap();
+    assert!(!view.unsealed);
+    assert!(!view.integrity_truncated);
+    let ranges = view.integrity.unwrap();
+    assert_eq!(ranges.len(), 1, "{ranges:?}");
+    assert_eq!(ranges[0].outcome, "inconsistent");
+    assert_eq!(
+        ranges[0].reasons,
+        ["untrusted_evidence", "missing_evidence"]
+    );
+
+    // A record past the seals: unsealed until a durable append.
+    let journal = agent.journal.as_mut().unwrap();
+    let _ = journal
+        .append(&JournalRecord::new(Kind::CloseOutcome, 5), 5)
+        .unwrap();
+    assert!(agent.view().journal.unwrap().unsealed);
+
+    let journal = agent.journal.as_mut().unwrap();
+    journal.damage(u64::from(karyos_sys::frame::HEADER_LENGTH) + 16);
+    journal.verify(6);
+    let view = agent.view().journal.unwrap();
+    let ranges = view.integrity.unwrap();
+    assert_eq!(ranges[0].start, 0);
+    assert_eq!(ranges[0].outcome, "inconsistent");
+    assert_eq!(ranges[0].reasons, ["corruption"]);
+    assert!(ranges.iter().all(|range| range.outcome != "verified"));
+    assert_eq!(ranges.last().unwrap().outcome, "unsealed");
+    let _ = std::fs::remove_dir_all(&dir);
+}

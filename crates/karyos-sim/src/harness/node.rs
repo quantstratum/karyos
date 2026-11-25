@@ -340,6 +340,9 @@ pub struct TestService {
     expired: u64,
     /// Answers kept per client.
     retention: usize,
+    /// The log time: the largest event time applied, as the sessions
+    /// section of a shipped snapshot records it (ADR-0111, decision 4).
+    log_time: u64,
 }
 
 impl Default for TestService {
@@ -360,6 +363,7 @@ impl TestService {
             deduplicated: 0,
             expired: 0,
             retention: retention.max(1),
+            log_time: 0,
         }
     }
 
@@ -369,6 +373,7 @@ impl TestService {
     /// core's own entry) answers nothing.
     pub fn apply(&mut self, entry: &Entry) -> Option<(Command, Ret)> {
         self.applied = Some(entry.index);
+        self.log_time = self.log_time.max(entry.event_time);
         let command = Command::decode(&entry.payload)?;
         let answers = self.answered.entry(command.client).or_default();
         if let Some(ret) = answers.by_sequence.get(&command.sequence) {
@@ -411,9 +416,16 @@ impl TestService {
         self.applied
     }
 
+    /// The log time: the largest event time applied (ADR-0111).
+    #[must_use]
+    pub fn log_time(&self) -> u64 {
+        self.log_time
+    }
+
     /// Its whole state as a snapshot's service section (W5; karyos#687):
-    /// the values, the deduplication table, the last index applied and
-    /// the deduplicated count, each length-prefixed, little endian; `None`
+    /// the values, the deduplication table, the last index applied, the
+    /// deduplicated and expired counts and the log time, each
+    /// length-prefixed, little endian; `None`
     /// when a length passes its prefix.
     #[must_use]
     pub fn encode(&self) -> Option<Vec<u8>> {
@@ -449,6 +461,7 @@ impl TestService {
         }
         bytes.extend_from_slice(&self.deduplicated.to_le_bytes());
         bytes.extend_from_slice(&self.expired.to_le_bytes());
+        bytes.extend_from_slice(&self.log_time.to_le_bytes());
         Some(bytes)
     }
 
@@ -510,6 +523,7 @@ impl TestService {
         };
         let deduplicated = u64_at(&mut rest)?;
         let expired = u64_at(&mut rest)?;
+        let log_time = u64_at(&mut rest)?;
         rest.is_empty().then_some(Self {
             values,
             answered,
@@ -517,6 +531,7 @@ impl TestService {
             deduplicated,
             expired,
             retention,
+            log_time,
         })
     }
 
@@ -1201,7 +1216,7 @@ pub enum Observation {
         /// The section's length.
         total: u64,
     },
-    /// A server dropped a snapshot piece by [`Case::lose_snapshot_piece`](super::workloads::Case::lose_snapshot_piece).
+    /// A server dropped a snapshot piece by [`super::workloads::Case::lose_snapshot_piece`].
     SnapshotPieceLost {
         /// The server.
         node: NodeId,
@@ -1613,7 +1628,7 @@ impl<C: ConsensusCore> ServerNode<C> {
         limits: Option<Limits>,
     ) -> Result<Self, ServerError> {
         let mut log = RaftLog::create(disk.clone(), Path::new(LOG_DIR), geometry, 1)?;
-        let core = caught(|| Self::recovered(id, &peers, (limits, None), &mut log))
+        let core = caught(|| Self::recovered(id, &peers, (limits, None, None), &mut log))
             .transpose()
             .map_err(ServerError::Unsupported)?;
         Ok(Self::assemble(
@@ -1742,7 +1757,7 @@ impl<C: ConsensusCore> ServerNode<C> {
     }
 
     /// Drops piece `piece` (from 0) of the first snapshot transfer it
-    /// receives, as if the network lost it ([`Case::lose_snapshot_piece`](super::workloads::Case::lose_snapshot_piece)).
+    /// receives, as if the network lost it ([`super::workloads::Case::lose_snapshot_piece`]).
     #[must_use]
     pub const fn losing_snapshot_piece(mut self, piece: u64) -> Self {
         self.lose_piece = Some((piece, 0));
@@ -2397,12 +2412,15 @@ impl<C: ConsensusCore> ServerNode<C> {
         }
         self.base = Some(base);
         let digest = service.digest();
+        let base_time = service.log_time();
         self.service = service;
         self.observe(Observation::Installed { node, base, digest });
         let budget = self.limits.map(|_| self.budget.clone());
         if let Err(refused) = core.install(
             base,
-            &mut LogView::metered(log, budget.as_ref()).with_base(Some(base)),
+            &mut LogView::metered(log, budget.as_ref())
+                .with_base(Some(base))
+                .with_base_time(Some(base_time)),
         ) {
             match refused {
                 super::core::InstallRefused::Unsupported => {
@@ -2454,12 +2472,12 @@ impl<C: ConsensusCore> ServerNode<C> {
     fn recovered(
         id: NodeId,
         peers: &[NodeId],
-        (limits, base): (Option<Limits>, Option<SnapshotBase>),
+        (limits, base, base_time): (Option<Limits>, Option<SnapshotBase>, Option<u64>),
         log: &mut RaftLog<SimDisk>,
     ) -> Result<C, Unsupported> {
         // The core sees the snapshot its node recovers over (karyos#903
-        // review).
-        let mut view = LogView::new(log).with_base(base);
+        // review), and its log time (ADR-0111).
+        let mut view = LogView::new(log).with_base(base).with_base_time(base_time);
         match limits {
             Some(limits) => C::recover_with(id, peers, &limits, &mut view),
             None => Ok(C::recover(id, peers, &mut view)),
@@ -2809,6 +2827,12 @@ impl<C: ConsensusCore> ServerNode<C> {
             .as_ref()
             .and_then(|store| Self::active_service(store, commit));
         self.base = latest.as_ref().map(|(base, _)| *base);
+        // The snapshot's log time: the C-TIME watermark of a log empty
+        // after it (ADR-0111, decision 4).
+        let base_time = latest
+            .as_ref()
+            .and_then(|(_, bytes)| TestService::decode(bytes))
+            .map(|service| service.log_time());
         let first = log.first_index();
         let entries: Vec<(u64, u64)> = log
             .last_index()
@@ -2823,7 +2847,8 @@ impl<C: ConsensusCore> ServerNode<C> {
             entries,
             durable: log.durable_index(),
         });
-        let core = match Self::recovered(self.id, &self.peers, (self.limits, self.base), &mut log) {
+        let recovering = (self.limits, self.base, base_time);
+        let core = match Self::recovered(self.id, &self.peers, recovering, &mut log) {
             Ok(core) => core,
             // The core took its limits at its creation: it is not the
             // same core if it refuses them now.

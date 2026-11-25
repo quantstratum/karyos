@@ -581,6 +581,15 @@ impl<O: SocketOps> SocketsTx<O> {
         self.core.drain_etf(&mut self.ops, queue, out)
     }
 
+    /// `CLOCK_TAI` now, in nanoseconds, as this endpoint's flushes read it
+    /// (ADR-0109 point 3); `None` where the kernel refuses the clock or the
+    /// platform has none. A sender converts a timed head's time to the
+    /// send time of [`TxOptions::txtime`](crate::backend::TxOptions::txtime)
+    /// with it.
+    pub fn tai_now_ns(&mut self) -> Option<u64> {
+        self.ops.tai_now_ns()
+    }
+
     /// Returns the pending items of `queue` with `QueueClosed`, up to the
     /// report capacity, then closes it; call again while `more` is true.
     /// Until then the queue takes no claim, commit or flush.

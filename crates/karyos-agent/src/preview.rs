@@ -303,6 +303,26 @@ impl Previews {
         instance: Option<u128>,
         now: Instant,
     ) -> Result<u64, SubmitRefusal> {
+        let epoch = self.peek(token, bound, instance, now)?;
+        self.remove(token);
+        Ok(epoch)
+    }
+
+    /// As [`Previews::take`], but a matching preview is kept: the
+    /// two-person flow uses it up only once its `ApprovalRequested` is
+    /// durable (karyos#739). An expired preview, or one of a driver that
+    /// is a new instance since, is dropped as by `take`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Previews::take`].
+    pub(crate) fn peek(
+        &mut self,
+        token: Token,
+        bound: &Bound,
+        instance: Option<u128>,
+        now: Instant,
+    ) -> Result<u64, SubmitRefusal> {
         let index = self
             .kept
             .iter()
@@ -327,12 +347,16 @@ impl Previews {
             return Err(SubmitRefusal::ParametersMismatch);
         }
         let epoch = kept.epoch;
-        let changed = instance != Some(kept.instance);
-        let _ = self.kept.remove(index);
-        if changed {
+        if instance != Some(kept.instance) {
+            let _ = self.kept.remove(index);
             return Err(SubmitRefusal::TargetChanged);
         }
         Ok(epoch)
+    }
+
+    /// Drops the preview of `token`: used up.
+    pub(crate) fn remove(&mut self, token: Token) {
+        self.kept.retain(|kept| kept.token != token);
     }
 
     /// Drops the previews expired at `now`.
@@ -448,8 +472,7 @@ impl Outcomes {
         records: &[crate::journal::JournalRecord],
         (now, boot): (u64, &[u8]),
     ) -> Self {
-        use crate::journal::{Kind, UNKNOWN_OUTCOME};
-        use crate::operations::GuardAnswer;
+        use crate::journal::Kind;
         let mut outcomes = Self::default();
         for record in records
             .iter()
@@ -461,24 +484,7 @@ impl Outcomes {
                 PreviewKind::Close
             };
             let operation = record.operation;
-            let answer = if record.code == UNKNOWN_OUTCOME {
-                GuardAnswer::NoAnswer { operation }
-            } else if record.code == 0 {
-                match karyos_sys::guard::decode(record.word) {
-                    Ok(state) => GuardAnswer::State {
-                        operation,
-                        guard: record.guard,
-                        state,
-                    },
-                    Err(_) => GuardAnswer::NoAnswer { operation },
-                }
-            } else {
-                GuardAnswer::Refused {
-                    operation,
-                    code: record.code,
-                    detail: record.word,
-                }
-            };
+            let answer = submitted_answer(record);
             let used = Used {
                 kind,
                 dir: Some(PathBuf::from(
@@ -507,6 +513,33 @@ impl Outcomes {
     /// The operation ids the outcomes hold: the caller ids used.
     pub(crate) fn ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.by_id.keys().copied()
+    }
+}
+
+/// The outcome a [`crate::journal::Kind::Submitted`] record journals.
+pub(crate) fn submitted_answer(
+    record: &crate::journal::JournalRecord,
+) -> crate::operations::GuardAnswer {
+    use crate::journal::UNKNOWN_OUTCOME;
+    use crate::operations::GuardAnswer;
+    let operation = record.operation;
+    if record.code == UNKNOWN_OUTCOME {
+        GuardAnswer::NoAnswer { operation }
+    } else if record.code == 0 {
+        match karyos_sys::guard::decode(record.word) {
+            Ok(state) => GuardAnswer::State {
+                operation,
+                guard: record.guard,
+                state,
+            },
+            Err(_) => GuardAnswer::NoAnswer { operation },
+        }
+    } else {
+        GuardAnswer::Refused {
+            operation,
+            code: record.code,
+            detail: record.word,
+        }
     }
 }
 

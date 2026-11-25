@@ -342,7 +342,7 @@ fn the_retention_kinds_keep_the_existing_codes() {
     }
     // 17 and 18 are the rate change's (karyos#740), 19 a submit's
     // (karyos#738); 20 to 22 a Cluster admin command's (karyos#772); 23
-    // is no kind yet.
+    // to 26 the two-person flow's (karyos#739); 27 is no kind yet.
     assert_eq!(Kind::from_code(19), Some(Kind::Submitted));
     assert_eq!(Kind::Submitted.code(), 19);
     for (code, kind) in (20u64..).zip([
@@ -353,7 +353,70 @@ fn the_retention_kinds_keep_the_existing_codes() {
         assert_eq!(kind.code(), code);
         assert_eq!(Kind::from_code(code), Some(kind));
     }
-    assert_eq!(Kind::from_code(23), None);
+    for (code, kind) in (23u64..).zip([
+        Kind::ApprovalRequested,
+        Kind::ApprovalGranted,
+        Kind::ApprovalWithdrawn,
+        Kind::ApprovalExpired,
+    ]) {
+        assert_eq!(kind.code(), code);
+        assert_eq!(Kind::from_code(code), Some(kind));
+    }
+    assert_eq!(Kind::from_code(27), None);
+}
+
+/// karyos#739: an approval record round-trips with its target, command,
+/// boot, parameter bytes and instance; the records written before the
+/// approval kinds (a plain request, a relayed one, a submit and a Cluster
+/// record) decode as they did and encode back to the same bytes.
+#[test]
+fn approval_records_round_trip_and_older_records_decode_unchanged() {
+    let mut record = JournalRecord::new(Kind::ApprovalRequested, 9);
+    record.operation = 41;
+    record.operator = 50_002;
+    record.relay = 7;
+    record.reason = b"reopen after the drill".to_vec();
+    record.parameters = 2;
+    record.word = 600_000_000_000;
+    record.target = b"orders".to_vec();
+    record.command = b"kill".to_vec();
+    record.boot = b"boot-a".to_vec();
+    record.bytes = vec![0xab, 0xcd];
+    record.instance = u128::MAX - 3;
+    assert_eq!(JournalRecord::decode(&record.encode()), Some(record));
+    for kind in [
+        Kind::ApprovalGranted,
+        Kind::ApprovalWithdrawn,
+        Kind::ApprovalExpired,
+    ] {
+        let mut record = JournalRecord::new(kind, 10);
+        record.operation = 41;
+        record.code = 3;
+        assert_eq!(JournalRecord::decode(&record.encode()), Some(record));
+    }
+    // A plain request's bytes from before: unchanged.
+    let words: [u64; 11] = [1, 1, 7, 3, 0, 7, 1000, 0xD16E57, 0, 0, 5];
+    let mut payload: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    payload.extend_from_slice(b"drill");
+    let record = JournalRecord::decode(&payload).unwrap();
+    assert_eq!((record.bytes.len(), record.instance), (0, 0));
+    assert_eq!(record.encode(), payload);
+    // A relayed one, a submit and a Cluster record: unchanged too.
+    let mut relayed = request(Kind::ReopenRequest, 8, 3);
+    relayed.relay = 7;
+    let mut submitted = JournalRecord::new(Kind::Submitted, 11);
+    submitted.target = b"/run/a".to_vec();
+    submitted.boot = b"boot-a".to_vec();
+    let mut cluster = JournalRecord::new(Kind::ClusterOutcome, 12);
+    cluster.target = b"orders".to_vec();
+    cluster.command = b"kill".to_vec();
+    cluster.evidence = b"sha256:ab".to_vec();
+    for record in [relayed, submitted, cluster] {
+        let bytes = record.encode();
+        let decoded = JournalRecord::decode(&bytes).unwrap();
+        assert_eq!(decoded, record);
+        assert_eq!(decoded.encode(), bytes);
+    }
 }
 
 /// karyos#985: each durable append seals the recording to its durable end,
@@ -469,4 +532,161 @@ fn a_large_unsealed_journal_is_sealed_in_bounded_chunks() {
         .collect();
     assert!(ranges.len() > 4, "{}", ranges.len());
     assert!(ranges.iter().all(|range| range.end - range.start <= chunk));
+}
+
+/// karyos#702: sealing left the record layout as it was: a record's bytes
+/// as written before it decode to the same record and encode back.
+#[test]
+fn a_record_written_before_sealing_still_decodes() {
+    let words: [u64; 11] = [1, 1, 7, 3, 0, 7, 1000, 0xD16E57, 0, 0, 5];
+    let mut payload: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    payload.extend_from_slice(b"drill");
+    let record = JournalRecord::decode(&payload).unwrap();
+    assert_eq!(record, request(Kind::CloseRequest, 7, 3));
+    assert_eq!(record.encode(), payload);
+}
+
+/// karyos#702: `unsealed` is computed: false while the seals cover all
+/// the journal wrote, true for a tail past them until the next durable
+/// append, for a journal whose integrity journal could not be opened, and
+/// for an unavailable one.
+#[test]
+fn unsealed_is_computed_from_the_seals() {
+    use karyos_archive::integrity::journal::IntegrityJournal;
+
+    let dir = dir("unsealed");
+    let mut journal = Journal::open(&dir, 10).unwrap();
+    assert!(!journal.unsealed());
+    let _ = journal
+        .append(&request(Kind::CloseOutcome, 11, 3), 11)
+        .unwrap();
+    assert!(journal.unsealed());
+    let _ = journal
+        .append_durable(&request(Kind::CloseRequest, 12, 3), 12)
+        .unwrap();
+    assert!(!journal.unsealed());
+    journal.break_recorder();
+    assert!(journal.unsealed());
+    drop(journal);
+
+    // An integrity journal that cannot be opened: its path is a directory.
+    let path = IntegrityJournal::<StdDisk>::path(&dir);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let journal = Journal::open(&dir, 20).unwrap();
+    assert_eq!(journal.failed_seals(), 1);
+    assert!(journal.unsealed());
+}
+
+/// karyos#702: a damaged range of the journal is named by the verifier,
+/// reading the directory as `karyos-catalog verify` does, and the
+/// journal's own verification reports it rather than a clean trail.
+#[test]
+fn a_damaged_range_is_named_by_the_verifier_and_reported() {
+    use karyos_archive::integrity::SealKind;
+    use karyos_archive::integrity::journal::read_records;
+    use karyos_archive::integrity::verify::{Evidence, Outcome, RangeBytes, Reason, verify};
+
+    let dir = dir("damaged");
+    let mut journal = Journal::open(&dir, 10).unwrap();
+    for time in 11..15 {
+        let _ = journal
+            .append_durable(&request(Kind::CloseRequest, time, 3), time)
+            .unwrap();
+    }
+    journal.verify(20);
+    let intact = journal.integrity().unwrap().clone();
+    assert_eq!(intact.at, 20);
+    assert!(!intact.truncated);
+    assert_eq!(intact.ranges.len(), 1, "{intact:?}");
+    assert_eq!(intact.ranges[0].start, 0);
+    assert_eq!(intact.ranges[0].outcome, "inconsistent");
+    assert_eq!(
+        intact.ranges[0].reasons,
+        ["untrusted_evidence", "missing_evidence"]
+    );
+
+    // Media damage inside the first record's payload, which the first seal
+    // covers.
+    journal.damage(u64::from(karyos_sys::frame::HEADER_LENGTH) + 16);
+    let recording = journal.recording();
+    let (data, _) = journal.recorder.as_ref().unwrap().store().segment_paths(0);
+    let (records, fault) = read_records(&mut StdDisk, &dir).unwrap();
+    assert_eq!(fault, None);
+    let first = records
+        .iter()
+        .find(|record| record.kind == SealKind::OpenSegment && record.subject == recording)
+        .copied()
+        .unwrap();
+    // The segment's bytes as on disk: the store's own recovery would cut
+    // the damaged frame, and the verifier must see it.
+    let bytes = std::fs::read(&data).unwrap();
+    let written = u64::try_from(bytes.len()).unwrap();
+    let externality = karyos_archive::integrity::anchor::Externality::default();
+    let evidence = Evidence {
+        records: &records,
+        journal_fault: fault,
+        journal_id: 0,
+        trust: None,
+        registry: &[],
+        heads: &[],
+        anchors: &[],
+        anchor_faults: 0,
+        stores: &NoAnchors,
+        externality: &externality,
+        written: &[(recording, written)],
+    };
+    let verification = verify(&evidence, |_, start, end| {
+        let range = usize::try_from(start).unwrap()..usize::try_from(end).unwrap();
+        RangeBytes::Bytes(bytes[range].to_vec())
+    });
+    let named = verification
+        .ranges
+        .iter()
+        .find(|range| range.reasons.contains(&Reason::Corruption))
+        .unwrap();
+    assert_eq!(named.outcome, Outcome::Inconsistent);
+    assert_eq!((named.start, named.end), (first.start, first.end));
+    assert_eq!(named.first_inconsistent, Some(first.counter));
+    assert!(
+        verification
+            .ranges
+            .iter()
+            .all(|range| range.outcome != Outcome::Verified)
+    );
+
+    // The journal reports the damaged range, then the intact rest.
+    journal.verify(30);
+    let damaged = journal.integrity().unwrap();
+    assert_eq!(damaged.at, 30);
+    assert_eq!(damaged.ranges.len(), 2, "{damaged:?}");
+    assert_eq!(
+        (damaged.ranges[0].start, damaged.ranges[0].end),
+        (first.start, first.end)
+    );
+    assert_eq!(damaged.ranges[0].outcome, "inconsistent");
+    assert_eq!(damaged.ranges[0].reasons, ["corruption"]);
+    assert_eq!(damaged.ranges[1].start, first.end);
+    assert_eq!(
+        damaged.ranges[1].reasons,
+        ["untrusted_evidence", "missing_evidence"]
+    );
+    assert_ne!(journal.integrity().unwrap().ranges, intact.ranges);
+}
+
+/// karyos#702: a journal is verified again only once its last
+/// verification is a period old.
+#[test]
+fn a_verification_stands_for_its_period() {
+    let dir = dir("period");
+    let mut journal = Journal::open(&dir, 10).unwrap();
+    assert_eq!(journal.integrity().unwrap().at, 10);
+    journal.verify_if_due(10 + VERIFY_PERIOD_NS - 1);
+    assert_eq!(journal.integrity().unwrap().at, 10);
+    journal.verify_if_due(10 + VERIFY_PERIOD_NS);
+    assert_eq!(journal.integrity().unwrap().at, 10 + VERIFY_PERIOD_NS);
+    // An unavailable journal keeps no verification.
+    journal.break_recorder();
+    journal.verify(20 + VERIFY_PERIOD_NS);
+    assert_eq!(journal.integrity(), None);
 }

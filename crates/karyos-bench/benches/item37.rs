@@ -128,6 +128,7 @@ fn churn(config: DedupConfig, rate: u64, seconds: u64) -> Result<(u64, usize), F
         for client in 1..=LIVE {
             let outcome = table.request(
                 Request::new(client, client, sequence, sequence),
+                b"order",
                 now,
                 |_| Some(0),
             );
@@ -194,10 +195,15 @@ fn full_table(config: DedupConfig) -> Result<SessionTable, Failed> {
     for client in 1..=u64::from(config.sessions) {
         let _ = ok(table.register(client, client, 0), "a registration")?;
         for sequence in 0..u64::from(config.window) {
-            let _ = table.request(Request::new(client, client, sequence, 0), 0, |reply| {
-                reply.get_mut(..length)?.fill(0x5a);
-                Some(length)
-            });
+            let _ = table.request(
+                Request::new(client, client, sequence, 0),
+                b"order",
+                0,
+                |reply| {
+                    reply.get_mut(..length)?.fill(0x5a);
+                    Some(length)
+                },
+            );
         }
     }
     Ok(table)

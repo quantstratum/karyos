@@ -375,6 +375,7 @@ fn run_timed(scenario: &TimedScenario, seed: u64) -> Result<TimedReport, Failure
         tolerance: TOLERANCE,
         cancel_on_deadline: scenario.cancel_on_deadline,
         max_horizon: u64::MAX,
+        advance: 0,
     };
     let mut gate = TimedGate::new(
         Recorder {
