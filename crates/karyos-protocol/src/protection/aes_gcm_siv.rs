@@ -1156,6 +1156,48 @@ pub fn classify_outer(frame_type: u16) -> Result<(), EncRejection> {
     }
 }
 
+/// The class part of the full-batch validation of section 9, run on the
+/// inner frames of an opened datagram before any of them takes effect. It
+/// walks the frames by their `frame_length`, each aligned to 32 bytes, and
+/// refuses an inner `0x21` and an inner `0x20`. The one inner `0x20` the
+/// ADR allows, a signed GUARD or SESSION_ABORT alone in a domain 1
+/// datagram, stays refused until ADR-0086 open point 5 fixes its bodies
+/// ("Assigned to the implementation", item 2). The type, length, order and
+/// authority checks of each frame belong to the driver.
+///
+/// # Errors
+///
+/// [`EncRejection::MixedClass`] for an inner envelope, and
+/// [`EncRejection::InnerRejected`] for a frame whose header or length does
+/// not fit.
+pub fn check_inner_classes(frames: &[u8]) -> Result<(), EncRejection> {
+    let alignment = usize::try_from(crate::frame::FRAME_ALIGNMENT).unwrap_or(32);
+    let mut at = 0_usize;
+    while let Some(rest) = frames.get(at..).filter(|rest| !rest.is_empty()) {
+        let frame_type = rest
+            .get(6..8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u16::from_le_bytes)
+            .ok_or(EncRejection::InnerRejected)?;
+        if frame_type == FRAME_TYPE || frame_type == super::hmac_sha256::FRAME_TYPE {
+            return Err(EncRejection::MixedClass);
+        }
+        let length = rest
+            .get(..4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(i32::from_le_bytes)
+            .and_then(|length| usize::try_from(length).ok())
+            .filter(|length| *length >= 8 && *length <= rest.len())
+            .ok_or(EncRejection::InnerRejected)?;
+        let stride = length
+            .div_ceil(alignment)
+            .saturating_mul(alignment)
+            .min(rest.len());
+        at = at.saturating_add(stride);
+    }
+    Ok(())
+}
+
 /// `label || header`.
 fn associated_data(header: &[u8; HEADER_LEN]) -> [u8; 20 + HEADER_LEN] {
     let mut out = [0_u8; 20 + HEADER_LEN];

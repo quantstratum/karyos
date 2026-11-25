@@ -996,3 +996,314 @@ proptest! {
         }
     }
 }
+
+// Adversarial tests of SPEC.md section 13 "Encrypted control and
+// downgrade" (ADR-0114 sections 8 and 9; karyos#651): the envelope
+// stripped, classes mixed in one datagram, and a plaintext SETUP. None may
+// yield frames, each has its own reason, and none changes state.
+
+/// A trusted frame of `frame_type` carrying `payload`, padded to the
+/// 32-byte frame alignment.
+fn trusted_frame(frame_type: u16, payload: &[u8]) -> Vec<u8> {
+    let length = 32 + payload.len();
+    let mut frame = vec![0_u8; length.div_ceil(32) * 32];
+    frame[..4].copy_from_slice(&i32::try_from(length).unwrap().to_le_bytes());
+    frame[4] = crate::frame::PROTOCOL_VERSION;
+    frame[6..8].copy_from_slice(&frame_type.to_le_bytes());
+    frame[32..length].copy_from_slice(payload);
+    frame
+}
+
+/// A genuine authenticated envelope (`0x20`, ADR-0086) around `frames`.
+fn authenticated(frames: &[u8]) -> Vec<u8> {
+    use crate::protection::hmac_sha256::{self, HmacSha256};
+    let binding = hmac_sha256::Binding {
+        domain: hmac_sha256::Domain::Data,
+        party_epoch: 0,
+        session_id: -2,
+        stream_id: 1001,
+        key_id: 1,
+    };
+    let profile = HmacSha256::new(&IKM, binding, 0).unwrap();
+    let mut datagram = vec![0_u8; frames.len() + profile.envelope_len()];
+    datagram[..frames.len()].copy_from_slice(frames);
+    let total = profile.seal(&mut datagram, frames.len()).unwrap();
+    datagram.truncate(total);
+    datagram
+}
+
+/// The bare frame types other than SETUP and RSP_SETUP.
+const BARE_TYPES: [u16; 11] = [
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x06, 0x08, 0x10, 0x11, 0x12, 0x13,
+];
+
+/// The three attack shapes and the one reason each must carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// A bare frame of a SPEC.md section 5 type: the envelope stripped.
+    Stripped(u16),
+    /// An authenticated envelope as the outer frame.
+    AuthenticatedOuter,
+    /// A trusted frame appended after the encrypted envelope.
+    TrustedAppended,
+    /// An authenticated envelope appended after the encrypted envelope.
+    AuthenticatedAppended,
+    /// An authenticated envelope inside the encrypted one.
+    NestedAuthenticated,
+    /// An encrypted envelope inside the encrypted one.
+    NestedEncrypted,
+    /// An allowed frame, then an authenticated envelope, inside.
+    AllowedThenAuthenticated,
+    /// A plaintext SETUP.
+    PlaintextSetup,
+    /// A bare RSP_SETUP.
+    PlaintextRspSetup,
+}
+
+impl Shape {
+    const ALL: [Self; 8] = [
+        Self::AuthenticatedOuter,
+        Self::TrustedAppended,
+        Self::AuthenticatedAppended,
+        Self::NestedAuthenticated,
+        Self::NestedEncrypted,
+        Self::AllowedThenAuthenticated,
+        Self::PlaintextSetup,
+        Self::PlaintextRspSetup,
+    ];
+
+    fn reason(self) -> EncRejection {
+        match self {
+            Self::Stripped(_) => EncRejection::BareFrame,
+            Self::AuthenticatedOuter => EncRejection::WrongClass,
+            Self::TrustedAppended
+            | Self::AuthenticatedAppended
+            | Self::NestedAuthenticated
+            | Self::NestedEncrypted
+            | Self::AllowedThenAuthenticated => EncRejection::MixedClass,
+            Self::PlaintextSetup | Self::PlaintextRspSetup => EncRejection::PlaintextSetup,
+        }
+    }
+
+    /// Whether the outer envelope is genuine, so the refusal comes from the
+    /// inner class check after the open.
+    fn is_nested(self) -> bool {
+        matches!(
+            self,
+            Self::NestedAuthenticated | Self::NestedEncrypted | Self::AllowedThenAuthenticated
+        )
+    }
+
+    /// The attack datagram for `profile`, around the random `payload`.
+    fn build(self, profile: &AesGcmSiv, payload: &[u8], seq: u64) -> Vec<u8> {
+        let data = trusted_frame(0x01, payload);
+        match self {
+            Self::Stripped(code) => trusted_frame(code, payload),
+            Self::AuthenticatedOuter => authenticated(&data),
+            Self::TrustedAppended => {
+                let mut datagram = sealed(profile, &data, seq);
+                datagram.extend_from_slice(&trusted_frame(0x01, &payload[..payload.len().min(64)]));
+                datagram
+            }
+            Self::AuthenticatedAppended => {
+                let mut datagram = sealed(profile, &data, seq);
+                datagram.extend_from_slice(&authenticated(&payload[..payload.len().min(64)]));
+                datagram
+            }
+            Self::NestedAuthenticated => sealed(profile, &authenticated(&data), seq),
+            Self::NestedEncrypted => {
+                let inner = profile_of(profile.context().domain);
+                sealed(profile, &sealed(&inner, &data, seq), seq)
+            }
+            Self::AllowedThenAuthenticated => {
+                let mut frames = data.clone();
+                frames.extend_from_slice(&authenticated(&[]));
+                sealed(profile, &frames, seq)
+            }
+            Self::PlaintextSetup => trusted_frame(0x05, &[0x5e; 72][..40]),
+            Self::PlaintextRspSetup => trusted_frame(0x07, &[0x7e; 24]),
+        }
+    }
+}
+
+/// Runs the receive path of this module on `datagram`: the open, then, for
+/// a datagram that opened, the inner class check, and only then the mark.
+/// Returns the reason, or the frames it would deliver.
+fn receive(profile: &AesGcmSiv, datagram: &[u8]) -> Result<usize, EncRejection> {
+    let mut buffer = datagram.to_vec();
+    let opened = profile.open_in_place(&mut buffer)?;
+    check_inner_classes(&buffer[opened.start..opened.start + opened.frames])?;
+    profile.mark(opened.seq)?;
+    Ok(opened.frames)
+}
+
+fn assert_refused(profile: &AesGcmSiv, shape: Shape, datagram: &[u8]) {
+    let before = state(profile);
+    assert_eq!(receive(profile, datagram), Err(shape.reason()), "{shape:?}");
+    // The trait seam never yields frames for an outer refusal, and a
+    // nested refusal is caught by the inner check, so no seq is marked.
+    if !shape.is_nested() {
+        assert!(
+            matches!(profile.open(datagram), Verdict::Reject(_)),
+            "{shape:?}"
+        );
+        let mut out = [0_u8; MAX_PLAINTEXT];
+        assert_eq!(
+            profile.open_into(datagram, &mut out),
+            Err(shape.reason()),
+            "{shape:?}"
+        );
+    }
+    assert_eq!(state(profile), before, "{shape:?}: state unchanged");
+}
+
+#[test]
+fn a_stripped_envelope_is_refused_as_a_bare_frame() {
+    for domain in [
+        Domain::Sender,
+        Domain::Receiver,
+        Domain::Setup,
+        Domain::RspSetup,
+    ] {
+        let profile = profile_of(domain);
+        for code in BARE_TYPES {
+            let shape = Shape::Stripped(code);
+            assert_refused(&profile, shape, &shape.build(&profile, &[0xd7; 100], 1));
+        }
+        // The genuine frames of a sealed datagram, sent without it.
+        let frames = trusted_frame(0x01, &[1; 40]);
+        assert_eq!(receive(&profile, &frames), Err(EncRejection::BareFrame));
+    }
+}
+
+#[test]
+fn mixed_classes_are_refused_as_mixed_or_wrong_class() {
+    for domain in [
+        Domain::Sender,
+        Domain::Receiver,
+        Domain::Setup,
+        Domain::RspSetup,
+    ] {
+        let profile = profile_of(domain);
+        for (seq, shape) in Shape::ALL.into_iter().enumerate() {
+            if matches!(shape.reason(), EncRejection::PlaintextSetup) {
+                continue;
+            }
+            let seq = u64::try_from(seq).unwrap() + 10;
+            assert_refused(&profile, shape, &shape.build(&profile, &[0x3c; 120], seq));
+        }
+    }
+}
+
+#[test]
+fn a_plaintext_setup_is_refused_as_plaintext_setup() {
+    for domain in [
+        Domain::Sender,
+        Domain::Receiver,
+        Domain::Setup,
+        Domain::RspSetup,
+    ] {
+        let profile = profile_of(domain);
+        for shape in [Shape::PlaintextSetup, Shape::PlaintextRspSetup] {
+            assert_refused(&profile, shape, &shape.build(&profile, &[], 0));
+        }
+        // A SETUP inside an authenticated envelope is still another class.
+        let setup = authenticated(&trusted_frame(0x05, &[0x5e; 40]));
+        assert_eq!(receive(&profile, &setup), Err(EncRejection::WrongClass));
+    }
+}
+
+#[test]
+fn the_three_attack_reasons_are_pairwise_distinct() {
+    let stripped = Shape::Stripped(0x01).reason();
+    let mixed = [
+        Shape::AuthenticatedOuter.reason(),
+        Shape::TrustedAppended.reason(),
+        Shape::NestedEncrypted.reason(),
+    ];
+    let setup = Shape::PlaintextSetup.reason();
+    for reason in mixed {
+        assert_ne!(stripped, reason);
+        assert_ne!(setup, reason);
+    }
+    assert_ne!(stripped, setup);
+    // And distinct from every reason a genuine but damaged datagram gets.
+    for reason in [stripped, setup].into_iter().chain(mixed) {
+        for other in [
+            EncRejection::Short,
+            EncRejection::Length,
+            EncRejection::FrameType,
+            EncRejection::Profile,
+            EncRejection::Tag,
+            EncRejection::Pairwise,
+            EncRejection::InnerRejected,
+        ] {
+            assert_ne!(reason, other);
+        }
+    }
+}
+
+#[test]
+fn no_attack_shape_is_accepted_before_a_key_exists() {
+    // Before any key is bound the receiver holds no profile: the outer
+    // frame type alone decides, and no shape passes it.
+    let profile = data();
+    for shape in Shape::ALL
+        .into_iter()
+        .chain(BARE_TYPES.map(Shape::Stripped))
+    {
+        if shape.is_nested()
+            || matches!(shape, Shape::TrustedAppended | Shape::AuthenticatedAppended)
+        {
+            continue;
+        }
+        let datagram = shape.build(&profile, &[0x11; 32], 0);
+        let frame_type = u16::from_le_bytes(datagram[6..8].try_into().unwrap());
+        assert_eq!(classify_outer(frame_type), Err(shape.reason()), "{shape:?}");
+    }
+}
+
+#[test]
+fn the_inner_class_check_walks_aligned_frames() {
+    let mut frames = trusted_frame(0x01, &[1; 40]);
+    frames.extend_from_slice(&trusted_frame(0x00, &[]));
+    assert_eq!(check_inner_classes(&frames), Ok(()));
+    assert_eq!(check_inner_classes(&[]), Ok(()));
+    let mut nested = frames.clone();
+    nested.extend_from_slice(&trusted_frame(FRAME_TYPE, &[0; 16]));
+    assert_eq!(check_inner_classes(&nested), Err(EncRejection::MixedClass));
+    let mut bad = frames.clone();
+    bad[..4].copy_from_slice(&4000_i32.to_le_bytes());
+    assert_eq!(check_inner_classes(&bad), Err(EncRejection::InnerRejected));
+    assert_eq!(
+        check_inner_classes(&[0; 5]),
+        Err(EncRejection::InnerRejected)
+    );
+}
+
+proptest! {
+    /// Random frames wrapped in every attack shape, for every domain: each
+    /// is refused with its own reason, yields no frames and changes nothing.
+    #[test]
+    fn every_attack_shape_is_refused_with_its_reason(
+        payload in proptest::collection::vec(any::<u8>(), 1..500),
+        pick in any::<usize>(),
+        domain in 0_usize..4,
+        seq in 0_u64..1_000_000,
+    ) {
+        let domain = [Domain::Sender, Domain::Receiver, Domain::Setup, Domain::RspSetup][domain];
+        let profile = profile_of(domain);
+        let shapes: Vec<Shape> = Shape::ALL
+            .into_iter()
+            .chain(BARE_TYPES.map(Shape::Stripped))
+            .collect();
+        let shape = shapes[pick % shapes.len()];
+        // Built first: the nested shapes seal on this profile.
+        let datagram = shape.build(&profile, &payload, seq);
+        let before = state(&profile);
+        prop_assert_eq!(receive(&profile, &datagram), Err(shape.reason()));
+        let yielded = matches!(profile.open(&datagram), Verdict::Accept { .. });
+        prop_assert!(!yielded || shape.is_nested(), "shape {:?} yielded frames", shape);
+        prop_assert_eq!(state(&profile), before);
+    }
+}
