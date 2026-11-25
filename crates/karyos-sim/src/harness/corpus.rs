@@ -17,18 +17,34 @@
 //!   schedule as `step:action`, what the case does not cover
 //!   ([`Case::notes`]), the trace digest, and the error of a run that
 //!   could not be set up or stepped.
-//! - **Not yet.** Per-fault coverage (before the first commit, during
-//!   replication, after the last commit) and the minimised traces of
-//!   failing seeds (manifest, Corpora) need commit times in steps, which
-//!   the observations do not carry; a later step adds them. Until then a
-//!   failing seed is listed with its case, and its full trace is the
-//!   run's to rebuild from the seed.
+//! - **Per-fault coverage** (manifest, Seed corpora): each line lists
+//!   the faults its run applied, each with its step and whether it fell
+//!   before the run's first leader commit, during replication, or after
+//!   its last ([`Phase`]); the [`Summary`] counts the seeds of each fault
+//!   kind per workload in each phase.
+//! - **Named seeds** ([`NAMED_SEEDS`], 1 to 10 of the CI corpus) carry
+//!   their run's full trace in their line, so the same schedules can be
+//!   compared across variants and rerun by anyone.
+//! - **Minimised traces.** A failing run's line carries its case shrunk
+//!   ([`minimise`]): the schedule's faults removed one at a time, and then
+//!   its steps halved, while the run still fails the same check under the
+//!   same seed, with the shrunk run's schedule, steps and trace. The
+//!   seed is kept: a schedule is only a function of its seed.
 
 use std::io::Write;
 use std::ops::RangeInclusive;
 
+use std::collections::BTreeMap;
+
 use super::core::ConsensusCore;
-use super::workloads::{Case, Failed, RunError, pass, run};
+use super::workloads::{Case, Failed, Outcome, Phase, RunError, pass, run};
+
+/// The named seeds of every fault (manifest, Failure schedules: seeds 1 to
+/// 10 of the CI corpus): their lines carry their full trace.
+pub const NAMED_SEEDS: RangeInclusive<u64> = 1..=10;
+
+/// The most runs [`minimise`] spends on one failing run.
+pub const MINIMISE_RUNS: u32 = 64;
 
 /// What a run is evidence of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +131,79 @@ pub struct Summary {
     pub errors: u64,
     /// Runs whose case needs a capability the core does not have.
     pub not_demonstrated: u64,
+    /// Per workload and fault kind: the runs in which it fell before the
+    /// first leader commit, during replication and after the last.
+    pub coverage: BTreeMap<(String, String), [u64; 3]>,
+}
+
+/// A failing run's shrunk case: its schedule and steps, and its trace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Minimised {
+    /// The shrunk case.
+    pub case: Case,
+    /// Its run's trace.
+    pub trace: Vec<String>,
+}
+
+/// The kind of check `case` fails under `seed`, if it fails one.
+fn failing<C: ConsensusCore>(case: &Case, seed: u64) -> Option<(&'static str, Outcome)> {
+    let outcome = run::<C>(case, seed).ok()?;
+    match pass(case, &outcome) {
+        Err(failed) => Some((failed_kind(&failed), outcome)),
+        Ok(_) => None,
+    }
+}
+
+/// Shrinks a case that fails check `kind` under `seed`: removes each
+/// scheduled fault in turn, keeping a removal while the run still fails
+/// `kind`, then halves the steps (never below the last fault's step) while
+/// it still does; at most [`MINIMISE_RUNS`] runs. `None` when the case no
+/// longer fails `kind` at all, which a deterministic run never does.
+#[must_use]
+pub fn minimise<C: ConsensusCore>(case: &Case, seed: u64, kind: &str) -> Option<Minimised> {
+    let (_, mut outcome) = failing::<C>(case, seed).filter(|(got, _)| *got == kind)?;
+    let mut shrunk = case.clone();
+    let mut runs = 1u32;
+    let mut at = 0;
+    while at < shrunk.schedule.len() && runs < MINIMISE_RUNS {
+        let mut candidate = shrunk.clone();
+        let _ = candidate.schedule.remove(at);
+        runs += 1;
+        match failing::<C>(&candidate, seed) {
+            Some((got, again)) if got == kind => {
+                shrunk = candidate;
+                outcome = again;
+            }
+            _ => at += 1,
+        }
+    }
+    let floor = shrunk
+        .schedule
+        .iter()
+        .map(|(step, _)| *step)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    while runs < MINIMISE_RUNS {
+        let steps = shrunk.steps / 2;
+        if steps < floor || steps == 0 {
+            break;
+        }
+        let mut candidate = shrunk.clone();
+        candidate.steps = steps;
+        runs += 1;
+        match failing::<C>(&candidate, seed) {
+            Some((got, again)) if got == kind => {
+                shrunk = candidate;
+                outcome = again;
+            }
+            _ => break,
+        }
+    }
+    Some(Minimised {
+        case: shrunk,
+        trace: outcome.trace,
+    })
 }
 
 /// One workload: its name and its cases under a seed (W4's survival modes
@@ -142,8 +231,14 @@ pub fn run_corpus<C: ConsensusCore>(
     for seed in seeds {
         for (workload, cases) in workloads {
             for case in &cases(seed) {
+                let mut faults = Vec::new();
+                let mut trace = None;
                 let (verdict, bound, digest, error) = match run::<C>(case, seed) {
                     Ok(outcome) => {
+                        faults.clone_from(&outcome.faults);
+                        if NAMED_SEEDS.contains(&seed) {
+                            trace = Some(outcome.trace.clone());
+                        }
                         let replayed = (1..repetitions)
                             .all(|_| run::<C>(case, seed).is_ok_and(|again| again == outcome));
                         let verdict = match pass(case, &outcome) {
@@ -184,6 +279,28 @@ pub fn run_corpus<C: ConsensusCore>(
                 if bound {
                     summary.step_bound = summary.step_bound.saturating_add(1);
                 }
+                for fault in &faults {
+                    let slot = summary
+                        .coverage
+                        .entry(((*workload).to_owned(), fault.kind().to_owned()))
+                        .or_default();
+                    let at = match fault.phase {
+                        Phase::BeforeFirstCommit => 0,
+                        Phase::DuringReplication => 1,
+                        Phase::AfterLastCommit => 2,
+                    };
+                    if let Some(count) = slot.get_mut(at) {
+                        *count = count.saturating_add(1);
+                    }
+                }
+                // A replay failure is the determinism gate's, not one a
+                // shrunk schedule reproduces.
+                let minimised = match verdict {
+                    Verdict::Failed(kind) if kind != "failed_not_replayed" => {
+                        minimise::<C>(case, seed, kind)
+                    }
+                    _ => None,
+                };
                 let line = Line {
                     evidence,
                     core,
@@ -195,6 +312,9 @@ pub fn run_corpus<C: ConsensusCore>(
                     bound,
                     digest,
                     error: error.as_deref(),
+                    faults: &faults,
+                    trace: trace.as_deref(),
+                    minimised: minimised.as_ref(),
                 };
                 writeln!(out, "{}", line.json())?;
             }
@@ -215,20 +335,62 @@ struct Line<'a> {
     bound: bool,
     digest: Option<u64>,
     error: Option<&'a str>,
+    faults: &'a [super::workloads::FaultPhase],
+    trace: Option<&'a [String]>,
+    minimised: Option<&'a Minimised>,
+}
+
+/// A schedule as JSON strings, `step:action`.
+fn schedule_json(case: &Case) -> String {
+    case.schedule
+        .iter()
+        .map(|(step, action)| string(&format!("{step}:{action:?}")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// A trace as a JSON array of strings.
+fn trace(lines: &[String]) -> String {
+    format!(
+        "[{}]",
+        lines
+            .iter()
+            .map(|line| string(line))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 impl Line<'_> {
     /// The line as one JSON object.
     fn json(&self) -> String {
-        let schedule: Vec<String> = self
-            .case
-            .schedule
+        let schedule = schedule_json(self.case);
+        let coverage: Vec<String> = self
+            .faults
             .iter()
-            .map(|(step, action)| string(&format!("{step}:{action:?}")))
+            .map(|fault| {
+                format!(
+                    "{{\"step\":{},\"fault\":{},\"phase\":{}}}",
+                    fault.step,
+                    string(&fault.fault),
+                    string(fault.phase.name())
+                )
+            })
             .collect();
+        let minimised = self.minimised.map_or_else(
+            || "null".to_owned(),
+            |shrunk| {
+                format!(
+                    "{{\"steps\":{},\"schedule\":[{}],\"trace\":{}}}",
+                    shrunk.case.steps,
+                    schedule_json(&shrunk.case),
+                    trace(&shrunk.trace)
+                )
+            },
+        );
         let notes: Vec<String> = self.case.notes.iter().map(|note| string(note)).collect();
         format!(
-            "{{\"evidence\":{},\"core\":{},\"workload\":{},\"case\":{},\"seed\":{},\"repetitions\":{},\"window\":{},\"limits\":{},\"verdict\":{},\"step_bound\":{},\"steps\":{},\"schedule\":[{}],\"notes\":[{}],\"digest\":{},\"error\":{}}}",
+            "{{\"evidence\":{},\"core\":{},\"workload\":{},\"case\":{},\"seed\":{},\"repetitions\":{},\"window\":{},\"limits\":{},\"verdict\":{},\"step_bound\":{},\"steps\":{},\"schedule\":[{}],\"notes\":[{}],\"digest\":{},\"error\":{},\"coverage\":[{}],\"trace\":{},\"minimised\":{}}}",
             string(self.evidence.text()),
             string(self.core),
             string(self.workload),
@@ -249,11 +411,14 @@ impl Line<'_> {
             string(self.verdict.name()),
             self.bound,
             self.case.steps,
-            schedule.join(","),
+            schedule,
             notes.join(","),
             self.digest
                 .map_or_else(|| "null".to_owned(), |digest| digest.to_string()),
             self.error.map_or_else(|| "null".to_owned(), string),
+            coverage.join(","),
+            self.trace.map_or_else(|| "null".to_owned(), trace),
+            minimised,
         )
     }
 }

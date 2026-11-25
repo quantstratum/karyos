@@ -788,6 +788,93 @@ pub struct Outcome {
     pub deduplicated: u64,
     /// Whether a standby was promoted: the states are the standby's.
     pub promoted: bool,
+    /// Each fault the run applied, in order, and where it fell against the
+    /// run's leader commits (C5's per-fault coverage; karyos#691).
+    pub faults: Vec<FaultPhase>,
+}
+
+/// Where a fault fell against a run's leader commits (quantstratum-docs:
+/// karyos/evaluations/c5-raft-comparison-v1.md, Seed corpora: "how many
+/// seeds reached it before the first commit, during replication and
+/// after the last commit").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Phase {
+    /// No leader had committed anything when it acted.
+    BeforeFirstCommit,
+    /// Some leader commits came before it, and some after.
+    DuringReplication,
+    /// Every leader commit of the run came before it.
+    AfterLastCommit,
+}
+
+impl Phase {
+    /// Its name in a line.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::BeforeFirstCommit => "before_first_commit",
+            Self::DuringReplication => "during_replication",
+            Self::AfterLastCommit => "after_last_commit",
+        }
+    }
+}
+
+/// One fault of a run: the step it acted at, what it was, and its phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultPhase {
+    /// The step.
+    pub step: u64,
+    /// The fault: a scheduled action as `Debug` prints it, or a lost
+    /// reply's trigger (`Triggered:cut`, `Triggered:crash`, ...).
+    pub fault: String,
+    /// Where it fell.
+    pub phase: Phase,
+}
+
+impl FaultPhase {
+    /// The fault's kind, without its arguments: `Crash`, `Isolate`,
+    /// `Triggered:cut`.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        self.fault
+            .split(['(', ' ', '{'])
+            .next()
+            .unwrap_or(&self.fault)
+    }
+}
+
+/// Each fault's phase: `marks` are the faults with the number of
+/// observations recorded when each acted.
+fn phases(observations: &[Observation], marks: &[(u64, String, usize)]) -> Vec<FaultPhase> {
+    let commits: Vec<usize> = observations
+        .iter()
+        .enumerate()
+        .filter(|(_, observation)| matches!(observation, Observation::Commit { leader: true, .. }))
+        .map(|(at, _)| at)
+        .collect();
+    let mut faults: Vec<(u64, String, usize)> = marks.to_vec();
+    for (at, observation) in observations.iter().enumerate() {
+        if let Observation::Triggered { what, at: step, .. } = observation
+            && *what != "deadline"
+        {
+            faults.push((*step, format!("Triggered:{what}"), at));
+        }
+    }
+    faults.sort_by_key(|(step, _, at)| (*step, *at));
+    faults
+        .into_iter()
+        .map(|(step, fault, at)| {
+            let before = commits.iter().filter(|commit| **commit < at).count();
+            let phase = if before == 0 {
+                Phase::BeforeFirstCommit
+            } else if before == commits.len() {
+                Phase::AfterLastCommit
+            } else {
+                Phase::DuringReplication
+            };
+            FaultPhase { step, fault, phase }
+        })
+        .collect()
 }
 
 /// A case its run did not pass.
@@ -1101,11 +1188,17 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
     let mut schedule = case.schedule.clone();
     schedule.sort_by_key(|(step, _)| *step);
     let mut done = 0u64;
+    let mut marks: Vec<(u64, String, usize)> = Vec::new();
     for (step, action) in schedule {
         if let Some(steps) = step.checked_sub(done).filter(|steps| *steps > 0) {
             sim.run_for(steps).map_err(RunError::Sim)?;
             done = step;
         }
+        marks.push((
+            step,
+            format!("{action:?}"),
+            recorder.borrow().observations.len(),
+        ));
         match action {
             Action::Crash(id) => sim.crash(id).map_err(RunError::Node)?,
             Action::Restart(id) => sim.restart(id).map_err(RunError::Node)?,
@@ -1434,6 +1527,7 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         states,
         deduplicated,
         promoted,
+        faults: phases(&recorded.observations, &marks),
     })
 }
 
