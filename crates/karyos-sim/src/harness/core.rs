@@ -78,6 +78,8 @@ pub struct LogView<'a> {
     budget: Option<&'a ReadBudget>,
     /// The latest snapshot the node holds, if any (W5).
     base: Option<SnapshotBase>,
+    /// That snapshot's log time, where the node knows it (ADR-0111).
+    base_time: Option<u64>,
 }
 
 /// What a [`LogView`] reads: C4's log over any disk, so the same core runs
@@ -224,6 +226,7 @@ impl<'a> LogView<'a> {
             log,
             budget: None,
             base: None,
+            base_time: None,
         }
     }
 
@@ -236,6 +239,7 @@ impl<'a> LogView<'a> {
             log,
             budget,
             base: None,
+            base_time: None,
         }
     }
 
@@ -329,6 +333,39 @@ impl<'a> LogView<'a> {
     pub fn with_base(mut self, base: Option<SnapshotBase>) -> Self {
         self.base = base;
         self
+    }
+
+    /// It, with `log_time` as the log time of the node's latest snapshot:
+    /// the largest event time applied up to its base, which its sessions
+    /// section records (ADR-0111, decision 4).
+    #[must_use]
+    pub fn with_base_time(mut self, log_time: Option<u64>) -> Self {
+        self.base_time = log_time;
+        self
+    }
+
+    /// The log time of the node's latest snapshot, if the node gave it:
+    /// the C-TIME watermark of a log that is empty after that snapshot.
+    #[must_use]
+    pub fn base_time(&self) -> Option<u64> {
+        self.base_time
+    }
+
+    /// The watermark of the history up to the log's last entry (contract
+    /// C-TIME, ADR-0111): its last entry's event time, or, with no entry,
+    /// the snapshot's log time, and 0 for an empty log with no snapshot;
+    /// `None` when the last entry cannot be read or the snapshot's log
+    /// time is not known.
+    pub fn watermark(&mut self) -> Option<u64> {
+        match self.last_index() {
+            Some(last) => self
+                .entries(last..last.saturating_add(1), u64::MAX)
+                .ok()?
+                .last()
+                .map(|entry| entry.event_time),
+            None if self.base.is_some() => self.base_time,
+            None => Some(0),
+        }
     }
 
     /// The node's latest snapshot, if any: the log holds no entry at or

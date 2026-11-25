@@ -200,6 +200,20 @@ pub struct Entry {
     pub payload: Vec<u8>,
 }
 
+/// Contract C-TIME (ADR-0111): the `event_time` a leader gives the entry
+/// it appends, `max(raw, watermark)`. `raw` is its clock's reading at the
+/// append; `watermark` is the largest `event_time` of its log history up
+/// to its last entry: that entry's own (the recovered log's last after a
+/// restart), or, when the log is empty after a snapshot, the snapshot's
+/// session table log time ([`crate::SessionTable::log_time`]), and 0 for
+/// an empty log with no snapshot. A no-op whenever the clock is ahead; a
+/// clamped entry carries exactly the watermark, which is how a time
+/// evidence producer knows it is possibly clamped (ADR-0111, decision 5).
+#[must_use]
+pub const fn stamp(raw: u64, watermark: u64) -> u64 {
+    if raw > watermark { raw } else { watermark }
+}
+
 impl Entry {
     /// The entry's frame: its header, then its payload.
     ///

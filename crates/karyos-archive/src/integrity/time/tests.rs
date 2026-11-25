@@ -440,3 +440,62 @@ fn a_reversed_interval_is_refused() {
         Verdict::NoEvidence
     );
 }
+
+/// ADR-0111, decision 5: a Cluster entry at or below the watermark of the
+/// history before it is possibly clamped, strictly above it is raw, and an
+/// unknown watermark is never guessed.
+#[test]
+fn a_cluster_entry_is_classified_against_the_watermark_before_it() {
+    assert_eq!(
+        classify_cluster_time(5_000, Some(5_000)),
+        ClusterTime::PossiblyClamped
+    );
+    assert_eq!(
+        classify_cluster_time(4_000, Some(5_000)),
+        ClusterTime::PossiblyClamped
+    );
+    assert_eq!(classify_cluster_time(5_001, Some(5_000)), ClusterTime::Raw);
+    // The log's first entry: the watermark is 0.
+    assert_eq!(classify_cluster_time(1, Some(0)), ClusterTime::Raw);
+    assert_eq!(
+        classify_cluster_time(0, Some(0)),
+        ClusterTime::PossiblyClamped
+    );
+    assert_eq!(classify_cluster_time(9_000, None), ClusterTime::Unknown);
+}
+
+/// ADR-0111, decision 5: a possibly clamped entry's bound is the missing
+/// bound, `no_evidence`; one above the watermark gets the raw clock's
+/// bound through `derived_bound` with `derived = raw`; an unknown
+/// watermark is `no_evidence`, even for an entry that may be raw.
+#[test]
+fn a_cluster_entry_is_bounded_only_above_the_watermark() {
+    let cal = calibration().calibration;
+    assert_eq!(
+        cluster_entry_bound(5_000, Some(5_000), coordinate(), &cal, &reference()),
+        Err(Gap::Missing)
+    );
+    assert_eq!(
+        cluster_entry_bound(3_000, Some(5_000), coordinate(), &cal, &reference()),
+        Err(Gap::Missing)
+    );
+    let raw = cluster_entry_bound(6_000, Some(5_000), coordinate(), &cal, &reference());
+    assert_eq!(
+        raw,
+        derived_bound(6_000, 6_000, coordinate(), &cal, &reference())
+    );
+    assert_eq!(raw, combined_bound(6_000, coordinate(), &cal, &reference()));
+    assert!(raw.is_ok());
+    assert_eq!(
+        cluster_entry_bound(6_000, None, coordinate(), &cal, &reference()),
+        Err(Gap::Missing)
+    );
+    // Above the watermark it is still the raw evidence's: a gap there is
+    // reported, never replaced.
+    let mut unscaled = reference();
+    unscaled.scale_stated = false;
+    assert_eq!(
+        cluster_entry_bound(6_000, Some(5_000), coordinate(), &cal, &unscaled),
+        Err(Gap::ScaleNotStated)
+    );
+}
