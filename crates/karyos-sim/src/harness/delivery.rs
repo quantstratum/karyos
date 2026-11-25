@@ -133,11 +133,8 @@ pub enum Answer {
     SessionExpired,
     /// The session's window is full.
     WindowFull,
-    /// Past the sequence the session expects.
-    OutOfOrder {
-        /// The one it expects.
-        expected: u64,
-    },
+    /// The identity applied before with another command (karyos#750).
+    PayloadMismatch,
     /// The request's fate cannot be determined: it may or may not have
     /// been applied (decision D5). A server gives it for the requests it
     /// took when it stops leading; a client gives it when it cannot
@@ -165,7 +162,7 @@ impl Answer {
             Outcome::ReplyTooLarge => Self::ReplyTooLarge,
             Outcome::SessionExpired => Self::SessionExpired,
             Outcome::WindowFull => Self::WindowFull,
-            Outcome::OutOfOrder { expected } => Self::OutOfOrder { expected },
+            Outcome::PayloadMismatch => Self::PayloadMismatch,
             other => Self::Other(format!("{other:?}")),
         }
     }
