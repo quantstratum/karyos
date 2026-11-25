@@ -214,7 +214,7 @@ pub enum Kind {
     /// its driver was unavailable.
     ApprovalExpired,
     /// A product service's request, before it sends its command
-    /// (R-CORE-42, karyos#773; [`crate::product`]).
+    /// (R-CORE-42, karyos#773; the `product` module, on Linux).
     ProductRequest,
     /// A product service's outcome, after its command's answer.
     ProductOutcome,
