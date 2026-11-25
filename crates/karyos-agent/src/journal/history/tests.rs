@@ -234,10 +234,7 @@ fn a_full_page_is_bounded_work() {
         slowest = slowest.max(started.elapsed());
         assert_eq!(page.records.len(), HISTORY_MAX);
     }
-    assert!(
-        slowest < WRITE_DEADLINE,
-        "a full page took {slowest:?}"
-    );
+    assert!(slowest < WRITE_DEADLINE, "a full page took {slowest:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
