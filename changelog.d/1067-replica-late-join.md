@@ -1,7 +1,3 @@
-### Added
-
-- `EmbeddedDriver::await_network_images` and `EmbeddedDriver::subscribe_image_of` (karyos#1067, ADR-0100 decisions 1 to 6): an in-process network subscription of the embedded API awaits its images, so each image of its key gets a reader cell at its join, which `subscribe_image_of` adopts in place: the reader reads what the image received before the attach. The in-process twin of `AddImageSubscriptionOf`. Without a cell to adopt (never awaited, taken, or a required cell past `image_join_deadline`), it returns the new `DriverError::NoAwaitingCell`, and a caller joins at the head with `subscribe`. `remove_network_subscription` withdraws the subscription's awaiting entry and cells.
-
 ### Fixed
 
 - `karyosd --replica` reads each incarnation of the source from its join, so it no longer misses a replication request's first messages (karyos#1067). The source sends a request's status and payload once, from its incarnation's position 0, as soon as the replica's image exists; the replica subscribed on a later duty at the image's head, and on a loaded host the messages were already there, so it waited for payload that had gone by and counted nothing.
