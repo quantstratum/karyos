@@ -1,0 +1,3 @@
+### Added
+
+- Schema 6 replication carries Cluster log seals (karyos#714, ADR-0120 decision 2). A `SourceSeal` may now hold a seal of kind 3, `ClusterLog`; template, lengths and vectors P-1 to P-6 are unchanged, and vector P-8 fixes the new kind. A replication names its `SealScope`: `SealScope::segments(recording)` is ADR-0091 as before, and `SealScope::cluster_log(LOG_RECORDING, epoch)` takes only the log seals of that epoch, for the request boundaries (`check_request_in`), what the source sends (`Sender::accept_in`), what the replica counts (`check_seal_in`, `Receiver::in_scope`, `Replica::verify_in`) and its lag (`Replica::lag_in`). A Cluster log copy is recorded under the log recording id, not the seal epoch.

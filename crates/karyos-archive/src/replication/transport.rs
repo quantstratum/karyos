@@ -13,15 +13,15 @@ use std::sync::mpsc::{Receiver as Returned, SyncSender, TryRecvError, sync_chann
 
 use crate::control::ResponseCode;
 use crate::disk::Disk;
+use crate::integrity::SealRecord;
 use crate::integrity::copies::CopyCatalog;
 use crate::integrity::journal::IntegrityJournal;
 use crate::integrity::replication::{Replica, ReplicationError, Verdict};
-use crate::integrity::{SealKind, SealRecord};
 use crate::segment::{SegmentError, SegmentStore};
 
 use super::{
-    MAX_CHUNK, Mode, ReplicateRecording, ReplicationStatus, RequestRefusal, State, check_request,
-    check_seal,
+    MAX_CHUNK, Mode, ReplicateRecording, ReplicationStatus, RequestRefusal, SealScope, State,
+    check_request_in, check_seal_in,
 };
 
 /// A message the source sends, owned until the host encodes it.
@@ -131,6 +131,8 @@ impl Refusal {
 #[derive(Debug)]
 pub struct Sender {
     request: ReplicateRecording,
+    /// The seals that cover its ranges.
+    scope: SealScope,
     /// The next position to send.
     next: u64,
     /// The end of the last range sent whole with its seal.
@@ -167,13 +169,39 @@ impl Sender {
         start: u64,
         seals: &[SealRecord],
     ) -> Result<Self, Refusal> {
+        Self::accept_in(
+            request,
+            SealScope::segments(request.recording_id),
+            known,
+            start,
+            seals,
+        )
+    }
+
+    /// [`Sender::accept`] under `scope`: only the scope's seals bound the
+    /// request and are sent (for a Cluster log, its `ClusterLog` seals of
+    /// one epoch, ADR-0120 decisions 2 and 4).
+    ///
+    /// # Errors
+    ///
+    /// As [`Sender::accept`], and [`Refusal::Invalid`] with
+    /// [`RequestRefusal::OutOfScope`] for a request of another recording
+    /// than the scope's.
+    pub fn accept_in(
+        request: ReplicateRecording,
+        scope: SealScope,
+        known: bool,
+        start: u64,
+        seals: &[SealRecord],
+    ) -> Result<Self, Refusal> {
         if !known {
             return Err(Refusal::UnknownRecording);
         }
-        check_request(&request, start, seals).map_err(Refusal::Invalid)?;
+        check_request_in(&request, scope, start, seals).map_err(Refusal::Invalid)?;
         let (give, pool) = sync_channel(CHUNK_POOL);
         Ok(Self {
             request,
+            scope,
             next: request.from,
             sent_end: request.from,
             done: None,
@@ -197,6 +225,12 @@ impl Sender {
     #[must_use]
     pub const fn request(&self) -> &ReplicateRecording {
         &self.request
+    }
+
+    /// The seals that cover its ranges.
+    #[must_use]
+    pub const fn scope(&self) -> SealScope {
+        self.scope
     }
 
     /// The end of the last range sent whole with its seal: the seals at
@@ -240,8 +274,8 @@ impl Sender {
         if self.done.is_some() {
             return Ok(());
         }
-        let recording = self.request.recording_id;
-        let sealed_end = sealed_end(seals, recording, store.start());
+        let scope = self.scope;
+        let sealed_end = sealed_end(seals, scope, store.start());
         // A purge past the next position interrupts the request first:
         // a start marker would advertise the purged start as the request's,
         // which the source would then read as an interior gap.
@@ -262,10 +296,7 @@ impl Sender {
         }
         let mut left = budget;
         let wanted = |seal: &SealRecord, sent_end: u64, until: u64| {
-            seal.subject == recording
-                && matches!(seal.kind, SealKind::OpenSegment | SealKind::ClosedSegment)
-                && seal.end > sent_end
-                && seal.end <= until
+            scope.admits(seal) && seal.end > sent_end && seal.end <= until
         };
         // The journal holds a recording's range seals in position order,
         // so one pass in that order sends them all: no rescan per range.
@@ -359,7 +390,7 @@ impl Sender {
     /// A status of the recording as the store holds it now.
     #[must_use]
     pub fn status(&self, store: &SegmentStore<impl Disk>, seals: &[SealRecord]) -> Outgoing {
-        let sealed_end = sealed_end(seals, self.request.recording_id, store.start());
+        let sealed_end = sealed_end(seals, self.scope, store.start());
         Outgoing::Status(self.report(State::Streaming, store, sealed_end))
     }
 
@@ -404,11 +435,19 @@ impl Sender {
     }
 }
 
-/// Where `recording`'s range seals end, from `start`.
-fn sealed_end(seals: &[SealRecord], recording: u64, start: u64) -> u64 {
+/// Where the scope's range seals end, from `start`. ADR-0091's scope
+/// counts any range seal of the recording, as it always did; a Cluster
+/// log's, only its seals of the request's epoch.
+fn sealed_end(seals: &[SealRecord], scope: SealScope, start: u64) -> u64 {
+    let counts = |seal: &SealRecord| match scope {
+        SealScope::Segments { recording_id } => {
+            seal.subject == recording_id && seal.kind.is_range()
+        }
+        SealScope::ClusterLog { .. } => scope.admits(seal),
+    };
     seals
         .iter()
-        .filter(|seal| seal.subject == recording && seal.kind.is_range())
+        .filter(|seal| counts(seal))
         .map(|seal| seal.end)
         .max()
         .unwrap_or(start)
@@ -495,17 +534,33 @@ pub enum Arrival {
 #[derive(Debug)]
 pub struct Receiver {
     recording_id: u64,
+    scope: SealScope,
     replica: Replica,
 }
 
 impl Receiver {
-    /// Receives `recording_id` as `replica`.
+    /// Receives `recording_id` as `replica`, under ADR-0091's scope.
     #[must_use]
     pub const fn new(recording_id: u64, replica: Replica) -> Self {
+        Self::in_scope(SealScope::segments(recording_id), replica)
+    }
+
+    /// Receives the scope's recording as `replica`, counting only the
+    /// scope's seals (ADR-0120 decision 2): a Cluster log copy is recorded
+    /// under its recording id, not the seals' epoch.
+    #[must_use]
+    pub const fn in_scope(scope: SealScope, replica: Replica) -> Self {
         Self {
-            recording_id,
+            recording_id: scope.recording_id(),
+            scope,
             replica,
         }
+    }
+
+    /// The seals it counts.
+    #[must_use]
+    pub const fn scope(&self) -> SealScope {
+        self.scope
     }
 
     /// Takes bytes that arrived at `start` into `store`, the replica's
@@ -586,7 +641,7 @@ impl Receiver {
         copies: &mut CopyCatalog<D>,
         journal: &mut IntegrityJournal<D>,
     ) -> Result<Verdict, ReceiveError> {
-        check_seal(seal, self.recording_id).map_err(|_| ReceiveError::ForeignSeal)?;
+        check_seal_in(seal, self.scope).map_err(|_| ReceiveError::ForeignSeal)?;
         // Checked before anything is read or allocated: the range must be
         // whole in the store, and bounded.
         let (floor, tail) = (store.start(), store.written());
@@ -608,7 +663,9 @@ impl Receiver {
         let length = usize::try_from(span).map_err(|_| SegmentError::PositionOverflow)?;
         let mut bytes = vec![0u8; length];
         store.read(seal.start, &mut bytes)?;
-        Ok(self.replica.verify(copies, journal, seal, &bytes)?)
+        Ok(self
+            .replica
+            .verify_in(copies, journal, self.scope, seal, &bytes)?)
     }
 
     /// The replica this receiver records as.

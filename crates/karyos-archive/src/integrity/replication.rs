@@ -21,6 +21,7 @@ use super::copies::{ArrivalProfile, CopyCatalog, CopyRecord, CopyState, Enforcem
 use super::journal::{IntegrityError, IntegrityJournal};
 use super::{Digest, Inconsistency, SealRecord, verify_range};
 use crate::disk::Disk;
+use crate::replication::SealScope;
 
 /// Why a replica could not take a range.
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +30,12 @@ pub enum ReplicationError {
     /// The record seals no range of recorded bytes.
     #[error("seal record {counter} seals no range of recorded bytes")]
     NotARange {
+        /// The record's counter.
+        counter: u64,
+    },
+    /// The seal is not one of the replication's scope (ADR-0120 decision 2).
+    #[error("seal record {counter} is outside the replication's seal scope")]
+    OutOfScope {
         /// The record's counter.
         counter: u64,
     },
@@ -192,6 +199,47 @@ impl Replica {
         seal: &SealRecord,
         bytes: &[u8],
     ) -> Result<Verdict, ReplicationError> {
+        self.verify_as(copies, journal, seal.subject, seal, bytes)
+    }
+
+    /// [`Replica::verify`] for a replication under `scope`: the seal must
+    /// be one of the scope's, and the copy is recorded under the scope's
+    /// recording id, apart from the seal's subject (for a Cluster log,
+    /// `LOG_RECORDING`, not the seal epoch; ADR-0120 decisions 2 and 4).
+    ///
+    /// # Errors
+    ///
+    /// [`ReplicationError::OutOfScope`] for a seal the scope does not
+    /// admit, or as [`Replica::verify`].
+    pub fn verify_in<D: Disk>(
+        &self,
+        copies: &mut CopyCatalog<D>,
+        journal: &mut IntegrityJournal<D>,
+        scope: SealScope,
+        seal: &SealRecord,
+        bytes: &[u8],
+    ) -> Result<Verdict, ReplicationError> {
+        if !seal.kind.is_range() {
+            return Err(ReplicationError::NotARange {
+                counter: seal.counter,
+            });
+        }
+        if !scope.admits(seal) {
+            return Err(ReplicationError::OutOfScope {
+                counter: seal.counter,
+            });
+        }
+        self.verify_as(copies, journal, scope.recording_id(), seal, bytes)
+    }
+
+    fn verify_as<D: Disk>(
+        &self,
+        copies: &mut CopyCatalog<D>,
+        journal: &mut IntegrityJournal<D>,
+        recording: u64,
+        seal: &SealRecord,
+        bytes: &[u8],
+    ) -> Result<Verdict, ReplicationError> {
         if !seal.kind.is_range() {
             return Err(ReplicationError::NotARange {
                 counter: seal.counter,
@@ -202,7 +250,7 @@ impl Replica {
         }
         let counted = copies.current()?.into_iter().any(|copy| {
             copy.location == self.location
-                && copy.recording == seal.subject
+                && copy.recording == recording
                 && copy.start == seal.start
                 && copy.end == seal.end
                 && copy.digest == seal.content
@@ -216,7 +264,7 @@ impl Replica {
             return Ok(Verdict::AlreadyCounted);
         }
         let record = self.record(
-            seal.subject,
+            recording,
             seal.start,
             seal.end,
             seal.content,
@@ -284,6 +332,31 @@ impl Replica {
         source_start: u64,
         source_sealed_end: u64,
     ) -> Result<ReplicationLag, IntegrityError> {
+        self.lag_in(
+            copies,
+            SealScope::segments(recording),
+            source_start,
+            source_sealed_end,
+        )
+    }
+
+    /// [`Replica::lag`] of a replication under `scope`: the copies counted
+    /// are those recorded under the scope's recording id (for a Cluster
+    /// log, `LOG_RECORDING`), whatever the seals' subject. A standby keeps
+    /// each source node and epoch at a location of its own (ADR-0120
+    /// decision 4), so this replica's copies are of one epoch.
+    ///
+    /// # Errors
+    ///
+    /// The copy catalog's error.
+    pub fn lag_in<D: Disk>(
+        &self,
+        copies: &CopyCatalog<D>,
+        scope: SealScope,
+        source_start: u64,
+        source_sealed_end: u64,
+    ) -> Result<ReplicationLag, IntegrityError> {
+        let recording = scope.recording_id();
         let mut verified: Vec<(u64, u64)> = copies
             .current()?
             .into_iter()
