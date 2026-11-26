@@ -71,6 +71,13 @@ while [ $# -gt 0 ]; do
     shift 2
 done
 first=${seeds%..*} last=${seeds#*..}
+# Bad bounds would make every seed loop run zero times, leaving the log
+# alone to decide; refuse them before building anything.
+number='^[0-9]+$'
+[[ $seeds == *..* && $first =~ $number && $last =~ $number ]] && [ "$first" -le "$last" ] ||
+    { echo "upgrade-evidence: --seeds must be <first>..<last>, first <= last: $seeds" >&2; exit 2; }
+[[ $count =~ $number ]] && [ "$count" -ge 1 ] ||
+    { echo "upgrade-evidence: --count must be a positive integer: $count" >&2; exit 2; }
 [ -d "$log_dir" ] || { echo "upgrade-evidence: no log at $log_dir" >&2; exit 2; }
 
 root=$(git rev-parse --show-toplevel)
@@ -89,6 +96,12 @@ cleanup() {
 trap cleanup EXIT
 
 target=${CARGO_TARGET_DIR:-$root/target}
+# Absolute, so the builds inside each worktree and the binaries run from
+# here name the same directory.
+case $target in
+    /*) ;;
+    *) target=$PWD/$target ;;
+esac
 for side in old new; do
     rev=$old supported=$old_supported
     [ $side = new ] && rev=$new supported=$new_supported

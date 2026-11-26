@@ -66,7 +66,8 @@ use karyos_archive::segment::{Geometry, SyncPolicy};
 use karyos_cluster::log::{Entry, RaftLog};
 use karyos_cluster::service::{
     Activation, ActiveVersion, Applied, ApplyError, ClusteredService, ContainerConfig, Context,
-    CoordinatedStop, Envelope, ServiceContainer, ServiceSnapshot, SessionBounds, SnapshotFull,
+    CoordinatedStop, Envelope, MAX_SERVICE_PARTS, ServiceContainer, ServiceSnapshot, SessionBounds,
+    SnapshotFull,
 };
 use karyos_cluster::{DedupConfig, Request};
 
@@ -511,12 +512,39 @@ pub struct Step {
     pub outcome: String,
 }
 
+/// The closing snapshot's budget in [`replay`]: a service whose state
+/// needs more calls [`replay_with`] with its own.
+pub const SNAPSHOT_BUDGET: usize = 1 << 20;
+
 /// Applies `entries` in order to `container` and returns each step, up to
-/// and including the first stop, then the closing snapshot.
+/// and including the first stop, then the closing snapshot, taken within
+/// [`SNAPSHOT_BUDGET`] bytes and [`MAX_SERVICE_PARTS`] parts.
+///
+/// # Errors
+///
+/// A closing snapshot that could not be taken: the replay is not
+/// evidence, since the states it would compare are unknown.
 pub fn replay<S: ClusteredService>(
     container: &mut ServiceContainer<S>,
     entries: impl IntoIterator<Item = Entry>,
-) -> Vec<Step> {
+) -> Result<Vec<Step>, String> {
+    replay_with(
+        container,
+        entries,
+        ServiceSnapshot::new(SNAPSHOT_BUDGET, MAX_SERVICE_PARTS),
+    )
+}
+
+/// [`replay`], with the closing snapshot taken into `parts`.
+///
+/// # Errors
+///
+/// A closing snapshot that could not be taken.
+pub fn replay_with<S: ClusteredService>(
+    container: &mut ServiceContainer<S>,
+    entries: impl IntoIterator<Item = Entry>,
+    mut parts: ServiceSnapshot,
+) -> Result<Vec<Step>, String> {
     let mut steps = Vec::new();
     for entry in entries {
         let result = container.apply(&entry);
@@ -530,13 +558,19 @@ pub fn replay<S: ClusteredService>(
             break;
         }
     }
-    let mut parts = ServiceSnapshot::new(4096, 4);
-    let snapshot = format!("{:?}", container.snapshot(&mut parts));
+    let snapshot = match container.snapshot(&mut parts) {
+        Ok(snapshot) => format!("{snapshot:?}"),
+        Err(error) => {
+            return Err(format!(
+                "the closing snapshot could not be taken: {error:?}"
+            ));
+        }
+    };
     steps.push(Step {
         entry: None,
         outcome: snapshot,
     });
-    steps
+    Ok(steps)
 }
 
 /// The first step at which two replays differ: its position, and both
@@ -556,7 +590,9 @@ pub struct Divergence {
 ///
 /// # Errors
 ///
-/// The first [`Divergence`].
+/// The first [`Divergence`]; a replay that is not evidence (a container
+/// that cannot start, a closing snapshot that cannot be taken) is one with
+/// neither side.
 pub fn differential<A: ClusteredService, B: ClusteredService>(
     old: A,
     new: B,
@@ -579,8 +615,15 @@ pub fn differential<A: ClusteredService, B: ClusteredService>(
             new: None,
         })
     })?;
-    let left = replay(&mut old, entries.clone());
-    let right = replay(&mut new, entries);
+    let incomplete = |_| {
+        Box::new(Divergence {
+            at: 0,
+            old: None,
+            new: None,
+        })
+    };
+    let left = replay(&mut old, entries.clone()).map_err(incomplete)?;
+    let right = replay(&mut new, entries).map_err(incomplete)?;
     compare(&left, &right)
 }
 
@@ -643,9 +686,17 @@ pub fn write_journal(dir: &Path, manifest: &str, steps: &[Step]) -> Result<(), S
             Some(entry) => (KIND_ENTRY, entry.payload.as_slice(), entry.event_time),
             None => (KIND_SNAPSHOT, &[][..], 0),
         };
+        // A value is never cut: a prefix compared clean says nothing of
+        // the rest.
         let observed = step.outcome.as_bytes();
-        let observed = observed.get(..MAX_INLINE).unwrap_or(observed);
-        let value = value.get(..MAX_INLINE).unwrap_or(value);
+        if observed.len() > MAX_INLINE || value.len() > MAX_INLINE {
+            return Err(format!(
+                "group_seq {seq}: an entry of {} bytes or an outcome of {} bytes is over the \
+                 {MAX_INLINE}-byte record value; not recorded",
+                value.len(),
+                observed.len()
+            ));
+        }
         let records = [
             GroupRecord::External(ExternalEvent {
                 group_seq: seq,
@@ -689,6 +740,14 @@ pub fn read_log(dir: &Path, geometry: Geometry) -> Result<Vec<Entry>, String> {
         return Ok(Vec::new());
     };
     let first = log.first_index();
+    // The container starts at index 1: a compacted log would replay
+    // nothing but its first entry's `OutOfOrder`, the same on both sides.
+    if first != 1 {
+        return Err(format!(
+            "{}: the log starts at index {first}; the replay needs it from index 1",
+            dir.display()
+        ));
+    }
     log.entries(first..last + 1, u64::MAX)
         .map_err(|error| error.to_string())
 }
@@ -796,12 +855,12 @@ fn execute(args: &Args) -> Result<(), String> {
         ),
         "replay" => {
             let entries = read_log(&need(&args.log, "--log")?, geometry()?)?;
-            let steps = replay(&mut container()?, entries);
+            let steps = replay(&mut container()?, entries)?;
             write_journal(&need(&args.out, "--out")?, &args.manifest, &steps)
         }
         _ => {
             let entries = generate(args.seed, args.count, args.max_service);
-            let steps = replay(&mut container()?, entries);
+            let steps = replay(&mut container()?, entries)?;
             write_journal(&need(&args.out, "--out")?, &args.manifest, &steps)
         }
     }

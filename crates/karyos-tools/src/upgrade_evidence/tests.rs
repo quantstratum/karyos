@@ -177,7 +177,7 @@ fn test_a_version_1_and_a_version_2_binary_agree_on_every_seed() {
         assert!(steps.is_ok(), "seed {seed}: {steps:?}");
         let mut container =
             ServiceContainer::new(Reference::new(1), ContainerConfig::default()).unwrap();
-        let replayed = replay(&mut container, generate(seed, COUNT, 1));
+        let replayed = replay(&mut container, generate(seed, COUNT, 1)).unwrap();
         // Each sequence ends at its unknown input's stop, compared too.
         let last = &replayed[replayed.len() - 2].outcome;
         assert!(last.starts_with("Err("), "seed {seed}: {last}");
@@ -193,7 +193,7 @@ fn test_a_version_1_and_a_version_2_binary_agree_on_every_seed() {
         .flat_map(|seed| {
             let mut container =
                 ServiceContainer::new(Reference::new(1), ContainerConfig::default()).unwrap();
-            replay(&mut container, generate(seed, COUNT, 1))
+            replay(&mut container, generate(seed, COUNT, 1)).unwrap()
         })
         .filter(|step| step.outcome.starts_with("Ok(Fired"))
         .count();
@@ -248,8 +248,8 @@ fn test_a_new_command_type_is_refused_alike_by_both() {
     ];
     let mut old = ServiceContainer::new(Reference::new(1), ContainerConfig::default()).unwrap();
     let mut new = ServiceContainer::new(Reference::new(2), ContainerConfig::default()).unwrap();
-    let left = replay(&mut old, entries.clone());
-    let right = replay(&mut new, entries);
+    let left = replay(&mut old, entries.clone()).unwrap();
+    let right = replay(&mut new, entries).unwrap();
     assert_eq!(compare(&left, &right), Ok(3));
     assert_eq!(left[1].outcome, right[1].outcome);
     assert!(left[1].outcome.contains("VersionInactive { active"));
@@ -280,7 +280,7 @@ fn test_the_journals_compare_clean_and_a_change_diverges() {
     let entries = generate(3, COUNT, 1);
     let run = |service: Reference| {
         let mut container = ServiceContainer::new(service, ContainerConfig::default()).unwrap();
-        replay(&mut container, entries.clone())
+        replay(&mut container, entries.clone()).unwrap()
     };
     let old = journals(&scratch, "old", &run(Reference::new(1)), "old");
     let new = journals(&scratch, "new", &run(Reference::new(2)), "new");
@@ -291,7 +291,7 @@ fn test_the_journals_compare_clean_and_a_change_diverges() {
     let changed = journals(
         &scratch,
         "changed",
-        &replay(&mut container, entries.clone()),
+        &replay(&mut container, entries.clone()).unwrap(),
         "changed",
     );
     let report = diff(&request(old, changed));
@@ -377,4 +377,66 @@ fn test_bad_arguments_are_an_error() {
     );
     assert_eq!(run(Vec::<OsString>::new(), &mut out, &mut err), 0);
     assert!(String::from_utf8_lossy(&out).contains("upgrade-evidence"));
+}
+
+/// A value over a record's inline limit is refused, never cut: a cut
+/// value would compare clean on its prefix alone.
+#[test]
+fn test_an_outcome_over_the_record_limit_is_refused_not_cut() {
+    let scratch = Scratch::new("oversize");
+    let steps = vec![Step {
+        entry: None,
+        outcome: "x".repeat(MAX_INLINE + 1),
+    }];
+    let refused = write_journal(&scratch.0.join("j"), "m", &steps).unwrap_err();
+    assert!(refused.contains("not recorded"), "{refused}");
+    let fits = vec![Step {
+        entry: None,
+        outcome: "x".repeat(MAX_INLINE),
+    }];
+    write_journal(&scratch.0.join("k"), "m", &fits).unwrap();
+}
+
+/// A log that does not start at index 1 is refused before any replay:
+/// both binaries would otherwise record the same `OutOfOrder`.
+#[test]
+fn test_a_log_that_starts_above_index_1_is_refused() {
+    let scratch = Scratch::new("compacted");
+    let dir = scratch.0.join("log");
+    std::fs::create_dir_all(&dir).unwrap();
+    let geometry = Geometry::new(65_536, 65_536).unwrap();
+    let entries: Vec<Entry> = generate(5, 10, 1)
+        .into_iter()
+        .map(|mut entry| {
+            entry.index += 4;
+            entry
+        })
+        .collect();
+    let mut log = RaftLog::create(StdDisk, &dir, geometry, 5).unwrap();
+    let _ = log.append(&entries).unwrap();
+    let _ = log.sync().unwrap();
+    log.close().unwrap();
+    let refused = read_log(&dir, geometry).unwrap_err();
+    assert!(refused.contains("starts at index 5"), "{refused}");
+}
+
+/// A closing snapshot that cannot be taken makes the replay an error,
+/// not a comparable outcome; the default budget holds the reference.
+#[test]
+fn test_a_snapshot_that_cannot_be_taken_is_not_evidence() {
+    let entries = generate(2, 50, 1);
+    let mut container =
+        ServiceContainer::new(Reference::new(1), ContainerConfig::default()).unwrap();
+    let refused =
+        replay_with(&mut container, entries.clone(), ServiceSnapshot::new(8, 1)).unwrap_err();
+    assert!(refused.contains("closing snapshot"), "{refused}");
+    let mut container =
+        ServiceContainer::new(Reference::new(1), ContainerConfig::default()).unwrap();
+    let steps = replay(&mut container, entries).unwrap();
+    let closing = steps.last().unwrap();
+    assert!(
+        closing.entry.is_none() && !closing.outcome.contains("Full"),
+        "{}",
+        closing.outcome
+    );
 }

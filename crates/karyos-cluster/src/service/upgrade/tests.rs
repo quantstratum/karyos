@@ -920,3 +920,30 @@ fn test_a_new_command_type_applies_identically_on_an_old_and_a_new_binary() {
     assert_eq!(old.applied(), new.applied());
     assert!(old.service().seen.is_empty() && new.service().seen.is_empty());
 }
+
+/// An entry at the activation index that stops the container (here
+/// different bounds under a session) stops it before the activation:
+/// the version, the pending activation and the service are unchanged, so
+/// a snapshot never holds the next version under the previous index.
+#[test]
+fn test_an_entry_that_stops_at_the_activation_index_changes_no_version() {
+    let mut container = up_to(2, 6);
+    assert_eq!(
+        container.apply(&raw(7, activation(2, 1, &[5]))),
+        Ok(Applied::Nothing)
+    );
+    fill(&mut container, 8, 106);
+    let logged = container.sessions().config().with_window(2);
+    let bounds = super::super::SessionBounds::new(logged).to_vec().unwrap();
+    assert!(matches!(
+        container.apply(&raw(107, bounds)),
+        Err(ApplyError::BoundsDiffer { .. })
+    ));
+    assert_eq!(container.applied(), Some(106));
+    assert_eq!(container.active_version(), ActiveVersion::INITIAL);
+    assert_eq!(
+        container.pending_activation(),
+        Some((ActiveVersion::new(2, 1), 107))
+    );
+    assert!(container.service().seen.is_empty(), "no on_configuration");
+}

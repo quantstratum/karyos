@@ -85,7 +85,7 @@
 //! ([`Context::active_version`]), never the binary's; a command the active
 //! version cannot run ([`ClusteredService::required_version`]) is refused
 //! at the leader ([`ProposeRefused::VersionInactive`]) and again when it
-//! applies ([`Applied::CoreRefused`]). See [`upgrade`]'s table.
+//! applies ([`Applied::CoreRefused`]). See the `service::upgrade` module's table.
 
 mod compose;
 #[cfg(test)]
@@ -1296,6 +1296,13 @@ impl<S: ClusteredService> ServiceContainer<S> {
             }
             _ => false,
         };
+        // The entry's own fallible checks run before the activation at
+        // its index, so an entry that stops the container changes no
+        // version and reaches no `on_configuration`.
+        let rebuilt = match &decoded {
+            Some(Decoded::Bounds(bounds)) => self.prepare_bounds(bounds)?,
+            _ => None,
+        };
         self.activate(entry)?;
         let envelope = match decoded {
             None => None,
@@ -1304,7 +1311,7 @@ impl<S: ClusteredService> ServiceContainer<S> {
             }
             Some(decoded) => match decoded {
                 Decoded::Service(envelope) => Some(envelope),
-                Decoded::Bounds(bounds) => return self.apply_bounds(entry, bounds),
+                Decoded::Bounds(bounds) => return Ok(self.apply_bounds(entry, &bounds, rebuilt)),
                 Decoded::Membership => {
                     // The core's: it delivers nothing, and moves the log
                     // time on as any entry.
@@ -1481,21 +1488,32 @@ impl<S: ClusteredService> ServiceContainer<S> {
         })
     }
 
+    /// The checks of a bounds entry that can stop the container, with
+    /// nothing changed: the rebuilt table when different bounds rebuild a
+    /// fresh one.
+    fn prepare_bounds(&self, bounds: &SessionBounds) -> Result<Option<SessionTable>, ApplyError> {
+        let table = self.sessions.config();
+        if self.bounds_logged || bounds.config == table {
+            return Ok(None);
+        }
+        if !self.fresh {
+            return Err(ApplyError::BoundsDiffer {
+                logged: bounds.config,
+                table,
+            });
+        }
+        SessionTable::new_within(bounds.config, self.session_budget)
+            .map(Some)
+            .map_err(ApplyError::BoundsUnheld)
+    }
+
     fn apply_bounds(
         &mut self,
         entry: &Entry,
-        bounds: SessionBounds,
-    ) -> Result<Applied<'_>, ApplyError> {
-        let table = self.sessions.config();
-        if !self.bounds_logged && bounds.config != table {
-            if !self.fresh {
-                return Err(ApplyError::BoundsDiffer {
-                    logged: bounds.config,
-                    table,
-                });
-            }
-            let mut rebuilt = SessionTable::new_within(bounds.config, self.session_budget)
-                .map_err(ApplyError::BoundsUnheld)?;
+        bounds: &SessionBounds,
+        rebuilt: Option<SessionTable>,
+    ) -> Applied<'_> {
+        if let Some(mut rebuilt) = rebuilt {
             rebuilt.observe(self.sessions.log_time());
             self.sessions = rebuilt;
         }
@@ -1507,6 +1525,6 @@ impl<S: ClusteredService> ServiceContainer<S> {
         self.applied = Some(entry.index);
         self.bounds_logged = true;
         self.sessions.observe(entry.event_time);
-        Ok(Applied::Nothing)
+        Applied::Nothing
     }
 }
