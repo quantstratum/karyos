@@ -337,10 +337,6 @@ impl Wire for Custom {
         decode(bytes)
     }
 
-    /// The adapter's pool gave out its appends' entries and vectors: they
-    /// come back to it through the Ready buffer once sent (C5 v3).
-    const RECLAIMS_SENT: bool = true;
-
     fn appended(message: &Message) -> Option<(u64, Vec<(u64, u64)>)> {
         let CoreMessage::Append { term, .. } = message.core else {
             return None;

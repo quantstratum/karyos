@@ -98,12 +98,6 @@ pub trait Wire: ConsensusCore {
     /// The term and index an accepted append reply acknowledges; `None`
     /// for any other message.
     fn acknowledged(message: &Self::Message) -> Option<(u64, u64)>;
-
-    /// Whether the node gives each message back to the core once it has
-    /// sent it, through the Ready buffer ([`ReadyBuf::give_sent`]), for an
-    /// adapter that pools its messages' buffers (C5 v3). Otherwise the node
-    /// frees it, counted as its encoding.
-    const RECLAIMS_SENT: bool = false;
 }
 
 /// A probed core's messages are its inner core's. [`run_server`] counts
@@ -137,8 +131,6 @@ impl<C: Wire> Wire for Probed<C> {
     fn acknowledged(message: &Self::Message) -> Option<(u64, u64)> {
         C::acknowledged(message)
     }
-
-    const RECLAIMS_SENT: bool = C::RECLAIMS_SENT;
 }
 
 /// The largest datagram a node sends or reads.
@@ -987,22 +979,18 @@ fn arrived<'d, C: Wire>(
 /// its warm-up (C5 v2, "Processes"; version 1's allocation gate counts
 /// "adapters and encoding included"); outside a measurement it counts
 /// nothing. The message itself is freed here too, as the outbox hands it
-/// over, unless the core takes its messages back ([`Wire::RECLAIMS_SENT`]):
-/// then it is returned, for the node to give back through its Ready
-/// buffer.
+/// over.
 fn send<C: Wire>(
     socket: &UdpSocket,
     (id, number): (NodeId, u32),
     message: C::Message,
     address: SocketAddr,
     buffers: &mut Buffers,
-) -> Option<C::Message> {
+) {
     probe::encoding(|| {
         transmit::<C>(socket, (id, number), &message, address, buffers);
-        // Given back for the node to return through its Ready buffer, or
-        // freed here.
-        C::RECLAIMS_SENT.then_some(message)
-    })
+        drop(message);
+    });
 }
 
 /// The buffers a node encodes and sends in, kept and prefilled at its
@@ -1137,9 +1125,6 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
         traces: config.case.limits.is_some(),
     };
     serving.record_state(&core, &log);
-    // Room for the messages given back between two drives, at
-    // initialisation.
-    serving.ready.reserve_sent(SENT_ROOM);
     let start = Instant::now();
     let mut buffer = vec![0u8; MAX_DATAGRAM];
     let mut scratch = vec![0u8; 1 << 16];
