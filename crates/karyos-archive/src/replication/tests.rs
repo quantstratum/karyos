@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! ADR-0091's vectors P-1 to P-6, byte for byte, and the rules.
+//! ADR-0091's vectors P-1 to P-6 and ADR-0120's P-8, byte for byte, and
+//! the rules.
 
 #![allow(
     clippy::unwrap_used,
@@ -26,6 +27,23 @@ const P4: &str = "06006600010078008400000007000000000000000100020000000000050000
 const P5: &str = "0600670001002900350000000700000000000000030000000000000000000000000000000010000000000000002000000000000001";
 const P6: &str =
     "06000100010021002d000000070000000000000003000000000000000a00000000000000090000000000000001";
+
+/// ADR-0120's P-8: P-4's inputs with `kind` 3 (`ClusterLog`) and
+/// `subject` 2, the Cluster log's seal epoch.
+const P8_BYTES: &str = "060066000100780084000000070000000000000001000300000000000500000000000000020000000000000000000000000000000010000000000000111111111111111111111111111111111111111111111111111111111111111122222222222222222222222222222222222222222222222222222222222222220620ed5900000000";
+
+/// The Cluster log recording of the Cluster log scope's tests
+/// (karyos-cluster's `LOG_RECORDING`), and the seal epoch of P-8.
+const LOG: u64 = 1;
+const EPOCH: u64 = 2;
+
+fn log_seal() -> SealRecord {
+    SealRecord {
+        kind: SealKind::ClusterLog,
+        subject: EPOCH,
+        ..seal()
+    }
+}
 
 fn seal() -> SealRecord {
     SealRecord {
@@ -107,15 +125,140 @@ fn the_vectors_decode_and_encode_exactly() {
 }
 
 #[test]
+fn p8_a_cluster_log_seal_decodes_and_encodes_exactly() {
+    let message = ReplicationMessage::SourceSeal(SourceSeal {
+        correlation_id: 7,
+        seal: log_seal(),
+    });
+    let wire = hex(P8_BYTES);
+    assert_eq!(wire.len(), 132);
+    assert_eq!(encoded(&message), wire);
+    assert_eq!(ReplicationMessage::decode(&wire).unwrap(), message);
+    // Only the kind, the subject and the CRC differ from P-4.
+    let p4 = hex(P4);
+    let differ: Vec<usize> = (0..132).filter(|&at| p4[at] != wire[at]).collect();
+    assert_eq!(differ, [22, 36, 124, 125, 126, 127]);
+}
+
+#[test]
+fn a_source_seal_carries_only_range_kinds_of_a_replication() {
+    for kind in [
+        SealKind::OpenSegment,
+        SealKind::ClosedSegment,
+        SealKind::ClusterLog,
+    ] {
+        let message = ReplicationMessage::SourceSeal(SourceSeal {
+            correlation_id: 7,
+            seal: SealRecord { kind, ..seal() },
+        });
+        assert_eq!(
+            ReplicationMessage::decode(&encoded(&message)).unwrap(),
+            message
+        );
+    }
+    let catalog = SourceSeal {
+        correlation_id: 7,
+        seal: SealRecord {
+            kind: SealKind::Catalog,
+            ..seal()
+        },
+    };
+    assert_eq!(
+        catalog.encode(&mut [0u8; 132]),
+        Err(CodecError::ValueOutOfRange { field: "seal" })
+    );
+    // A catalog record on the wire, its CRC right: refused on decode.
+    let mut wire = hex(P4);
+    let record = catalog.seal.encode();
+    wire[20..132].copy_from_slice(&record);
+    assert_eq!(
+        ReplicationMessage::decode(&wire),
+        Err(CodecError::ValueOutOfRange { field: "seal" })
+    );
+}
+
+#[test]
+fn a_cluster_log_scope_counts_only_its_epochs_log_seals() {
+    let scope = SealScope::cluster_log(LOG, EPOCH);
+    assert_eq!(scope.recording_id(), LOG);
+    assert!(check_seal_in(&log_seal(), scope).is_ok());
+    // Another epoch, or a segment seal of any subject, is refused.
+    let other_epoch = SealRecord {
+        subject: EPOCH + 1,
+        ..log_seal()
+    };
+    assert!(check_seal_in(&other_epoch, scope).is_err());
+    for kind in [SealKind::OpenSegment, SealKind::ClosedSegment] {
+        for subject in [LOG, EPOCH] {
+            let segment = SealRecord {
+                kind,
+                subject,
+                ..seal()
+            };
+            assert!(check_seal_in(&segment, scope).is_err());
+        }
+    }
+    // A log seal is never one of an ordinary recording, whatever its
+    // subject.
+    assert!(check_seal(&log_seal(), EPOCH).is_err());
+    assert!(check_seal_in(&log_seal(), SealScope::segments(EPOCH)).is_err());
+    assert!(check_seal_in(&seal(), SealScope::segments(3)).is_ok());
+}
+
+#[test]
+fn a_cluster_log_request_starts_and_ends_on_its_epochs_seals() {
+    let scope = SealScope::cluster_log(LOG, EPOCH);
+    let request = |recording_id, from, until| ReplicateRecording {
+        correlation_id: 1,
+        recording_id,
+        from,
+        until,
+        mode: Mode::OnDemand,
+    };
+    let older = SealRecord {
+        subject: EPOCH - 1,
+        end: 8192,
+        ..log_seal()
+    };
+    let segment = SealRecord {
+        subject: LOG,
+        end: 12288,
+        ..seal()
+    };
+    let seals = [log_seal(), older, segment];
+    let check = |request: &ReplicateRecording| check_request_in(request, scope, 0, &seals);
+    assert_eq!(check(&request(LOG, 0, 4096)), Ok(()));
+    assert_eq!(check(&request(LOG, 4096, u64::MAX)), Ok(()));
+    // Another epoch's boundary, or a segment seal's, is no boundary here.
+    assert_eq!(
+        check(&request(LOG, 8192, u64::MAX)),
+        Err(RequestRefusal::FromOffBoundary)
+    );
+    assert_eq!(
+        check(&request(LOG, 0, 12288)),
+        Err(RequestRefusal::UntilOffBoundary)
+    );
+    assert_eq!(
+        check(&request(LOG + 5, 0, 4096)),
+        Err(RequestRefusal::OutOfScope)
+    );
+    // An ordinary recording's request never takes a log seal as a boundary.
+    assert_eq!(
+        check_request(&request(EPOCH, 4096, u64::MAX), 0, &seals),
+        Err(RequestRefusal::FromOffBoundary)
+    );
+    assert_eq!(
+        check_request(&request(LOG, 12288, u64::MAX), 0, &seals),
+        Ok(())
+    );
+}
+
+#[test]
 fn refusals_follow_the_rules() {
-    // A Cluster log seal, or a seal of another recording, is refused.
+    // A Cluster log seal, or a seal of another recording, is refused for
+    // an ordinary recording.
     let mut cluster = seal();
     cluster.kind = SealKind::ClusterLog;
-    let message = SourceSeal {
-        correlation_id: 7,
-        seal: cluster,
-    };
-    assert!(message.encode(&mut [0u8; 132]).is_err());
     assert!(check_seal(&cluster, 3).is_err());
     assert!(check_seal(&seal(), 4).is_err());
     assert!(check_seal(&seal(), 3).is_ok());
@@ -792,5 +935,242 @@ mod transport {
                 field: "sealed_end"
             })
         );
+    }
+}
+
+mod cluster_log {
+    //! ADR-0120 decision 2: a Cluster log replication sends and counts
+    //! only its `ClusterLog` seals of one epoch, and its copies are
+    //! recorded under the log's recording id, not the epoch.
+
+    use std::path::PathBuf;
+
+    use super::super::transport::{Outgoing, ReceiveError, Receiver, Sender};
+    use super::super::*;
+    use crate::disk::StdDisk;
+    use crate::integrity::copies::{CopyCatalog, Enforcement};
+    use crate::integrity::journal::IntegrityJournal;
+    use crate::integrity::replication::{Replica, ReplicationError, Verdict};
+    use crate::segment::{Geometry, SegmentStore, SyncPolicy};
+
+    const LOG: u64 = super::LOG;
+    const EPOCH: u64 = super::EPOCH;
+
+    struct Dirs(PathBuf);
+
+    impl Drop for Dirs {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn dirs(name: &str) -> (Dirs, PathBuf, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("karyos-repl-log-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (source, replica) = (root.join("source"), root.join("replica"));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&replica).unwrap();
+        (Dirs(root), source, replica)
+    }
+
+    fn store(dir: &std::path::Path) -> SegmentStore<StdDisk> {
+        SegmentStore::create(
+            StdDisk,
+            dir,
+            LOG,
+            Geometry::new(4096, 1 << 16).unwrap(),
+            SyncPolicy::None,
+            0,
+        )
+        .unwrap()
+    }
+
+    /// A log of three ranges: the first sealed in epoch 1, the next two
+    /// in [`EPOCH`], plus a segment seal of the log's recording id over
+    /// the last range that no Cluster log replication may take.
+    fn source(dir: &std::path::Path) -> (SegmentStore<StdDisk>, Vec<SealRecord>) {
+        let mut store = store(dir);
+        let mut journal = IntegrityJournal::open(StdDisk, dir).unwrap().journal;
+        let mut position = 0u64;
+        for (index, (epoch, length)) in [(EPOCH - 1, 64usize), (EPOCH, 100), (EPOCH, 20_000)]
+            .into_iter()
+            .enumerate()
+        {
+            let bytes = vec![u8::try_from(index + 1).unwrap(); length];
+            store.append(position, &bytes).unwrap();
+            let end = position + u64::try_from(length).unwrap();
+            journal
+                .seal_cluster_log(epoch, position, &bytes, end)
+                .unwrap()
+                .unwrap();
+            position = end;
+        }
+        store.sync().unwrap();
+        (store, journal.records().unwrap())
+    }
+
+    fn request(from: u64) -> ReplicateRecording {
+        ReplicateRecording {
+            correlation_id: 7,
+            recording_id: LOG,
+            from,
+            until: u64::MAX,
+            mode: Mode::OnDemand,
+        }
+    }
+
+    fn replica() -> Replica {
+        Replica::new([9; 32], 0, Enforcement::Unsupported)
+    }
+
+    #[test]
+    fn a_cluster_log_replicates_under_its_epochs_seals() {
+        let (_dirs, source_dir, replica_dir) = dirs("whole");
+        let (mut source_store, seals) = source(&source_dir);
+        let scope = SealScope::cluster_log(LOG, EPOCH);
+        // The epoch starts at 64: below it is another epoch's range.
+        assert!(Sender::accept_in(request(0), scope, true, 64, &seals).is_err());
+        let mut sender = Sender::accept_in(request(64), scope, true, 64, &seals).unwrap();
+        assert_eq!(sender.scope(), scope);
+        let mut out = Vec::new();
+        sender
+            .poll(&mut source_store, &seals, false, usize::MAX, &mut out)
+            .unwrap();
+        let sent: Vec<SealRecord> = out
+            .iter()
+            .filter_map(|message| match message {
+                Outgoing::Seal(seal) => Some(*seal),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent.len(), 2);
+        assert!(
+            sent.iter()
+                .all(|seal| seal.kind == SealKind::ClusterLog && seal.subject == EPOCH)
+        );
+        assert!(matches!(
+            out.last(),
+            Some(Outgoing::Status(status))
+                if status.state == State::CaughtUp && status.sealed_end == 20_164
+        ));
+
+        // The replica holds the log from the epoch's start.
+        let mut store = SegmentStore::create(
+            StdDisk,
+            &replica_dir,
+            LOG,
+            Geometry::new(4096, 1 << 16).unwrap(),
+            SyncPolicy::None,
+            64,
+        )
+        .unwrap();
+        let mut journal = IntegrityJournal::open(StdDisk, &replica_dir)
+            .unwrap()
+            .journal;
+        let mut copies = CopyCatalog::open(StdDisk, &replica_dir, &mut journal).unwrap();
+        let receiver = Receiver::in_scope(scope, replica());
+        assert_eq!(receiver.scope(), scope);
+        let mut buf = vec![0u8; 16422];
+        let mut verdicts = Vec::new();
+        for message in &out {
+            let message = match message {
+                Outgoing::Bytes { start, bytes } => {
+                    ReplicationMessage::RecordingBytes(RecordingBytes {
+                        correlation_id: 7,
+                        recording_id: LOG,
+                        start: *start,
+                        bytes,
+                    })
+                }
+                Outgoing::Seal(seal) => ReplicationMessage::SourceSeal(SourceSeal {
+                    correlation_id: 7,
+                    seal: *seal,
+                }),
+                Outgoing::Status(status) => ReplicationMessage::ReplicationStatus(*status),
+            };
+            let length = message.encode(&mut buf).unwrap();
+            match ReplicationMessage::decode(&buf[..length]).unwrap() {
+                ReplicationMessage::RecordingBytes(bytes) => {
+                    let _ = receiver
+                        .bytes(bytes.recording_id, bytes.start, bytes.bytes, &mut store)
+                        .unwrap();
+                }
+                ReplicationMessage::SourceSeal(seal) => verdicts.push(
+                    receiver
+                        .seal(&seal.seal, &mut store, &mut copies, &mut journal)
+                        .unwrap(),
+                ),
+                ReplicationMessage::ReplicationStatus(_) => {}
+                _ => panic!("not a source message"),
+            }
+        }
+        assert!(
+            verdicts
+                .iter()
+                .all(|verdict| matches!(verdict, Verdict::Counted(_)))
+        );
+        // Recorded under the log's recording id, never the epoch.
+        for (start, end) in [(64, 164), (164, 20_164)] {
+            assert_eq!(copies.verified_copies(LOG, start, end).unwrap(), 1);
+            assert_eq!(copies.verified_copies(EPOCH, start, end).unwrap(), 0);
+        }
+        let lag = receiver
+            .replica()
+            .lag_in(&copies, scope, 64, 20_164)
+            .unwrap();
+        assert_eq!((lag.verified_end, lag.behind), (20_164, 0));
+        let short = receiver
+            .replica()
+            .lag_in(&copies, scope, 64, 30_000)
+            .unwrap();
+        assert_eq!(short.behind, 30_000 - 20_164);
+        assert_eq!(
+            receiver.replica().lag(&copies, LOG, 64, 20_164).unwrap(),
+            lag
+        );
+
+        // A seal of another epoch, or a segment seal of the log's id, is
+        // foreign to this replication and records nothing.
+        let records = copies.records().len();
+        let other = seals
+            .iter()
+            .find(|seal| seal.subject == EPOCH - 1)
+            .copied()
+            .unwrap();
+        let segment = SealRecord {
+            kind: SealKind::OpenSegment,
+            subject: LOG,
+            ..sent[0]
+        };
+        for foreign in [other, segment] {
+            assert!(matches!(
+                receiver.seal(&foreign, &mut store, &mut copies, &mut journal),
+                Err(ReceiveError::ForeignSeal)
+            ));
+            assert!(matches!(
+                replica().verify_in(&mut copies, &mut journal, scope, &foreign, &[]),
+                Err(ReplicationError::OutOfScope { .. })
+            ));
+        }
+        assert_eq!(copies.records().len(), records);
+    }
+
+    #[test]
+    fn an_ordinary_replication_of_the_log_sends_no_log_seal() {
+        let (_dirs, source_dir, _replica_dir) = dirs("ordinary");
+        let (mut source_store, seals) = source(&source_dir);
+        // ADR-0091's scope: no segment seal covers the log, so nothing is
+        // sent and no log seal is a boundary.
+        let mut sender = Sender::accept(request(0), true, 0, &seals).unwrap();
+        let mut out = Vec::new();
+        sender
+            .poll(&mut source_store, &seals, false, usize::MAX, &mut out)
+            .unwrap();
+        assert!(
+            !out.iter()
+                .any(|message| matches!(message, Outgoing::Seal(_) | Outgoing::Bytes { .. }))
+        );
+        assert!(Sender::accept(request(64), true, 0, &seals).is_err());
     }
 }

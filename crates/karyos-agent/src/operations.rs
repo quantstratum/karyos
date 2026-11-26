@@ -17,7 +17,7 @@
 //!   such ([`UNKNOWN_OUTCOME`]).
 //! - **Denied.** A close or reopen the requester's role does not allow is
 //!   never sent; its request and its outcome, refused `not_authorised`,
-//!   are journalled without waiting ([`refuse_unauthorised`]; SPEC §13,
+//!   are journalled without waiting (`refuse_unauthorised`; SPEC §13,
 //!   Audited operations, karyos#719).
 //! - **Rate change (R-CORE-21, karyos#740).** A rate policy change on a
 //!   guarded stream: the safety path (a tightening) goes ahead whatever

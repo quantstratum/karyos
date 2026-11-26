@@ -13,6 +13,12 @@
 //! check of a request against its seals, and [`check_seal`] the replica's
 //! check of a seal before [`crate::integrity::replication::Replica::verify`]
 //! counts it.
+//!
+//! A replication's ranges are sealed under its [`SealScope`]: the open and
+//! closed segment seals of the recording (ADR-0091), or, for a Cluster
+//! log replication, the log's `ClusterLog` seals of one seal epoch
+//! (ADR-0120 decision 2). [`check_request_in`] and [`check_seal_in`] take
+//! the scope; [`check_request`] and [`check_seal`] are ADR-0091's.
 
 use karyos_codec::{Block, CodecError, Decoder, Encoder, Envelope, Template};
 
@@ -68,6 +74,83 @@ fn recording(value: u64) -> Result<u64, CodecError> {
     } else {
         Ok(value)
     }
+}
+
+/// Which seals cover a replication's ranges (ADR-0120 decision 2).
+///
+/// The recording id is the one the request names and the replica's
+/// copies are recorded under; it is apart from the seals' subject, which
+/// for a Cluster log is the seal epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SealScope {
+    /// Open and closed segment seals whose subject is `recording_id`:
+    /// every replication but the Cluster log's (ADR-0091).
+    Segments {
+        /// The recording, never 0.
+        recording_id: u64,
+    },
+    /// `ClusterLog` seals whose subject is `epoch`, for the Cluster log
+    /// recording `recording_id` (ADR-0120 decisions 2 and 4).
+    ClusterLog {
+        /// The Cluster log recording (karyos-cluster's `LOG_RECORDING`).
+        recording_id: u64,
+        /// The source log's seal epoch every seal of the request names.
+        epoch: u64,
+    },
+}
+
+impl SealScope {
+    /// ADR-0091's scope for `recording_id`.
+    #[must_use]
+    #[inline]
+    pub const fn segments(recording_id: u64) -> Self {
+        Self::Segments { recording_id }
+    }
+
+    /// A Cluster log replication of `recording_id` under the seals of
+    /// `epoch`.
+    #[must_use]
+    #[inline]
+    pub const fn cluster_log(recording_id: u64, epoch: u64) -> Self {
+        Self::ClusterLog {
+            recording_id,
+            epoch,
+        }
+    }
+
+    /// The recording the request names and copies are recorded under.
+    #[must_use]
+    #[inline]
+    pub const fn recording_id(self) -> u64 {
+        match self {
+            Self::Segments { recording_id } | Self::ClusterLog { recording_id, .. } => recording_id,
+        }
+    }
+
+    /// Whether `seal` is one of this scope's range seals.
+    #[must_use]
+    #[inline]
+    pub const fn admits(self, seal: &SealRecord) -> bool {
+        match self {
+            Self::Segments { recording_id } => {
+                seal.subject == recording_id
+                    && matches!(seal.kind, SealKind::OpenSegment | SealKind::ClosedSegment)
+            }
+            Self::ClusterLog { epoch, .. } => {
+                seal.subject == epoch && matches!(seal.kind, SealKind::ClusterLog)
+            }
+        }
+    }
+}
+
+/// The seal kinds a [`SourceSeal`] may carry: open and closed segment
+/// (ADR-0091), and `ClusterLog` (ADR-0120 decision 2).
+const fn carried(kind: SealKind) -> bool {
+    matches!(
+        kind,
+        SealKind::OpenSegment | SealKind::ClosedSegment | SealKind::ClusterLog
+    )
 }
 
 /// How long a replication runs.
@@ -306,7 +389,7 @@ impl SourceSeal {
             .get(8..8 + SEAL_RECORD_LENGTH)
             .ok_or(out_of_range("seal"))?;
         let seal = SealRecord::decode(bytes).map_err(|_| out_of_range("seal"))?;
-        if !matches!(seal.kind, SealKind::OpenSegment | SealKind::ClosedSegment) {
+        if !carried(seal.kind) {
             return Err(out_of_range("seal"));
         }
         Ok(Self {
@@ -320,12 +403,10 @@ impl SourceSeal {
     /// # Errors
     ///
     /// [`CodecError::Truncated`], and [`CodecError::ValueOutOfRange`] for
-    /// a seal of a kind other than an open or closed segment.
+    /// a seal of a kind other than an open or closed segment or a Cluster
+    /// log range.
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        if !matches!(
-            self.seal.kind,
-            SealKind::OpenSegment | SealKind::ClosedSegment
-        ) {
+        if !carried(self.seal.kind) {
             return Err(out_of_range("seal"));
         }
         let mut encoder = Encoder::new(out, &SOURCE_SEAL)?;
@@ -474,6 +555,8 @@ pub enum RequestRefusal {
     FromOffBoundary,
     /// `until` is neither `u64::MAX` nor a seal boundary.
     UntilOffBoundary,
+    /// The request names another recording than the scope's.
+    OutOfScope,
 }
 
 /// The source's check of `request` against the recording's start and its
@@ -488,12 +571,33 @@ pub fn check_request(
     start: u64,
     seals: &[SealRecord],
 ) -> Result<(), RequestRefusal> {
+    check_request_in(
+        request,
+        SealScope::segments(request.recording_id),
+        start,
+        seals,
+    )
+}
+
+/// [`check_request`] under `scope`: the boundaries are those of the
+/// scope's seals, and the request must name the scope's recording.
+///
+/// # Errors
+///
+/// The [`RequestRefusal`].
+pub fn check_request_in(
+    request: &ReplicateRecording,
+    scope: SealScope,
+    start: u64,
+    seals: &[SealRecord],
+) -> Result<(), RequestRefusal> {
+    if request.recording_id != scope.recording_id() {
+        return Err(RequestRefusal::OutOfScope);
+    }
     let boundary = |position: u64| {
-        seals.iter().any(|seal| {
-            seal.subject == request.recording_id
-                && matches!(seal.kind, SealKind::OpenSegment | SealKind::ClosedSegment)
-                && seal.end == position
-        })
+        seals
+            .iter()
+            .any(|seal| scope.admits(seal) && seal.end == position)
     };
     if request.from < start {
         return Err(RequestRefusal::BelowStart);
@@ -514,9 +618,17 @@ pub fn check_request(
 ///
 /// [`CodecError::ValueOutOfRange`] for any other kind or subject.
 pub fn check_seal(seal: &SealRecord, recording_id: u64) -> Result<(), CodecError> {
-    if seal.subject == recording_id
-        && matches!(seal.kind, SealKind::OpenSegment | SealKind::ClosedSegment)
-    {
+    check_seal_in(seal, SealScope::segments(recording_id))
+}
+
+/// The replica's check of a seal under `scope`: only the scope's seals
+/// count (for a Cluster log, `ClusterLog` seals of the request's epoch).
+///
+/// # Errors
+///
+/// [`CodecError::ValueOutOfRange`] for any other kind or subject.
+pub fn check_seal_in(seal: &SealRecord, scope: SealScope) -> Result<(), CodecError> {
+    if scope.admits(seal) {
         Ok(())
     } else {
         Err(out_of_range("seal"))

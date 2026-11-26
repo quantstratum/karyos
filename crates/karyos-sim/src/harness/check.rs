@@ -955,6 +955,9 @@ fn server_of(observation: &Observation) -> Option<NodeId> {
         | Observation::Deduplicated { node, .. }
         | Observation::Redirected { node, .. }
         | Observation::FeedApplied { node, .. }
+        | Observation::ReplicationRefused { node, .. }
+        | Observation::CopyStarted { node, .. }
+        | Observation::RecoveryPoint { node, .. }
         | Observation::Promoted { node, .. }
         | Observation::Leading { node, .. } => Some(*node),
         Observation::Success { .. }

@@ -1891,13 +1891,106 @@ fn many_small_commits_leave_one_seal_per_chunk() {
         .iter()
         .filter(|record| record.kind == SealKind::ClusterLog && record.start < record.end)
         .count() as u64;
+    // Each chunk ends on the last frame boundary within SEAL_CHUNK
+    // (ADR-0120 decision 3), so it is up to one frame short of a chunk:
+    // one more seal at most.
     let chunks = log.written() / SEAL_CHUNK;
-    assert_eq!(seals, chunks, "{seals} seals for {} bytes", log.written());
+    assert!(
+        (chunks..=chunks + 1).contains(&seals),
+        "{seals} seals for {} bytes",
+        log.written()
+    );
     assert!(seals < commits / 100);
     // The tail is sealed on request, and the log still opens.
     log.seal().unwrap();
     drop(log);
     assert_eq!(open(StdDisk, &dir.0, small()).last_index(), Some(commits));
+}
+
+/// The frame starts of `log`'s entries from `first`, the store's start,
+/// with the end of the last frame: every boundary a seal may take.
+fn frame_boundaries(log: &RaftLog<StdDisk>, first: u64) -> Vec<u64> {
+    let mut boundaries = vec![first];
+    let mut at = first;
+    let mut index = log.first_index();
+    while let Some(span) = log.frame_span(index) {
+        at += span;
+        boundaries.push(at);
+        index += 1;
+    }
+    boundaries
+}
+
+/// ADR-0120 decision 3 (karyos#714): every Cluster log seal starts and
+/// ends on a frame boundary, at most `SEAL_CHUNK` long unless one frame is
+/// longer, so a replicated range is whole frames.
+#[test]
+fn every_seal_starts_and_ends_on_a_frame_boundary() {
+    use karyos_cluster::log::SEAL_CHUNK;
+    let dir = TempDir::new("frame-seals");
+    let mut log = RaftLog::create(StdDisk, &dir.0, small(), 1).unwrap();
+    // Frames of uneven sizes, so a fixed cut would land inside one.
+    for index in 1..=900u64 {
+        let size = 1_000 + (index * 37 % 3_000) as usize;
+        let payload = vec![5; size];
+        log.append(&[entry(index, 1, &payload)]).unwrap();
+        log.sync().unwrap();
+        log.save_hard_state(HardState {
+            current_term: 1,
+            voted_for: None,
+            commit: Some(index),
+        })
+        .unwrap();
+    }
+    log.seal().unwrap();
+    let seals = cluster_seals(&dir.0);
+    assert!(seals.len() > 1, "{seals:?}");
+    let boundaries = frame_boundaries(&log, seals[0].0);
+    for &(start, end) in &seals {
+        assert!(boundaries.binary_search(&start).is_ok(), "start {start}");
+        assert!(boundaries.binary_search(&end).is_ok(), "end {end}");
+        assert!(end - start <= SEAL_CHUNK, "{start}..{end}");
+    }
+    // Contiguous, and the last ends at the committed end.
+    for pair in seals.windows(2) {
+        assert_eq!(pair[0].1, pair[1].0);
+    }
+    assert_eq!(seals.last().unwrap().1, log.written());
+}
+
+/// ADR-0120 decision 3: a frame longer than `SEAL_CHUNK` is sealed whole,
+/// in one seal ending at its end, never cut.
+#[test]
+fn a_frame_longer_than_a_chunk_is_sealed_whole() {
+    use karyos_cluster::log::SEAL_CHUNK;
+    let dir = TempDir::new("long-frame-seal");
+    let mut log = RaftLog::create(StdDisk, &dir.0, geometry(), 1).unwrap();
+    let big = usize::try_from(SEAL_CHUNK + SEAL_CHUNK / 2).unwrap();
+    log.append(&[entry(1, 1, &[9; 200])]).unwrap();
+    let payload = vec![9; big];
+    log.append(&[entry(2, 1, &payload)]).unwrap();
+    log.append(&[entry(3, 1, &[9; 200])]).unwrap();
+    log.sync().unwrap();
+    log.save_hard_state(HardState {
+        current_term: 1,
+        voted_for: None,
+        commit: Some(3),
+    })
+    .unwrap();
+    log.seal().unwrap();
+    let seals = cluster_seals(&dir.0);
+    let boundaries = frame_boundaries(&log, seals[0].0);
+    // Entry 1's frame, then entry 2's alone (longer than a chunk), then
+    // entry 3's: each a seal of whole frames.
+    assert_eq!(
+        seals,
+        vec![
+            (boundaries[0], boundaries[1]),
+            (boundaries[1], boundaries[2]),
+            (boundaries[2], boundaries[3]),
+        ]
+    );
+    assert!(boundaries[2] - boundaries[1] > SEAL_CHUNK);
 }
 
 /// The committed ClusterLog seal ranges of the journal in `dir`.
