@@ -117,8 +117,8 @@ fn openraft_replication_path_allocates_and_the_gate_reports_it() {
 /// only that each run passes its case and the probe measured entries.
 /// Ignored by default: the run record runs it at its run commit.
 #[test]
-#[ignore = "C5 v2's allocation measurement; the run record runs it at its commit"]
-fn the_c5_v2_allocation_lines() {
+#[ignore = "C5 v3's allocation measurement; the run record runs it at its commit"]
+fn the_c5_v3_allocation_lines() {
     use karyos_raft_eval::openraft_core::OpenRaft;
     use karyos_raft_eval::raft_rs::RaftRs;
     use karyos_sim::harness::custom::Custom;
@@ -184,7 +184,7 @@ fn the_c5_v2_allocation_lines() {
             .collect();
         let _ = writeln!(
             std::io::stdout(),
-            "{{\"evidence\":\"C5 v2 simulator\",\"core\":\"{core}\",\"variant\":\"{variant}\",\
+            "{{\"evidence\":\"C5 v3 simulator\",\"core\":\"{core}\",\"variant\":\"{variant}\",\
              \"forms\":\"borrowed: propose_slice, ready_into, entries_into\",\
              \"case\":\"{}\",\"servers\":{},\"clients\":{},\"operations\":{},\
              \"payload\":{},\"limits\":{},\"seed\":1,\"warmup\":{WARMUP},\"entries\":{},\

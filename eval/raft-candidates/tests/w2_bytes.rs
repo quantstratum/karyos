@@ -361,7 +361,7 @@ fn the_oracle_counts_each_unacknowledged_index_once() {
 
 /// The byte case's oracle over the corpus seeds, for the run record (C5
 /// v2 run record, "W2 in-flight byte case"): one JSON line per core and
-/// seed into `KARYOS_C5_OUT/c5-v2-w2-bytes-<core>-<first>-<last>.jsonl`,
+/// seed into `KARYOS_C5_OUT/c5-v3-w2-bytes-<core>-<first>-<last>.jsonl`,
 /// with the most bytes unacknowledged to one follower, the largest entry,
 /// the commands replicated, the refusals by kind, safety and the harness
 /// verdict, and whether the seed meets the frozen pass (bound held,
@@ -377,7 +377,7 @@ fn the_byte_case_over_the_corpus_seeds() {
     fn over<C: Read>(name: &str, seeds: std::ops::RangeInclusive<u64>, dir: &std::path::Path) {
         let case = case();
         let path = dir.join(format!(
-            "c5-v2-w2-bytes-{name}-{}-{}.jsonl",
+            "c5-v3-w2-bytes-{name}-{}-{}.jsonl",
             seeds.start(),
             seeds.end()
         ));

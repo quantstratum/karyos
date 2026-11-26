@@ -394,7 +394,7 @@ mod w1 {
         let host = json_escaped(&output_of("uname", &["-n"]));
         let _ = writeln!(
             std::io::stdout(),
-            "{{\"evidence\":\"C5 v2 processes\",\"variant\":\"{variant}\",\
+            "{{\"evidence\":\"C5 v3 processes\",\"variant\":\"{variant}\",\
              \"processes\":{},\"commit\":\"{commit}\",\"tick_ms\":{TICK_MS},\
              \"encoding\":\"{encoding}\",\"host\":\"{host}\",\"warmup\":{WARMUP},\
              \"entries\":{entries},\"allocations\":{allocations},\"frees\":{frees},\
