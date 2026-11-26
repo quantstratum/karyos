@@ -33,7 +33,9 @@ use std::rc::Rc;
 use karyos_cluster::standby::{RecoveryPoint, Refusal};
 use karyos_sim::cluster::Node;
 use karyos_sim::harness::check::{self, Violation};
-use karyos_sim::harness::node::{ClientNode, Observation, Op, Recorder, Ret, Shared, Wire};
+use karyos_sim::harness::node::{
+    ClientNode, HARNESS_CLUSTER, Observation, Op, Recorder, Ret, Shared, Wire,
+};
 use karyos_sim::harness::reference::{Message, Reference};
 use karyos_sim::harness::standby::{
     self, ExternalLease, FeedRefusal, Fencing, PRIMARY, PromotionReport, STANDBY,
@@ -222,6 +224,7 @@ fn s5_a_client_rejects_a_lower_generation_once_it_saw_a_higher() {
     let mut client = ClientNode::new(10, 0, script, Rc::clone(&recorder));
     let mut out: Vec<(NodeId, Wire<Message>)> = Vec::new();
     let answer = |sequence: u64, generation: u64| Wire::<Message>::Response {
+        cluster: HARNESS_CLUSTER,
         sequence,
         bytes: Ret::Appended(sequence).canonical(),
         index: sequence,

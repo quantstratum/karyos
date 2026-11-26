@@ -27,8 +27,8 @@ use karyos_cluster::{Entry, LogError};
 use super::check::{self, Violation};
 use super::core::{Change, Configuration, ConsensusCore, Limits, Unsupported};
 use super::node::{
-    ClientNode, Compaction, Member, Observation, Op, RETRY_AFTER, Recorder, Ret, ServerError,
-    ServerNode, ServiceModel, Shared, TestService, Wire,
+    ClientNode, Compaction, HARNESS_CLUSTER, HARNESS_STANDBY, Member, Observation, Op, RETRY_AFTER,
+    Recorder, Ret, ServerError, ServerNode, ServiceModel, Shared, TestService, Wire,
 };
 use super::reference;
 use super::standby::{ExternalLease, FeedFault, Fencing};
@@ -1093,7 +1093,14 @@ fn advance<C: ConsensusCore>(
                 {
                     for &client in stepping.clients {
                         let _ = sim
-                            .send(operator, client, Wire::Redirect { server: leader })
+                            .send(
+                                operator,
+                                client,
+                                Wire::Redirect {
+                                    cluster: HARNESS_CLUSTER,
+                                    server: leader,
+                                },
+                            )
                             .map_err(RunError::Sim)?;
                     }
                 }
@@ -1503,7 +1510,14 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                     for (index, &client) in clients.iter().enumerate() {
                         if !case.stay_on_primary.contains(&index) {
                             let _ = sim
-                                .send(operator, client, Wire::Redirect { server })
+                                .send(
+                                    operator,
+                                    client,
+                                    Wire::Redirect {
+                                        cluster: HARNESS_STANDBY,
+                                        server,
+                                    },
+                                )
                                 .map_err(RunError::Sim)?;
                         }
                     }
