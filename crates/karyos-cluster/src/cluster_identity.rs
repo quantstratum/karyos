@@ -98,6 +98,10 @@ pub enum IdentityError {
     /// The stored record is refused.
     #[error("the cluster identity record is refused: {0}")]
     Refused(IdentityProblem),
+    /// The directory holds a node's state but no identity record: the
+    /// node does not start (ADR-0123 decision 1).
+    #[error("the node's state has no cluster identity record: it does not start")]
+    Missing,
     /// A record is already stored: the identity is written once.
     #[error("a cluster identity is already stored: it is written once")]
     Exists,
@@ -196,6 +200,32 @@ impl IdentityRecord {
             file::Read::Bytes(bytes) => Self::decode(&bytes)
                 .map(Some)
                 .map_err(IdentityError::Refused),
+        }
+    }
+
+    /// The record a node opening `dir` starts under (ADR-0123 decision
+    /// 1): the stored one; or, for a node with no state yet (`fresh`),
+    /// `create`d, its identity given by the bootstrap or the operator.
+    ///
+    /// # Errors
+    ///
+    /// [`IdentityError::Missing`] for a node with state and no record:
+    /// it does not start under a default; else as [`Self::load`] and
+    /// [`Self::create`].
+    pub fn open<D: Disk>(
+        disk: &mut D,
+        dir: &Path,
+        fresh: bool,
+        create: impl FnOnce() -> Self,
+    ) -> Result<Self, IdentityError> {
+        match Self::load(disk, dir)? {
+            Some(record) => Ok(record),
+            None if fresh => {
+                let record = create();
+                record.create(disk, dir)?;
+                Ok(record)
+            }
+            None => Err(IdentityError::Missing),
         }
     }
 
@@ -344,6 +374,36 @@ mod tests {
             live().create(&mut disk, &dir),
             Err(IdentityError::Exists)
         ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_node_with_state_and_no_identity_does_not_start() {
+        use karyos_archive::disk::StdDisk;
+        let dir = std::env::temp_dir().join(format!(
+            "karyos-cluster-identity-open-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut disk = StdDisk;
+        assert!(matches!(
+            IdentityRecord::open(&mut disk, &dir, false, live),
+            Err(IdentityError::Missing)
+        ));
+        assert_eq!(
+            IdentityRecord::open(&mut disk, &dir, true, live).unwrap(),
+            live()
+        );
+        // Opened again, the stored record wins over a new one.
+        assert_eq!(
+            IdentityRecord::open(&mut disk, &dir, true, isolated).unwrap(),
+            live()
+        );
+        assert_eq!(
+            IdentityRecord::open(&mut disk, &dir, false, isolated).unwrap(),
+            live()
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
