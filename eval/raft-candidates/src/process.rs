@@ -56,7 +56,8 @@ use karyos_sim::harness::core::{
     drive_into,
 };
 use karyos_sim::harness::node::{
-    Breach, Command, Observation, Positions, SEAL_TICKS, TestService, Wire as Harness,
+    Breach, Command, Observation, Positions, SEAL_TICKS, ServiceBounds, TestService,
+    Wire as Harness,
 };
 use karyos_sim::harness::probe::{self, Probed};
 use karyos_sim::harness::standby::FIRST_GENERATION;
@@ -681,6 +682,10 @@ struct Serving<M> {
     items: Vec<(u64, Item)>,
     /// Messages to clients.
     replies: Vec<(NodeId, Harness<M>)>,
+    /// Buffers for the response bytes of replies (C5 v3): a reply's bytes
+    /// are copied into one inside the application window and it comes
+    /// back once the reply is framed, so answering allocates nothing.
+    reply_bytes: ReplyBytes,
     ready: ReadyBuf<M>,
     command: Vec<u8>,
     /// Its clock, in ticks.
@@ -695,6 +700,46 @@ struct Serving<M> {
     /// Whether it records the appends it sends and the acknowledgements
     /// it steps (W2: the byte oracle's trace).
     traces: bool,
+}
+
+/// A server's pool of reply buffers (C5 v3), prefilled at initialisation
+/// from the case's bounds: one buffer of [`REPLY_SMALL`] bytes per client
+/// for an append's answer, and one of the service's largest answer
+/// ([`ServiceBounds::response_bytes`]) for a read. Taken and given back
+/// inside [`probe::application`], so a miss, a buffer grown or the pool
+/// grown, is counted as `apply`.
+struct ReplyBytes(Vec<Vec<u8>>);
+
+/// Bytes of a small reply buffer: an append's answer is 9.
+const REPLY_SMALL: usize = 16;
+
+impl ReplyBytes {
+    fn prefilled(bounds: &ServiceBounds) -> Self {
+        let mut pool = Vec::with_capacity(bounds.clients.len().saturating_add(1));
+        pool.push(Vec::with_capacity(bounds.response_bytes()));
+        pool.extend((0..bounds.clients.len()).map(|_| Vec::with_capacity(REPLY_SMALL)));
+        Self(pool)
+    }
+
+    /// A copy of `bytes` in a pooled buffer: the smallest one it fits.
+    fn copy(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let fits = (0..self.0.len())
+            .filter(|&at| self.0[at].capacity() >= bytes.len())
+            .min_by_key(|&at| self.0[at].capacity());
+        let mut buffer = match fits {
+            Some(at) => self.0.swap_remove(at),
+            None => self.0.pop().unwrap_or_default(),
+        };
+        buffer.clear();
+        buffer.extend_from_slice(bytes);
+        buffer
+    }
+
+    /// A reply's buffer, back once the reply is framed.
+    fn give_back(&mut self, mut buffer: Vec<u8>) {
+        buffer.clear();
+        self.0.push(buffer);
+    }
 }
 
 fn observe(items: &mut Vec<(u64, Item)>, observation: Observation) {
@@ -787,6 +832,7 @@ impl<M> Serving<M> {
             response,
             pending,
             replies,
+            reply_bytes,
             ready,
             limits,
             budget,
@@ -825,10 +871,20 @@ impl<M> Serving<M> {
                 // test service, prefilled to the case's bounds and
                 // answering into the node's kept response buffer, so it
                 // allocates nothing (C5 v3).
-                let applied = probe::application(|| service.apply_into(entry, response));
-                let response = applied.is_some().then(|| response.clone());
+                // A reply's bytes are the application's output: copied into
+                // a pooled buffer inside the same window (C5 v3).
+                let answered = probe::application(|| {
+                    let applied = service.apply_into(entry, response)?;
+                    let bytes = pending
+                        .contains(&(applied.client, applied.sequence))
+                        .then(|| reply_bytes.copy(response));
+                    Some((applied, bytes))
+                });
+                // The judge's record of the answer: instrumentation, off the
+                // declared path, so outside the window (C5 v3 run record).
+                let response = answered.is_some().then(|| response.clone());
                 let mut items = items.borrow_mut();
-                if let (Some(applied), Some(bytes)) = (applied, &response)
+                if let Some((applied, Some(bytes))) = answered
                     && pending.remove(&(applied.client, applied.sequence))
                 {
                     if applied.replayed {
@@ -856,7 +912,7 @@ impl<M> Serving<M> {
                         applied.client,
                         Harness::Response {
                             sequence: applied.sequence,
-                            bytes: bytes.clone(),
+                            bytes,
                             index: entry.index,
                             generation: FIRST_GENERATION,
                         },
@@ -1128,6 +1184,7 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
         positions: None,
         items: Vec::new(),
         replies: Vec::new(),
+        reply_bytes: ReplyBytes::prefilled(&bounds),
         ready: ReadyBuf::default(),
         command: Vec::new(),
         now: 0,
@@ -1270,6 +1327,10 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
             ) {
                 connection.queue(&framed);
             }
+            // The reply's buffer back to the pool, in the window it left.
+            if let Harness::Response { bytes, .. } = message {
+                probe::application(|| serving.reply_bytes.give_back(bytes));
+            }
         }
         for connection in &mut connections {
             connection.flush();
@@ -1291,6 +1352,44 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reply pool hands out a prefilled buffer that fits and takes it
+    /// back, so answering within the bounds grows nothing (C5 v3).
+    #[test]
+    fn a_reply_takes_a_prefilled_buffer_that_fits_and_gives_it_back() {
+        let bounds = ServiceBounds {
+            clients: vec![4, 5],
+            values: 8,
+            payload: 32,
+            answers: 4,
+        };
+        let mut pool = ReplyBytes::prefilled(&bounds);
+        let room = pool.0.capacity();
+        let large = bounds.response_bytes();
+        assert_eq!(pool.0.len(), 3);
+
+        let appended = pool.copy(&[0; 9]);
+        assert_eq!(appended, [0; 9]);
+        assert_eq!(appended.capacity(), REPLY_SMALL);
+        let read = pool.copy(&vec![1; large]);
+        assert_eq!(read.len(), large);
+        assert!(read.capacity() >= large);
+        // The small buffers left fit an append; the large one was taken.
+        assert!(pool.0.iter().all(|buffer| buffer.capacity() == REPLY_SMALL));
+
+        pool.give_back(appended);
+        pool.give_back(read);
+        assert_eq!(pool.0.len(), 3);
+        assert_eq!(pool.0.capacity(), room);
+        assert!(pool.0.iter().all(Vec::is_empty));
+        assert_eq!(
+            pool.0
+                .iter()
+                .filter(|buffer| buffer.capacity() >= large)
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn every_client_message_round_trips_through_its_frame() {
