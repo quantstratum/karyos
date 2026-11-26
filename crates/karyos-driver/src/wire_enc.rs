@@ -85,7 +85,7 @@ pub const PAIRWISE_FILES: usize = 4;
 pub(crate) const RETIRED_BOOTS: usize = 8;
 
 /// The reasons [`EncRejections`] counts, one per [`EncRejection`].
-pub const ENC_REASONS: usize = 31;
+pub const ENC_REASONS: usize = 32;
 
 /// The counter index of `reason`. Exhaustive: a new reason does not
 /// compile until it has its own counter.
@@ -123,6 +123,7 @@ pub const fn reason_index(reason: EncRejection) -> usize {
         EncRejection::ResyncRefused => 28,
         EncRejection::BeforeJoin => 29,
         EncRejection::VmGeneration => 30,
+        EncRejection::Withdrawn => 31,
     }
 }
 
@@ -403,6 +404,49 @@ impl ChannelKeys {
             .map(|file| &*file.secret)
     }
 
+    /// The `key_id` of its files; `None` once every file is gone.
+    fn key_id(&self) -> Option<u32> {
+        self.files.iter().flatten().map(|file| file.key_id).next()
+    }
+
+    /// Admits every file of its `key_id` the key set names to verify and
+    /// it does not hold yet (rotation, ADR-0114 section 6 and ADR-0086
+    /// section 7): into a free slot, or in place of a lower epoch. A file
+    /// of the other class, purpose or profile is not admitted. Returns
+    /// whether one was.
+    pub fn admit(&mut self, keys: &dyn crate::wire_auth::KeySet) -> bool {
+        let Some(key_id) = self.key_id() else {
+            return false;
+        };
+        let mut admitted = false;
+        for file in keys.verifying(key_id).into_iter().flatten() {
+            if self.ikm(file.file_epoch).is_some() {
+                continue;
+            }
+            let Ok(secret) = secret_of(file, Purpose::Channel) else {
+                continue;
+            };
+            let lowest = self
+                .files
+                .iter()
+                .flatten()
+                .map(|held| held.epoch)
+                .min()
+                .unwrap_or(0);
+            let at = self.files.iter().position(Option::is_none).or_else(|| {
+                self.files.iter().position(|slot| {
+                    slot.as_ref()
+                        .is_some_and(|held| held.epoch == lowest && lowest < secret.epoch)
+                })
+            });
+            if let Some(slot) = at.and_then(|at| self.files.get_mut(at)) {
+                *slot = Some(secret);
+                admitted = true;
+            }
+        }
+        admitted
+    }
+
     /// The lowest held epoch above `key_epoch`.
     fn next_epoch(&self, key_epoch: u32) -> Option<u32> {
         self.files
@@ -478,6 +522,52 @@ impl PairwiseFiles {
             }
         }
         dropped
+    }
+
+    /// Admits every pairwise file of a receiver it already serves that the
+    /// key set names to verify and it does not hold yet (rotation): into a
+    /// free slot, or in place of that receiver's lower epoch. Returns
+    /// whether one was.
+    pub fn admit(&mut self, keys: &dyn crate::wire_auth::KeySet) -> bool {
+        let mut key_ids: [Option<u32>; PAIRWISE_FILES] = [None; PAIRWISE_FILES];
+        for (slot, file) in key_ids.iter_mut().zip(self.files.iter().flatten()) {
+            *slot = Some(file.secret.key_id);
+        }
+        let mut admitted = false;
+        for key_id in key_ids.into_iter().flatten() {
+            for file in keys.verifying(key_id).into_iter().flatten() {
+                let Scope::Pairwise { receiver_id, .. } = file.scope else {
+                    continue;
+                };
+                let served =
+                    self.files.iter().flatten().any(|held| {
+                        held.receiver_id == receiver_id && held.secret.key_id == key_id
+                    });
+                let [highest, lowest] = self.epochs_of(receiver_id);
+                if !served || [highest, lowest].contains(&Some(file.file_epoch)) {
+                    continue;
+                }
+                let Ok(secret) = secret_of(file, Purpose::Pairwise) else {
+                    continue;
+                };
+                let lower = lowest.or(highest).filter(|epoch| *epoch < secret.epoch);
+                let at = self.files.iter().position(Option::is_none).or_else(|| {
+                    self.files.iter().position(|slot| {
+                        slot.as_ref().is_some_and(|held| {
+                            held.receiver_id == receiver_id && Some(held.secret.epoch) == lower
+                        })
+                    })
+                });
+                if let Some(slot) = at.and_then(|at| self.files.get_mut(at)) {
+                    *slot = Some(PairwiseFile {
+                        receiver_id,
+                        secret,
+                    });
+                    admitted = true;
+                }
+            }
+        }
+        admitted
     }
 
     /// The epochs held for `receiver_id`, highest first.
@@ -915,6 +1005,31 @@ impl EncSealer {
         });
         if pairwise_lost || self.keys.ikm(epoch).is_none() {
             self.withdraw();
+            return;
+        }
+        // Rotation (section 6): a newly admitted file epoch that the key
+        // set signs with becomes the sealer's key epoch at the next
+        // datagram, `party_epoch` 0, under a key whose context names the
+        // new epoch, so its sequence restarting at 0 reuses no nonce.
+        self.keys.admit(keys);
+        if let Some(pairwise) = self.pairwise.as_mut() {
+            pairwise.admit(keys);
+        }
+        let signing = self
+            .keys
+            .key_id()
+            .and_then(|key_id| keys.current_epoch(key_id))
+            .filter(|signing| *signing > epoch && self.keys.ikm(*signing).is_some());
+        if let Some(signing) = signing {
+            let mut next = *self.key.context();
+            next.key_epoch = signing;
+            next.party_epoch = 0;
+            if derive_into(&self.keys, self.pairwise.as_ref(), next, &mut self.key).is_ok() {
+                self.derived_ns = (self.clock)();
+            } else {
+                // The key may be half re-keyed: never seal under it.
+                self.withdraw();
+            }
         }
     }
 
@@ -1009,7 +1124,18 @@ impl EncSealer {
         if self.must_roll(protected, now_ns) {
             self.roll(now_ns)?;
         }
-        Ok(self.key.seal_next(datagram, frames)?)
+        #[cfg(test)]
+        let plaintext = recording().then(|| datagram.get(..frames).map(<[u8]>::to_vec));
+        let sealed = self.key.seal_next(datagram, frames)?;
+        #[cfg(test)]
+        if let Some(Some(frames)) = plaintext {
+            record(SealedRecord {
+                context: *self.key.context(),
+                seq: self.key.next_seq().saturating_sub(1),
+                frames,
+            });
+        }
+        Ok(sealed)
     }
 
     /// Moves to the next `party_epoch` now, as a budget would (tests).
@@ -1024,6 +1150,49 @@ impl EncSealer {
     pub(crate) fn key(&self) -> &AesGcmSiv {
         &self.key
     }
+}
+
+/// One datagram a sealer sealed: its key's context, its envelope
+/// sequence and its plaintext frames (tests).
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct SealedRecord {
+    pub(crate) context: KeyContext,
+    pub(crate) seq: u64,
+    pub(crate) frames: Vec<u8>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SEALED: core::cell::RefCell<Option<Vec<SealedRecord>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn recording() -> bool {
+    SEALED.with(|sealed| sealed.borrow().is_some())
+}
+
+#[cfg(test)]
+fn record(record: SealedRecord) {
+    SEALED.with(|sealed| {
+        if let Some(sealed) = sealed.borrow_mut().as_mut() {
+            sealed.push(record);
+        }
+    });
+}
+
+/// Starts recording every seal on this thread (tests).
+#[cfg(test)]
+pub(crate) fn record_seals() {
+    SEALED.with(|sealed| *sealed.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stops recording and returns what was sealed since [`record_seals`]
+/// (tests).
+#[cfg(test)]
+pub(crate) fn take_seals() -> Vec<SealedRecord> {
+    SEALED.with(|sealed| sealed.borrow_mut().take().unwrap_or_default())
 }
 
 /// A sender datagram sealer of either class, as the repair path uses it.
@@ -1171,7 +1340,7 @@ impl EncOpener {
     /// Withdraws it (H8 finding 4): its key files, previous and spare keys
     /// are dropped and its current and scratch keys replaced in place, all
     /// erased on drop; every later open is refused with
-    /// [`EncRejection::Epoch`] and every resynchronisation with
+    /// [`EncRejection::Withdrawn`] and every resynchronisation with
     /// [`EncRejection::ResyncRefused`].
     pub fn withdraw(&mut self) {
         self.withdrawn = true;
@@ -1223,12 +1392,25 @@ impl EncOpener {
             self.withdraw();
             return;
         }
-        if self
+        // A revoked previous epoch goes, its slot erased in place and kept
+        // as the spare, so the next promotion still finds a slot and the
+        // data path constructs no key.
+        let keys_held = &self.keys;
+        if let Some((mut slot, _)) = self
             .previous
-            .as_ref()
-            .is_some_and(|(slot, _)| self.keys.ikm(slot.key.context().key_epoch).is_none())
+            .take_if(|(slot, _)| keys_held.ikm(slot.key.context().key_epoch).is_none())
         {
-            self.previous = None;
+            erase(&mut slot.key, self.erase);
+            if self.spare.is_none() {
+                self.spare = Some(slot.key);
+            }
+        }
+        // Rotation (section 6): a newly admitted file epoch is the next
+        // epoch at `party_epoch` 0; the first datagram fully accepted under
+        // it promotes, and the current one stays for the 10 s overlap.
+        self.keys.admit(keys);
+        if let Some(pairwise) = self.pairwise.as_mut() {
+            pairwise.admit(keys);
         }
     }
 
@@ -1326,7 +1508,7 @@ impl EncOpener {
         }
         if self.withdrawn {
             zeroize::Zeroize::zeroize(out);
-            return Err(EncRejection::Epoch);
+            return Err(EncRejection::Withdrawn);
         }
         let header = header(datagram)?;
         let selected = self.select(&header, rate, now_ns)?;

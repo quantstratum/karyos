@@ -9715,3 +9715,279 @@ fn a_held_fence_submits_no_setup_under_an_admitting_key_view() {
 
 /// H8 unit-level invariants raised to two-agent proofs (karyos#648).
 mod invariants_e2e;
+
+/// An in-memory key or state directory, shared with the test.
+#[derive(Clone, Default)]
+struct MemDir(std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>);
+
+impl MemDir {
+    fn put(&self, name: &str, text: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), text.as_bytes().to_vec());
+    }
+}
+
+impl crate::wire_keys::store::Files for MemDir {
+    fn names(&self) -> Result<Vec<String>, crate::wire_keys::store::FileError> {
+        Ok(self.0.lock().unwrap().keys().cloned().collect())
+    }
+
+    fn read(
+        &self,
+        name: &str,
+        buf: &mut [u8],
+    ) -> Result<usize, crate::wire_keys::store::FileError> {
+        let files = self.0.lock().unwrap();
+        let bytes = files
+            .get(name)
+            .ok_or(crate::wire_keys::store::FileError::NotFound)?;
+        if bytes.len() >= buf.len() {
+            return Err(crate::wire_keys::store::FileError::Refused);
+        }
+        buf[..bytes.len()].copy_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn write_atomic(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), crate::wire_keys::store::FileError> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), bytes.to_vec());
+        Ok(())
+    }
+
+    fn lock(&self) -> Result<(), crate::wire_keys::store::FileError> {
+        Ok(())
+    }
+}
+
+/// The wall clock of the rotation test: 2026-11-20T12:00:00Z.
+fn rotation_wall() -> i64 {
+    1_795_176_000
+}
+
+/// The driver's key store reloads (its cadence moved on by `skew_s`) and
+/// its view, when it changed, is applied to both roles in the same duty,
+/// as the conductor does (H8 R3-1).
+fn reload_and_apply(rig: &mut Rig, wire: &mut crate::net::wire::WireKeys, skew_s: u64) {
+    crate::net::wire::MONO_SKEW.with(|skew| skew.set(skew.get() + skew_s * 1_000_000_000));
+    let fence = rig.agents.sender.role.key_fence();
+    if let Some(view) = wire.duty(&fence) {
+        for link in [&rig.links.sender, &rig.links.receiver] {
+            link.post(|reply| AgentCommand::ApplyKeys {
+                reply,
+                keys: std::sync::Arc::clone(&view),
+            })
+            .unwrap();
+        }
+        wire.posted(true);
+    }
+    rig.round(true);
+}
+
+/// ADR-0114 section 6 and ADR-0086 section 7, end to end on unicast
+/// through the driver's one key store: an established encrypted session
+/// delivers; key epoch 2 is admitted by a reload and applied to both roles
+/// in the same duty; data keeps flowing with no loss; the publication's
+/// domain 1 sealer and the image's domain 4 sealer move to key epoch 2
+/// from `party_epoch` 0 and the image's opener promotes to it. A DATA
+/// datagram under epoch 1 is accepted within the 10 s overlap and refused
+/// (`enc_epoch`) after it, on the rig's clock. No (key, nonce) pair is
+/// used twice on either side: every sealed datagram's key context and
+/// sequence is recorded, and all are distinct.
+#[test]
+fn a_key_rotation_keeps_an_encrypted_session_flowing() {
+    use std::collections::HashSet;
+
+    use karyos_protocol::protection::aes_gcm_siv::{Domain, EncRejection};
+    use karyos_sys::log_buffer::Role;
+
+    use crate::wire_enc::{ChannelKeys, EncSealer, MAX_SEALED, record_seals, take_seals};
+    use crate::wire_keys::store::{Files as _, KeyStore};
+
+    const EPOCH_1: &str = "format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=1\npurpose=channel\nprofile_id=16\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=3333333333333333333333333333333333333333333333333333333333333333\nchannel_id=7\nstream_id=6\n";
+    const EPOCH_2: &str = "format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=2\npurpose=channel\nprofile_id=16\nnot_before=2026-11-20T00:00:00Z\nnot_after=2027-02-17T00:00:00Z\nsecret=5555555555555555555555555555555555555555555555555555555555555555\nchannel_id=7\nstream_id=6\n";
+    const PAIRWISE: &str = "format=karyos-wire-key-v1\nkey_id=9\nfile_epoch=1\npurpose=pairwise\nprofile_id=16\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=4444444444444444444444444444444444444444444444444444444444444444\nreceiver_id=77\npublisher_id=5\n";
+
+    let (keys_dir, state_dir) = (MemDir::default(), MemDir::default());
+    keys_dir.put("3-1.key", EPOCH_1);
+    keys_dir.put("9-1.key", PAIRWISE);
+    KeyStore::<MemDir, MemDir>::initialise(&state_dir, zeroize::Zeroizing::new([7; 32])).unwrap();
+    let _ = state_dir.names().unwrap();
+    let (mut wire, _) = crate::net::wire::WireKeys::start(
+        Box::new(keys_dir.clone()),
+        Box::new(state_dir),
+        Some(rotation_wall),
+    )
+    .unwrap();
+
+    let (mut rig, b) = encrypted_rig();
+    let a = rig.publisher;
+    // From the first seal: the receiver's first domain 4 control (the SM
+    // that establishes) is sealed under epoch 1 here, while the delivery
+    // below lasts too few rounds for another status interval.
+    record_seals();
+    let slot = established(&mut rig);
+    reload_and_apply(&mut rig, &mut wire, 0);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let batch = |from: u8| -> Vec<Vec<u8>> { (from..from + 8).map(|i| vec![i; 150]).collect() };
+    assert_eq!(enc_deliver(&mut rig, &mut subscriber, &batch(0)), batch(0));
+    assert_eq!(
+        rig.agents
+            .receiver
+            .role
+            .enc_epochs(slot)
+            .map(|(key, _)| key),
+        Some(1)
+    );
+
+    // Epoch 2 lands in the key directory; the next reload admits it.
+    keys_dir.put("3-2.key", EPOCH_2);
+    let reload_s = u64::try_from(crate::wire_keys::store::RELOAD_INTERVAL_S).unwrap();
+    reload_and_apply(&mut rig, &mut wire, reload_s);
+    {
+        use crate::wire_auth::KeySet as _;
+        let view = wire.view();
+        assert_eq!(view.current_epoch(3), Some(2), "the store admitted epoch 2");
+        assert_eq!(view.signing(3).map(|file| file.file_epoch), Some(2));
+        let verifying: Vec<u32> = view
+            .verifying(3)
+            .iter()
+            .flatten()
+            .map(|file| file.file_epoch)
+            .collect();
+        assert_eq!(
+            verifying,
+            vec![1, 2],
+            "epoch 1 verifies through the overlap"
+        );
+    }
+    assert_eq!(
+        enc_deliver(&mut rig, &mut subscriber, &batch(10)),
+        batch(10),
+        "no loss across the rotation"
+    );
+    assert_eq!(
+        enc_deliver(&mut rig, &mut subscriber, &batch(20)),
+        batch(20)
+    );
+    // Several SM intervals (10 ms each) on the rig's clock after the
+    // rotation: the receiver seals domain 4 controls under the new keys,
+    // and its SMs keep the session alive.
+    let receiver_seals = |rig: &Rig| rig.agents.receiver.role.counters().sm_sent;
+    let before_sms = receiver_seals(&rig);
+    for _ in 0..200 {
+        rig.round(true);
+    }
+    assert!(
+        receiver_seals(&rig) >= before_sms + 5,
+        "the receiver sent SMs after the rotation"
+    );
+    let seals = take_seals();
+    let epochs_of = |domain: Domain| -> Vec<(u32, u16)> {
+        seals
+            .iter()
+            .filter(|record| record.context.domain == domain)
+            .map(|record| (record.context.key_epoch, record.context.party_epoch))
+            .collect()
+    };
+    for domain in [Domain::Sender, Domain::Receiver] {
+        let epochs = epochs_of(domain);
+        assert!(
+            epochs.contains(&(1, 0)),
+            "{domain:?} sealed under epoch 1: {epochs:?}"
+        );
+        let first_new = epochs.iter().position(|(key, _)| *key == 2);
+        let Some(first_new) = first_new else {
+            panic!("{domain:?} never moved to epoch 2: {epochs:?}");
+        };
+        assert_eq!(epochs[first_new], (2, 0), "{domain:?} starts at party 0");
+        assert!(
+            epochs[first_new..].iter().all(|(key, _)| *key == 2),
+            "{domain:?} never goes back: {epochs:?}"
+        );
+    }
+    let (key_epoch, _) = rig.agents.receiver.role.enc_epochs(slot).unwrap();
+    assert_eq!(key_epoch, 2, "the image's opener promoted");
+    // No (key, nonce) pair twice, on either side.
+    let mut seen = HashSet::new();
+    for record in &seals {
+        assert!(
+            seen.insert((record.context, record.seq)),
+            "reused: {:?} seq {}",
+            record.context,
+            record.seq
+        );
+    }
+
+    // A DATA datagram under epoch 1, beyond everything the image accepted
+    // under it: accepted within the overlap, refused after it.
+    let last_old = seals
+        .iter()
+        .filter(|record| record.context.domain == Domain::Sender && record.context.key_epoch == 1)
+        .max_by_key(|record| (record.context.party_epoch, record.seq))
+        .cloned()
+        .unwrap();
+    let old_keys =
+        ChannelKeys::new(&[&crate::wire_keys::parse("3-1.key", EPOCH_1.as_bytes()).unwrap()])
+            .unwrap();
+    let mut old = EncSealer::new(
+        &old_keys,
+        None,
+        last_old.context,
+        crate::wire_enc::monotonic_ns,
+    )
+    .unwrap();
+    let mut late = || {
+        let mut bytes = vec![0_u8; MAX_SEALED];
+        bytes[..last_old.frames.len()].copy_from_slice(&last_old.frames);
+        let length = old.seal(&mut bytes, last_old.frames.len()).unwrap();
+        bytes.truncate(length);
+        bytes
+    };
+    for _ in 0..=last_old.seq {
+        let _ = late();
+    }
+    let source = rig.endpoints.local_address(a).unwrap();
+    let refusals = |rig: &Rig| {
+        rig.agents
+            .receiver
+            .role
+            .enc_rejections(b, alias().stream_id)
+            .unwrap()
+    };
+    let before = refusals(&rig);
+    let inside = late();
+    let receiver = &mut rig.agents.receiver;
+    receiver
+        .role
+        .inject_datagram(&receiver.sessions, b, source, &inside, rig.now);
+    assert_eq!(refusals(&rig), before, "accepted within the overlap");
+    rig.now += 10_000 * MS;
+    VIRTUAL_NOW.with(|now| now.set(rig.now));
+    let outside = late();
+    let receiver = &mut rig.agents.receiver;
+    receiver
+        .role
+        .inject_datagram(&receiver.sessions, b, source, &outside, rig.now);
+    let after = refusals(&rig);
+    assert_eq!(
+        after.get(EncRejection::Epoch),
+        before.get(EncRejection::Epoch) + 1,
+        "refused after the overlap: {after:?}"
+    );
+    assert_eq!(after.total(), before.total() + 1);
+    for reason in [
+        EncRejection::Tag,
+        EncRejection::Pairwise,
+        EncRejection::Withdrawn,
+    ] {
+        assert_eq!(after.get(reason), 0, "{reason:?}: {after:?}");
+    }
+}

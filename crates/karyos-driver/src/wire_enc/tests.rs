@@ -159,6 +159,7 @@ fn every_rejection_reason_has_its_own_counter() {
         R::ResyncRefused,
         R::BeforeJoin,
         R::VmGeneration,
+        R::Withdrawn,
     ];
     assert_eq!(all.len(), ENC_REASONS);
     let mut seen = [false; ENC_REASONS];
@@ -845,11 +846,17 @@ fn a_withdrawn_opener_never_opens_again() {
     assert!(opener.is_withdrawn());
     assert_eq!(
         open(&mut opener, &mut channel, &current),
-        Err(EncRejection::Epoch)
+        Err(EncRejection::Withdrawn)
     );
     assert_eq!(
         open(&mut opener, &mut channel, &next),
-        Err(EncRejection::Epoch)
+        Err(EncRejection::Withdrawn)
+    );
+    assert_eq!(channel.rejections.get(EncRejection::Withdrawn), 2);
+    assert_eq!(
+        channel.rejections.get(EncRejection::Epoch),
+        0,
+        "its own counter"
     );
     assert_eq!(
         opener.resync(1, 5, clock()),
@@ -920,4 +927,131 @@ fn withdraw_erases_under_a_bootstrap_or_domain_6_context() {
             Err(EncSendError::Withdrawn)
         ));
     }
+}
+
+/// A key set holding `files`.
+fn set(files: Vec<KeyFile>) -> crate::wire_auth::FixedKeys {
+    crate::wire_auth::FixedKeys { files }
+}
+
+/// H8 finding 4 with ADR-0114 section 6: once an opener has promoted (its
+/// spare used, its previous epoch held), revoking the previous epoch's
+/// file erases that slot in place and keeps it as the spare, so the next
+/// promotion still finds a slot and constructs no key.
+#[test]
+fn a_revoked_previous_epoch_keeps_its_slot_as_the_spare() {
+    let both = ChannelKeys::new(&[&channel_file(1, 0x11), &channel_file(2, 0x22)]).unwrap();
+    let mut opener = EncOpener::new(&both, None, context(Domain::Sender), clock()).unwrap();
+    let mut next = context(Domain::Sender);
+    next.key_epoch = 2;
+    let mut sealer = EncSealer::new(&both, None, next, clock).unwrap();
+    let mut channel = EncChannel::default();
+    assert!(
+        open(&mut opener, &mut channel, &seal(&mut sealer, &frame(DATA)))
+            .unwrap()
+            .promoted
+    );
+    assert!(opener.previous.is_some() && opener.spare.is_none());
+    // Epoch 1 revoked: the previous slot is erased and becomes the spare.
+    opener.apply_keys(&set(vec![channel_file(2, 0x22)]));
+    assert!(!opener.is_withdrawn());
+    assert!(opener.previous.is_none());
+    let spare = opener.spare.as_ref().expect("recycled, not dropped");
+    assert_eq!(spare.context(), &opener.erase, "erased in place");
+    // The next epoch still promotes, from the recycled slot.
+    sealer.roll_now();
+    let accepted = open(&mut opener, &mut channel, &seal(&mut sealer, &frame(DATA))).unwrap();
+    assert!(accepted.promoted);
+    assert_eq!(opener.epochs(), (2, 1));
+    assert!(opener.previous.is_some(), "the overlap is kept");
+}
+
+/// ADR-0114 section 6 rotation: a file epoch newly admitted by the key
+/// set moves a live sealer to `(new, 0)` at its next datagram, under a key
+/// whose context names the new epoch (its sequence restarts, no nonce is
+/// reused), and a live opener that admitted it too accepts that datagram
+/// as its next epoch and promotes, keeping the old epoch for exactly the
+/// 10 s overlap. A file of another class or purpose is never admitted.
+#[test]
+fn a_rotation_moves_live_sealers_and_openers_to_the_new_epoch() {
+    let start = clock();
+    let mut sealer = sender();
+    let mut opener = opener();
+    let mut channel = EncChannel::default();
+    let first = seal(&mut sealer, &frame(DATA));
+    let old_late = seal(&mut sealer, &frame(DATA));
+    assert!(open(&mut opener, &mut channel, &first).is_ok());
+    let old_context = *sealer.context();
+    let old_seq = sealer.key().next_seq();
+    // Epoch 2 admitted and signing; epoch 1 still verifies (the overlap).
+    let rotated = set(vec![channel_file(1, 0x11), channel_file(2, 0x22)]);
+    sealer.apply_keys(&rotated);
+    opener.apply_keys(&rotated);
+    assert!(!sealer.is_withdrawn() && !opener.is_withdrawn());
+    assert_eq!(
+        (sealer.context().key_epoch, sealer.context().party_epoch),
+        (2, 0)
+    );
+    assert_eq!(sealer.key().next_seq(), 0, "a new key, its counter from 0");
+    assert_ne!(*sealer.context(), old_context, "never the old key's nonces");
+    assert_eq!(old_seq, 2);
+    let new = seal(&mut sealer, &frame(DATA));
+    let accepted = open(&mut opener, &mut channel, &new).unwrap();
+    assert!(accepted.promoted);
+    assert_eq!(opener.epochs(), (2, 0));
+    // The previous epoch for exactly 10 s after the promotion.
+    set_now(start + EPOCH_OVERLAP_NS - 1);
+    assert!(open(&mut opener, &mut channel, &old_late).is_ok());
+    let mut stale = EncSealer::new(&keys(), None, context(Domain::Sender), clock).unwrap();
+    for _ in 0..4 {
+        let _ = seal(&mut stale, &frame(DATA));
+    }
+    set_now(start + EPOCH_OVERLAP_NS);
+    assert_eq!(
+        open(&mut opener, &mut channel, &seal(&mut stale, &frame(DATA))),
+        Err(EncRejection::Epoch)
+    );
+    // Applying the same set again changes nothing.
+    sealer.apply_keys(&rotated);
+    assert_eq!(sealer.key().next_seq(), 1);
+    // Wrong purpose: a pairwise file of the channel's key id is ignored.
+    let mut keys = keys();
+    let mut wrong = pairwise_file(66, 3, 0x33);
+    wrong.key_id = 3;
+    assert!(!keys.admit(&set(vec![channel_file(1, 0x11), wrong])));
+    assert_eq!(keys.current_epoch(), 1);
+}
+
+/// Rotation on the receiver side of a domain 4 key: a new pairwise epoch
+/// of the receiver the sealer serves is admitted with the channel epoch,
+/// and the domain 4 sealer moves to the new key epoch and keeps sealing
+/// with its trailer; an unrelated receiver's file is not admitted.
+#[test]
+fn a_rotation_admits_the_served_receivers_pairwise_epoch() {
+    let mut receiver = EncSealer::new(
+        &keys(),
+        Some(&pairs(0x22)),
+        context(Domain::Receiver),
+        clock,
+    )
+    .unwrap();
+    let rotated = set(vec![
+        channel_file(1, 0x11),
+        channel_file(2, 0x22),
+        pairwise_file(66, 1, 0x22),
+        pairwise_file(66, 2, 0x44),
+    ]);
+    receiver.apply_keys(&rotated);
+    assert!(!receiver.is_withdrawn());
+    assert_eq!(receiver.context().key_epoch, 2);
+    assert_eq!(
+        receiver.pairwise.as_ref().unwrap().epochs_of(66),
+        [Some(2), Some(1)]
+    );
+    assert!(!seal(&mut receiver, &frame(DATA)).is_empty());
+    let mut files = pairs(0x22);
+    let mut other = pairwise_file(77, 1, 0x55);
+    other.key_id = 9;
+    assert!(!files.admit(&set(vec![other])));
+    assert_eq!(files.epochs_of(77), [None, None]);
 }

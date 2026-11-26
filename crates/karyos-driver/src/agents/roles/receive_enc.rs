@@ -339,6 +339,9 @@ impl ReceiverEnc {
         for subscription in &mut self.subscriptions {
             subscription.keys.retain(keys);
             subscription.pairwise.retain(keys);
+            // Rotation: a newly admitted epoch serves the next bindings.
+            subscription.keys.admit(keys);
+            subscription.pairwise.admit(keys);
             // Each domain 6 sealer follows its own key only, keeping its
             // sequence; a withdrawn one stays in the table as a tombstone,
             // so its (target, key, boot id) is refused and never rebuilt

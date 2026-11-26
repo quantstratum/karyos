@@ -574,6 +574,9 @@ pub enum EncRejection {
     /// closed and no key is derived again until the driver runs under
     /// fresh identities (ADR-0114 section 10). Raised by the driver.
     VmGeneration,
+    /// `enc_withdrawn`: the opener's keys were withdrawn by a key reload
+    /// (revoked, expired, or the store disabled). Raised by the driver.
+    Withdrawn,
 }
 
 impl From<Replay> for EncRejection {
@@ -611,7 +614,8 @@ impl From<EncRejection> for Rejection {
             EncRejection::Party
             | EncRejection::RetiredBoot
             | EncRejection::RetiredParty
-            | EncRejection::VmGeneration => Self::Key,
+            | EncRejection::VmGeneration
+            | EncRejection::Withdrawn => Self::Key,
             EncRejection::Tag
             | EncRejection::Pairwise
             | EncRejection::InnerRejected

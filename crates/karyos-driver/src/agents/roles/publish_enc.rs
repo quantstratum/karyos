@@ -188,6 +188,10 @@ impl PublicationEnc {
     pub(crate) fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
         self.keys.retain(keys);
         self.pairwise.retain(keys);
+        // Rotation: a newly admitted epoch serves the next answers,
+        // bindings and scratch derivations.
+        self.keys.admit(keys);
+        self.pairwise.admit(keys);
         if let Some(setup) = &mut self.setup {
             setup.apply_keys(keys);
         }
