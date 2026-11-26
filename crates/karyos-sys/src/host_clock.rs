@@ -21,6 +21,37 @@ pub fn host_monotonic_ns() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// The host's boot identity and this process's time namespace, as
+/// ADR-0117 (point 3) derives a `CLOCK_MONOTONIC` epoch from them: the 36
+/// ASCII characters of `/proc/sys/kernel/random/boot_id` and the inode of
+/// `/proc/self/ns/time`. A control-path call.
+///
+/// # Errors
+///
+/// Either file unreadable, or a boot id that is not 36 characters.
+#[cfg(target_os = "linux")]
+pub fn time_identity() -> std::io::Result<([u8; 36], u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let text = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let boot: [u8; 36] = text
+        .trim_end_matches('\n')
+        .as_bytes()
+        .try_into()
+        .map_err(|_| std::io::Error::other("the boot id is not 36 characters"))?;
+    let namespace = std::fs::metadata("/proc/self/ns/time")?.ino();
+    Ok((boot, namespace))
+}
+
+/// [`time_identity`] off Linux: neither identity exists.
+///
+/// # Errors
+///
+/// Always [`std::io::ErrorKind::Unsupported`].
+#[cfg(not(target_os = "linux"))]
+pub fn time_identity() -> std::io::Result<([u8; 36], u64)> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
 /// Nanoseconds of the host's `CLOCK_TAI`, the clock domain of timed
 /// transmission's `Tai` schedules (`quantstratum-docs:
 /// karyos/design/timed-tx.md`, TT-2; Linux only), through the same
@@ -104,6 +135,28 @@ pub fn realtime_paired_read() -> Option<(u64, u64, u64)> {
     let before = rustix::time::clock_gettime(rustix::time::ClockId::MonotonicRaw);
     let realtime = rustix::time::clock_gettime(rustix::time::ClockId::Realtime);
     let after = rustix::time::clock_gettime(rustix::time::ClockId::MonotonicRaw);
+    Some((ns(before)?, ns(realtime)?, ns(after)?))
+}
+
+/// A bracketed read of `CLOCK_REALTIME` against `CLOCK_MONOTONIC`, the
+/// clock of host trace clocks (ADR-0117, point 4): `CLOCK_MONOTONIC`,
+/// `CLOCK_REALTIME` and `CLOCK_MONOTONIC` again, in ns (the middle one
+/// since the Unix epoch), like [`realtime_paired_read`]. `None` when a
+/// reading is negative or overflows. A control-path call, through safe
+/// `rustix` only.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn monotonic_realtime_paired_read() -> Option<(u64, u64, u64)> {
+    fn ns(time: rustix::time::Timespec) -> Option<u64> {
+        let seconds = u64::try_from(time.tv_sec).ok()?;
+        let nanos = u64::try_from(time.tv_nsec).ok()?;
+        seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|ns| ns.checked_add(nanos))
+    }
+    let before = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    let realtime = rustix::time::clock_gettime(rustix::time::ClockId::Realtime);
+    let after = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     Some((ns(before)?, ns(realtime)?, ns(after)?))
 }
 

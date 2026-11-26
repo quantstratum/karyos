@@ -222,7 +222,9 @@ pub enum JournalKind {
 }
 
 impl JournalKind {
-    const fn code(self) -> u64 {
+    /// The kind word of the entry (word 16).
+    #[must_use]
+    pub const fn code(self) -> u64 {
         match self {
             Self::Subscriber => 1,
             Self::Publisher => 2,

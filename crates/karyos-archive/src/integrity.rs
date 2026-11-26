@@ -65,6 +65,7 @@ pub mod tiering_offline;
 pub mod time;
 pub mod time_evidence;
 pub mod time_producer;
+pub mod trace_evidence;
 pub mod trust;
 pub mod verify;
 

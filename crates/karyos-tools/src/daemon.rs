@@ -337,6 +337,21 @@ pub fn ipc_config(admission: &AdmissionOptions) -> IpcConfig {
     }
 }
 
+/// Sets the driver's network trace hooks (`--trace-network`, ADR-0117):
+/// a [`karyos_trace::NetworkTraceAgent`] per side, stamping with the host
+/// clock and holding at most `journals` journals, so the network journals
+/// (kinds 3 and 4) reach the trace mirror.
+#[cfg(target_os = "linux")]
+fn set_network_trace_hooks(driver: &mut EmbeddedDriver<SharedTerms>, journals: usize) {
+    use karyos_protocol::trace_hook::NetSide;
+    use karyos_trace::{HostMonotonicClock, NetworkTraceAgent};
+    let id = driver.driver_id();
+    for side in [NetSide::Sender, NetSide::Receiver] {
+        let agent = NetworkTraceAgent::new(id, HostMonotonicClock::new(1), journals);
+        driver.set_network_trace_hook(side, Some(Box::new(agent)));
+    }
+}
+
 /// The daemon's driver, alone or behind its Archive (`--archive`).
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
@@ -391,6 +406,9 @@ impl Daemon {
                 Box::new(SystemClock::new()),
             )
             .map_err(StartError::Driver)?;
+            if options.trace_network {
+                set_network_trace_hooks(&mut driver, options.driver.max_trace_journals);
+            }
             let mut streams = Vec::with_capacity(configs.len().checked_add(2).unwrap_or(0));
             for (stream, config) in configs {
                 let handle = driver
@@ -494,8 +512,14 @@ impl Daemon {
         let Serving::Archive(archive) = &mut self.serving else {
             return self;
         };
-        archive.stop_recordings();
+        // What the trace mirror holds is published before the trace
+        // recording is asked to stop (ADR-0117); its stop may then wait
+        // for the calibration journal (point 7), past which its last
+        // ranges are `no_evidence` and the daemon stops.
+        let within = within.saturating_add(archive.stop_wait());
         let deadline = Instant::now().checked_add(within);
+        archive.drain_trace(deadline);
+        archive.stop_recordings();
         while archive.stopping() && deadline.is_none_or(|deadline| Instant::now() < deadline) {
             let _ = archive.cycle();
             std::thread::yield_now();
@@ -812,6 +836,8 @@ mod tests {
             retention: None,
             time_evidence: false,
             calibration_journal: None,
+            trace: None,
+            time_requirements: Vec::new(),
             replications: Vec::new(),
             replicas: Vec::new(),
             trusted_network: false,
@@ -858,6 +884,8 @@ mod tests {
             retention: None,
             time_evidence: false,
             calibration_journal: None,
+            trace: None,
+            time_requirements: Vec::new(),
             replications: Vec::new(),
             replicas: Vec::new(),
             trusted_network: false,

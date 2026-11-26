@@ -104,7 +104,7 @@ impl Daemon {
                 return status;
             }
             assert!(
-                start.elapsed() < Duration::from_secs(20),
+                start.elapsed() < Duration::from_secs(40),
                 "karyosd did not exit"
             );
             std::thread::sleep(Duration::from_millis(5));
@@ -829,4 +829,669 @@ fn karyosd_reports_no_time_evidence_without_a_group_from_its_calibration_journal
     for path in [&archive, &journal, &anchors, &dir] {
         let _ = std::fs::remove_dir_all(path);
     }
+}
+
+/// The environment variable that makes [`signer_process`] the Ed25519
+/// signer program of the trace evidence test.
+const SIGNER: &str = "KARYOSD_TEST_SIGNER";
+
+/// The test signer's seed, and the authority's that endorses its key.
+const SIGNER_SEED: [u8; 32] = [9; 32];
+const AUTHORITY_SEED: [u8; 32] = [1; 32];
+/// The Archive's identity in the trust file.
+const ARCHIVE_ID: [u8; 32] = [0x42; 32];
+/// The operator's anchor store location.
+const OPERATOR: [u8; 32] = [0x0A; 32];
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Not a test of its own: with [`SIGNER`] set, this process is the
+/// `--archive-signer` program (`<program> sign`): the head's signed bytes
+/// in hex on standard input, the Ed25519 signature in hex on standard
+/// output, a real signature with the test key.
+#[test]
+fn signer_process() {
+    use std::io::{BufRead as _, Write as _};
+    if std::env::var_os(SIGNER).is_none() {
+        return;
+    }
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).unwrap();
+    let line = line.trim();
+    let bytes: Vec<u8> = (0..line.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&line[at..at + 2], 16).unwrap())
+        .collect();
+    let key = karyos_archive::integrity::test_key::TestKey::from_seed(SIGNER_SEED);
+    let mut out = std::io::stdout().lock();
+    // On a line of its own: the harness prints the test's name before it.
+    writeln!(out, "\n{}", hex(&key.sign_bytes(&bytes))).unwrap();
+    out.flush().unwrap();
+}
+
+/// Registers the signer's key in the integrity journal of `dir`, endorsed
+/// by the authority, before the daemon opens it.
+fn register_signer(dir: &Path) {
+    use karyos_archive::disk::StdDisk;
+    use karyos_archive::integrity::journal::IntegrityJournal;
+    use karyos_archive::integrity::ledger::Ledger;
+    use karyos_archive::integrity::test_key::TestKey;
+    use karyos_archive::integrity::trust::{
+        Algorithm, Custody, KEYS_FILE, KeyRegistry, REGISTRY_ENTRY_LENGTH, RegistryAction,
+        RegistryEntry, TrustRoot, key_id,
+    };
+    std::fs::create_dir_all(dir).unwrap();
+    let mut journal = IntegrityJournal::open(StdDisk, dir).unwrap().journal;
+    let authority = TestKey::from_seed(AUTHORITY_SEED);
+    let public = TestKey::from_seed(SIGNER_SEED).public();
+    let mut entry = RegistryEntry {
+        action: RegistryAction::Register,
+        algorithm: Algorithm::Ed25519,
+        custody: Custody::Declared,
+        sequence: 0,
+        key_id: key_id(&public),
+        public,
+        effective: u64::try_from(journal.records().unwrap().len()).unwrap(),
+        evidence: [0; 32],
+        endorsement: [0; 64],
+    };
+    entry.endorsement = authority.sign_bytes(&entry.endorsement_bytes(&ARCHIVE_ID));
+    let trust = TrustRoot {
+        archive_id: ARCHIVE_ID,
+        authorities: vec![authority.public()],
+    };
+    let mut keys = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, dir, KEYS_FILE).unwrap();
+    KeyRegistry::new(trust)
+        .append(&entry, &mut journal, &mut keys)
+        .unwrap();
+}
+
+/// The last signed head of `dir`'s journal, and whether it covers the
+/// journal's last record.
+fn last_head(dir: &Path) -> (Option<karyos_archive::integrity::trust::SignedHead>, bool) {
+    use karyos_archive::disk::StdDisk;
+    use karyos_archive::integrity::journal::read_records;
+    use karyos_archive::integrity::ledger::read_entries;
+    use karyos_archive::integrity::trust::{HEADS_FILE, SIGNED_HEAD_LENGTH, SignedHead};
+    let (records, _) = read_records(&mut StdDisk, dir).unwrap();
+    let heads: Vec<[u8; SIGNED_HEAD_LENGTH]> = read_entries(&mut StdDisk, dir, HEADS_FILE).unwrap();
+    let head = heads.last().map(|bytes| SignedHead::decode(bytes).unwrap());
+    let covered = match (head, records.last()) {
+        (Some(head), Some(last)) => head.head.counter >= last.counter,
+        _ => false,
+    };
+    (head, covered)
+}
+
+/// Runs `karyos-tools` with `args`; returns its standard output, asserting
+/// success.
+fn tools(args: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_karyos-tools"))
+        .args(args)
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "{args:?}: {out}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    out
+}
+
+/// The 18 words of the `record` line a calibrate tool printed.
+fn printed_record(out: &str) -> Vec<String> {
+    out.lines()
+        .find_map(|line| line.strip_prefix("record "))
+        .unwrap_or_else(|| panic!("no record in {out}"))
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `calibrate realtime --from monotonic --epoch boot` of the trace clock
+/// (domain 5), valid `extension_ms` past its reads, appended to `journal`;
+/// retried when a slew within the run refuses it. Returns its validity's
+/// end, in ns of `CLOCK_MONOTONIC`.
+fn calibrate_monotonic(journal: &Path, extension_ms: u64) -> u64 {
+    use karyos_trace::clocks::record::ClockRecord;
+    for _ in 0..10 {
+        let output = Command::new(env!("CARGO_BIN_EXE_karyos-tools"))
+            .args([
+                "calibrate",
+                "realtime",
+                "--from",
+                "monotonic",
+                "--source-domain",
+                "5",
+                "--epoch",
+                "boot",
+                "--reads",
+                "256",
+                "--interval-us",
+                "100",
+                "--extension-ms",
+                &extension_ms.to_string(),
+            ])
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            continue;
+        }
+        let words = printed_record(&String::from_utf8_lossy(&output.stdout));
+        let mut append = vec![
+            "calibrate",
+            "append",
+            "--journal",
+            journal.to_str().unwrap(),
+        ];
+        append.extend(words.iter().map(String::as_str));
+        let _ = tools(&append);
+        // Printed in hex with `0x`.
+        let parsed: Vec<u64> = words
+            .iter()
+            .map(|word| u64::from_str_radix(word.trim_start_matches("0x"), 16).unwrap())
+            .collect();
+        let Ok(ClockRecord::Calibration(calibration)) =
+            ClockRecord::decode(&parsed.try_into().unwrap())
+        else {
+            panic!("not a calibration");
+        };
+        return calibration.valid_to;
+    }
+    panic!("calibrate realtime refused every run");
+}
+
+/// `calibrate utc --epoch boot` from a synthetic synchronised chrony
+/// state sampled now, valid `window_ms`, appended to `journal`.
+fn reference_now(journal: &Path, tracking: &Path, window_ms: u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        .to_string();
+    let out = tools(&[
+        "calibrate",
+        "utc",
+        "--tracking",
+        tracking.to_str().unwrap(),
+        "--sampled-at-ns",
+        &now,
+        "--window-ms",
+        &window_ms.to_string(),
+        "--epoch",
+        "boot",
+    ]);
+    let words = printed_record(&out);
+    let mut append = vec![
+        "calibrate",
+        "append",
+        "--journal",
+        journal.to_str().unwrap(),
+    ];
+    append.extend(words.iter().map(String::as_str));
+    let _ = tools(&append);
+}
+
+/// Waits until `CLOCK_MONOTONIC` is past `instant`.
+fn monotonic_past(instant: u64) {
+    while karyos_sys::host_clock::host_monotonic_ns() <= instant {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A publication of stream [`STREAM`] traced by a `TraceAgent` with the
+/// host clock, through a trace journal of the daemon in `dir`.
+struct Traced {
+    client: karyos_client::ipc::RemoteClient,
+    publication: karyos_client::ClientPublication<SharedTerms>,
+}
+
+impl Traced {
+    fn new(dir: &Path) -> Self {
+        use karyos_sys::record_journal::JournalLayout;
+        use karyos_trace::{
+            BufferedIds, ClockProvenance, HostMonotonicClock, OsRandom, RECORD_WORDS, Sampling,
+            TraceAgent, journal::ObserverId, trace_writer,
+        };
+        // Once the daemon's socket answers.
+        let start = Instant::now();
+        let mut client = loop {
+            match karyos_client::ipc::attach(dir, Duration::from_secs(5), 16) {
+                Ok(client) => break client,
+                Err(error) => {
+                    assert!(start.elapsed() < Duration::from_secs(10), "attach: {error}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        let key = StreamKey {
+            stream_id: STREAM,
+            session_id: SESSION,
+        };
+        let _ = client.add_publication(key, false).unwrap();
+        let start = Instant::now();
+        let mut grant = None;
+        while grant.is_none() {
+            assert!(start.elapsed() < Duration::from_secs(10), "no grant");
+            let _ = client.poll(usize::MAX, |completion| match completion.outcome {
+                Outcome::Fetchable(fetchable) => grant = Some(fetchable),
+                other => panic!("expected a grant, got {other:?}"),
+            });
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let grant = grant.unwrap();
+        let layout = JournalLayout {
+            capacity: 1024,
+            payload_words: RECORD_WORDS,
+            drop_ranges: 2,
+        };
+        let _ = client
+            .trace_journal(
+                layout,
+                grant.registration,
+                ClockProvenance::HostMonotonic.word(),
+            )
+            .unwrap();
+        let mut fetchable = None;
+        while fetchable.is_none() {
+            assert!(start.elapsed() < Duration::from_secs(10), "no journal");
+            let _ = client.poll(usize::MAX, |completion| match completion.outcome {
+                Outcome::FetchableJournal(journal) => fetchable = Some(journal),
+                other => panic!("expected a journal, got {other:?}"),
+            });
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (number, raw) = client
+            .take_journal(&fetchable.unwrap())
+            .unwrap()
+            .into_parts();
+        let instance = client.instance();
+        let driver = [(instance >> 64) as u64, instance as u64];
+        let writer = trace_writer(
+            raw,
+            ObserverId {
+                driver,
+                journal: number,
+            },
+            1,
+        )
+        .unwrap();
+        let agent = TraceAgent::new(
+            Sampling::All,
+            BufferedIds::new(4096, OsRandom).unwrap(),
+            HostMonotonicClock::new(1),
+            writer,
+        );
+        let identity = karyos_client::PublicationIdentity {
+            driver,
+            registration: grant.registration,
+            stream_id: STREAM,
+            session_id: SESSION,
+            incarnation: 1,
+        };
+        let publication = client
+            .take_publication(&grant)
+            .unwrap()
+            .with_trace(Box::new(agent), identity);
+        Self {
+            client,
+            publication,
+        }
+    }
+
+    /// Offers one untraced message, once the recording takes it: the
+    /// stream is recorded before any observation is made.
+    fn connected(&mut self) {
+        let start = Instant::now();
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(10), "not recorded");
+            let _ = self.client.poll(usize::MAX, |_| {});
+            if let Ok(karyos_client::OfferOutcome::Accepted { .. }) = self.publication.offer(b"x") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Offers `count` traced messages, each once the recording takes it.
+    fn publish(&mut self, count: u32) {
+        let start = Instant::now();
+        let mut sent = 0;
+        while sent < count {
+            assert!(start.elapsed() < Duration::from_secs(10), "sent {sent}");
+            let _ = self.client.poll(usize::MAX, |_| {});
+            let decision = self.publication.trace_message(None);
+            match self
+                .publication
+                .offer_with_trace(&sent.to_le_bytes(), &decision)
+            {
+                Ok(karyos_client::OfferOutcome::Accepted { .. }) => sent += 1,
+                _ => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+    }
+}
+
+/// ADR-0117 end to end (karyos#991, #1065, #1128): a karyosd with a real
+/// Ed25519 signer, a trust file and the calibration journal records its
+/// trace journal as an Archive recording while a client traced with the
+/// host clock publishes across a calibration boundary; the calibrations
+/// (C1, C2 across the boundary, a later C3) and UTC references come from
+/// `karyos-tools calibrate realtime --from monotonic --epoch boot` and
+/// `calibrate utc --epoch boot`. After the stop, the heads are signed (the
+/// daemon restarted until they are) and anchored by the operator, and
+/// `karyos-catalog verify --trust --anchors --time-requirement` exits 0
+/// with entries citing both calibrations, each `met`, and no uncovered
+/// range; a stricter requirement is `not_met`.
+#[test]
+fn karyosd_records_its_trace_journal_with_time_evidence() {
+    use karyos_archive::disk::StdDisk;
+    use karyos_archive::integrity::anchor::{LedgerAnchorStore, publish_due};
+    use karyos_archive::integrity::time_evidence::{NO_BOUND, entries_dir, read_sealed};
+
+    if karyos_sys::host_clock::time_identity().is_err() {
+        return;
+    }
+    let dir = dir("trace-evidence");
+    let root = dir.with_extension("root");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let archive = root.join("archive");
+    let journal = root.join("calibrations");
+    let anchors = root.join("anchors");
+    let time_anchors = root.join("time-anchors");
+    for path in [&archive, &anchors, &time_anchors] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    register_signer(&archive);
+    register_signer(&entries_dir(&archive));
+    let authority = karyos_archive::integrity::test_key::TestKey::from_seed(AUTHORITY_SEED);
+    let trust = root.join("trust");
+    std::fs::write(
+        &trust,
+        format!(
+            "archive {}\nauthority {}\njournal 0\ntime-journal 1\n",
+            hex(&ARCHIVE_ID),
+            hex(&authority.public())
+        ),
+    )
+    .unwrap();
+    let signer = root.join("signer.sh");
+    std::fs::write(
+        &signer,
+        format!(
+            "#!/bin/sh\n{SIGNER}=1 \"{}\" --exact signer_process --nocapture --test-threads=1 2>/dev/null | grep -E '^[0-9a-f]{{128}}$'\n",
+            std::env::current_exe().unwrap().display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&signer, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let tracking = root.join("tracking");
+    std::fs::write(
+        &tracking,
+        "A29FC87B,ntp.example,2,1700000000.0,0.000001,0,0,0,0.001,0.002,0.0001,0.0002,64,Normal\n",
+    )
+    .unwrap();
+    let public =
+        hex(&karyos_archive::integrity::test_key::TestKey::from_seed(SIGNER_SEED).public());
+    let signing = [
+        "--archive-signer",
+        signer.to_str().unwrap(),
+        "--archive-signer-key",
+        &public,
+        "--archive-trust",
+        trust.to_str().unwrap(),
+        "--archive-time-evidence",
+        "--archive-calibration-journal",
+        journal.to_str().unwrap(),
+    ];
+    let record = format!("{STREAM}:{SESSION}");
+    let mut args: Vec<&str> = vec!["--record", &record];
+    args.extend(signing);
+    args.extend([
+        "--archive-trace-record",
+        "50:1",
+        "--archive-trace-clock",
+        "5:boot:1000",
+        "--archive-time-requirement",
+        "5:1000000000:1000",
+        "--archive-calibration-wait",
+        "10s",
+        "--archive-seal-interval",
+        "200ms",
+    ]);
+    let log_path = root.join("first.log");
+    let mut daemon = Daemon::start(&dir, &archive, &args, &log_path);
+    let mut traced = Traced::new(&dir);
+    // The recording of the stream is attached before the calibrations,
+    // and nothing is observed before C1.
+    traced.connected();
+
+    // C1 and a UTC reference valid over the whole run, then traffic
+    // within C1.
+    reference_now(&journal, &tracking, 60_000);
+    let c1 = calibrate_monotonic(&journal, 5_000);
+    traced.publish(20);
+    assert!(karyos_sys::host_clock::host_monotonic_ns() < c1, "C1 ended");
+    // The boundary: C2 starts after C1 ends; traffic within C2.
+    monotonic_past(c1);
+    let c2 = calibrate_monotonic(&journal, 5_000);
+    traced.publish(20);
+    assert!(karyos_sys::host_clock::host_monotonic_ns() < c2, "C2 ended");
+    // The later records: C3 and a UTC reference past every observation.
+    monotonic_past(c2);
+    let _ = calibrate_monotonic(&journal, 5_000);
+    reference_now(&journal, &tracking, 10_000);
+    std::thread::sleep(Duration::from_millis(1_500));
+    drop(traced);
+    assert!(daemon.stop().success(), "{}", log(&log_path));
+    let text = log(&log_path);
+    assert!(text.contains("trace mirror published"), "{text}");
+
+    // The clean shutdown waited for the last heads' signatures: the
+    // operator's anchors cover them, with no second run.
+    for journal_dir in [archive.clone(), entries_dir(&archive)] {
+        assert!(
+            last_head(&journal_dir).1,
+            "{} is not signed",
+            journal_dir.display()
+        );
+    }
+    for (journal_dir, store) in [
+        (archive.clone(), &anchors),
+        (entries_dir(&archive), &time_anchors),
+    ] {
+        let (Some(head), true) = last_head(&journal_dir) else {
+            panic!("{} is not covered", journal_dir.display());
+        };
+        let mut anchored = LedgerAnchorStore::open(StdDisk, store, OPERATOR).unwrap();
+        publish_due(
+            &mut anchored,
+            None,
+            Some(&head),
+            std::num::NonZeroU64::new(1).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    }
+
+    // Two entries cite different calibrations, each bounded.
+    let entries = read_sealed(StdDisk, &archive).unwrap();
+    let bounded: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.bound_max_ns != NO_BOUND)
+        .collect();
+    let mut digests: Vec<[u8; 32]> = bounded.iter().map(|entry| entry.calibration).collect();
+    digests.sort_unstable();
+    digests.dedup();
+    assert!(digests.len() >= 2, "{entries:#?}");
+
+    let verify = |requirement: Option<&str>| {
+        let output = Command::new(env!("CARGO_BIN_EXE_karyos-catalog"))
+            .arg("verify")
+            .arg(&archive)
+            .arg("--trust")
+            .arg(&trust)
+            .arg("--anchors")
+            .arg(format!("{}={}", hex(&OPERATOR), anchors.display()))
+            .args(
+                requirement
+                    .map(|requirement| ["--time-requirement", requirement])
+                    .into_iter()
+                    .flatten(),
+            )
+            .arg("--time-anchors")
+            .arg(format!("{}={}", hex(&OPERATOR), time_anchors.display()))
+            .output()
+            .unwrap();
+        (
+            output.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )
+    };
+    // No --time-requirement: the recording carries the operator's
+    // requirement for clock domain 5 (karyos#1128).
+    let (code, shown) = verify(None);
+    assert!(
+        shown.contains(
+            "clock domain 5: declared 1000000000:1000, applied 1000000000:1000 (recorded)"
+        ),
+        "{shown}"
+    );
+    assert_eq!(code, Some(0), "{shown}");
+    for entry in &bounded {
+        let [.., domain, epoch] = entry.clock;
+        let line = format!(
+            "time recording {} [{}, {}) clock {domain}:{epoch} met",
+            entry.recording, entry.start, entry.end
+        );
+        assert!(shown.contains(&line), "{line:?} not in\n{shown}");
+    }
+    assert!(!shown.contains("uncovered"), "{shown}");
+    assert!(!shown.contains(" loss "), "{shown}");
+    assert!(shown.ends_with("time verdict: met\n"), "{shown}");
+    // A stricter requirement: 1 ns of divergence.
+    // The verifier's own, stricter requirement overrides it.
+    let (code, shown) = verify(Some("1:1000"));
+    assert_eq!(code, Some(0), "{shown}");
+    assert!(
+        shown.contains("declared 1000000000:1000, applied 1:1000 (--time-requirement)"),
+        "{shown}"
+    );
+    assert!(!shown.contains("looser"), "{shown}");
+    assert!(shown.ends_with("time verdict: not_met\n"), "{shown}");
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ADR-0117 point 5, end to end: a real ring overwrite. karyosd's trace
+/// mirror holds two records while the driver drains a traced client's
+/// burst into it, so the ring overwrites records before the publisher
+/// reads them; the publisher reports them as losses of the client's own
+/// journal, and `karyos-catalog verify --time-requirement` reports each
+/// affected sealed range `no_evidence` with the lost journal and
+/// sequences, and the recording's verdict `no_evidence` for capture,
+/// never `met`.
+#[test]
+fn a_ring_overwrite_reaches_verify_as_no_evidence() {
+    use karyos_archive::disk::StdDisk;
+    use karyos_archive::integrity::anchor::LedgerAnchorStore;
+
+    if karyos_sys::host_clock::time_identity().is_err() {
+        return;
+    }
+    let dir = dir("ring-overwrite");
+    let root = dir.with_extension("root");
+    let _ = std::fs::remove_dir_all(&root);
+    let archive = root.join("archive");
+    let journal = root.join("calibrations");
+    let time_anchors = root.join("time-anchors");
+    for path in [&archive, &time_anchors] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    // The entries' anchor store must be there for verify to read it.
+    drop(LedgerAnchorStore::open(StdDisk, &time_anchors, OPERATOR).unwrap());
+    let record = format!("{STREAM}:{SESSION}");
+    let log_path = root.join("daemon.log");
+    let mut daemon = Daemon::start(
+        &dir,
+        &archive,
+        &[
+            "--record",
+            &record,
+            "--archive-time-evidence",
+            "--archive-calibration-journal",
+            journal.to_str().unwrap(),
+            "--archive-trace-record",
+            "50:1",
+            "--archive-trace-clock",
+            "5:boot:1000",
+            "--archive-calibration-wait",
+            "0s",
+            "--archive-seal-interval",
+            "200ms",
+            "--trace-mirror-records",
+            "2",
+        ],
+        &log_path,
+    );
+    let mut traced = Traced::new(&dir);
+    traced.connected();
+    // Bursts the driver drains many records of at once into two slots.
+    for _ in 0..20 {
+        traced.publish(50);
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    drop(traced);
+    assert!(daemon.stop().success(), "{}", log(&log_path));
+    let text = log(&log_path);
+    let losses: u64 = text
+        .lines()
+        .find(|line| line.contains("trace mirror published"))
+        .and_then(|line| line.split("losses=").nth(1))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(losses > 0, "no overwrite: {text}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_karyos-catalog"))
+        .arg("verify")
+        .arg(&archive)
+        .args(["--time-requirement", "1000000000:1000", "--time-anchors"])
+        .arg(format!("{}={}", hex(&OPERATOR), time_anchors.display()))
+        .output()
+        .unwrap();
+    let shown = String::from_utf8_lossy(&output.stdout).into_owned();
+    let lines: Vec<&str> = shown
+        .lines()
+        .filter(|line| line.contains(" loss journal "))
+        .collect();
+    assert!(
+        !lines.is_empty(),
+        "{shown}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for line in &lines {
+        assert!(line.ends_with(" no_evidence"), "{line}");
+        // Each overwrite's journal is known: the client's, never 0.
+        assert!(!line.contains(" loss journal 0 "), "{line}");
+    }
+    assert!(
+        shown.contains("time verdict: no_evidence (capture incomplete: "),
+        "{shown}"
+    );
+    assert!(!shown.contains(" met\n"), "{shown}");
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&dir);
 }

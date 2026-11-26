@@ -390,3 +390,27 @@ fn reaching_needs_the_cited_targets_reference_too() {
     // Events of no session prove nothing and wait for nothing.
     assert!(Snapshot::default().reaches(&clock(), &self::events(&[(40, false)])));
 }
+
+/// ADR-0117 point 3: the boot epoch differs across boots and time
+/// namespaces, is the same for the same pair, and is never 0.
+#[test]
+fn the_boot_epoch_differs_across_boots_and_namespaces() {
+    let boot = *b"0e0b5b5e-2d0d-4d4e-9c3a-6b1f5e8a7c21";
+    let other = *b"0e0b5b5e-2d0d-4d4e-9c3a-6b1f5e8a7c22";
+    let epoch = boot_epoch(&boot, 4_026_531_834);
+    assert_eq!(epoch, boot_epoch(&boot, 4_026_531_834));
+    assert_ne!(epoch, boot_epoch(&other, 4_026_531_834));
+    assert_ne!(epoch, boot_epoch(&boot, 4_026_532_000));
+    assert_ne!(epoch, 0);
+    // The first 8 bytes of SHA-256(boot id || inode LE), little-endian.
+    use sha2::Digest as _;
+    let mut hasher = Sha256::new();
+    hasher.update(boot);
+    hasher.update(4_026_531_834u64.to_le_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    assert_eq!(epoch, u64::from_le_bytes(digest[..8].try_into().unwrap()));
+    // This host's, when it has the identities.
+    if let Ok((boot, namespace)) = karyos_sys::host_clock::time_identity() {
+        assert_eq!(host_boot_epoch().unwrap(), boot_epoch(&boot, namespace));
+    }
+}
