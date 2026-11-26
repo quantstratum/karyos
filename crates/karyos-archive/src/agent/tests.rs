@@ -21,6 +21,9 @@ use crate::catalog::StopReason;
 use crate::disk::StdDisk;
 use crate::recorder::{Frames, SourceError};
 
+/// A trace recording's time evidence (ADR-0117).
+mod trace;
+
 /// A source of `chunks` from `position`, sealed after them when `seal`,
 /// revoked after them when `fail`.
 #[derive(Default)]
@@ -6811,4 +6814,97 @@ fn immutable_segments_are_released_only_by_a_purge() {
     let (last, _) = &segments[segments.len() - 1];
     assert!(last.exists());
     assert!(std::fs::OpenOptions::new().write(true).open(last).is_err());
+}
+
+/// A clean shutdown waits, within `shutdown_signing_wait`, for the last
+/// heads of the integrity journal and of the entries' journal to be
+/// signed: the final range's records, the stop's catalog record among
+/// them, are covered when the agent has stopped.
+#[test]
+fn a_clean_shutdown_signs_the_last_heads() {
+    use crate::integrity::journal::{IntegrityJournal, read_records};
+    use crate::integrity::ledger::{Ledger, read_entries};
+    use crate::integrity::signing::{BacklogPolicy, SigningConfig};
+    use crate::integrity::test_key::TestKey;
+    use crate::integrity::time::{Source, SyncState};
+    use crate::integrity::time_evidence::{Entry, entries_dir};
+    use crate::integrity::trust::{
+        Algorithm, Custody, HEADS_FILE, KEYS_FILE, KeyRegistry, REGISTRY_ENTRY_LENGTH,
+        RegistryAction, RegistryEntry, SIGNED_HEAD_LENGTH, SignedHead, TrustRoot, key_id,
+    };
+
+    let dir = temp_dir("shutdown-signs");
+    let entries = entries_dir(&dir);
+    std::fs::create_dir_all(&entries).unwrap();
+    let archive = [7u8; 32];
+    let authority = TestKey::from_seed([1; 32]);
+    let archival = TestKey::from_seed([9; 32]);
+    let trust = TrustRoot {
+        archive_id: archive,
+        authorities: vec![authority.public()],
+    };
+    for journal_dir in [&dir, &entries] {
+        let mut journal = IntegrityJournal::open(StdDisk, journal_dir)
+            .unwrap()
+            .journal;
+        let mut keys =
+            Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, journal_dir, KEYS_FILE).unwrap();
+        let mut entry = RegistryEntry {
+            action: RegistryAction::Register,
+            algorithm: Algorithm::Ed25519,
+            custody: Custody::Declared,
+            sequence: 0,
+            key_id: key_id(&archival.public()),
+            public: archival.public(),
+            effective: 0,
+            evidence: [0; 32],
+            endorsement: [0; 64],
+        };
+        entry.endorsement = authority.sign_bytes(&entry.endorsement_bytes(&archive));
+        KeyRegistry::new(trust.clone())
+            .append(&entry, &mut journal, &mut keys)
+            .unwrap();
+    }
+    let signing = ArchiveSigning {
+        trust,
+        journal_id: 1,
+        time_evidence_journal_id: Some(2),
+        config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
+        signer: Box::new(archival),
+    };
+    let config = sealing().with_shutdown_signing_wait(Duration::from_secs(20));
+    let agent = ArchiveHandle::spawn_signing(StdDisk, &dir, config, signing).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let entry = Entry {
+        source: Source::Gnss,
+        sync_state: SyncState::Synchronised,
+        clock: [1, 0, 2, 3, 4],
+        recording: id,
+        start: 0,
+        end: u64::try_from(all.len()).unwrap(),
+        min_time: 1000,
+        max_time: 2000,
+        granularity: 1,
+        bound_min_ns: 150,
+        bound_max_ns: 160,
+        calibration: [0xAA; 32],
+        utc_reference: [0xBB; 32],
+        tick_fs: 1_000_000,
+    };
+    agent.record_time_evidence(entry).unwrap();
+    // At once: nothing waited for the signer before the shutdown.
+    agent.shutdown().unwrap();
+    for journal_dir in [&dir, &entries] {
+        let (records, _) = read_records(&mut StdDisk, journal_dir).unwrap();
+        let heads: Vec<[u8; SIGNED_HEAD_LENGTH]> =
+            read_entries(&mut StdDisk, journal_dir, HEADS_FILE).unwrap();
+        let head = SignedHead::decode(heads.last().unwrap()).unwrap();
+        assert_eq!(
+            head.head.counter,
+            records.last().unwrap().counter,
+            "{}",
+            journal_dir.display()
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }

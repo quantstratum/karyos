@@ -55,7 +55,13 @@ Usage: karyos-tools calibrate phc [--device /dev/ptp0] [--reads 4096]
        karyos-tools calibrate append --journal <dir> [<word>...]
        karyos-tools calibrate utc [--tracking <file> --sampled-at-ns N]
            [--window-ms 10000] ...
-       karyos-tools calibrate realtime [--reads 4096] [--domain 4] ...
+       karyos-tools calibrate realtime [--from raw|monotonic] [--reads 4096]
+           [--domain 4] ...
+
+Every --epoch takes a number or `boot`: the epoch of this boot and time
+namespace (SHA-256 of the boot id and the time namespace inode, as
+karyosd --archive-trace-clock derives it); refused when either is
+unreadable.
 
 `utc` turns `chronyc -c tracking` into a UTC reference record for
 CLOCK_REALTIME, and `realtime` fits CLOCK_MONOTONIC_RAW to CLOCK_REALTIME
@@ -170,7 +176,7 @@ pub fn parse(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Option<Se
             "--extension-ms" => settings.extension_ms = number()?,
             "--source-domain" => settings.source_domain = number()?,
             "--target-domain" => settings.target_domain = number()?,
-            "--epoch" => settings.epoch = number()?,
+            "--epoch" => settings.epoch = epoch(&value)?,
             _ => return Err(format!("unknown argument {arg}")),
         }
     }
@@ -178,6 +184,27 @@ pub fn parse(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Option<Se
         return Err("the source and target domains must differ".to_owned());
     }
     Ok(Some(settings))
+}
+
+/// An `--epoch` value: a number, or `boot`, the epoch of this boot and
+/// time namespace (ADR-0117, point 3), derived exactly as `karyosd
+/// --archive-trace-clock` derives it
+/// ([`karyos_archive::integrity::time_producer::host_boot_epoch`]), so a
+/// calibration made in another boot or namespace never matches a run.
+///
+/// # Errors
+///
+/// A message for a value that is neither, or for `boot` when the boot id
+/// or the time namespace cannot be read.
+pub fn epoch(value: &str) -> Result<u64, String> {
+    if value == "boot" {
+        return karyos_archive::integrity::time_producer::host_boot_epoch().map_err(|error| {
+            format!("--epoch boot: the boot id or the time namespace is unreadable: {error}")
+        });
+    }
+    value
+        .parse()
+        .map_err(|_| format!("--epoch takes a whole number or boot, not {value}"))
 }
 
 /// The fit's clocks: this host's, told apart by domain.
@@ -513,7 +540,13 @@ pub fn run_link(
             ("--samples", _) => samples = Some(value),
             ("--server-domain", Ok(number)) => server = number,
             ("--client-domain", Ok(number)) => client = number,
-            ("--epoch", Ok(number)) => epoch = number,
+            ("--epoch", _) => match self::epoch(&value) {
+                Ok(number) => epoch = number,
+                Err(error) => {
+                    let _ = writeln!(err, "karyos-tools calibrate link: {error}");
+                    return EXIT_ERROR;
+                }
+            },
             ("--max-gap-ms", Ok(number)) => max_gap_ms = number,
             ("--max-bound-ns", Ok(number)) => max_bound_ns = number,
             _ => {
