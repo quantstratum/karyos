@@ -100,6 +100,11 @@ fn ask(server: &mut Server, agent: &mut Agent, request: &str) -> String {
     std::thread::scope(|scope| {
         let client = scope.spawn(move || {
             let mut stream = UnixStream::connect(path).unwrap();
+            // Bounded, so a serve that fails ends the test instead of
+            // leaving this read waiting.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
             stream.write_all(line.as_bytes()).unwrap();
             let mut answer = String::new();
             let _ = stream.read_to_string(&mut answer).unwrap();
