@@ -178,7 +178,7 @@ fn a_journal_down_at_run_time_makes_reopen_and_gap_ack_unavailable() {
     let mut agent = Agent::new(AgentConfig::new(Vec::new()).with_journal(dir.join("journal")));
     let state = |agent: &Agent, name: &str| {
         agent
-            .capabilities(true, true, true, true)
+            .capabilities(true, true, true, true, true)
             .into_iter()
             .find(|capability| capability.name == name)
             .unwrap()

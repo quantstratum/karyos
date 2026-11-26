@@ -347,6 +347,40 @@ fn trace_export_page(c: &mut Criterion) {
     group.finish();
 }
 
+/// The cost of a `journal-history` page (R-CORE-14, karyos#725): the
+/// most records a request may ask for, each with the longest reason, read
+/// from the journal's segment files and encoded. A guard operation that
+/// arrives behind a history request waits for this at most.
+fn journal_history_page(c: &mut Criterion) {
+    use karyos_agent::journal::{HISTORY_MAX, Journal, JournalRecord, Kind, MAX_REASON};
+
+    let dir = std::env::temp_dir().join(format!("karyos-bench-history-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut journal = Journal::open(&dir, 1).unwrap_or_else(|_| std::process::abort());
+    for time in 0..2 * u64::try_from(HISTORY_MAX).unwrap_or(u64::MAX) {
+        let mut record = JournalRecord::new(Kind::CloseRequest, time);
+        record.guard = time;
+        record.reason = vec![b'r'; MAX_REASON];
+        let _ = journal
+            .append(&record, time)
+            .unwrap_or_else(|_| std::process::abort());
+    }
+    let _ = journal
+        .append_durable(&JournalRecord::new(Kind::CloseOutcome, 0), 0)
+        .unwrap_or_else(|_| std::process::abort());
+    let mut group = c.benchmark_group("journal history");
+    let _ = group.bench_function("256 records, encoded", |b| {
+        b.iter(|| {
+            if let Ok(page) = journal.history(None, HISTORY_MAX) {
+                black_box(karyos_agent::json::journal_history(&page));
+            }
+        });
+    });
+    group.finish();
+    drop(journal);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An application point's record (R-CORE-1, karyos#722) against a
 /// `Publish` record: each appends one record and the collector takes it
 /// back, so the journal never fills and both pay the same take.
@@ -438,8 +472,8 @@ fn trace_application_point(c: &mut Criterion) {
 )]
 mod group {
     use super::{
-        conflation_write_poll, rate_serve, term_copies, trace_application_point, trace_decisions,
-        trace_export_page,
+        conflation_write_poll, journal_history_page, rate_serve, term_copies,
+        trace_application_point, trace_decisions, trace_export_page,
     };
     criterion::criterion_group!(
         benches,
@@ -447,6 +481,7 @@ mod group {
         trace_decisions,
         term_copies,
         trace_export_page,
+        journal_history_page,
         trace_application_point,
         rate_serve
     );
