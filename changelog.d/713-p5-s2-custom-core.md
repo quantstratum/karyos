@@ -1,0 +1,3 @@
+### Added
+
+- P5-S2, the standby scenarios S1 to S4, S6 and S7, now runs against the custom Raft core in both groups as well as the reference fixture, over the feed and over the Cluster log replication (`crates/karyos-sim/tests/standby_custom.rs`, karyos#713). Each group's leader is elected. Each standby check catches its violation planted in a record the core produced. `p5_s2_results_on_the_core_and_on_the_fixture` reports each scenario's result on the core and on the fixture apart, with its seeds. The fixture's two-handover case runs on the fixture only, because the core's harness adapter offers no leadership transfer.
