@@ -36,6 +36,14 @@
 //!   releases a reply only while it holds the lease on its own clock. Every
 //!   reply carries its server's generation, and a client rejects a lower
 //!   one once it has seen a higher one.
+//! - **Cluster log replication** (ADR-0120, karyos#714): in place of the
+//!   feed, a primary server whose core leads pushes its log's stored
+//!   bytes, its `ClusterLog` seals of one epoch and a status to the
+//!   standby ([`Wire::ReplStart`] and the rest), as schema 6 would; the
+//!   standby's leader checks them with
+//!   [`karyos_cluster::standby::Standby`] and proposes what passes. Its
+//!   acknowledgement names its copy's received and checked ends, and
+//!   whether a seal stalled, so the sender resends from there.
 //!
 //! [`ClusterSim`]: crate::cluster::ClusterSim
 
@@ -44,10 +52,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::rc::Rc;
 
+use karyos_archive::integrity::SealRecord;
 use karyos_archive::segment::Geometry;
 use karyos_cluster::snapshot::{
     PendingSnapshot, Section, SectionKind, SnapshotConfig, SnapshotError, SnapshotReader,
     SnapshotStore, WRITE_CHUNK,
+};
+use karyos_cluster::standby::{
+    Position, RecoveryPoint, Refusal, ReplicaCheck, Sealed, Standby, StandbyConfig, TailBound,
 };
 use karyos_cluster::{Entry, LogError, RaftLog};
 
@@ -58,7 +70,7 @@ use super::core::{
 };
 use super::standby::{
     self, ExternalLease, FEED_BATCH_BYTES, FEED_PERIOD, FIRST_GENERATION, FeedEntry, FeedFault,
-    FeedRefusal, Fencing, PromotionReport,
+    FeedRefusal, Fencing, PromotionReport, STATUS_INTERVAL,
 };
 use crate::cluster::{Node, Outbox};
 use crate::disk::{SimDisk, Survives};
@@ -1121,6 +1133,33 @@ pub enum Observation {
         /// The fencing it asked for.
         fencing: Fencing,
     },
+    /// A standby server refused a replicated request, range or seal
+    /// (ADR-0120).
+    ReplicationRefused {
+        /// The server.
+        node: NodeId,
+        /// The source server.
+        source: NodeId,
+        /// Why.
+        refusal: Refusal,
+    },
+    /// A standby server started a copy of a source's log.
+    CopyStarted {
+        /// The server.
+        node: NodeId,
+        /// The source server.
+        source: NodeId,
+        /// Where the copy starts in the source's log.
+        start: u64,
+    },
+    /// A standby server's recovery point, at a status (ADR-0120 decision
+    /// 8).
+    RecoveryPoint {
+        /// The server.
+        node: NodeId,
+        /// The point.
+        point: RecoveryPoint,
+    },
     /// A standby server whose core leads was promoted.
     Promoted {
         /// The server.
@@ -1479,8 +1518,45 @@ pub enum Wire<M> {
     },
     /// The harness promotes the standby, the old primary fenced.
     Promote {
+        /// How the old primary was fenced.
+        fencing: Fencing,
         /// The requests known to be in flight, by client and sequence.
         unknown: Vec<(NodeId, u64)>,
+    },
+    /// A primary server's Cluster log replication starts at `start`, the
+    /// first seal boundary of its epoch at or after its store's start.
+    ReplStart {
+        /// The position.
+        start: u64,
+    },
+    /// Stored bytes of the source's log, whole frames.
+    ReplBytes {
+        /// Their position in the source's log.
+        position: u64,
+        /// The bytes.
+        bytes: Vec<u8>,
+    },
+    /// A `ClusterLog` seal of the replication's epoch.
+    ReplSeal {
+        /// The seal.
+        seal: SealRecord,
+    },
+    /// The source's status: where its epoch's seals end.
+    ReplStatus {
+        /// The sealed end.
+        sealed: u64,
+    },
+    /// The source ended its request (`state` 5 `interrupted`).
+    ReplEnd,
+    /// The standby's acknowledgement of a status.
+    ReplAck {
+        /// Where its copy's received bytes end.
+        received: u64,
+        /// Where its checked seals end.
+        checked: u64,
+        /// Whether a seal waited or was refused since the last one: the
+        /// sender resends from `received`.
+        stalled: bool,
     },
     /// The harness sends a client to another server.
     Redirect {
@@ -1500,8 +1576,34 @@ struct FeedOut {
     faults: BTreeMap<u64, FeedFault>,
 }
 
+/// A primary server's Cluster log replication to the standby
+/// (ADR-0120).
+#[derive(Debug, Clone)]
+struct ReplicationOut {
+    /// The standby's servers.
+    to: Vec<NodeId>,
+    /// Damage still to apply in transit, one send each, by the index of
+    /// the frame sent.
+    faults: BTreeMap<u64, FeedFault>,
+    /// The request under way.
+    active: Option<ReplicationActive>,
+}
+
+/// A replication request under way.
+#[derive(Debug, Clone, Copy)]
+struct ReplicationActive {
+    epoch: u64,
+    start: u64,
+    /// The next byte to send.
+    next: u64,
+    /// Where the standby's checked seals end.
+    checked: u64,
+    /// The standby acknowledged it.
+    accepted: bool,
+}
+
 /// A standby server's state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 struct StandbyIn {
     /// The primary's servers, which acknowledgements go to.
     primary: Vec<NodeId>,
@@ -1513,6 +1615,15 @@ struct StandbyIn {
     learnt: Option<u64>,
     /// Promoted: it takes requests and replies.
     promoted: bool,
+    /// Its follower of the primary's Cluster log, when it follows over
+    /// replication rather than the feed.
+    follower: Option<Standby<ReplicaCheck<SimDisk>>>,
+    /// It follows over replication.
+    replicated: bool,
+    /// Whether its core led at its last duty.
+    leading: bool,
+    /// A seal waited or was refused since the last acknowledgement.
+    stalled: bool,
 }
 
 /// A server: a core over C4's log on its own disk, and the test service.
@@ -1542,6 +1653,8 @@ pub struct ServerNode<C: ConsensusCore> {
     now: u64,
     /// The feed to a standby, for a primary server.
     feed: Option<FeedOut>,
+    /// The Cluster log replication to a standby, for a primary server.
+    replication: Option<ReplicationOut>,
     /// The lease it holds to act, for a primary server.
     lease: Option<Rc<RefCell<ExternalLease>>>,
     /// The standby state, for a standby server.
@@ -1716,6 +1829,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             generation: FIRST_GENERATION,
             now: 0,
             feed: None,
+            replication: None,
             lease: None,
             standby: None,
             limits,
@@ -1772,6 +1886,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             generation: FIRST_GENERATION,
             now: 0,
             feed: None,
+            replication: None,
             lease: None,
             standby: None,
             limits: None,
@@ -2498,6 +2613,31 @@ impl<C: ConsensusCore> ServerNode<C> {
         self
     }
 
+    /// Replicates its Cluster log to the standby servers `to` while its
+    /// core leads (ADR-0120), damaging in transit one send of each frame
+    /// `faults` names.
+    #[must_use]
+    pub fn with_replication(mut self, to: Vec<NodeId>, faults: &[(u64, FeedFault)]) -> Self {
+        self.replication = Some(ReplicationOut {
+            to,
+            faults: faults.iter().copied().collect(),
+            active: None,
+        });
+        self
+    }
+
+    /// A standby server that follows the primary's Cluster log over
+    /// replication rather than the feed (after [`ServerNode::as_standby`]).
+    #[must_use]
+    pub fn over_replication(mut self) -> Self {
+        let follower = follower_on(&self.disk);
+        if let Some(standby) = self.standby.as_mut() {
+            standby.replicated = true;
+            standby.follower = follower;
+        }
+        self
+    }
+
     /// A standby server, fed by the servers `primary`.
     #[must_use]
     pub fn as_standby(mut self, primary: Vec<NodeId>) -> Self {
@@ -2684,6 +2824,9 @@ impl<C: ConsensusCore> ServerNode<C> {
                     .is_none_or(|(verified, _)| index > verified)
                 {
                     standby.verified = Some((index, term));
+                    if let Some(follower) = standby.follower.as_mut() {
+                        follower.applied(Position { index, term });
+                    }
                     if standby
                         .proposed
                         .is_none_or(|(proposed, _)| index > proposed)
@@ -2759,6 +2902,7 @@ impl<C: ConsensusCore> ServerNode<C> {
         }
         // A standby's leader acknowledges a verified position that moved.
         if let Some(standby) = &self.standby
+            && standby.follower.is_none()
             && standby.verified != verified_before
             && core.leads()
         {
@@ -2766,6 +2910,23 @@ impl<C: ConsensusCore> ServerNode<C> {
             for &to in &standby.primary {
                 out.push((to, Wire::FeedAck { verified }));
             }
+        }
+        // A standby leader change (ADR-0120 decision 7): the new leader
+        // rebuilds V from its own log, as its service applied it, and
+        // discards any copy it held.
+        if let Some(standby) = self.standby.as_mut() {
+            let leads = core.leads();
+            if leads
+                && !standby.leading
+                && let Some(follower) = standby.follower.as_mut()
+            {
+                follower.rebuild(
+                    standby
+                        .verified
+                        .map(|(index, term)| Position { index, term }),
+                );
+            }
+            standby.leading = leads;
         }
         // Asked only when the core says it may have moved: building it
         // allocates, and the replication path must not (ADR-0105).
@@ -2926,6 +3087,13 @@ impl<C: ConsensusCore> ServerNode<C> {
         if let Some(standby) = self.standby.as_mut() {
             standby.verified = None;
             standby.proposed = None;
+            standby.leading = false;
+            standby.stalled = false;
+            // Its replica's journal and catalog reopen on the disk the
+            // crash left; V is rebuilt as its service applies its log.
+            if standby.replicated {
+                standby.follower = follower_on(&self.disk);
+            }
         }
         // Recorded at every start, so a check compares it with the log; the
         // new core's stamp starts again.
@@ -2984,6 +3152,11 @@ impl<C: ConsensusCore> ServerNode<C> {
                 {
                     send_feed(feed, core.committed(), log, out);
                 }
+            }
+            if let Some(replication) = self.replication.as_mut()
+                && now.is_multiple_of(FEED_PERIOD)
+            {
+                send_replication(replication, core.leads(), log, out);
             }
         }
         self.duty(out);
@@ -3138,23 +3311,174 @@ impl<C: ConsensusCore> ServerNode<C> {
                     }
                 }
             }
+            Wire::ReplStart { start } => {
+                if let Some(standby) = self.standby.as_mut()
+                    && !standby.promoted
+                    && core.leads()
+                    && let Some(follower) = standby.follower.as_mut()
+                {
+                    let before = follower.copy();
+                    let observation = match follower.begin(u64::from(from), start, self.now) {
+                        Ok(()) if follower.copy() != before => Some(Observation::CopyStarted {
+                            node: self.id,
+                            source: from,
+                            start,
+                        }),
+                        Ok(()) => None,
+                        Err(refusal) => Some(Observation::ReplicationRefused {
+                            node: self.id,
+                            source: from,
+                            refusal,
+                        }),
+                    };
+                    if let Some(observation) = observation {
+                        self.recorder.borrow_mut().observations.push(observation);
+                    }
+                }
+            }
+            Wire::ReplBytes { position, bytes } => {
+                if let Some(standby) = self.standby.as_mut()
+                    && !standby.promoted
+                    && core.leads()
+                    && let Some(follower) = standby.follower.as_mut()
+                {
+                    let _ = follower.receive(u64::from(from), position, &bytes);
+                }
+            }
+            Wire::ReplSeal { seal } => {
+                if let Some(standby) = self.standby.as_mut()
+                    && !standby.promoted
+                    && core.leads()
+                    && let Some(follower) = standby.follower.as_mut()
+                {
+                    match follower.seal(u64::from(from), &seal) {
+                        Ok(Sealed::Ready(ready)) => {
+                            for entry in ready {
+                                if core.propose(entry.wrapped, &mut view).is_err() {
+                                    // Not proposed: a new copy from V.
+                                    follower.rebuild(
+                                        standby
+                                            .verified
+                                            .map(|(index, term)| Position { index, term }),
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Sealed::Waiting) => standby.stalled = true,
+                        Err(Refusal::NotActive { .. }) => {}
+                        Err(refusal) => {
+                            standby.stalled = true;
+                            self.recorder.borrow_mut().observations.push(
+                                Observation::ReplicationRefused {
+                                    node: self.id,
+                                    source: from,
+                                    refusal,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Wire::ReplStatus { sealed } => {
+                if let Some(standby) = self.standby.as_mut()
+                    && !standby.promoted
+                    && core.leads()
+                    && let Some(follower) = standby.follower.as_mut()
+                    && let Ok(ends) = follower.status(u64::from(from), sealed, self.now)
+                {
+                    let point = follower.recovery_point(self.now);
+                    self.recorder
+                        .borrow_mut()
+                        .observations
+                        .push(Observation::RecoveryPoint {
+                            node: self.id,
+                            point,
+                        });
+                    out.push((
+                        from,
+                        Wire::ReplAck {
+                            received: ends.received,
+                            checked: ends.checked,
+                            stalled: standby.stalled,
+                        },
+                    ));
+                    standby.stalled = false;
+                }
+            }
+            Wire::ReplEnd => {
+                if let Some(follower) = self
+                    .standby
+                    .as_mut()
+                    .and_then(|standby| standby.follower.as_mut())
+                {
+                    follower.end(u64::from(from));
+                }
+            }
+            Wire::ReplAck {
+                received,
+                checked,
+                stalled,
+            } => {
+                if let Some(active) = self
+                    .replication
+                    .as_mut()
+                    .and_then(|replication| replication.active.as_mut())
+                {
+                    active.accepted = true;
+                    active.checked = active.checked.max(checked);
+                    if stalled {
+                        active.next = received.max(active.start);
+                    }
+                }
+            }
             Wire::FeedAck { verified } => {
                 if let Some(feed) = self.feed.as_mut() {
                     feed.acked = feed.acked.max(verified);
                 }
             }
-            Wire::Promote { unknown } => {
+            Wire::Promote { fencing, unknown } => {
                 if let Some(standby) = self.standby.as_mut()
                     && !standby.promoted
                 {
                     standby.promoted = true;
                     self.generation = self.generation.saturating_add(1);
+                    // The harness verified the fencing: the follower is
+                    // told so, as the operator or the arbiter would.
+                    let evidence = match fencing {
+                        Fencing::OperatorStop => karyos_cluster::standby::Fencing::OperatorStop {
+                            members: standby.primary.iter().map(|&id| u64::from(id)).collect(),
+                            confirmed: standby.primary.iter().map(|&id| u64::from(id)).collect(),
+                        },
+                        Fencing::Lease => karyos_cluster::standby::Fencing::Lease { expired: true },
+                    };
+                    let in_flight = unknown
+                        .iter()
+                        .map(|&(client, sequence)| karyos_cluster::standby::InFlight {
+                            client: u64::from(client),
+                            sequence,
+                        })
+                        .collect();
+                    let replication = standby
+                        .follower
+                        .as_mut()
+                        .and_then(|follower| follower.promote(&evidence, in_flight).ok());
+                    // Over replication the primary's commit is not learnt:
+                    // the last sealed entry the standby took stands for it.
+                    let learnt_commit = match &standby.follower {
+                        Some(follower) => follower
+                            .tail()
+                            .map(|tail| tail.index)
+                            .max(standby.verified.map(|(index, _)| index)),
+                        None => standby.learnt,
+                    };
                     if core.leads() {
                         let report = PromotionReport {
                             generation: self.generation,
                             verified: standby.verified.map(|(index, _)| index),
-                            learnt_commit: standby.learnt,
+                            learnt_commit,
                             unknown,
+                            replication,
                         };
                         self.recorder
                             .borrow_mut()
@@ -3210,6 +3534,162 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
 
     fn restart(&mut self, _now: u64) {
         let _ = self.guarded(Self::start);
+    }
+}
+
+/// The follower settings of every standby server over replication: the
+/// harness's logs start at [`standby::PRIMARY_FIRST_INDEX`], and the
+/// log's seal duty runs every [`SEAL_TICKS`].
+fn follower_config() -> StandbyConfig {
+    StandbyConfig {
+        primary_first_index: standby::PRIMARY_FIRST_INDEX,
+        status_interval: STATUS_INTERVAL,
+        tail_bound: TailBound::Interval(SEAL_TICKS),
+        generation: FIRST_GENERATION,
+    }
+}
+
+/// The directory of a standby server's replica journal and copy
+/// catalog, beside its log.
+pub const REPLICA_DIR: &str = "/replica";
+
+/// A fresh follower whose seals the schema 6 replica on `disk` verifies;
+/// `None` when the replica cannot open (the server then follows nothing).
+fn follower_on(disk: &SimDisk) -> Option<Standby<ReplicaCheck<SimDisk>>> {
+    let check = ReplicaCheck::open(disk.clone(), Path::new(REPLICA_DIR)).ok()?;
+    Some(Standby::new(follower_config(), check, None))
+}
+
+/// One period of `replication` from a server whose core leads (or no
+/// longer does): ends a request the log says must end; starts one at the
+/// log's replication start; sends its stored frames up to its epoch's
+/// sealed end, from the next position, [`FEED_BATCH_BYTES`] at most,
+/// damaging the first one its faults name (one per period, so each
+/// damage fails or stalls a send of its own); then the seals past the standby's
+/// checked end that the bytes sent cover, and a status. A failed read
+/// stops the period.
+fn send_replication<M>(
+    replication: &mut ReplicationOut,
+    leads: bool,
+    log: &mut RaftLog<SimDisk>,
+    out: &mut Outbox<Wire<M>>,
+) {
+    if let Some(active) = replication.active
+        && log
+            .replication_end(active.epoch, active.next, leads)
+            .is_some()
+    {
+        for &to in &replication.to {
+            out.push((to, Wire::ReplEnd));
+        }
+        replication.active = None;
+    }
+    if !leads {
+        return;
+    }
+    if replication.active.is_none() {
+        let Ok(Some(start)) = log.replication_start() else {
+            return;
+        };
+        replication.active = Some(ReplicationActive {
+            epoch: log.seal_epoch(),
+            start,
+            next: start,
+            checked: start,
+            accepted: false,
+        });
+    }
+    let Some(active) = replication.active.as_mut() else {
+        return;
+    };
+    let Ok((epoch, seals)) = log.replication_seals() else {
+        return;
+    };
+    if epoch != active.epoch {
+        return;
+    }
+    if !active.accepted {
+        for &to in &replication.to {
+            out.push((
+                to,
+                Wire::ReplStart {
+                    start: active.start,
+                },
+            ));
+        }
+    }
+    let sealed = seals
+        .last()
+        .map_or(active.start, |seal| seal.end)
+        .max(active.start);
+    let mut budget = FEED_BATCH_BYTES;
+    let mut damaged = false;
+    while active.next < sealed && budget > 0 {
+        let mut header = [0u8; karyos_cluster::log::FRAME_HEADER];
+        if log.read_stored(active.next, &mut header).is_err() {
+            return;
+        }
+        let length = header
+            .get(4..8)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map_or(0, u32::from_le_bytes);
+        let span = u64::from(length).saturating_add(karyos_cluster::log::FRAME_HEADER_LEN);
+        let Ok(size) = usize::try_from(span) else {
+            return;
+        };
+        let mut frame = vec![0u8; size];
+        if log.read_stored(active.next, &mut frame).is_err() {
+            return;
+        }
+        let index = frame
+            .get(8..16)
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+            .map(u64::from_le_bytes);
+        let fault = index
+            .filter(|_| !damaged)
+            .and_then(|index| replication.faults.remove(&index));
+        damaged |= fault.is_some();
+        match fault {
+            Some(FeedFault::Skip) => {}
+            Some(FeedFault::Corrupt) => {
+                if let Some(byte) = frame.get_mut(karyos_cluster::log::FRAME_HEADER) {
+                    *byte ^= 0xFF;
+                }
+            }
+            Some(FeedFault::Term) => {
+                if let Some(term) = frame.get_mut(16..24) {
+                    let raised = <[u8; 8]>::try_from(&*term)
+                        .map_or(0, u64::from_le_bytes)
+                        .saturating_add(1);
+                    term.copy_from_slice(&raised.to_le_bytes());
+                }
+            }
+            None => {}
+        }
+        if fault != Some(FeedFault::Skip) {
+            for &to in &replication.to {
+                out.push((
+                    to,
+                    Wire::ReplBytes {
+                        position: active.next,
+                        bytes: frame.clone(),
+                    },
+                ));
+            }
+        }
+        active.next = active.next.saturating_add(span);
+        budget = budget.saturating_sub(span);
+    }
+    for seal in seals
+        .iter()
+        .filter(|seal| seal.end > active.checked && seal.end <= active.next)
+    {
+        for &to in &replication.to {
+            out.push((to, Wire::ReplSeal { seal: *seal }));
+        }
+    }
+    for &to in &replication.to {
+        out.push((to, Wire::ReplStatus { sealed }));
     }
 }
 

@@ -620,8 +620,13 @@ pub struct Case {
     pub lease: Option<u64>,
     /// Ticks the arbiter waits past a lease's end for the clocks' skew.
     pub lease_margin: u64,
-    /// Faults on the feed, each on one send of its primary index.
+    /// Faults on the feed, each on one send of its primary index; over
+    /// replication, damage in transit to one send of that index's frame.
     pub feed_faults: Vec<(u64, FeedFault)>,
+    /// The standby follows the primary's Cluster log over replication
+    /// (ADR-0120, karyos#714) rather than the feed, which stays as the
+    /// control.
+    pub replication: bool,
     /// Clients, by index, that stay on the primary after a promotion.
     pub stay_on_primary: Vec<usize>,
     /// The limits every server's core is declared (W2), if any: a core
@@ -726,6 +731,7 @@ impl Case {
             lease: None,
             lease_margin: 0,
             feed_faults: Vec::new(),
+            replication: false,
             stay_on_primary: Vec::new(),
             limits: None,
             window: 1,
@@ -1033,8 +1039,13 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         };
         if in_standby {
             server = server.as_standby(primary.clone());
+            if case.replication {
+                server = server.over_replication();
+            }
         } else {
-            if !standby.is_empty() {
+            if !standby.is_empty() && case.replication {
+                server = server.with_replication(standby.clone(), &case.feed_faults);
+            } else if !standby.is_empty() {
                 server = server.with_feed(standby.clone(), &case.feed_faults);
             }
             if let Some(lease) = &lease {
@@ -1202,6 +1213,7 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                                 operator,
                                 id,
                                 Wire::Promote {
+                                    fencing,
                                     unknown: unknown.clone(),
                                 },
                             )

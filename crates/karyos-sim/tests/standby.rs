@@ -16,7 +16,12 @@
 //! - S6: damaged feed sends are refused before they apply;
 //! - S7: a restarted standby resumes from its verified position;
 //! - each standby check catches its violation in a hand-built record, and
-//!   the history across a promotion leaves an unknown outcome pending.
+//!   the history across a promotion leaves an unknown outcome pending;
+//! - S1 to S4, S6 and S7 again over the Cluster log replication (ADR-0120,
+//!   karyos#714), the feed's runs their control: S6's damage applied to
+//!   the bytes in transit, S7's restarted standby leader rebuilding its
+//!   verified position from its own log, and a primary leader change
+//!   starting a new copy.
 
 // Test helpers outside #[test] functions are not covered by clippy.toml's
 // test exemptions (ADR-0007 exempts tests from these lints).
@@ -25,6 +30,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use karyos_cluster::standby::{RecoveryPoint, Refusal};
 use karyos_sim::cluster::Node;
 use karyos_sim::harness::check::{self, Violation};
 use karyos_sim::harness::node::{ClientNode, Observation, Op, Recorder, Ret, Shared, Wire};
@@ -304,6 +310,7 @@ fn promotion(verified: Option<u64>, learnt_commit: Option<u64>) -> Observation {
             verified,
             learnt_commit,
             unknown: Vec::new(),
+            replication: None,
         },
     }
 }
@@ -537,4 +544,275 @@ fn an_old_answer_beyond_the_verified_position_is_left_pending() {
     // The append beyond the verified position is pending; the read went to
     // a fresh client id.
     assert_eq!(across.events().len(), 5);
+}
+
+// The same scenarios over the Cluster log replication (ADR-0120,
+// karyos#714); the runs above, over the feed, are their control.
+
+fn recovery_points(outcome: &Outcome) -> Vec<RecoveryPoint> {
+    outcome
+        .observations
+        .iter()
+        .filter_map(|observation| match observation {
+            Observation::RecoveryPoint { point, .. } => Some(*point),
+            _ => None,
+        })
+        .collect()
+}
+
+fn replication_refusals(outcome: &Outcome) -> Vec<Refusal> {
+    outcome
+        .observations
+        .iter()
+        .filter_map(|observation| match observation {
+            Observation::ReplicationRefused { refusal, .. } => Some(refusal.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn copy_sources(outcome: &Outcome) -> Vec<NodeId> {
+    outcome
+        .observations
+        .iter()
+        .filter_map(|observation| match observation {
+            Observation::CopyStarted { source, .. } => Some(*source),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn s1_over_replication_the_standby_follows_with_effects_disabled() {
+    let case = standby::over_replication(standby::s1());
+    for seed in corpus() {
+        // `passing` runs the standby checks: no standby reply before a
+        // promotion, every applied primary entry the primary's.
+        let outcome = passing(&case, seed);
+        assert_eq!(
+            verified(&outcome, STANDBY[0]),
+            primary_commit(&outcome),
+            "seed {seed:#x}"
+        );
+        assert_eq!(
+            verified(&outcome, STANDBY[1]),
+            verified(&outcome, STANDBY[0])
+        );
+        assert!(promoted(&outcome).is_none());
+        // No feed ran: the entries came over the replication.
+        assert!(
+            !outcome
+                .observations
+                .iter()
+                .any(|observation| matches!(observation, Observation::FeedRefused { .. }))
+        );
+        assert!(!copy_sources(&outcome).is_empty(), "seed {seed:#x}");
+        // The recovery point is reported continuously and is never zero:
+        // behind while it lags (a non-zero count by its type), then at the
+        // sealed end with the tail unknown.
+        let points = recovery_points(&outcome);
+        assert!(
+            points
+                .iter()
+                .any(|point| matches!(point, RecoveryPoint::Behind { .. })),
+            "seed {seed:#x}: {points:?}"
+        );
+        assert!(matches!(
+            points.last(),
+            Some(RecoveryPoint::AtSealedEnd { .. })
+        ));
+        assert!(replication_refusals(&outcome).is_empty(), "seed {seed:#x}");
+    }
+}
+
+#[test]
+fn s1_over_replication_a_new_primary_leader_is_a_new_copy() {
+    let case = standby::over_replication(standby::s1_source_change());
+    for seed in corpus() {
+        let outcome = passing(&case, seed);
+        let sources = copy_sources(&outcome);
+        let mut distinct = sources.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(distinct.len() >= 2, "seed {seed:#x}: {sources:?}");
+        assert!(distinct.iter().all(|source| PRIMARY.contains(source)));
+        assert_eq!(
+            verified(&outcome, STANDBY[0]),
+            primary_commit(&outcome),
+            "seed {seed:#x}"
+        );
+    }
+}
+
+#[test]
+fn s2_over_replication_an_operator_stop_then_a_promotion() {
+    let case = standby::over_replication(standby::s2());
+    for seed in corpus() {
+        let outcome = passing(&case, seed);
+        let (node, report) = promoted(&outcome).unwrap();
+        assert_eq!(node, STANDBY[0]);
+        assert_eq!(report.generation, 2);
+        assert!(report.verified <= report.learnt_commit);
+        let follower = report.replication.clone().unwrap();
+        assert_eq!(follower.generation, 2);
+        assert_eq!(
+            follower.verified.map(|position| position.index),
+            report.verified
+        );
+        // Every request in flight is reported unknown, with its client and
+        // sequence.
+        let mut unknown: Vec<(u64, u64)> = report
+            .unknown
+            .iter()
+            .map(|&(client, sequence)| (u64::from(client), sequence))
+            .collect();
+        unknown.sort_unstable();
+        let listed: Vec<(u64, u64)> = follower
+            .unknown
+            .iter()
+            .map(|flight| (flight.client, flight.sequence))
+            .collect();
+        assert_eq!(listed, unknown, "seed {seed:#x}");
+        // The gap is a lower bound: the sealed bytes not verified, and an
+        // unsealed tail that is unknown.
+        if let Some(copy) = follower.copy {
+            assert!(
+                follower.gap.sealed_unverified
+                    >= copy
+                        .sealed
+                        .unwrap_or(copy.checked)
+                        .saturating_sub(copy.verified)
+            );
+        }
+        assert_eq!(
+            follower.gap.unsealed_tail,
+            karyos_cluster::standby::TailBound::Interval(karyos_sim::harness::node::SEAL_TICKS)
+        );
+        // The clients finished on the standby, in generation 2, and no
+        // old-generation success followed (the standby checks).
+        assert!(
+            outcome.observations.iter().any(|observation| matches!(
+                observation,
+                Observation::Success { generation: 2, .. }
+            ))
+        );
+    }
+}
+
+#[test]
+fn s3_over_replication_a_lease_expiry_then_a_promotion_with_the_old_primary_alive() {
+    let case = standby::over_replication(standby::s3());
+    for seed in corpus() {
+        let outcome = workloads::run::<Reference>(&case, seed).unwrap();
+        assert_eq!(
+            workloads::pass(&case, &outcome),
+            Ok(Some(Liveness::Stalled { waiting: 1 })),
+            "seed {seed:#x}"
+        );
+        let (_, report) = promoted(&outcome).unwrap();
+        assert_eq!(report.generation, 2, "seed {seed:#x}");
+        assert!(report.replication.is_some());
+        assert!(outcome.observations.iter().any(|observation| matches!(
+            observation,
+            Observation::Fenced {
+                fencing: Fencing::Lease,
+                lease_end: Some(_)
+            }
+        )));
+    }
+}
+
+#[test]
+fn s4_over_replication_a_promotion_before_fencing_is_refused() {
+    let case = standby::over_replication(standby::s4());
+    for seed in corpus() {
+        let outcome = passing(&case, seed);
+        for fencing in [Fencing::Lease, Fencing::OperatorStop] {
+            assert!(
+                outcome
+                    .observations
+                    .contains(&Observation::PromotionRefused { fencing }),
+                "seed {seed:#x}"
+            );
+        }
+        assert!(promoted(&outcome).is_none());
+        assert!(
+            !outcome.observations.iter().any(|observation| matches!(
+                observation,
+                Observation::Success { generation: 2, .. }
+            ))
+        );
+        assert_eq!(verified(&outcome, STANDBY[0]), primary_commit(&outcome));
+    }
+}
+
+#[test]
+fn s6_over_replication_damage_in_transit_is_refused_before_it_applies() {
+    let case = standby::over_replication(standby::s6());
+    for seed in corpus() {
+        let outcome = passing(&case, seed);
+        let refusals = replication_refusals(&outcome);
+        // The flipped byte (index 3) and the changed term (index 5) fail
+        // their seals; the skipped chunk (index 7) only leaves the seal
+        // waiting, so it is no refusal, and the resend fills it.
+        let seals = refusals
+            .iter()
+            .filter(|refusal| matches!(refusal, Refusal::Seal(_)))
+            .count();
+        assert!(seals >= 2, "seed {seed:#x}: {refusals:?}");
+        assert!(
+            refusals
+                .iter()
+                .all(|refusal| matches!(refusal, Refusal::Seal(_) | Refusal::Busy { .. })),
+            "seed {seed:#x}: {refusals:?}"
+        );
+        // Nothing damaged applied (the standby checks compare every
+        // applied entry with the primary's), and the resends got through.
+        assert_eq!(
+            verified(&outcome, STANDBY[0]),
+            primary_commit(&outcome),
+            "seed {seed:#x}"
+        );
+    }
+}
+
+#[test]
+fn s7_over_replication_a_restarted_standby_leader_rebuilds_v_from_its_log() {
+    let case = standby::over_replication(standby::s7());
+    for seed in corpus() {
+        let outcome = passing(&case, seed);
+        assert_eq!(
+            verified(&outcome, STANDBY[0]),
+            primary_commit(&outcome),
+            "seed {seed:#x}"
+        );
+        // Each primary entry applied once per standby server and run of
+        // it: the restart re-applies from its own log, the new copy skips
+        // up to V.
+        let mut applied: Vec<(NodeId, u64)> = outcome
+            .observations
+            .iter()
+            .filter_map(|observation| match observation {
+                Observation::FeedApplied { node, index, .. } => Some((*node, *index)),
+                _ => None,
+            })
+            .collect();
+        let total = applied.len();
+        applied.sort_unstable();
+        applied.dedup();
+        assert!(total <= 2 * applied.len(), "seed {seed:#x}");
+    }
+}
+
+#[test]
+fn every_replicated_scenario_runs_with_its_feed_control() {
+    let feed = standby::cases();
+    let replicated = standby::replicated_cases();
+    assert_eq!(feed.len(), replicated.len());
+    for (control, case) in feed.iter().zip(&replicated) {
+        assert!(!control.replication);
+        assert!(case.replication);
+        assert_eq!(case.schedule, control.schedule);
+        assert_eq!(case.feed_faults, control.feed_faults);
+    }
 }

@@ -8,8 +8,19 @@
 //!   its own voters and disks. Its service applies the primary's
 //!   committed log with external effects disabled: it takes no client
 //!   request and sends no reply until it is promoted.
-//! - **The feed** stands in for ADR-0051's recording replication until
-//!   that exists. Every [`FEED_PERIOD`] ticks the primary's leader sends
+//! - **The replication** (ADR-0120, karyos#714; [`over_replication`]):
+//!   the primary's leader pushes its Cluster log's stored bytes, its
+//!   `ClusterLog` seals of one epoch and a status, as schema 6 does; the
+//!   standby's leader checks each sealed range with
+//!   [`karyos_cluster::standby::Standby`] (seal, frames, chain, anchor at
+//!   its verified position) and proposes what passes, wrapped. Damage
+//!   ([`FeedFault`]) is applied to the bytes in transit: a flipped byte or
+//!   a changed term fails the seal, a skipped chunk leaves the copy short
+//!   so the seal waits and the sender resends. A restarted or new standby
+//!   leader rebuilds its verified position from its own log; a new
+//!   primary leader is a new source, so a new copy.
+//! - **The feed** is the control run of the same scenarios: it stood in
+//!   for the replication before it existed. Every [`FEED_PERIOD`] ticks the primary's leader sends
 //!   its committed entries after the standby's verified position, each a
 //!   [`FeedEntry`] with a checksum over its index, term and payload, over
 //!   C1 links. The standby's leader checks each range by log matching
@@ -34,9 +45,13 @@
 use super::workloads::{Action, Case, Progress};
 use crate::net::NodeId;
 
-/// The tag every wrapped feed entry's bytes start with in the standby's
-/// log.
-pub const FEED_MAGIC: [u8; 4] = *b"KS5\x01";
+/// The tag every wrapped primary entry's bytes start with in the
+/// standby's log, over the feed or the replication.
+pub const FEED_MAGIC: [u8; 4] = karyos_cluster::standby::WRAP_MAGIC;
+
+/// Ticks a replication source may go without a status before the
+/// standby takes another source, and reports its recovery point unknown.
+pub const STATUS_INTERVAL: u64 = 5 * FEED_PERIOD;
 
 /// Ticks between two feed sends of the primary's leader.
 pub const FEED_PERIOD: u64 = 4;
@@ -86,24 +101,13 @@ pub fn checksum(index: u64, term: u64, payload: &[u8]) -> u64 {
 /// primary's index and term, then the payload.
 #[must_use]
 pub fn wrap(index: u64, term: u64, payload: &[u8]) -> Vec<u8> {
-    let mut bytes = FEED_MAGIC.to_vec();
-    bytes.extend_from_slice(&index.to_le_bytes());
-    bytes.extend_from_slice(&term.to_le_bytes());
-    bytes.extend_from_slice(payload);
-    bytes
+    karyos_cluster::standby::wrap(index, term, payload)
 }
 
 /// The primary's index, term and payload of a wrapped entry, if it is one.
 #[must_use]
 pub fn unwrap(bytes: &[u8]) -> Option<(u64, u64, &[u8])> {
-    let rest = bytes.strip_prefix(&FEED_MAGIC)?;
-    let (index, rest) = rest.split_first_chunk::<8>()?;
-    let (term, payload) = rest.split_first_chunk::<8>()?;
-    Some((
-        u64::from_le_bytes(*index),
-        u64::from_le_bytes(*term),
-        payload,
-    ))
+    karyos_cluster::standby::unwrap(bytes)
 }
 
 /// A damage to one send of one index on the feed.
@@ -208,6 +212,10 @@ pub struct PromotionReport {
     /// gateways that would report them (SPEC.md §9) and hands the list to
     /// the standby, which echoes it; no check derives it.
     pub unknown: Vec<(NodeId, u64)>,
+    /// Over replication, the follower's own report (ADR-0120 decision
+    /// 8): `V` and its term, the copy's ends, the gap as a lower bound,
+    /// the unknown outcomes. Over the feed, `None`.
+    pub replication: Option<karyos_cluster::standby::PromotionReport>,
 }
 
 /// The servers of every standby scenario: three in the primary, ids 0 to
@@ -337,4 +345,34 @@ pub fn s7() -> Case {
 #[must_use]
 pub fn cases() -> Vec<Case> {
     vec![s1(), s2(), s3(), s4(), s6(), s7()]
+}
+
+/// `case` with the standby following over the Cluster log replication
+/// (ADR-0120) instead of the feed: the same scenario, the feed's run its
+/// control.
+#[must_use]
+pub fn over_replication(mut case: Case) -> Case {
+    case.replication = true;
+    case.name.push_str(" over replication");
+    case
+}
+
+/// S1 with the primary's leadership handed over twice while the standby
+/// follows: whichever server led first, one of the handovers moves it, so
+/// the standby takes a second source, a new copy (ADR-0120 decisions 4
+/// and 5).
+#[must_use]
+pub fn s1_source_change() -> Case {
+    let mut case = followed("S1 follow across primary leader changes", 12);
+    case.schedule = vec![
+        (60, Action::TransferLeadership(PRIMARY[1])),
+        (160, Action::TransferLeadership(PRIMARY[2])),
+    ];
+    case
+}
+
+/// [`cases`] over the replication.
+#[must_use]
+pub fn replicated_cases() -> Vec<Case> {
+    cases().into_iter().map(over_replication).collect()
 }
