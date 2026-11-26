@@ -71,8 +71,15 @@ pub const PART_METADATA: u64 = 24 + crate::snapshot::SECTION_HEADER as u64;
 pub const TIMERS_VERSION: u64 = 1;
 const BOUNDS_LOGGED: u8 = 1;
 const FRESH: u8 = 2;
-/// The version of the sessions section ([`SessionTable::encode`]).
-pub const SESSIONS_SECTION_VERSION: u64 = 1;
+/// The version of the sessions section this build writes: 2 since
+/// karyos#715, the log's version state (the active version, whether a
+/// configuration has activated, any pending `Activation` and any logged
+/// `CoordinatedStop`, ADR-0122 decision 5) ahead of the session table
+/// ([`SessionTable::encode`]).
+pub const SESSIONS_SECTION_VERSION: u64 = 2;
+/// The sessions section earlier builds wrote: the session table alone,
+/// restored as the state before any `Activation`.
+pub const SESSIONS_SECTION_VERSION_1: u64 = 1;
 
 /// One part of a service's state, as it writes or restores it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +343,19 @@ pub enum RestoreError {
     /// The sessions section does not decode.
     #[error(transparent)]
     Sessions(#[from] DecodeError),
+    /// The sessions section's version state (version 2) does not decode,
+    /// or names an activation at or before the snapshot's index.
+    #[error("the sessions section's version state is malformed")]
+    Versions,
+    /// The snapshot's active service version is above what this binary
+    /// runs ([`super::ClusteredService::supported_version`]).
+    #[error("the snapshot runs version {active}, this binary at most {supported}")]
+    VersionUnsupported {
+        /// The snapshot's active service version.
+        active: u32,
+        /// This binary's.
+        supported: u32,
+    },
     /// The sessions section's bounds are not this container's.
     #[error("the snapshot's session bounds are not this container's")]
     SessionBounds,
@@ -409,7 +429,12 @@ impl<S: ClusteredService> ServiceContainer<S> {
         Ok(ComposedSnapshot {
             index,
             log_time: self.sessions.log_time(),
-            sessions: self.sessions.encode(),
+            sessions: {
+                let mut out = Vec::new();
+                self.versions.encode(&mut out);
+                out.extend(self.sessions.encode());
+                out
+            },
             timers: {
                 let mut flags = 0;
                 if self.bounds_logged {
@@ -469,10 +494,27 @@ impl<S: ClusteredService> ServiceContainer<S> {
         }
         let [sessions, timers, guards] = found;
         let sessions = sessions.ok_or(RestoreError::Missing(SectionKind::Sessions))?;
-        if sessions.version != SESSIONS_SECTION_VERSION {
-            return Err(RestoreError::Version {
-                kind: SectionKind::Sessions,
-                version: sessions.version,
+        let (versions, table_bytes) = match sessions.version {
+            SESSIONS_SECTION_VERSION_1 => (
+                super::upgrade::Versions::default(),
+                sessions.bytes.as_slice(),
+            ),
+            SESSIONS_SECTION_VERSION => super::upgrade::Versions::decode(&sessions.bytes, index)
+                .ok_or(RestoreError::Versions)?,
+            version => {
+                return Err(RestoreError::Version {
+                    kind: SectionKind::Sessions,
+                    version,
+                });
+            }
+        };
+        // A replica runs the semantics of the version the snapshot names
+        // (ADR-0122 decision 5): a binary that cannot is refused here.
+        let supported = self.service.supported_version();
+        if versions.active.service > supported {
+            return Err(RestoreError::VersionUnsupported {
+                active: versions.active.service,
+                supported,
             });
         }
         let timers = timers.ok_or(RestoreError::Missing(SectionKind::Timers))?;
@@ -491,7 +533,7 @@ impl<S: ClusteredService> ServiceContainer<S> {
         // Within this container's session budget, checked before the
         // table is allocated; logged bounds restore as the log's entry
         // would, unlogged ones must be this container's.
-        let table = SessionTable::decode_within(&sessions.bytes, self.session_budget)?;
+        let table = SessionTable::decode_within(table_bytes, self.session_budget)?;
         if table.config() != self.sessions.config() && !bounds_logged {
             return Err(RestoreError::SessionBounds);
         }
@@ -516,6 +558,7 @@ impl<S: ClusteredService> ServiceContainer<S> {
         self.applied = Some(index);
         self.fresh = fresh;
         self.bounds_logged = bounds_logged;
+        self.versions = versions;
         Ok(())
     }
 }
