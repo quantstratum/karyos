@@ -322,6 +322,9 @@ pub(crate) struct ReceiverEnc {
     /// Per channel key id, the highest file epoch a reclaimed domain 6
     /// entry of this boot sealed under (H8-11).
     floors: Vec<(u32, u32)>,
+    /// Per channel key id, the highest file epoch seen to sign this boot:
+    /// a subscription made again starts at it (H8-17).
+    activation: crate::wire_enc::ActivationFloors,
     /// Refusals no encrypted subscription owns, by reason:
     /// `enc_unexpected` on a trusted or authenticated stream among them.
     pub(crate) unattributed: EncRejections,
@@ -417,6 +420,7 @@ impl ReceiverEnc {
             // and pairwise (H8-06).
             subscription.keys.follow_signing(keys);
             subscription.pairwise.follow_signing(keys);
+            self.activation.hold(&mut subscription.keys);
             // Its domain 5 scratch slot holds a key of an earlier set:
             // erased in place (H8-05).
             crate::wire_enc::erase_slot(&mut subscription.bootstrap);
@@ -508,8 +512,10 @@ impl ReceiverEnc {
 
     /// Makes a subscription encrypted, replacing an earlier one of its
     /// key.
-    pub(crate) fn subscribe(&mut self, subscription: SubscriptionEnc) {
+    pub(crate) fn subscribe(&mut self, mut subscription: SubscriptionEnc) {
         self.unsubscribe(subscription.endpoint, subscription.stream_id);
+        // It starts at the role's activation floor, not 0 (H8-17).
+        self.activation.hold(&mut subscription.keys);
         // The fixed tables, made once on the control path: the receive
         // path pushes into them without allocating.
         if self.rsp.capacity() < RSP_SEALERS {

@@ -1639,6 +1639,42 @@ fn a_backward_clock_step_never_lets_the_predecessor_bind_again() {
     }
 }
 
+/// H8-17 (section 7): the activation floor is the receiver role's, per
+/// channel key id, not the subscription's. After the successor has been
+/// seen to sign, the clock steps back and the subscription is made again
+/// as admission makes it (removed, a fresh one bound, the current view
+/// applied): no SETUP under the predecessor establishes; one under the
+/// successor does.
+#[test]
+fn a_recreated_subscription_keeps_the_activation_floor() {
+    let made = || {
+        SubscriptionEnc::new(
+            EndpointId(1),
+            6,
+            &[&channel(0x11), &second_epoch()],
+            &[&pairwise()],
+            66,
+        )
+        .unwrap()
+    };
+    for (epoch, binds) in [(1, false), (2, true)] {
+        let (_, mut role): (_, super::super::ReceiverRole) =
+            super::super::roles(&AgentConfig::default()).unwrap();
+        role.encrypt_subscription(made());
+        for signing in [1, 2] {
+            role.enc.apply_keys(&view(signing, &[1, 2]));
+        }
+        role.enc.unsubscribe(EndpointId(1), 6);
+        role.encrypt_subscription(made());
+        assert_eq!(role.enc.activation.floor(3), Some(2));
+        role.enc.apply_keys(&view(1, &[1, 2]));
+        let (sessions, _link) = session_rings(std::num::NonZeroUsize::new(4).unwrap());
+        let source: SocketAddr = "10.0.0.2:4000".parse().unwrap();
+        role.inject_datagram(&sessions, EndpointId(1), source, &announce_at(epoch), 1_000);
+        assert_eq!(role.enc.verified.len(), usize::from(binds), "epoch {epoch}");
+    }
+}
+
 /// H8-16 (section 6b): the previous epoch's key a resynchronisation kept
 /// for the 10 s overlap is erased by role maintenance once the overlap
 /// has passed, with no further promotion and no root retired.

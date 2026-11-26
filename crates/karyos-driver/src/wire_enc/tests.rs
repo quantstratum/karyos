@@ -1587,8 +1587,8 @@ fn rotation_and_retirement_erase_every_cached_pairwise_copy() {
     .unwrap();
     assert_eq!(
         opener.cached_pairwise(),
-        [[Some(1), None], [Some(1), None]],
-        "made with the first file"
+        [[None, None], [None, None]],
+        "made with the first file, erased until used (H8-16)"
     );
     opener.apply_keys(&FixedKeys {
         files: vec![
@@ -1764,4 +1764,29 @@ fn a_four_lane_sm_fits_the_256_byte_floor_sealed() {
     let floor = usize::try_from(karyos_protocol::network::MIN_MTU).unwrap();
     assert_eq!(sealed, floor, "152 + 20 + 84");
     assert_eq!(length + crate::wire_auth::ENVELOPE_LEN, 200);
+}
+
+/// H8-16 (section 6b): no slot an opener does not use keeps a key
+/// schedule: not the scratch slot or the spare after construction, not
+/// the recycled slot after one or two consecutive promotions within the
+/// overlap, and not after the previous key expires.
+#[test]
+fn no_unused_opener_slot_keeps_a_schedule() {
+    let start = clock();
+    let mut sealer = sender();
+    let mut opener = opener();
+    let mut channel = EncChannel::default();
+    assert!(opener.unused_erased(), "after construction");
+    assert!(open(&mut opener, &mut channel, &seal(&mut sealer, &frame(DATA))).is_ok());
+    for party_epoch in 1..=2 {
+        sealer.roll_now();
+        let next = seal(&mut sealer, &frame(DATA));
+        assert!(open(&mut opener, &mut channel, &next).unwrap().promoted);
+        assert_eq!(opener.epochs(), (1, party_epoch));
+        assert!(opener.has_previous());
+        assert!(opener.unused_erased(), "after promotion {party_epoch}");
+    }
+    opener.expire_previous(start + EPOCH_OVERLAP_NS);
+    assert!(!opener.has_previous());
+    assert!(opener.unused_erased(), "after expiry");
 }

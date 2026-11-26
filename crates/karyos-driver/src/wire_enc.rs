@@ -355,6 +355,71 @@ pub(crate) fn erase_slot(slot: &mut Option<AesGcmSiv>) {
     }
 }
 
+/// The channel key ids a role keeps an activation floor for.
+pub(crate) const ACTIVATION_FLOORS: usize = 64;
+
+/// Per channel `key_id`, the highest file epoch a role has seen sign for
+/// the boot (H8-17): kept by the role, not by a subscription or
+/// publication, so one made again under a wall clock stepped back across
+/// a successor's activation starts at that floor, never at 0. Fixed,
+/// made with the role; it only rises. A key id it has no room for keeps
+/// nothing binding (fail closed).
+#[derive(Debug, Clone)]
+pub(crate) struct ActivationFloors {
+    floors: [(u32, u32); ACTIVATION_FLOORS],
+    len: usize,
+}
+
+impl Default for ActivationFloors {
+    fn default() -> Self {
+        Self {
+            floors: [(0, 0); ACTIVATION_FLOORS],
+            len: 0,
+        }
+    }
+}
+
+impl ActivationFloors {
+    /// Raises the floor of `keys`' key id to its activation and `keys` to
+    /// the floor: both end at the higher. A key set of a key id the table
+    /// has no room for binds nothing.
+    pub(crate) fn hold(&mut self, keys: &mut ChannelKeys) {
+        let Some(key_id) = keys.key_id() else {
+            return;
+        };
+        let held = self.floors.get(..self.len).unwrap_or_default();
+        let at = held.iter().position(|(id, _)| *id == key_id);
+        let at = match at {
+            Some(at) => at,
+            None if self.len < ACTIVATION_FLOORS => {
+                let at = self.len;
+                if let Some(slot) = self.floors.get_mut(at) {
+                    *slot = (key_id, 0);
+                }
+                self.len = at.saturating_add(1);
+                at
+            }
+            None => {
+                keys.activated = u32::MAX;
+                return;
+            }
+        };
+        if let Some((_, floor)) = self.floors.get_mut(at) {
+            *floor = (*floor).max(keys.activated);
+            keys.activated = *floor;
+        }
+    }
+
+    /// The floor of `key_id` (tests).
+    #[cfg(test)]
+    pub(crate) fn floor(&self, key_id: u32) -> Option<u32> {
+        self.floors
+            .get(..self.len)
+            .and_then(|held| held.iter().find(|(id, _)| *id == key_id))
+            .map(|(_, floor)| *floor)
+    }
+}
+
 /// The channel key files of an `encrypted` channel: the `IKM` of every
 /// section 4 derivation, selected by `key_epoch` (its file epoch).
 #[derive(Debug, Clone)]
@@ -1568,9 +1633,14 @@ impl EncOpener {
         let key = derive(keys, pairwise, context, false)?;
         // Every key this opener will hold is made now, its mutex locked
         // once by the constructor: promotions and scratch derivations only
-        // re-key and move them.
-        let scratch = derive(keys, pairwise, context, false)?;
-        let spare = derive(keys, pairwise, context, false)?;
+        // re-key and move them. Neither is in use yet, so neither keeps a
+        // copy of the current key's schedule: both are erased in place now
+        // (H8-16), and every use re-keys the scratch slot first.
+        let erase_with = erase_context(&context)?;
+        let mut scratch = derive(keys, pairwise, context, false)?;
+        erase(&mut scratch, erase_with);
+        let mut spare = derive(keys, pairwise, context, false)?;
+        erase(&mut spare, erase_with);
         Ok(Self {
             keys: keys.clone(),
             pairwise: pairwise.cloned(),
@@ -1581,7 +1651,7 @@ impl EncOpener {
             previous: None,
             scratch,
             spare: Some(spare),
-            erase: erase_context(&context)?,
+            erase: erase_with,
             withdrawn: false,
             generation: vm_generation::generation(),
         })
@@ -1864,16 +1934,19 @@ impl EncOpener {
 
     /// Commits the scratch key as current at `now_ns`, keeping the old
     /// current for the overlap. The slot that becomes the next scratch is
-    /// the dropped previous epoch's, or the spare: keys only move.
+    /// the dropped previous epoch's, or the spare: keys only move. The
+    /// recycled slot is erased in place first, so the dropped epoch's
+    /// schedule survives nowhere (H8-16).
     fn promote(&mut self, now_ns: u64) {
         let recycled = self
             .previous
             .take()
             .map(|(slot, _)| slot.key)
             .or_else(|| self.spare.take());
-        let Some(recycled) = recycled else {
+        let Some(mut recycled) = recycled else {
             return;
         };
+        erase(&mut recycled, self.erase);
         let key = core::mem::replace(&mut self.scratch, recycled);
         let old = core::mem::replace(
             &mut self.current,
@@ -1899,6 +1972,17 @@ impl EncOpener {
         if self.spare.is_none() {
             self.spare = Some(slot.key);
         }
+    }
+
+    /// Whether every slot not in use, the scratch slot and the spare, is
+    /// erased (tests, H8-16).
+    #[cfg(test)]
+    pub(crate) fn unused_erased(&self) -> bool {
+        *self.scratch.context() == self.erase
+            && self
+                .spare
+                .as_ref()
+                .is_none_or(|spare| *spare.context() == self.erase)
     }
 
     /// Whether it holds a previous epoch's key (tests).

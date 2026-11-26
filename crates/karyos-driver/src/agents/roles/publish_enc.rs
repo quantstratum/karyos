@@ -557,6 +557,9 @@ pub(crate) struct SenderEnc {
     watch: Option<VmGenerationWatch>,
     /// The VM generation the role last redrew its identities for.
     seen: u64,
+    /// Per channel key id, the highest file epoch seen to sign this boot:
+    /// a publication made again starts at it (H8-17).
+    activation: crate::wire_enc::ActivationFloors,
 }
 
 impl SenderEnc {
@@ -565,6 +568,7 @@ impl SenderEnc {
     pub(crate) fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
         for publication in &mut self.publications {
             publication.apply_keys(keys);
+            self.activation.hold(&mut publication.keys);
         }
     }
 
@@ -581,8 +585,10 @@ impl SenderEnc {
     /// Makes the publication `publication` names encrypted, replacing an
     /// earlier one of its key; its `Outbound` must have been made
     /// encrypted too.
-    pub(crate) fn publish(&mut self, publication: PublicationEnc) {
+    pub(crate) fn publish(&mut self, mut publication: PublicationEnc) {
         self.unpublish(publication.endpoint, publication.alias);
+        // It starts at the role's activation floor, not 0 (H8-17).
+        self.activation.hold(&mut publication.keys);
         self.publications.push(publication);
     }
 
@@ -629,7 +635,13 @@ impl<T: StreamTerms> SenderRole<T> {
         for publication in &mut self.enc.publications {
             publication.expire_previous();
         }
-        if self.enc.publications.is_empty() && self.publication_auth.is_empty() {
+        // A role registered with the fence keeps maintaining, with no
+        // publication left too: it still observes every change and reports
+        // itself redrawn, so it never holds the fence for others (H8-19).
+        if self.enc.publications.is_empty()
+            && self.publication_auth.is_empty()
+            && self.enc.watch.is_none()
+        {
             return;
         }
         if self.enc.watch.is_none() {
@@ -847,7 +859,10 @@ impl<T: StreamTerms> SenderRole<T> {
             .iter()
             .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
             .map(|outbound| &**outbound);
-        let admit = |control: &Control| receiver_control_admissible(outbound, source, control);
+        let (identity, bindings) = (publication.identity, &self.bindings);
+        let admit = |control: &Control| {
+            receiver_control_admissible(outbound, source, identity, bindings, endpoint, control)
+        };
         let mut out = [0_u8; MAX_PLAINTEXT];
         match publication.open_checked(bytes, &mut out, &admit) {
             Ok(EncOpened::Receiver(control)) => Some((control, None)),
@@ -961,20 +976,50 @@ impl<T: StreamTerms> SenderRole<T> {
 /// change nothing, as [`SenderRole::status`] makes them for an SM: the
 /// publication's lane count, the receiver's configured tag and, from
 /// `source`, a destination of the publication (or a dynamic one's
-/// registrant). Run inside the domain 4 open, before the sequence is
-/// marked or an epoch promoted (H8-15); a refused control changes no
-/// state. Other controls pass: their own checks change nothing either.
+/// registrant), and the publication's incarnation `identity`. A NAK
+/// or RTTM REQUEST needs, as [`SenderRole::nak`] and the RTTM reply do, a
+/// binding on `endpoint` of its source, boot id, incarnation and receiver
+/// id (any while unconfirmed), and a NAK a repairing publication. Run
+/// inside the domain 4 open, before the sequence is marked or an epoch
+/// promoted (H8-15); a refused control changes no state. Any other
+/// control is refused: none is a receiver's domain 4 control.
 fn receiver_control_admissible<T: StreamTerms>(
     outbound: Option<&crate::agents::data::Outbound<T>>,
     source: Option<SocketAddr>,
+    identity: Identity,
+    bindings: &[super::ReceiverBinding],
+    endpoint: EndpointId,
     control: &Control,
 ) -> bool {
-    let Control::Status(status) = control else {
-        return true;
-    };
     let Some(outbound) = outbound else {
         return false;
     };
+    let bound = |alias: Alias, named: Identity, receiver: Receiver| {
+        named == identity
+            && bindings.iter().any(|binding| {
+                binding.endpoint == endpoint
+                    && binding.alias == alias
+                    && source.is_none_or(|source| {
+                        binding.source() == crate::sessions::rate::normalized(source)
+                    })
+                    && binding.boot_id == receiver.receiver_boot_id
+                    && binding.identity == named
+                    && binding
+                        .receiver_id
+                        .is_none_or(|id| id == receiver.receiver_id)
+            })
+    };
+    let status = match control {
+        Control::Status(status) => status,
+        Control::Nak(nak) => {
+            return outbound.repairs() && bound(nak.alias, nak.identity, nak.receiver);
+        }
+        Control::Rttm(rttm) => return bound(rttm.alias, rttm.identity, rttm.receiver),
+        _ => return false,
+    };
+    if status.identity != identity {
+        return false;
+    }
     let lanes = u8::try_from(outbound.readers().len()).ok() == Some(status.lanes.count());
     let tag = outbound.membership().is_none_or(|membership| {
         membership.configured_tag(status.receiver.receiver_id) == status.group_tag

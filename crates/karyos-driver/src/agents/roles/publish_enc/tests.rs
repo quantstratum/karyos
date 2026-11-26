@@ -1054,3 +1054,173 @@ fn sender_maintenance_erases_the_previous_receiver_key_after_its_overlap() {
     assert_eq!(sender.enc.publications[0].bound_epochs(), Some((1, 1)));
     NOW.with(|now| now.set(start));
 }
+
+/// H8-15 (sections 8 and 9): a NAK and an RTTM REQUEST are bound to their
+/// receiver inside the domain 4 open, and an SM to the publication's
+/// incarnation. Under the receiver's next `party_epoch`, a captured NAK
+/// and RTTM REQUEST injected from a source no binding names, and an SM
+/// naming another incarnation, are refused and change nothing: no epoch
+/// moves, and the very NAK and REQUEST from the bound source still open.
+#[test]
+fn a_next_epoch_nak_or_rttm_from_an_unbound_source_marks_nothing() {
+    use karyos_protocol::network::{Rttm, RttmKind};
+
+    let (mut sender, _): (super::super::SenderRole, super::super::ReceiverRole) =
+        super::super::roles(&crate::agents::AgentConfig::default()).unwrap();
+    let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let stranger: SocketAddr = "10.0.0.7:5000".parse().unwrap();
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 0,
+        mtu: 1408,
+    };
+    let (mut path, _log) =
+        crate::agents::data::testing::outbound(EndpointId(1), ALIAS, destination, term, 1, true);
+    path.enable_repair(
+        &crate::agents::repair::RepairConfig::default(),
+        term.term_length,
+        IDENTITY,
+    )
+    .unwrap();
+    sender.publications.push(path);
+    sender.enc.publish(publication());
+    sender.bind(EndpointId(1), destination, &plain_answer(), None, clock());
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    assert!(open(&mut sender.enc.publications[0], &receiver.challenge()).is_ok());
+    let (mut sealer, _) = receiver.data_keys();
+    sealer.roll_now();
+    let rttm = Control::Rttm(Rttm {
+        alias: ALIAS,
+        identity: IDENTITY,
+        receiver: Receiver {
+            receiver_boot_id: [5, 5],
+            receiver_id: 66,
+        },
+        probe_id: 1,
+        kind: RttmKind::Request,
+    });
+    let mut other = receiver.sm();
+    if let Control::Status(status) = &mut other {
+        status.identity.incarnation = 2;
+    }
+    let nak = seal_control(&mut sealer, &receiver.nak());
+    let request = seal_control(&mut sealer, &rttm);
+    let other = seal_control(&mut sealer, &other);
+    for bytes in [&nak, &request] {
+        assert!(
+            sender
+                .open_sealed_from(EndpointId(1), stranger, bytes)
+                .is_none()
+        );
+    }
+    assert!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &other)
+            .is_none()
+    );
+    let publication = &sender.enc.publications[0];
+    assert_eq!(publication.bound_epochs(), Some((1, 0)), "nothing promoted");
+    assert_eq!(
+        publication
+            .channel
+            .rejections
+            .get(EncRejection::InnerRejected),
+        3
+    );
+    for (bytes, control) in [(&nak, receiver.nak()), (&request, rttm)] {
+        assert_eq!(
+            sender
+                .open_sealed_from(EndpointId(1), destination, bytes)
+                .map(|(control, _)| control),
+            Some(control),
+            "its sequence was never marked"
+        );
+    }
+    assert_eq!(sender.enc.publications[0].bound_epochs(), Some((1, 1)));
+}
+
+/// H8-17 (section 7): the activation floor is the sender role's, per
+/// channel key id, not the publication's. Once the successor has been seen
+/// to sign, a backward clock step that selects the predecessor again and a
+/// publication made again under it, as admission makes one, never let an
+/// RSP_SETUP under the predecessor bind; one under the successor binds.
+#[test]
+fn a_recreated_publication_keeps_the_activation_floor() {
+    for (epoch, binds) in [(1, false), (2, true)] {
+        let (mut sender, _): (super::super::SenderRole, super::super::ReceiverRole) =
+            super::super::roles(&crate::agents::AgentConfig::default()).unwrap();
+        let made = |signing: u32| {
+            let mut publication = PublicationEnc::new(
+                EndpointId(1),
+                ALIAS,
+                IDENTITY,
+                &[&channel(1, 0x11), &channel(2, 0x33)],
+                &[&pairwise(0x22)],
+                clock,
+            )
+            .unwrap();
+            publication.sign_with(signing).unwrap();
+            publication
+        };
+        sender.enc.publish(made(1));
+        sender.enc.apply_keys(&activation(2, &[1, 2]));
+        // The clock steps back; the publication is made again under the
+        // predecessor's view.
+        sender.enc.unpublish(EndpointId(1), ALIAS);
+        sender.enc.publish(made(1));
+        assert_eq!(sender.enc.activation.floor(3), Some(2));
+        sender.enc.apply_keys(&activation(1, &[1, 2]));
+        let both = ChannelKeys::new(&[&channel(1, 0x11), &channel(2, 0x33)]).unwrap();
+        let mut receiver = peer(5, 0x22, epoch, &both);
+        let opened = open(&mut sender.enc.publications[0], &receiver.challenge());
+        if binds {
+            assert!(
+                matches!(
+                    opened,
+                    Ok(EncOpened::RspSetup(_, EncEstablishing { bind: true, .. }))
+                ),
+                "epoch {epoch}: {opened:?}"
+            );
+        } else {
+            assert_eq!(opened, Err(EncRejection::Epoch), "epoch {epoch}");
+            assert_eq!(sender.enc.publications[0].bound_receiver(), None);
+        }
+    }
+}
+
+/// H8-19 (section 10): a sender role registered with the fence keeps
+/// maintaining once its last encrypted publication is removed. Two roles
+/// watch the same VM; one removes its last publication; the change the
+/// other observes is reported redrawn by both, so the fence releases.
+#[test]
+fn a_sender_without_publications_still_releases_the_fence() {
+    use crate::wire_enc::vm_generation;
+
+    let mut senders: Vec<super::super::SenderRole> = (0..2)
+        .map(|_| {
+            super::super::roles(&crate::agents::AgentConfig::default())
+                .unwrap()
+                .0
+        })
+        .collect();
+    let mut injectors = Vec::new();
+    for sender in &mut senders {
+        sender.enc.publish(publication());
+        let (signal, injector) = vm_generation::InjectedSignal::new();
+        sender.enc.watch(VmGenerationWatch::new(Box::new(signal)));
+        sender.on_generation_change(0);
+        injectors.push(injector);
+    }
+    senders[0].enc.unpublish(EndpointId(1), ALIAS);
+    assert!(senders[0].enc.publications.is_empty());
+    // The other role observes the change first.
+    injectors[1].change();
+    for sender in senders.iter_mut().rev() {
+        sender.on_generation_change(vm_generation::POLL_INTERVAL_NS);
+    }
+    let current = vm_generation::generation();
+    assert!(current > 0);
+    assert_eq!(senders[0].enc_generation(), current, "reported redrawn");
+    assert_eq!(senders[1].enc_generation(), current);
+    assert!(!vm_generation::quiesced(), "the fence released");
+}
