@@ -945,3 +945,112 @@ fn the_domain_6_scratch_slot_keeps_no_retired_pairwise_key() {
     let mut again = peer(6, 0x22, 1, &keys());
     assert!(open(&mut publication, &again.challenge()).is_ok());
 }
+
+/// H8-15 (sections 8 and 9): the publication-specific checks of a
+/// receiver control run inside the domain 4 open, before its sequence is
+/// marked or an epoch promoted. With the receiver's next `party_epoch`
+/// (whose first accepted datagram would promote), a correctly sealed
+/// two-lane SM for this one-lane publication, and a one-lane SM from a
+/// source that is not a destination of the publication, are refused and
+/// counted and change nothing: no epoch moves, and the very datagram from
+/// the destination still opens (its sequence was never marked) and
+/// promotes.
+#[test]
+fn a_refused_domain_4_control_marks_nothing_and_promotes_nothing() {
+    let (mut sender, _): (super::super::SenderRole, super::super::ReceiverRole) =
+        super::super::roles(&crate::agents::AgentConfig::default()).unwrap();
+    let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let stranger: SocketAddr = "10.0.0.7:5000".parse().unwrap();
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 0,
+        mtu: 1408,
+    };
+    let (mut path, _log) =
+        crate::agents::data::testing::outbound(EndpointId(1), ALIAS, destination, term, 1, false);
+    path.set_destinations(
+        crate::agents::data::DEFAULT_MAX_DESTINATIONS,
+        &[destination],
+        &[],
+        Some(true),
+    )
+    .unwrap();
+    sender.publications.push(path);
+    sender.enc.publish(publication());
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    assert!(open(&mut sender.enc.publications[0], &receiver.challenge()).is_ok());
+    let (mut sealer, _) = receiver.data_keys();
+    sealer.roll_now();
+    let lane = LaneStatus {
+        consumption: 4096,
+        window: 65_536,
+    };
+    let mut two_lanes = receiver.sm();
+    if let Control::Status(status) = &mut two_lanes {
+        status.lanes = Lanes::new(&[lane, lane]).unwrap();
+    }
+    let two_lanes = seal_control(&mut sealer, &two_lanes);
+    assert!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &two_lanes)
+            .is_none()
+    );
+    let one_lane = seal_control(&mut sealer, &receiver.sm());
+    assert!(
+        sender
+            .open_sealed_from(EndpointId(1), stranger, &one_lane)
+            .is_none()
+    );
+    let publication = &sender.enc.publications[0];
+    assert_eq!(publication.bound_epochs(), Some((1, 0)), "nothing promoted");
+    assert_eq!(
+        publication
+            .channel
+            .rejections
+            .get(EncRejection::InnerRejected),
+        2
+    );
+    assert_eq!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &one_lane)
+            .map(|(control, _)| control),
+        Some(receiver.sm()),
+        "its sequence was never marked"
+    );
+    assert_eq!(sender.enc.publications[0].bound_epochs(), Some((1, 1)));
+}
+
+/// H8-16 (section 6b): the bound receiver's previous domain 4 key, kept
+/// for the 10 s overlap after a promotion, is erased by the sender role's
+/// maintenance once the overlap has passed, with no further promotion and
+/// no root retired.
+#[test]
+fn sender_maintenance_erases_the_previous_receiver_key_after_its_overlap() {
+    use crate::wire_enc::EPOCH_OVERLAP_NS;
+
+    let (mut sender, _): (super::super::SenderRole, super::super::ReceiverRole) =
+        super::super::roles(&crate::agents::AgentConfig::default()).unwrap();
+    sender.enc.publish(publication());
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    assert!(open(&mut sender.enc.publications[0], &receiver.challenge()).is_ok());
+    let (mut sealer, _) = receiver.data_keys();
+    sealer.roll_now();
+    let nak = seal_control(&mut sealer, &receiver.nak());
+    assert!(open(&mut sender.enc.publications[0], &nak).is_ok());
+    assert!(sender.enc.publications[0].bound_has_previous());
+    let start = clock();
+    NOW.with(|now| now.set(start + EPOCH_OVERLAP_NS - 1));
+    sender.on_generation_change(0);
+    assert!(
+        sender.enc.publications[0].bound_has_previous(),
+        "within the overlap"
+    );
+    NOW.with(|now| now.set(start + EPOCH_OVERLAP_NS));
+    sender.on_generation_change(0);
+    assert!(
+        !sender.enc.publications[0].bound_has_previous(),
+        "erased at its end"
+    );
+    assert_eq!(sender.enc.publications[0].bound_epochs(), Some((1, 1)));
+    NOW.with(|now| now.set(start));
+}

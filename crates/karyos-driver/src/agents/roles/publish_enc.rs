@@ -231,12 +231,31 @@ impl PublicationEnc {
     /// # Errors
     ///
     /// The [`EncRejection`].
+    #[cfg(test)]
     pub(crate) fn open(
         &mut self,
         datagram: &[u8],
         out: &mut [u8; MAX_PLAINTEXT],
     ) -> Result<EncOpened, EncRejection> {
-        let result = self.open_uncounted(datagram, out);
+        self.open_checked(datagram, out, &|_| true)
+    }
+
+    /// Opens as [`Self::open`], with `admit` the publication-specific
+    /// checks of a receiver control (domain 4) that change nothing: they
+    /// run inside the open, before its sequence is marked and before any
+    /// epoch is promoted, so a control they refuse moves no replay or
+    /// epoch state (sections 8 and 9, H8-15).
+    ///
+    /// # Errors
+    ///
+    /// The [`EncRejection`].
+    pub(crate) fn open_checked(
+        &mut self,
+        datagram: &[u8],
+        out: &mut [u8; MAX_PLAINTEXT],
+        admit: &dyn Fn(&Control) -> bool,
+    ) -> Result<EncOpened, EncRejection> {
+        let result = self.open_uncounted(datagram, out, admit);
         if let Err(reason) = result {
             self.channel.rejections.bump(reason);
         }
@@ -247,6 +266,7 @@ impl PublicationEnc {
         &mut self,
         datagram: &[u8],
         out: &mut [u8; MAX_PLAINTEXT],
+        admit: &dyn Fn(&Control) -> bool,
     ) -> Result<EncOpened, EncRejection> {
         // Section 10: nothing is opened after a VM generation change.
         if quiesced() {
@@ -258,7 +278,7 @@ impl PublicationEnc {
         }
         match head.domain {
             Domain::RspSetup => self.rsp_setup(datagram, out),
-            Domain::Receiver => self.receiver(datagram, out, head.receiver),
+            Domain::Receiver => self.receiver(datagram, out, head.receiver, admit),
             Domain::Sender | Domain::Setup => Err(EncRejection::Domain),
         }
     }
@@ -358,6 +378,7 @@ impl PublicationEnc {
         datagram: &[u8],
         out: &mut [u8; MAX_PLAINTEXT],
         party: Option<ReceiverIdentity>,
+        admit: &dyn Fn(&Control) -> bool,
     ) -> Result<EncOpened, EncRejection> {
         let now = (self.clock)();
         let party = party.ok_or(EncRejection::Party)?;
@@ -380,7 +401,8 @@ impl PublicationEnc {
                             && control_receiver(&control).is_some_and(|receiver| {
                                 id128(receiver.receiver_boot_id) == party.receiver_boot_id
                                     && receiver.receiver_id == party.receiver_id
-                            }) =>
+                            })
+                            && admit(&control) =>
                     {
                         Some(control)
                     }
@@ -493,6 +515,30 @@ impl PublicationEnc {
         self.bootstrap = None;
     }
 
+    /// Erases the bound receiver's previous epoch key once its overlap
+    /// has passed (H8-16): [`EncOpener::expire_previous`].
+    fn expire_previous(&mut self) {
+        let now = (self.clock)();
+        if let Some(bound) = self.bound.as_mut() {
+            bound.opener.expire_previous(now);
+        }
+    }
+
+    /// The bound receiver's domain 4 epoch pair (tests).
+    #[cfg(test)]
+    pub(crate) fn bound_epochs(&self) -> Option<(u32, u16)> {
+        self.bound.as_ref().map(|bound| bound.opener.epochs())
+    }
+
+    /// Whether the bound receiver's opener holds a previous epoch's key
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn bound_has_previous(&self) -> bool {
+        self.bound
+            .as_ref()
+            .is_some_and(|bound| bound.opener.has_previous())
+    }
+
     /// The bound receiver (tests).
     #[cfg(test)]
     pub(crate) fn bound_receiver(&self) -> Option<ReceiverIdentity> {
@@ -578,6 +624,11 @@ impl<T: StreamTerms> SenderRole<T> {
     /// When no fresh `driver_id` can be drawn nothing is redrawn, the
     /// fence stays held and the next duty tries again (fail closed).
     pub(super) fn on_generation_change(&mut self, now: u64) {
+        // Each duty erases a bound receiver's previous epoch key past its
+        // overlap (H8-16), on the publication's own clock.
+        for publication in &mut self.enc.publications {
+            publication.expire_previous();
+        }
         if self.enc.publications.is_empty() && self.publication_auth.is_empty() {
             return;
         }
@@ -761,9 +812,14 @@ impl<T: StreamTerms> SenderRole<T> {
     /// a new receiver installs the session's domain 1 sealer at once: the
     /// one establishment owns it, and nothing of the previous binding's
     /// key survives.
+    ///
+    /// `source` is the datagram's source: with the publication's lane
+    /// count, tag and destinations it is checked inside the open, before
+    /// anything is marked (H8-15). `None` (tests only) skips the source.
     pub(super) fn open_enc(
         &mut self,
         endpoint: EndpointId,
+        source: Option<SocketAddr>,
         bytes: &[u8],
     ) -> Option<(Control, Option<Establishing>)> {
         let alias = header(bytes).map(|head| Alias {
@@ -786,8 +842,14 @@ impl<T: StreamTerms> SenderRole<T> {
             self.enc.unattributed.bump(EncRejection::Binding);
             return None;
         };
+        let outbound = self
+            .publications
+            .iter()
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+            .map(|outbound| &**outbound);
+        let admit = |control: &Control| receiver_control_admissible(outbound, source, control);
         let mut out = [0_u8; MAX_PLAINTEXT];
-        match publication.open(bytes, &mut out) {
+        match publication.open_checked(bytes, &mut out, &admit) {
             Ok(EncOpened::Receiver(control)) => Some((control, None)),
             Ok(EncOpened::RspSetup(control, establishing)) => {
                 if establishing.bind {
@@ -895,6 +957,35 @@ impl<T: StreamTerms> SenderRole<T> {
 }
 
 /// The receiver block a receiver control names.
+/// The checks of a receiver control that depend on its publication and
+/// change nothing, as [`SenderRole::status`] makes them for an SM: the
+/// publication's lane count, the receiver's configured tag and, from
+/// `source`, a destination of the publication (or a dynamic one's
+/// registrant). Run inside the domain 4 open, before the sequence is
+/// marked or an epoch promoted (H8-15); a refused control changes no
+/// state. Other controls pass: their own checks change nothing either.
+fn receiver_control_admissible<T: StreamTerms>(
+    outbound: Option<&crate::agents::data::Outbound<T>>,
+    source: Option<SocketAddr>,
+    control: &Control,
+) -> bool {
+    let Control::Status(status) = control else {
+        return true;
+    };
+    let Some(outbound) = outbound else {
+        return false;
+    };
+    let lanes = u8::try_from(outbound.readers().len()).ok() == Some(status.lanes.count());
+    let tag = outbound.membership().is_none_or(|membership| {
+        membership.configured_tag(status.receiver.receiver_id) == status.group_tag
+    });
+    let eligible = source.is_none_or(|source| {
+        outbound.sends_to(crate::sessions::rate::normalized(source))
+            || outbound.registration().is_some()
+    });
+    lanes && tag && eligible
+}
+
 fn control_receiver(control: &Control) -> Option<Receiver> {
     match control {
         Control::Status(status) => Some(status.receiver),

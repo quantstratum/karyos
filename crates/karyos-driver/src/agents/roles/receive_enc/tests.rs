@@ -1216,36 +1216,72 @@ proptest::proptest! {
     }
 }
 
-/// H8-10 (ADR-0114 sections 4 and 5): `session_id` and `stream_id` are
-/// selectors, never HKDF inputs, so one publication's domain 6 key is the
-/// same on every alias. A channel key holder that announces the identity
-/// on a second alias after the first alias's challenge gets no second
-/// sealer for that key: the second alias's CHALLENGE is refused, never
-/// sealed at sequence 0 again, and the first alias's sequence continues.
+/// The header of `control` sealed by `seal`.
+fn sealed_head(seal: &mut SharedSealer, control: &Control) -> crate::wire_enc::Header {
+    let mut bytes = vec![0_u8; MAX_SEALED];
+    let length = control.encode(&mut bytes).unwrap();
+    let sealed = seal.seal_control(&mut bytes, length).unwrap();
+    crate::wire_enc::header(&bytes[..sealed]).unwrap()
+}
+
+/// H8-14 (with H8-10; ADR-0114 sections 4, 5 and 7): `session_id` and
+/// `stream_id` are selectors, never HKDF inputs, so a publication's domain
+/// 6 key is one key on every alias, with one sequence, and no alias owns
+/// it. A channel key holder that announces the target's identity on its
+/// own alias first gets its CHALLENGE sealed there; the genuine
+/// publication's verified ANNOUNCE on its alias then still gets its
+/// CHALLENGE sealed, its header naming that alias, its sequence continuing
+/// the key's one counter (never 0 again), and it opens under the target's
+/// key; the attacker's alias pins nothing.
 #[test]
-fn a_second_alias_of_one_key_gets_no_second_sequence() {
+fn a_forged_first_alias_never_pins_the_target() {
     let mut rig = rig();
-    rig.inject(&announce_on(IDENTITY, ALIAS));
-    assert_eq!(
-        sequence_of(&mut rsp_seal_of(&mut rig, &challenge_on(IDENTITY, ALIAS))),
-        0
-    );
     rig.inject(&announce_on(IDENTITY, ALIAS_2));
+    let forged = sealed_head(
+        &mut rsp_seal_of(&mut rig, &challenge_on(IDENTITY, ALIAS_2)),
+        &challenge_on(IDENTITY, ALIAS_2),
+    );
+    assert_eq!((forged.session_id, forged.seq), (ALIAS_2.session_id, 0));
+    rig.inject(&announce_on(IDENTITY, ALIAS));
     assert_eq!(rig.rejections().total(), 0, "both announces verified");
-    let mut buffer = [0_u8; 512];
-    let second = challenge_on(IDENTITY, ALIAS_2);
-    let length = second.encode(&mut buffer).unwrap();
+    let genuine = challenge_on(IDENTITY, ALIAS);
+    let mut seal = rsp_seal_of(&mut rig, &genuine);
+    let mut bytes = vec![0_u8; MAX_SEALED];
+    let length = genuine.encode(&mut bytes).unwrap();
+    let sealed = seal
+        .seal_control(&mut bytes, length)
+        .expect("the genuine alias is challenged");
+    let head = crate::wire_enc::header(&bytes[..sealed]).unwrap();
     assert_eq!(
-        rsp_seal_of(&mut rig, &second).seal_control(&mut buffer, length),
-        None,
-        "no second sequence under the same key"
+        (head.session_id, head.stream_id, head.seq),
+        (ALIAS.session_id, ALIAS.stream_id, 1),
+        "its alias, the key's one sequence"
     );
-    assert_eq!(rig.role.enc.rsp.len(), 1);
-    assert_eq!(
-        sequence_of(&mut rsp_seal_of(&mut rig, &challenge_on(IDENTITY, ALIAS))),
-        1,
-        "the key's one sequence continues"
+    // It opens under the target's domain 6 key with the receiver's
+    // pairwise trailer, the publication's alias in its header.
+    let mut out = [0_u8; MAX_PLAINTEXT];
+    let opened = crate::wire_enc::open_bootstrap(
+        &ChannelKeys::new(&[&channel(0x11)]).unwrap(),
+        Some(&crate::wire_enc::PairwiseFiles::new(&[&pairwise()]).unwrap()),
+        Some(publication_of(&IDENTITY)),
+        &bytes[..sealed],
+        &mut out,
+        &mut crate::wire_enc::OpenRate::default(),
+        0,
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    assert!(matches!(
+        karyos_protocol::network::classify(&out[..opened.frames]),
+        Ok(karyos_protocol::network::Datagram::Control(control)) if control == genuine
+    ));
+    assert_eq!(rig.role.enc.rsp.len(), 1, "one entry, one counter");
+    // Either alias continues the same counter.
+    let again = sealed_head(
+        &mut rsp_seal_of(&mut rig, &challenge_on(IDENTITY, ALIAS_2)),
+        &challenge_on(IDENTITY, ALIAS_2),
     );
+    assert_eq!(again.seq, 2);
 }
 
 /// A publication of the rig's driver, registration `n`.
@@ -1328,7 +1364,11 @@ fn a_still_derivable_rsp_entry_is_never_reclaimed() {
     use crate::wire_auth::FixedKeys;
 
     let mut role = full_rsp_table();
-    // Rotation: every sealer moves to epoch 2 and stays live.
+    // Every target is current (a verified SETUP named it), so at the
+    // rotation every sealer moves to epoch 2 and stays live.
+    for n in 0..u64::try_from(RSP_SEALERS).unwrap() {
+        role.enc.verified.push((EndpointId(1), ALIAS, target(n)));
+    }
     role.enc.apply_keys(&FixedKeys {
         files: vec![channel(0x11), second_epoch(), pairwise()],
     });
@@ -1471,4 +1511,153 @@ fn resync_binds_through_the_signing_epoch_around_activation() {
             }
         }
     }
+}
+
+/// H8-11: with normal overlapping rotation (the successor admitted and
+/// signing while the predecessor still verifies), an entry whose target is
+/// gone is not advanced to the successor: it stays withdrawn under epoch 1,
+/// only as that epoch's nonce history. A target that comes back verified
+/// gets the successor's key from sequence 0 (a key never used); once epoch
+/// 1 stops verifying the other 63 entries are reclaimed, so turnover goes
+/// past 64 targets within one boot, still bounded at 64.
+#[test]
+fn rsp_turnover_passes_64_targets_across_an_overlapping_rotation() {
+    use crate::agents::control::ControlSeal;
+    use crate::wire_auth::FixedKeys;
+
+    let all = u64::try_from(RSP_SEALERS).unwrap();
+    let mut role = full_rsp_table();
+    role.enc.apply_keys(&FixedKeys {
+        files: vec![channel(0x11), second_epoch(), pairwise()],
+    });
+    assert_eq!(role.enc.rsp.len(), RSP_SEALERS);
+    assert!(
+        role.enc
+            .rsp
+            .iter()
+            .all(|entry| entry.sealer.key_epoch().is_none() && entry.high_epoch == 1),
+        "no entry of a gone target advanced"
+    );
+    // Target 0 comes back: the successor's key, from sequence 0.
+    let mut back = role
+        .enc
+        .rsp_sealer(0, target(0), ALIAS, [4; 16], true)
+        .unwrap();
+    let head = sealed_head(&mut back, &announce());
+    assert_eq!((head.key_epoch, head.seq), (2, 0));
+    assert!(
+        role.enc
+            .rsp_sealer(0, target(all), ALIAS, [4; 16], true)
+            .is_none(),
+        "full while epoch 1 verifies (fail closed)"
+    );
+    // Epoch 1 stops verifying: its 63 histories go, target 0's live
+    // epoch 2 entry stays.
+    role.enc.apply_keys(&FixedKeys {
+        files: vec![second_epoch(), pairwise()],
+    });
+    assert_eq!(role.enc.rsp.len(), 1);
+    for n in all..2 * all {
+        let sealer = role.enc.rsp_sealer(0, target(n), ALIAS, [4; 16], true);
+        if n < 2 * all - 1 {
+            let head = sealed_head(&mut sealer.unwrap(), &announce());
+            assert_eq!((head.key_epoch, head.seq), (2, 0), "target {n}");
+        } else {
+            assert!(sealer.is_none(), "bounded at {RSP_SEALERS}");
+        }
+    }
+    let head = sealed_head(
+        &mut role
+            .enc
+            .rsp_sealer(0, target(0), ALIAS, [4; 16], true)
+            .unwrap(),
+        &announce(),
+    );
+    assert_eq!((head.key_epoch, head.seq), (2, 1), "target 0 continues");
+}
+
+/// H8-18 (section 10): a role whose last subscription went keeps its
+/// domain 6 sealers for the boot (H8-01) and stays registered with the
+/// fence; a VM generation change still withdraws them, a queued clone
+/// included, redraws its boot id and reports it, so the fence releases.
+#[test]
+fn a_role_without_subscriptions_still_closes_its_rsp_sealers_on_a_generation_change() {
+    let mut rig = rig();
+    let sessions = session_end();
+    rig.inject(&announce_on(IDENTITY, ALIAS));
+    let queued = rsp_seal_of(&mut rig, &challenge_of(IDENTITY));
+    assert!(!queued.is_withdrawn());
+    let injector = watched(&mut rig.role);
+    rig.role.enc.unsubscribe(EndpointId(1), 6);
+    assert!(rig.role.enc.subscriptions.is_empty());
+    assert_eq!(rig.role.enc.rsp.len(), 1, "kept for the boot");
+    let old = rig.role.boot_id();
+    injector.change();
+    rig.role.on_generation_change(&sessions, AFTER);
+    assert!(queued.is_withdrawn(), "the shared key is withdrawn");
+    assert!(rig.role.enc.rsp.is_empty());
+    assert_eq!(rig.role.enc_generation(), 1, "reported redrawn");
+    assert_ne!(rig.role.boot_id(), old);
+    assert!(!crate::wire_enc::quiesced(), "the fence released");
+}
+
+/// H8-17 (section 7, wire-key-files.md 2.3): once the successor has been
+/// seen to sign, a backward wall-clock step that selects the predecessor
+/// to sign again (both still verify) never lets it bind again: no SETUP
+/// under it establishes and no resynchronisation answer under it moves a
+/// binding; the successor still does both.
+#[test]
+fn a_backward_clock_step_never_lets_the_predecessor_bind_again() {
+    for (epoch, binds) in [(1, false), (2, true)] {
+        let (_, mut role): (_, super::super::ReceiverRole) =
+            super::super::roles(&AgentConfig::default()).unwrap();
+        role.enc.subscribe(
+            SubscriptionEnc::new(
+                EndpointId(1),
+                6,
+                &[&channel(0x11), &second_epoch()],
+                &[&pairwise()],
+                66,
+            )
+            .unwrap(),
+        );
+        for signing in [1, 2, 1] {
+            role.enc.apply_keys(&view(signing, &[1, 2]));
+        }
+        let (sessions, _link) = session_rings(std::num::NonZeroUsize::new(4).unwrap());
+        let source: SocketAddr = "10.0.0.2:4000".parse().unwrap();
+        role.inject_datagram(&sessions, EndpointId(1), source, &announce_at(epoch), 1_000);
+        assert_eq!(role.enc.verified.len(), usize::from(binds), "epoch {epoch}");
+        let mut role = bound();
+        for signing in [1, 2, 1] {
+            role.enc.apply_keys(&view(signing, &[1, 2]));
+        }
+        let result = role
+            .enc
+            .resync(0, &enc_answer(epoch, 3, NONCE), epoch, true, BOOT, 1_500);
+        assert_eq!(result.is_ok(), binds, "resync under epoch {epoch}");
+    }
+}
+
+/// H8-16 (section 6b): the previous epoch's key a resynchronisation kept
+/// for the 10 s overlap is erased by role maintenance once the overlap
+/// has passed, with no further promotion and no root retired.
+#[test]
+fn role_maintenance_erases_the_previous_key_after_its_overlap() {
+    let mut role = bound();
+    let sessions = session_end();
+    role.enc.images[0].opener.resync(1, 3, 1_500).unwrap();
+    assert!(role.enc.images[0].opener.has_previous());
+    let deadline = 1_500 + crate::wire_enc::EPOCH_OVERLAP_NS;
+    role.on_generation_change(&sessions, deadline - 1);
+    assert!(
+        role.enc.images[0].opener.has_previous(),
+        "within the overlap"
+    );
+    role.on_generation_change(&sessions, deadline);
+    assert!(
+        !role.enc.images[0].opener.has_previous(),
+        "erased at its end"
+    );
+    assert_eq!(role.enc.images[0].opener.epochs(), (1, 3));
 }

@@ -900,8 +900,9 @@ impl AesGcmSiv {
         out
     }
 
-    /// The header of a datagram of `length` bytes with sequence `seq`.
-    fn header(&self, length: i32, seq: u64) -> [u8; HEADER_LEN] {
+    /// The header of a datagram of `length` bytes with sequence `seq`,
+    /// written with the selectors `alias` (`session_id`, `stream_id`).
+    fn header(&self, length: i32, seq: u64, alias: (i32, i32)) -> [u8; HEADER_LEN] {
         let mut out = [0_u8; HEADER_LEN];
         put(&mut out, 0, &length.to_le_bytes());
         put(&mut out, 4, &[VERSION, 0]);
@@ -909,8 +910,8 @@ impl AesGcmSiv {
         put(&mut out, 8, &[PROFILE_ID, 16, self.context.domain as u8, 0]);
         put(&mut out, 12, &self.context.key_epoch.to_le_bytes());
         put(&mut out, 16, &self.context.party_epoch.to_le_bytes());
-        put(&mut out, 20, &self.context.session_id.to_le_bytes());
-        put(&mut out, 24, &self.context.stream_id.to_le_bytes());
+        put(&mut out, 20, &alias.0.to_le_bytes());
+        put(&mut out, 24, &alias.1.to_le_bytes());
         put(&mut out, 28, &seq.to_le_bytes());
         put(&mut out, 36, &self.party);
         out
@@ -958,6 +959,29 @@ impl AesGcmSiv {
     ///
     /// [`EncSealError`].
     pub fn seal_next(&self, datagram: &mut [u8], frames: usize) -> Result<usize, EncSealError> {
+        self.seal_next_as(
+            datagram,
+            frames,
+            (self.context.session_id, self.context.stream_id),
+        )
+    }
+
+    /// Seals as [`Self::seal_next`], with the header selectors `alias`
+    /// (`session_id`, `stream_id`) in place of the context's. They enter
+    /// no HKDF input and no nonce (sections 4 and 5), so one key and its
+    /// one counter serve every alias its party is reached on: the
+    /// `envelope_seq` comes from this key's counter whatever the alias
+    /// (H8-14). Allocates nothing. A refusal writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`EncSealError`].
+    pub fn seal_next_as(
+        &self,
+        datagram: &mut [u8],
+        frames: usize,
+        alias: (i32, i32),
+    ) -> Result<usize, EncSealError> {
         let trailer = self.trailer_len();
         let plaintext = frames.checked_add(trailer).ok_or(EncSealError::TooLong {
             plaintext: usize::MAX,
@@ -971,21 +995,20 @@ impl AesGcmSiv {
             u64::try_from(HEADER_LEN.saturating_add(plaintext)).map_err(|_| EncSealError::Aead)?;
         let seq = self.reserve()?;
         self.charge(protected)?;
-        self.seal_at(datagram, frames, plaintext, total, length, seq)
+        self.seal_at(datagram, (frames, plaintext, total), length, seq, alias)
     }
 
     fn seal_at(
         &self,
         datagram: &mut [u8],
-        frames: usize,
-        plaintext: usize,
-        total: usize,
+        (frames, plaintext, total): (usize, usize, usize),
         length: i32,
         seq: u64,
+        alias: (i32, i32),
     ) -> Result<usize, EncSealError> {
         let sealed = datagram.get_mut(..total).ok_or(EncSealError::Aead)?;
         sealed.copy_within(..frames, HEADER_LEN);
-        let header = self.header(length, seq);
+        let header = self.header(length, seq, alias);
         let (head, rest) = sealed
             .split_at_mut_checked(HEADER_LEN)
             .ok_or(EncSealError::Aead)?;

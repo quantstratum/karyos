@@ -7357,7 +7357,19 @@ impl<T: StreamTerms> SenderRole<T> {
         endpoint: EndpointId,
         bytes: &[u8],
     ) -> Option<(Control, Option<Establishing>)> {
-        self.open_sealed(endpoint, bytes)
+        self.open_sealed(endpoint, None, bytes)
+    }
+
+    /// Opens a sealed receiver control from `source` as the duty does
+    /// (tests).
+    #[cfg(test)]
+    pub(super) fn open_sealed_from(
+        &mut self,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        bytes: &[u8],
+    ) -> Option<(Control, Option<Establishing>)> {
+        self.open_sealed(endpoint, Some(source), bytes)
     }
 
     /// Installs the sealer of a verified establishment, as the answer
@@ -9163,6 +9175,7 @@ impl<T: StreamTerms> SenderRole<T> {
     fn open_sealed(
         &mut self,
         endpoint: EndpointId,
+        source: Option<SocketAddr>,
         bytes: &[u8],
     ) -> Option<(Control, Option<Establishing>)> {
         // Nothing is opened under a stale or unapplied key view (H8 R3-1).
@@ -9174,7 +9187,7 @@ impl<T: StreamTerms> SenderRole<T> {
             return None;
         }
         if crate::wire_enc::is_envelope(bytes) {
-            return self.open_enc(endpoint, bytes);
+            return self.open_enc(endpoint, source, bytes);
         }
         // Nothing binds or is answered while a VM generation change is not
         // released (karyos#648): the publications stay stopped.
@@ -9585,7 +9598,7 @@ impl<T: StreamTerms> SenderRole<T> {
                     source,
                     bytes,
                     seen,
-                } => match self.open_sealed(endpoint, bytes.get()) {
+                } => match self.open_sealed(endpoint, Some(source), bytes.get()) {
                     Some((control, establishing)) => (
                         ControlItem::Incoming {
                             endpoint,

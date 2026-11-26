@@ -365,6 +365,11 @@ pub struct ChannelKeys {
     /// only verifies early. `None` once no held file signs: nothing new is
     /// sealed.
     signing: Option<u32>,
+    /// The highest epoch it has seen sign (H8-17): the activation floor of
+    /// [`Self::binds`]. It only rises, so a wall clock stepped back across
+    /// a successor's activation, which selects the predecessor to sign
+    /// again, never lets the predecessor bind again.
+    activated: u32,
 }
 
 impl ChannelKeys {
@@ -392,11 +397,13 @@ impl ChannelKeys {
         let mut keys = Self {
             files: slots,
             signing: None,
+            activated: 0,
         };
         // Until a key set names its signing file, the highest held signs:
         // admission sets the one the view signs with
         // ([`ChannelKeys::set_signing`]), and every key set applied
-        // follows it ([`ChannelKeys::follow_signing`]).
+        // follows it ([`ChannelKeys::follow_signing`]). The activation
+        // floor starts at the first selection the view makes.
         keys.signing = Some(keys.current_epoch());
         Ok(keys)
     }
@@ -415,6 +422,7 @@ impl ChannelKeys {
             return false;
         }
         self.signing = Some(epoch);
+        self.activated = self.activated.max(epoch);
         true
     }
 
@@ -427,6 +435,9 @@ impl ChannelKeys {
             .and_then(|key_id| keys.signing(key_id))
             .map(|file| file.file_epoch)
             .filter(|epoch| self.ikm(*epoch).is_some());
+        if let Some(epoch) = self.signing {
+            self.activated = self.activated.max(epoch);
+        }
     }
 
     /// The lowest held epoch: every file epoch below it no longer verifies
@@ -447,12 +458,21 @@ impl ChannelKeys {
     /// the signing one, so during a successor's early verify allowance its
     /// predecessor, which every party still sends under, binds, and so
     /// does the successor already; once the successor signs, the retired
-    /// predecessor binds nothing. With no file signing nothing binds (fail
+    /// predecessor binds nothing, even when a backward wall-clock step
+    /// selects it to sign again: nothing below the highest epoch seen to
+    /// sign binds (H8-17). With no file signing nothing binds (fail
     /// closed).
     #[must_use]
     pub fn binds(&self, key_epoch: u32) -> bool {
-        self.signing
-            .is_some_and(|signing| key_epoch >= signing && self.ikm(key_epoch).is_some())
+        self.binding_epoch()
+            .is_some_and(|binding| key_epoch >= binding && self.ikm(key_epoch).is_some())
+    }
+
+    /// The active binding epoch (H8-12, H8-17): the signing epoch, never
+    /// below the highest epoch seen to sign; `None` with no file signing.
+    #[must_use]
+    pub fn binding_epoch(&self) -> Option<u32> {
+        self.signing.map(|signing| signing.max(self.activated))
     }
 
     /// The highest file epoch held, which may only verify yet (a
@@ -1313,6 +1333,23 @@ impl EncSealer {
     ///
     /// [`EncSendError`]; nothing is written.
     pub fn seal(&mut self, datagram: &mut [u8], frames: usize) -> Result<usize, EncSendError> {
+        self.seal_as(datagram, frames, None)
+    }
+
+    /// Seals as [`Self::seal`], the header naming `alias` (`session_id`,
+    /// `stream_id`) instead of its context's when given: the selectors
+    /// are no HKDF input, so the key and its one sequence are the same on
+    /// every alias (H8-14). Allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`EncSendError`]; nothing is written.
+    pub fn seal_as(
+        &mut self,
+        datagram: &mut [u8],
+        frames: usize,
+        alias: Option<(i32, i32)>,
+    ) -> Result<usize, EncSendError> {
         if self.generation != vm_generation::generation() {
             return Err(EncSendError::VmGeneration);
         }
@@ -1333,11 +1370,17 @@ impl EncSealer {
         }
         #[cfg(test)]
         let plaintext = recording().then(|| datagram.get(..frames).map(<[u8]>::to_vec));
-        let sealed = self.key.seal_next(datagram, frames)?;
+        let context = *self.key.context();
+        let alias = alias.unwrap_or((context.session_id, context.stream_id));
+        let sealed = self.key.seal_next_as(datagram, frames, alias)?;
         #[cfg(test)]
         if let Some(Some(frames)) = plaintext {
             record(SealedRecord {
-                context: *self.key.context(),
+                context: KeyContext {
+                    session_id: alias.0,
+                    stream_id: alias.1,
+                    ..context
+                },
                 seq: self.key.next_seq().saturating_sub(1),
                 frames,
             });
@@ -1840,6 +1883,28 @@ impl EncOpener {
             },
         );
         self.previous = Some((old, now_ns.saturating_add(EPOCH_OVERLAP_NS)));
+    }
+
+    /// Erases the previous epoch's key once its overlap has passed at
+    /// `now_ns` (section 6b, H8-16): selection already refuses it from its
+    /// deadline on, and from then nothing keeps its schedule. Its slot is
+    /// erased in place and kept as the spare, so the next promotion still
+    /// constructs no key. Role maintenance calls it every duty. Allocates
+    /// nothing.
+    pub fn expire_previous(&mut self, now_ns: u64) {
+        let Some((mut slot, _)) = self.previous.take_if(|(_, until)| now_ns >= *until) else {
+            return;
+        };
+        erase(&mut slot.key, self.erase);
+        if self.spare.is_none() {
+            self.spare = Some(slot.key);
+        }
+    }
+
+    /// Whether it holds a previous epoch's key (tests).
+    #[cfg(test)]
+    pub(crate) fn has_previous(&self) -> bool {
+        self.previous.is_some()
     }
 
     /// A copy of the current key's replay window (tests).

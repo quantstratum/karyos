@@ -117,6 +117,11 @@ impl ControlSeal for EncSealer {
         self.seal(buffer, frames).ok()
     }
 
+    fn seal_control_as(&mut self, buffer: &mut [u8], frames: usize, alias: Alias) -> Option<usize> {
+        self.seal_as(buffer, frames, Some((alias.session_id, alias.stream_id)))
+            .ok()
+    }
+
     fn withdraw(&mut self) {
         EncSealer::withdraw(self);
     }
@@ -132,6 +137,44 @@ impl ControlSeal for EncSealer {
 
     fn key_epoch(&self) -> Option<u32> {
         (!self.is_withdrawn()).then(|| self.context().key_epoch)
+    }
+}
+
+/// A domain 6 entry's key reached on another alias than its context's
+/// (H8-14): every seal reserves its sequence from the entry's one sealer
+/// and only the header's selectors name `alias`, so a target's key has one
+/// counter whichever alias it is challenged on, and no alias owns it.
+#[derive(Debug)]
+struct RspRoute {
+    shared: SharedSealer,
+    alias: Alias,
+}
+
+impl ControlSeal for RspRoute {
+    fn domain(&self) -> ControlDomain {
+        self.shared.domain()
+    }
+
+    fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
+        self.shared.seal_control_as(buffer, frames, self.alias)
+    }
+
+    /// Withdraws the entry's key for every holder, as a clone would.
+    fn withdraw(&mut self) {
+        ControlSeal::withdraw(&mut self.shared);
+    }
+
+    #[cfg(test)]
+    fn roll_for_test(&mut self) {
+        self.shared.roll_for_test();
+    }
+
+    fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        self.shared.apply_keys(keys);
+    }
+
+    fn key_epoch(&self) -> Option<u32> {
+        self.shared.key_epoch()
     }
 }
 
@@ -226,8 +269,9 @@ impl SubscriptionEnc {
 
 /// One domain 6 sealer of the role's receiver boot (H8-01, H8-10):
 /// everything its key derives from but the file epoch, which the sealer
-/// itself follows, the one alias whose headers it writes, the highest
-/// file epoch it was keyed under, and the sealer.
+/// itself follows, the alias its context names (a selector only: another
+/// alias is reached through an [`RspRoute`], H8-14), the highest file
+/// epoch it was keyed under, and the sealer.
 #[derive(Debug)]
 struct RspEntry {
     channel_key_id: u32,
@@ -315,11 +359,12 @@ impl ReceiverEnc {
         boot: [u64; 2],
         now: u64,
     ) -> Result<(), EncRejection> {
-        // The active binding epoch, the signing one (H8-12).
+        // The active binding epoch, the signing one, never below the
+        // highest seen to sign (H8-12, H8-17).
         let binding_key_epoch = self
             .subscriptions
             .get(index)
-            .and_then(|subscription| subscription.keys.signing_epoch())
+            .and_then(|subscription| subscription.keys.binding_epoch())
             .ok_or(EncRejection::ResyncRefused)?;
         let image = self
             .images
@@ -380,10 +425,33 @@ impl ReceiverEnc {
         // sequence; a withdrawn one stays in the table as a tombstone, so
         // its (target, key, boot id) is refused and never rebuilt with a
         // sequence restarted at 0 (nonce reuse), until every file epoch it
-        // sealed under has stopped verifying (H8-11).
+        // sealed under has stopped verifying (H8-11). An entry whose
+        // target is gone (no subscription of its key and receiver, or no
+        // verified SETUP or bound image names its publication) is not
+        // advanced into a successor epoch: it is withdrawn under the epochs
+        // it sealed under, kept only as their nonce history, so it is
+        // reclaimed once they stop verifying, and a later verified target
+        // gets the successor's key from sequence 0 ([`Self::rsp_sealer`]).
+        let (subscriptions, verified, images) = (&self.subscriptions, &self.verified, &self.images);
         for entry in &mut self.rsp {
             if let Some(epoch) = entry.sealer.key_epoch() {
                 entry.high_epoch = entry.high_epoch.max(epoch);
+            }
+            let active = subscriptions.iter().any(|subscription| {
+                (subscription.channel_key_id, subscription.receiver_id)
+                    == (entry.channel_key_id, entry.receiver_id)
+            }) && (verified
+                .iter()
+                .any(|(_, _, publication)| *publication == entry.publication)
+                || images
+                    .iter()
+                    .any(|image| publication_of(&image.identity) == entry.publication));
+            let advances = keys
+                .signing(entry.channel_key_id)
+                .is_some_and(|file| file.file_epoch > entry.high_epoch);
+            if !active && advances {
+                ControlSeal::withdraw(&mut entry.sealer);
+                continue;
             }
             entry.sealer.apply_keys(keys);
             if let Some(epoch) = entry.sealer.key_epoch() {
@@ -477,10 +545,17 @@ impl ReceiverEnc {
     /// has room, a new one under the signing epoch, above the key id's
     /// reclaimed epochs (H8-11).
     ///
-    /// The key is fixed by its derivation inputs, not by the alias: a
-    /// second alias for a key already made is refused (`None`), never
-    /// given a second sealer whose sequence would restart at 0 under the
-    /// same key (H8-10).
+    /// The key is fixed by its derivation inputs, not by the alias: one
+    /// entry, so one sequence, serves every alias of its target (H8-10),
+    /// and none owns it (H8-14). A `create` request on another alias than
+    /// the entry's context gets a route that seals from the entry's
+    /// sequence with only the header naming that alias; a request that no
+    /// verified datagram backs gets nothing on another alias.
+    ///
+    /// An entry withdrawn below the signing epoch (its target went at a
+    /// rotation, H8-11) is made again for a verified target under the
+    /// signing epoch, above every epoch it sealed under: a key never used,
+    /// so its sequence starts at 0 reusing no nonce.
     fn rsp_sealer(
         &mut self,
         index: usize,
@@ -491,18 +566,32 @@ impl ReceiverEnc {
     ) -> Option<SharedSealer> {
         let subscription = self.subscriptions.get(index)?;
         let (channel_key_id, receiver_id) = (subscription.channel_key_id, subscription.receiver_id);
-        if let Some(entry) = self.rsp.iter().find(|entry| {
+        let found = self.rsp.iter().position(|entry| {
             entry.channel_key_id == channel_key_id
                 && entry.receiver_id == receiver_id
                 && entry.publication == publication
                 && entry.boot == boot
-        }) {
-            return (entry.alias == alias).then(|| entry.sealer.clone());
-        }
-        if !create || self.rsp.len() >= RSP_SEALERS {
+        });
+        let signing = subscription.keys.signing_epoch();
+        if let Some(entry) = found.and_then(|at| self.rsp.get(at)) {
+            let renewable = create
+                && entry.sealer.key_epoch().is_none()
+                && signing.is_some_and(|epoch| epoch > entry.high_epoch);
+            if !renewable {
+                if entry.alias == alias {
+                    return Some(entry.sealer.clone());
+                }
+                return create.then(|| {
+                    SharedSealer::of(RspRoute {
+                        shared: entry.sealer.clone(),
+                        alias,
+                    })
+                });
+            }
+        } else if !create || self.rsp.len() >= RSP_SEALERS {
             return None;
         }
-        let key_epoch = subscription.keys.signing_epoch()?;
+        let key_epoch = signing?;
         if self
             .floors
             .iter()
@@ -531,7 +620,7 @@ impl ReceiverEnc {
         )
         .ok()?;
         let shared = SharedSealer::of(sealer);
-        self.rsp.push(RspEntry {
+        let entry = RspEntry {
             channel_key_id,
             receiver_id,
             publication,
@@ -539,7 +628,11 @@ impl ReceiverEnc {
             boot,
             high_epoch: key_epoch,
             sealer: shared.clone(),
-        });
+        };
+        match found.and_then(|at| self.rsp.get_mut(at)) {
+            Some(held) => *held = entry,
+            None => self.rsp.push(entry),
+        }
         Some(shared)
     }
 
@@ -1135,9 +1228,22 @@ impl<T: StreamTerms> ReceiverRole<T> {
     ///
     /// When no random word can be drawn the fence stays held and the next
     /// duty tries again (fail closed).
+    ///
+    /// It runs while the role holds any encrypted state, its domain 6
+    /// table and openers included, or is registered with the fence, whether
+    /// or not a subscription is left (H8-18): a role whose last subscription
+    /// went still withdraws its shared domain 6 keys and reports itself
+    /// redrawn, so the process fence releases. Each duty also erases every
+    /// image's previous epoch key past its overlap (H8-16).
     pub(super) fn on_generation_change(&mut self, sessions: &SessionEnd<T>, now: u64) {
+        for image in &mut self.enc.images {
+            image.opener.expire_previous(now);
+        }
         if self.enc.subscriptions.is_empty()
             && self.enc.published.is_empty()
+            && self.enc.rsp.is_empty()
+            && self.enc.images.is_empty()
+            && self.enc.watch.is_none()
             && self.subscription_auth.is_empty()
             && self.published_auth.is_empty()
         {

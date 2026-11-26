@@ -461,6 +461,19 @@ pub trait ControlSeal {
     fn domain(&self) -> Domain;
     /// Seals the control.
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize>;
+    /// Seals the control with its header naming `alias` instead of the
+    /// key's own selectors, from the key's one sequence (an encrypted
+    /// domain 6 key reached on another alias, H8-14). The default seals
+    /// nothing (fail closed).
+    fn seal_control_as(
+        &mut self,
+        buffer: &mut [u8],
+        frames: usize,
+        alias: karyos_protocol::network::Alias,
+    ) -> Option<usize> {
+        let _ = (buffer, frames, alias);
+        None
+    }
     /// Withdraws and erases its key: it seals nothing again (H8 finding 4).
     fn withdraw(&mut self);
     /// Moves to its next `party_epoch` now, as a budget would (tests).
@@ -642,6 +655,28 @@ impl ControlSeal for SharedSealer {
             return None;
         }
         self.sealer.lock().ok()?.seal_control(buffer, frames)
+    }
+
+    fn seal_control_as(
+        &mut self,
+        buffer: &mut [u8],
+        frames: usize,
+        alias: karyos_protocol::network::Alias,
+    ) -> Option<usize> {
+        if self.withdrawn.load(core::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        if self
+            .generation
+            .as_ref()
+            .is_some_and(|(generation, made)| generation.current() != *made)
+        {
+            return None;
+        }
+        self.sealer
+            .lock()
+            .ok()?
+            .seal_control_as(buffer, frames, alias)
     }
 
     /// Withdraws the shared key for every holder at once: the image's

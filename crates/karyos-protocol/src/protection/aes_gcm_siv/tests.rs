@@ -770,7 +770,8 @@ fn the_plaintext_cap_bounds_seal_and_open() {
 /// plaintext is `plaintext` as given, trailer or not.
 fn outer_only(profile: &AesGcmSiv, plaintext: &[u8], seq: u64) -> Vec<u8> {
     let total = plaintext.len() + ENVELOPE_LEN;
-    let header = profile.header(i32::try_from(total).unwrap(), seq);
+    let selectors = (profile.context().session_id, profile.context().stream_id);
+    let header = profile.header(i32::try_from(total).unwrap(), seq, selectors);
     let key = profile.context().derive(&IKM);
     let aead = Aes256GcmSiv::new(&Key::<Aes256GcmSiv>::from(*key));
     let mut body = plaintext.to_vec();
