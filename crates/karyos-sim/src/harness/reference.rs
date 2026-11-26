@@ -333,6 +333,10 @@ impl Reference {
 impl ConsensusCore for Reference {
     type Message = Message;
 
+    fn is_configuration_entry(payload: &[u8]) -> bool {
+        decode_configuration(payload).is_some()
+    }
+
     fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
         // The configurations its log holds, written or durable. A failed
         // read leaves the bootstrap configuration, which the harness's
@@ -564,8 +568,15 @@ impl ConsensusCore for Reference {
                 .flatten()
                 .map_or(unknown, |index| index.checked_add(1))
                 .unwrap_or(end);
-            // Below the log's first index: only the snapshot holds it.
-            if next < log.first_index() && log.base().is_some() {
+            // Below the log's first index, or at it without the term of the
+            // entry before it (an append needs that term): only the
+            // snapshot serves it.
+            let held_before = next
+                .checked_sub(1)
+                .is_some_and(|before| before == 0 || log.term(before).is_some());
+            if log.base().is_some()
+                && (next < log.first_index() || (next == log.first_index() && !held_before))
+            {
                 if !self.snapshot_to.contains(&peer) {
                     self.snapshot_to.push(peer);
                 }

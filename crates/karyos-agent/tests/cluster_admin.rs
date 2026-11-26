@@ -508,7 +508,8 @@ mod socket {
         let dir = dir("socket");
         let gateway = Gateway::new();
         let mut agent = Agent::new(AgentConfig::new(Vec::new()).with_journal(dir.join("journal")));
-        let caps = karyos_agent::json::capabilities(&agent.capabilities(true, false, false, false));
+        let caps =
+            karyos_agent::json::capabilities(&agent.capabilities(true, false, false, false, false));
         assert!(
             caps.contains(
                 r#"{"name":"cluster-command","state":"unavailable","reason":"not_configured"}"#
@@ -570,8 +571,9 @@ mod socket {
         );
         assert!(answer.contains(r#""outcome":"sequenced""#), "{answer}");
         assert_eq!(gateway.state(), (false, 0, 2));
-        let caps =
-            karyos_agent::json::capabilities(&agent.capabilities(false, false, false, false));
+        let caps = karyos_agent::json::capabilities(
+            &agent.capabilities(false, false, false, false, false),
+        );
         assert!(
             caps.contains(r#"{"name":"cluster-command","state":"forbidden","reason":"role"}"#),
             "{caps}"

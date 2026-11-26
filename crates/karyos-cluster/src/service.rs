@@ -58,6 +58,7 @@
 //! | Template | Id | Block | Maximum |
 //! | --- | --- | --- | --- |
 //! | `SessionBounds` | 1 | sessions 4, window 4, response bytes 4, ttl 8 | 32 |
+//! | `Membership` | 2 | voters 1, learners 1, 7 ids of 8 | 70 |
 //!
 //! Every field of 0 is `ValueOutOfRange`. The container applies a
 //! `SessionBounds` entry against its table's [`DedupConfig`]. The first
@@ -74,7 +75,8 @@
 //! they apply. A log written before karyos#927 carries no bounds entry:
 //! its registrations apply under the replica's configured bounds, as
 //! before, and a bounds entry that later differs from them stops the
-//! container as above.
+//! container as above. A `Membership` entry is a configuration entry of
+//! the core's ([`crate::membership`], karyos#711): it delivers nothing.
 
 mod compose;
 #[cfg(test)]
@@ -97,6 +99,7 @@ use crate::guards::{
     SectionError,
 };
 use crate::log::Entry;
+use crate::membership::MembershipEntry;
 
 /// Schema 2, the Cluster's log entries.
 pub const SCHEMA_ID: u16 = 2;
@@ -266,12 +269,17 @@ impl SessionBounds {
 enum Decoded<'a> {
     Service(Envelope<'a>),
     Bounds(SessionBounds),
+    Membership,
     Guard(GuardEntry),
 }
 
 impl<'a> Decoded<'a> {
     fn of(bytes: &'a [u8]) -> Result<Self, CodecError> {
         match karyos_codec::Envelope::read(bytes)?.schema_id {
+            CORE_SCHEMA_ID if MembershipEntry::is_one(bytes) => {
+                let _ = MembershipEntry::decode(bytes)?;
+                Ok(Self::Membership)
+            }
             CORE_SCHEMA_ID => Ok(Self::Bounds(SessionBounds::decode(bytes)?)),
             GUARD_SCHEMA_ID => Ok(Self::Guard(GuardEntry::decode(bytes)?)),
             _ => Ok(Self::Service(Envelope::decode(bytes)?)),
@@ -1063,6 +1071,13 @@ impl<S: ClusteredService> ServiceContainer<S> {
             match Decoded::of(&entry.payload).map_err(ApplyError::Envelope)? {
                 Decoded::Service(envelope) => Some(envelope),
                 Decoded::Bounds(bounds) => return self.apply_bounds(entry, bounds),
+                Decoded::Membership => {
+                    // The core's: it delivers nothing, and moves the log
+                    // time on as any entry.
+                    self.applied = Some(entry.index);
+                    self.sessions.observe(entry.event_time);
+                    return Ok(Applied::Nothing);
+                }
                 Decoded::Guard(guard) => return self.apply_guard(entry, guard),
             }
         };

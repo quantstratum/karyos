@@ -75,6 +75,18 @@
 //! refused install (the core holds the base or more, or leads) is
 //! [`InstallRefused::Stale`].
 //!
+//! **Membership** (karyos#711): the core's single-server changes.
+//! [`ConsensusCore::propose_change`] maps to [`Core::propose_change`],
+//! whose configuration entry ([`MembershipEntry`]) the leader writes like
+//! any proposal; a follower reports each configuration entry it receives
+//! to [`Core::configured`] as its write takes it, and a restart replays
+//! those its log holds, over the configuration its snapshot recorded
+//! ([`LogView::base_configuration`], given back by
+//! [`Core::restore_membership`], as after an install). A server that is
+//! not a bootstrap voter starts as a joining one ([`Config::joining`]). A
+//! promotion is refused while the learner is more than
+//! [`PROMOTION_LAG`] entries behind the commit.
+//!
 //! **Not taken:** leadership transfer answers
 //! [`TransferRefused::Unsupported`](super::core::TransferRefused::Unsupported); C5 version 2's W5 retry changes the
 //! leader by a crash, which needs no handover.
@@ -82,14 +94,15 @@
 use std::cell::RefCell;
 
 use karyos_cluster::consensus::{
-    Backpressure, Config, Core, Effects, Limits as CoreLimits, LogTerms, Message as CoreMessage,
-    ProposeError, Role, TermVote,
+    Backpressure, ChangeError, Config, Core, Effects, Limits as CoreLimits, LogTerms,
+    Message as CoreMessage, ProposeError, Role, TermVote,
 };
+use karyos_cluster::membership::{MEMBERSHIP, Membership, MembershipChange, MembershipEntry};
 use karyos_cluster::{Entry, HardState, stamp};
 
 use super::core::{
-    ConsensusCore, InstallRefused, Limit, Limits, LogView, NotLeader, Persisted, Ready, ReadyBuf,
-    Refused, SnapshotBase, Unsupported,
+    Change, ChangeRefused, Configuration, ConsensusCore, InstallRefused, Limit, Limits, LogView,
+    NotLeader, Persisted, Ready, ReadyBuf, Refused, SnapshotBase, Unsupported,
 };
 use crate::net::NodeId;
 
@@ -100,6 +113,9 @@ pub const ELECTION_MIN: u32 = 15;
 /// `ELECTION_MIN..ELECTION_MAX`, again at every reset, from the core's
 /// seeded source.
 pub const ELECTION_MAX: u32 = 30;
+/// Entries a learner may be behind the leader's commit and be promoted:
+/// the harness's promotion lag, the reference's.
+pub const PROMOTION_LAG: u64 = super::reference::PROMOTION_LAG;
 /// Ticks between a leader's heartbeats.
 pub const HEARTBEAT: u32 = 5;
 /// Entries per append at most: W1's primary batch limit.
@@ -545,6 +561,69 @@ fn node_id(id: u64) -> Option<NodeId> {
     NodeId::try_from(id.checked_sub(1)?).ok()
 }
 
+/// The membership a configuration entry's payload carries, if it is one.
+fn membership_of(payload: &[u8]) -> Option<Membership> {
+    MembershipEntry::decode(payload).ok().map(|entry| entry.0)
+}
+
+/// Reports every configuration entry `log` holds to `core`, in order: a
+/// restart's (karyos#711). Recovery reads the whole log once.
+fn replay_configurations(core: &mut Core, log: &mut LogView<'_>) {
+    let Some(last) = log.last_index() else {
+        return;
+    };
+    let first = log.first_index();
+    let mut entries = Vec::new();
+    let mut window = Vec::new();
+    let mut found = Vec::new();
+    let mut next = first;
+    while next <= last {
+        if log
+            .entries_into(
+                next..last.saturating_add(1),
+                u64::MAX,
+                &mut entries,
+                &mut window,
+            )
+            .is_err()
+            || entries.is_empty()
+        {
+            break;
+        }
+        for entry in &entries {
+            if let Some(membership) = membership_of(&entry.payload) {
+                found.push((entry.index, membership));
+            }
+        }
+        next = entries
+            .last()
+            .map_or(last, |entry| entry.index)
+            .saturating_add(1);
+    }
+    let view = View {
+        log,
+        pending: &[],
+        truncate: None,
+    };
+    for (index, membership) in found {
+        core.configured(index, membership, &view);
+    }
+}
+
+/// A harness change in the core's ids.
+const fn core_change(change: Change) -> MembershipChange {
+    match change {
+        Change::AddLearner(node) => MembershipChange::AddLearner(core_id(node)),
+        Change::Promote(node) => MembershipChange::Promote(core_id(node)),
+        Change::Remove(node) => MembershipChange::Remove(core_id(node)),
+    }
+}
+
+/// `ids` as node ids.
+fn node_ids(ids: impl Iterator<Item = u64>) -> Vec<NodeId> {
+    ids.filter_map(node_id).collect()
+}
+
 /// An entry's frame size for a payload of `payload` bytes.
 fn frame_len(payload: usize) -> Option<u64> {
     let empty = Entry {
@@ -574,8 +653,9 @@ impl Custom {
         // flight.
         let batch = limits.map_or(BATCH, |limits| BATCH.min(limits.in_flight_entries));
         // Seeded by the run and the node: the same run reproduces the same
-        // timeouts, and another seed draws others (`core::run_seed`).
-        let config = Config::new(
+        // timeouts, and another seed draws others (`core::run_seed`). A
+        // server that is not a bootstrap voter joins.
+        let config = Config::joining(
             core_id(id),
             &voters,
             ELECTION_MIN,
@@ -607,15 +687,24 @@ impl Custom {
                 .map(core_id),
         });
         let commit = stored.and_then(|state| state.commit).unwrap_or(0);
+        // Over the node's latest snapshot, if it holds one, and the
+        // configuration it recorded; then each configuration entry the
+        // log holds, in order.
+        let mut core = match log.base() {
+            Some(base) => {
+                let mut core =
+                    Core::new(config, term_vote, commit).with_snapshot(base.index, base.term);
+                if let Some(membership) = log.base_configuration().and_then(membership_of) {
+                    core.restore_membership(base.index, membership);
+                }
+                core
+            }
+            None => Core::new(config, term_vote, commit),
+        };
+        replay_configurations(&mut core, log);
         Ok(Self {
             id,
-            // Over the node's latest snapshot, if it holds one.
-            core: match log.base() {
-                Some(base) => {
-                    Core::new(config, term_vote, commit).with_snapshot(base.index, base.term)
-                }
-                None => Core::new(config, term_vote, commit),
-            },
+            core,
             read_bytes: limits.map_or(u64::MAX, |limits| limits.log_read_bytes),
             pending: Vec::with_capacity(bounds.ready_entries),
             truncate: None,
@@ -709,9 +798,21 @@ impl Custom {
             let skip = usize::try_from(skip)
                 .unwrap_or(usize::MAX)
                 .min(incoming.len());
+            let from = self.pending.len();
             self.pending.extend(incoming.drain(skip..));
             if let Some(last) = self.pending.last() {
                 self.watermark = last.event_time;
+            }
+            // Each configuration entry written takes effect now.
+            let view = View {
+                log,
+                pending: &self.pending,
+                truncate: self.truncate,
+            };
+            for entry in self.pending.get(from..).unwrap_or(&[]) {
+                if let Some(membership) = membership_of(&entry.payload) {
+                    self.core.configured(entry.index, membership, &view);
+                }
             }
         }
         if let Some((index, term)) = append {
@@ -847,6 +948,55 @@ impl Custom {
 
 impl ConsensusCore for Custom {
     type Message = Message;
+
+    fn is_configuration_entry(payload: &[u8]) -> bool {
+        MembershipEntry::is_one(payload)
+    }
+
+    fn configuration_stamp(&self) -> Option<u64> {
+        Some(self.core.configuration_changes())
+    }
+
+    fn configuration(&self) -> Option<Configuration> {
+        let membership = self.core.membership();
+        Some(Configuration {
+            index: self.core.configuration_index(),
+            voters: node_ids(membership.voters()),
+            outgoing: Vec::new(),
+            learners: node_ids(membership.learners()),
+        })
+    }
+
+    fn propose_change(
+        &mut self,
+        change: Change,
+        log: &mut LogView<'_>,
+    ) -> Result<(), ChangeRefused> {
+        // Every configuration entry is the template's fixed length.
+        let size = u64::from(MEMBERSHIP.max_length);
+        if frame_len(MEMBERSHIP.max_length as usize).is_none_or(|frame| frame > self.read_bytes) {
+            return Err(ChangeRefused::Invalid);
+        }
+        let mut none = Vec::new();
+        let change = core_change(change);
+        let proposed = self.call(log, &mut none, |core, view, sink| {
+            core.propose_change(change, size, PROMOTION_LAG, view, sink)
+        });
+        let (index, term, membership) = proposed.map_err(|error| match error {
+            ChangeError::NotLeader(_) => ChangeRefused::NotLeader(self.not_leader()),
+            ChangeError::InProgress => ChangeRefused::InProgress,
+            ChangeError::Lagging { behind } => ChangeRefused::Lagging { behind },
+            ChangeError::Invalid | ChangeError::Backpressure(_) => ChangeRefused::Invalid,
+        })?;
+        self.watermark = stamp(self.now, self.watermark);
+        let payload = MembershipEntry(membership).to_vec();
+        self.pending
+            .push(pooled(index, term, self.watermark, &payload));
+        self.call(log, &mut none, |core, view, sink| {
+            core.replicate(view, sink)
+        });
+        Ok(())
+    }
 
     fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
         // A membership the core refuses (not 3 or 5 voters) starts a
@@ -1081,6 +1231,9 @@ impl ConsensusCore for Custom {
             core.install(base.index, base.term, sink)
         })
         .map_err(|_| InstallRefused::Stale)?;
+        if let Some(membership) = log.base_configuration().and_then(membership_of) {
+            self.core.restore_membership(base.index, membership);
+        }
         // The log restarted after the base: what was pending at or below
         // it is gone with it, and the service holds the state up to it.
         let keep = self

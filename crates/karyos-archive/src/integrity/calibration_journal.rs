@@ -360,7 +360,14 @@ impl<D: Disk + Clone> CalibrationJournal<D> {
             }
             Err(error) => return Err(error.into()),
         };
-        locker.lock(&lock).map_err(|error| {
+        // Tried again while held, for the window a spawned child holds a
+        // copy of a closed lock until its exec (karyos_sys::spawn_window,
+        // karyos#1067): only a lock held past it is another writer's.
+        karyos_sys::spawn_window::retry_held(
+            || locker.lock(&lock),
+            |error| error.kind() == std::io::ErrorKind::WouldBlock,
+        )
+        .map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 JournalError::Locked
             } else {

@@ -187,3 +187,93 @@ fn an_incomplete_or_abandoned_snapshot_is_never_published() {
         Err(SnapshotError::NotNewer { .. })
     ));
 }
+
+/// A sealed snapshot is durable and unpublished: it reads back, and is
+/// published only by `publish_sealed`, which keeps a pinned snapshot from
+/// the purge; abandoned instead, it leaves nothing.
+#[test]
+fn a_sealed_snapshot_reads_back_and_publishes_keeping_its_pin() {
+    let dir = TempDir::new("sealed");
+    let mut store = open(&dir.0);
+    let a = store
+        .write(10, 1, &[Section::new(SectionKind::Service, 1, b"a")])
+        .unwrap();
+    let _ = store
+        .write(20, 1, &[Section::new(SectionKind::Service, 1, b"b")])
+        .unwrap();
+    let mut pending = store.begin(30, 1).unwrap();
+    pending.section(SectionKind::Service, 1, 1).unwrap();
+    pending.write(b"c").unwrap();
+    let sealed = store.seal(pending).unwrap();
+    assert_eq!(
+        store.latest().map(|info| info.index),
+        Some(20),
+        "not published"
+    );
+    let read = store.read(&sealed.info()).unwrap();
+    assert_eq!(read.len(), 1);
+    assert_eq!(read[0].bytes, b"c");
+    // Pinned, the oldest stays; the middle one goes.
+    let c = store.publish_sealed(sealed, Some(a.id)).unwrap();
+    let kept: Vec<u64> = store.snapshots().iter().map(|info| info.index).collect();
+    assert_eq!(kept, vec![10, 30]);
+    assert_eq!(store.latest(), Some(c));
+    drop(store);
+    let mut store = open(&dir.0);
+    assert_eq!(
+        store
+            .snapshots()
+            .iter()
+            .map(|info| info.index)
+            .collect::<Vec<_>>(),
+        vec![10, 30]
+    );
+    // Abandoned sealed: nothing left.
+    let before = files(&dir.0);
+    let mut pending = store.begin(40, 1).unwrap();
+    pending.section(SectionKind::Service, 1, 1).unwrap();
+    pending.write(b"d").unwrap();
+    let sealed = store.seal(pending).unwrap();
+    store.abandon_sealed(sealed).unwrap();
+    assert_eq!(files(&dir.0), before);
+}
+
+/// A handle begun by another store, or by this one before a reopen, is not
+/// taken and touches no file.
+#[test]
+fn a_foreign_handle_is_refused() {
+    let one = TempDir::new("one");
+    let two = TempDir::new("two");
+    let mut first = open(&one.0);
+    let mut second = open(&two.0);
+    let _ = second
+        .write(5, 1, &[Section::new(SectionKind::Service, 1, b"kept")])
+        .unwrap();
+    let before_two = files(&two.0);
+    let mut pending = first.begin(10, 1).unwrap();
+    pending.section(SectionKind::Service, 1, 1).unwrap();
+    pending.write(b"x").unwrap();
+    assert!(matches!(
+        second.publish(pending),
+        Err(SnapshotError::Foreign)
+    ));
+    let mut pending = first.begin(10, 1).unwrap();
+    pending.section(SectionKind::Service, 1, 1).unwrap();
+    assert!(matches!(
+        second.abandon(pending),
+        Err(SnapshotError::Foreign)
+    ));
+    assert_eq!(files(&two.0), before_two);
+    assert_eq!(second.latest().map(|info| info.index), Some(5));
+    // Reopened, the first store does not take what it began before.
+    let mut pending = first.begin(10, 1).unwrap();
+    pending.section(SectionKind::Service, 1, 1).unwrap();
+    pending.write(b"x").unwrap();
+    drop(first);
+    let mut first = open(&one.0);
+    assert!(matches!(
+        first.publish(pending),
+        Err(SnapshotError::Foreign)
+    ));
+    assert_eq!(first.latest(), None);
+}
