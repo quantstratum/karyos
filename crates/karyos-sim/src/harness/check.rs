@@ -930,6 +930,8 @@ fn server_of(observation: &Observation) -> Option<NodeId> {
         | Observation::SnapshotRefused { node, .. }
         | Observation::SnapshotPiece { node, .. }
         | Observation::SnapshotPieceLost { node, .. }
+        | Observation::SnapshotAbandoned { node, .. }
+        | Observation::SnapshotSent { node, .. }
         | Observation::Unsupported { node, .. }
         | Observation::Transfer { node, .. }
         | Observation::Deduplicated { node, .. }

@@ -54,6 +54,7 @@ pub mod report;
 pub mod samples;
 pub mod stats;
 mod terms;
+pub mod timeouts;
 pub mod wire;
 pub mod workloads;
 
