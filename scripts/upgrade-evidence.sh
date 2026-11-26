@@ -87,6 +87,7 @@ out=${out:-$root/target/upgrade-evidence/${old:0:12}-${new:0:12}}
 rm -rf "$out"
 mkdir -p "$out"
 work=$(mktemp -d "${TMPDIR:-/tmp}/karyos-upgrade-evidence.XXXXXX")
+# shellcheck disable=SC2329 # invoked by the EXIT trap below
 cleanup() {
     for side in old new; do
         [ -d "$work/$side" ] && git -C "$root" worktree remove --force "$work/$side" >/dev/null 2>&1
