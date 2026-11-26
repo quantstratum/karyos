@@ -1255,6 +1255,15 @@ pub enum Observation {
     /// The harness healed every link ([`super::workloads::Action::Heal`]):
     /// a mark in the order of observations.
     Healed,
+    /// The harness split the links between `left` and `right`
+    /// ([`super::workloads::Action::Split`]): a mark in the order of
+    /// observations, so a check can tell what came after the partition.
+    Split {
+        /// One side.
+        left: Vec<NodeId>,
+        /// The other.
+        right: Vec<NodeId>,
+    },
     /// A leader-relative trigger of a case acted, at harness step `at`
     /// ([`super::workloads::LostReply`], C5 version 2's W5 retry).
     Triggered {
