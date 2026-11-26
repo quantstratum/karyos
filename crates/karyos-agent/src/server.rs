@@ -118,6 +118,23 @@
 //!   O(journals) and O(counter cells) a request. An unknown `DIR` is
 //!   `{"error":"unknown driver"}`, one not attached yet `{"error":"driver
 //!   unavailable"}`.
+//! - **A product service's records (R-CORE-42, karyos#773).**
+//!   `journal-append request|outcome durable|ordinary OPID SERVICE COMMAND
+//!   VALUE CORRELATION [REASON]` and `journal-import RECORDING INTERVAL TIME
+//!   request|outcome OPID SERVICE COMMAND VALUE CORRELATION [REASON]`,
+//!   for the role `service` and an administrator, answer
+//!   [`json::product_answer`]; [`crate::product`] states the contract.
+//! - **Journal history (R-CORE-14, karyos#725).** `journal-history
+//!   [RECORDING POSITION [COUNT]]`, for every role, answers
+//!   [`json::journal_history`]: a page of the operations journal's
+//!   durable records from the cursor, or from the retention floor without
+//!   one, at most [`crate::journal::HISTORY_MAX`] records
+//!   ([`crate::journal::HISTORY_DEFAULT`] when no count is given). The
+//!   view's `journal.head` is where a reader that took the view follows
+//!   the history from; [`crate::journal::history`] states the contract. A
+//!   cursor of another recording, below the floor, past the durable end
+//!   or not at a record is refused, typed
+//!   ([`json::history_refusal`]), never answered with an empty page.
 //! - **Limits (R-CORE-38).** `limits` answers every dimension of [`LIMITS`]
 //!   with one of three answers, never "unknown": `{"value":N,
 //!   "negotiable":true}`, a bound a client may propose within;
@@ -202,7 +219,7 @@ pub const MAX_ACCEPTS: usize = 16;
 /// driver's built-in defaults: the CnC does not expose a driver's
 /// configured values, so a `karyosd` started with others is not reflected
 /// (a follow-up).
-pub const LIMITS: [Limit; 21] = [
+pub const LIMITS: [Limit; 22] = [
     Limit {
         name: "read.request_bytes",
         bound: Some(MAX_REQUEST as u64),
@@ -308,6 +325,12 @@ pub const LIMITS: [Limit; 21] = [
         bound: Some(registry::MAX_MEMORY_BYTES as u64),
         negotiable: false,
     },
+    // The records of one `journal-history` page (R-CORE-14).
+    Limit {
+        name: "journal.history_records",
+        bound: Some(crate::journal::HISTORY_MAX as u64),
+        negotiable: false,
+    },
 ];
 
 /// Why a `limits` proposal was refused.
@@ -390,6 +413,10 @@ pub enum Role {
     /// Reads, and writes the join metadata registry, nothing else
     /// (karyos#736): a product's uid.
     Registrar,
+    /// Reads, and appends a product service's records to the operations
+    /// journal, nothing else (R-CORE-42, karyos#773): a product service's
+    /// uid.
+    Service,
 }
 
 impl Role {
@@ -439,8 +466,15 @@ impl Role {
         matches!(self, Self::Registrar | Self::Administrator)
     }
 
+    /// Whether the role may append a product service's records to the
+    /// operations journal: a service or an administrator (karyos#773).
+    #[must_use]
+    pub const fn may_append(self) -> bool {
+        matches!(self, Self::Service | Self::Administrator)
+    }
+
     /// The role named `name`: `viewer`, `operator`, `risk-officer`,
-    /// `administrator` or `registrar`.
+    /// `administrator`, `registrar` or `service`.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         Some(match name {
@@ -449,6 +483,7 @@ impl Role {
             "risk-officer" => Self::RiskOfficer,
             "administrator" => Self::Administrator,
             "registrar" => Self::Registrar,
+            "service" => Self::Service,
             _ => return None,
         })
     }
@@ -629,6 +664,9 @@ pub enum Served {
     TraceExport,
     /// A driver's clocks and calibrations (R-CORE-40, karyos#741).
     Clocks,
+    /// A page of the journal's history, or its refusal (R-CORE-14,
+    /// karyos#725).
+    JournalHistory,
     /// A driver's rate limiters (R-CORE-40, karyos#741).
     RateLimits,
     /// A join registry entry written: put or retired (karyos#736).
@@ -797,13 +835,19 @@ impl Server {
         let forbidden = || (json::error("forbidden", None), Served::Refused);
         let (answer, served) = match (peer, parse(&line)) {
             (None, _) => (json::error("not authorized", None), Served::Refused),
-            (Some(_), Request::View) => (json::view(&agent.view()), Served::View),
+            // The journal's head in the view is past every record written
+            // before it (R-CORE-14, karyos#725).
+            (Some(_), Request::View) => {
+                agent.settle_journal();
+                (json::view(&agent.view()), Served::View)
+            }
             (Some((_, role)), Request::Capabilities) => (
                 json::capabilities(&agent.capabilities(
                     role.may_close(),
                     role.may_reopen(),
                     role.may_acknowledge(),
                     role.may_register(),
+                    role.may_append(),
                 )),
                 Served::Capabilities,
             ),
@@ -1034,6 +1078,26 @@ impl Server {
                 Ok(Err(refusal)) => (json::export_refusal(&refusal), Served::Refused),
                 Err(answer) => (json::guard_answer(&answer), Served::Refused),
             },
+            // Every role reads the history (R-CORE-14).
+            // A product service's records (R-CORE-42, karyos#773).
+            (Some((requester, role)), Request::JournalAppend(append)) => {
+                if role.may_append() {
+                    let answer = agent.journal_append(&append, requester);
+                    let served = match answer {
+                        crate::product::ProductAnswer::Journalled { .. } => Served::Operated,
+                        _ => Served::Refused,
+                    };
+                    (json::product_answer(&answer), served)
+                } else {
+                    forbidden()
+                }
+            }
+            (Some(_), Request::JournalHistory { from, count }) => {
+                match agent.journal_history(from, count) {
+                    Ok(page) => (json::journal_history(&page), Served::JournalHistory),
+                    Err(refusal) => (json::history_refusal(refusal), Served::Refused),
+                }
+            }
             (Some(_), Request::Clocks { dir }) => match agent.clocks(Path::new(dir)) {
                 Ok(read) => (json::clocks(&read), Served::Clocks),
                 Err(answer) => (json::guard_answer(&answer), Served::Refused),
@@ -1285,6 +1349,15 @@ enum Request<'a> {
     /// `clocks DIR` (R-CORE-40, karyos#741).
     Clocks {
         dir: &'a str,
+    },
+    /// `journal-append ...` and `journal-import ...` (R-CORE-42,
+    /// karyos#773; [`crate::product`]).
+    JournalAppend(crate::product::ProductAppend<'a>),
+    /// `journal-history [RECORDING POSITION [COUNT]]` (R-CORE-14,
+    /// karyos#725).
+    JournalHistory {
+        from: Option<crate::journal::HistoryCursor>,
+        count: usize,
     },
     /// `rate-limits DIR` (R-CORE-40, karyos#741).
     RateLimits {
@@ -1569,7 +1642,7 @@ const fn clearance(role: Role) -> crate::cluster_admin::Clearance {
     match role {
         Role::Administrator => Clearance::Administrator,
         Role::Operator | Role::RiskOfficer => Clearance::Operator,
-        Role::Viewer | Role::Registrar => Clearance::None,
+        Role::Viewer | Role::Registrar | Role::Service => Clearance::None,
     }
 }
 
@@ -1623,6 +1696,44 @@ fn request(rest: &str) -> Option<Request<'_>> {
             }))
         }
         "clocks" => Some(Request::Clocks { dir: arguments }),
+        // `journal-history [RECORDING POSITION [COUNT]]` (R-CORE-14): a
+        // count of 0 or above HISTORY_MAX is a bad argument.
+        // A product service's records (R-CORE-42, karyos#773): the
+        // contract's form, checked in `product::parse`.
+        "journal-append" | "journal-import" => Some(
+            crate::product::parse(arguments, name == "journal-import").map_or(
+                Request::BadArguments(if name == "journal-append" {
+                    "journal-append"
+                } else {
+                    "journal-import"
+                }),
+                Request::JournalAppend,
+            ),
+        ),
+        "journal-history" => {
+            let parsed = (|| {
+                if arguments.is_empty() {
+                    return Some(Request::JournalHistory {
+                        from: None,
+                        count: crate::journal::HISTORY_DEFAULT,
+                    });
+                }
+                let mut fields = arguments.split(' ');
+                let recording = number(fields.next()?)?;
+                let position = number(fields.next()?)?;
+                let count = match fields.next() {
+                    None => crate::journal::HISTORY_DEFAULT,
+                    Some(word) => usize::try_from(number(word)?)
+                        .ok()
+                        .filter(|count| (1..=crate::journal::HISTORY_MAX).contains(count))?,
+                };
+                fields.next().is_none().then_some(Request::JournalHistory {
+                    from: Some(crate::journal::HistoryCursor::new(recording, position)),
+                    count,
+                })
+            })();
+            Some(parsed.unwrap_or(Request::BadArguments("journal-history")))
+        }
         "rate-limits" => Some(Request::RateLimits { dir: arguments }),
         "guard-close-preview" | "guard-reopen-preview" => {
             let kind = if name == "guard-close-preview" {
@@ -1876,6 +1987,51 @@ mod tests {
                 parse(&format!("KARYOS-AGENT 1 {bad}\n")),
                 Request::BadArguments("trace-buckets"),
                 "{bad}"
+            );
+        }
+    }
+
+    /// R-CORE-14 (karyos#725): `journal-history [RECORDING POSITION
+    /// [COUNT]]`; a lone recording, a count of 0 or above the maximum, or
+    /// one more argument is its own bad-arguments error.
+    #[test]
+    fn journal_history_requests_take_a_cursor_and_a_count() {
+        use crate::journal::{HISTORY_DEFAULT, HISTORY_MAX, HistoryCursor};
+
+        assert_eq!(
+            parse("KARYOS-AGENT 1 journal-history\n"),
+            Request::JournalHistory {
+                from: None,
+                count: HISTORY_DEFAULT
+            }
+        );
+        assert_eq!(
+            parse("KARYOS-AGENT 1 journal-history 3 4096\n"),
+            Request::JournalHistory {
+                from: Some(HistoryCursor::new(3, 4096)),
+                count: HISTORY_DEFAULT
+            }
+        );
+        assert_eq!(
+            parse(&format!(
+                "KARYOS-AGENT 1 journal-history 3 0 {HISTORY_MAX}\n"
+            )),
+            Request::JournalHistory {
+                from: Some(HistoryCursor::new(3, 0)),
+                count: HISTORY_MAX
+            }
+        );
+        for line in [
+            "journal-history 3",
+            "journal-history x 0",
+            "journal-history 3 0 0",
+            "journal-history 3 0 257",
+            "journal-history 3 0 8 9",
+        ] {
+            assert_eq!(
+                parse(&format!("KARYOS-AGENT 1 {line}\n")),
+                Request::BadArguments("journal-history"),
+                "{line}"
             );
         }
     }

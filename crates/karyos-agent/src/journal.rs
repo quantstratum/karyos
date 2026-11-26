@@ -52,10 +52,15 @@
 //!   through the Archive library's engine over this directory
 //!   ([`retention`]); [`Integrity::purged`] lists each purged prefix with
 //!   its purge evidence.
+//! - **History** (R-CORE-14; karyos#725). [`Journal::history`] serves
+//!   the durable records in pages, with a cursor a reader keeps across
+//!   restarts, the retention floor, unknown intervals in place and a
+//!   sequence a reader checks for gaps ([`history`]).
 //! - **Encoding.** Sealing changed nothing in a record's layout
 //!   ([`JournalRecord::encode`]): a journal written before it decodes as it
 //!   did, and is sealed from its start at its next durable append.
 
+pub mod history;
 pub mod retention;
 #[cfg(test)]
 mod tests;
@@ -75,6 +80,9 @@ use karyos_archive::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
 use karyos_sys::frame::{FRAME_ALIGNMENT, FrameType, HEADER_LENGTH, Lane, Word0};
 
 use crate::retention::RangeOutcome;
+pub use history::{
+    HISTORY_DEFAULT, HISTORY_MAX, HistoryCursor, HistoryPage, HistoryRecord, HistoryRefusal,
+};
 pub use retention::{JournalPolicy, JournalRetention, JournalTrust, Purged};
 
 /// The journal recording's channel.
@@ -205,6 +213,17 @@ pub enum Kind {
     /// Cluster was busy, its dispatch record could not be made durable or
     /// its driver was unavailable.
     ApprovalExpired,
+    /// A product service's request, before it sends its command
+    /// (R-CORE-42, karyos#773; the `product` module, on Linux).
+    ProductRequest,
+    /// A product service's outcome, after its command's answer.
+    ProductOutcome,
+    /// A product's request imported after an unknown interval, by
+    /// operation id: `expected` names the interval, `word` the product's
+    /// own time of the original record.
+    ProductRequestImported,
+    /// A product's outcome imported the same way.
+    ProductOutcomeImported,
 }
 
 impl Kind {
@@ -236,6 +255,47 @@ impl Kind {
             Self::ApprovalGranted => 24,
             Self::ApprovalWithdrawn => 25,
             Self::ApprovalExpired => 26,
+            Self::ProductRequest => 27,
+            Self::ProductOutcome => 28,
+            Self::ProductRequestImported => 29,
+            Self::ProductOutcomeImported => 30,
+        }
+    }
+
+    /// Its name in the journal's history (R-CORE-14; karyos#725).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::CloseRequest => "close_request",
+            Self::CloseOutcome => "close_outcome",
+            Self::ReopenRequest => "reopen_request",
+            Self::ReopenOutcome => "reopen_outcome",
+            Self::UnknownInterval => "unknown_interval",
+            Self::GapAcknowledged => "gap_acknowledged",
+            Self::AgentStopped => "agent_stopped",
+            Self::AgentStarted => "agent_started",
+            Self::HoldRequest => "hold_request",
+            Self::HoldOutcome => "hold_outcome",
+            Self::ReleaseRequest => "release_request",
+            Self::ReleaseOutcome => "release_outcome",
+            Self::PurgeRequest => "purge_request",
+            Self::PurgeOutcome => "purge_outcome",
+            Self::VerifyRequest => "verify_request",
+            Self::VerifyOutcome => "verify_outcome",
+            Self::RateRequest => "rate_request",
+            Self::RateOutcome => "rate_outcome",
+            Self::Submitted => "submitted",
+            Self::ClusterRequest => "cluster_request",
+            Self::ClusterOutcome => "cluster_outcome",
+            Self::ClusterRefused => "cluster_refused",
+            Self::ApprovalRequested => "approval_requested",
+            Self::ApprovalGranted => "approval_granted",
+            Self::ApprovalWithdrawn => "approval_withdrawn",
+            Self::ApprovalExpired => "approval_expired",
+            Self::ProductRequest => "product_request",
+            Self::ProductOutcome => "product_outcome",
+            Self::ProductRequestImported => "product_request_imported",
+            Self::ProductOutcomeImported => "product_outcome_imported",
         }
     }
 
@@ -267,6 +327,10 @@ impl Kind {
             24 => Self::ApprovalGranted,
             25 => Self::ApprovalWithdrawn,
             26 => Self::ApprovalExpired,
+            27 => Self::ProductRequest,
+            28 => Self::ProductOutcome,
+            29 => Self::ProductRequestImported,
+            30 => Self::ProductOutcomeImported,
             _ => return None,
         })
     }
@@ -282,6 +346,20 @@ impl Kind {
                 | Self::VerifyRequest
                 | Self::RateRequest
                 | Self::ClusterRequest
+                | Self::ProductRequest
+        )
+    }
+
+    /// Whether its record is a product service's (R-CORE-42, karyos#773),
+    /// which carries the Cluster fields after the relay word: the service,
+    /// the command and the correlation.
+    pub(crate) const fn is_product(self) -> bool {
+        matches!(
+            self,
+            Self::ProductRequest
+                | Self::ProductOutcome
+                | Self::ProductRequestImported
+                | Self::ProductOutcomeImported
         )
     }
 
@@ -432,7 +510,7 @@ impl JournalRecord {
             // The relay word always, then the target and the boot, each
             // after its length word (karyos#738).
             &[&self.target, &self.boot]
-        } else if self.kind.is_cluster() {
+        } else if self.kind.is_cluster() || self.kind.is_product() {
             &[&self.target, &self.command, &self.evidence]
         } else if self.kind.is_approval() {
             &[
@@ -480,7 +558,11 @@ impl JournalRecord {
         let mut evidence = Vec::new();
         let mut bytes = Vec::new();
         let mut instance = 0;
-        let relay = if kind == Kind::Submitted || kind.is_cluster() || kind.is_approval() {
+        let relay = if kind == Kind::Submitted
+            || kind.is_cluster()
+            || kind.is_product()
+            || kind.is_approval()
+        {
             // The relay word, then the fields by length.
             let (relay, mut rest) = tail.split_first_chunk::<8>()?;
             let mut field = || -> Option<Vec<u8>> {
@@ -555,9 +637,26 @@ pub enum GapReason {
     /// begins.
     JournalReplaced,
     /// The journal could not be opened at the agent's start, so nothing
-    /// of the run is recorded. Never written: the agent holds it in memory
-    /// at [`UNOPENED_POSITION`], and its acknowledgement too.
+    /// of the run is recorded. The agent holds it in memory at
+    /// [`UNOPENED_POSITION`] for that run, and leaves an outage marker
+    /// beside the journal ([`outage_marker`]); the next start that opens
+    /// the journal records it from the marker (karyos#773 review).
     JournalUnavailableAtStart,
+    /// Appends were refused while the journal stayed open (a segment
+    /// close that could not be made, ADR-0115): recorded at the next
+    /// write, from the first refusal (karyos#773 review).
+    AppendRefused,
+}
+
+/// Where the agent marks, beside the journal directory `dir`, that the
+/// journal could not be opened at its start: `<dir>.unavailable`, holding
+/// the start's host time. The next start that opens the journal records
+/// the outage as an unknown interval and removes the marker.
+#[must_use]
+pub fn outage_marker(dir: &Path) -> PathBuf {
+    let mut name = dir.file_name().unwrap_or_default().to_os_string();
+    name.push(".unavailable");
+    dir.with_file_name(name)
 }
 
 /// The position that names the unknown interval of a journal that could
@@ -575,6 +674,20 @@ impl GapReason {
             Self::UncleanStop => 3,
             Self::JournalReplaced => 4,
             Self::JournalUnavailableAtStart => 5,
+            Self::AppendRefused => 6,
+        }
+    }
+
+    /// Its name, as the view and the history show it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::RequestWithoutOutcome => "request_without_outcome",
+            Self::TornTail => "torn_tail",
+            Self::UncleanStop => "unclean_stop",
+            Self::JournalReplaced => "journal_replaced",
+            Self::JournalUnavailableAtStart => "journal_unavailable_at_start",
+            Self::AppendRefused => "append_refused",
         }
     }
 
@@ -587,6 +700,7 @@ impl GapReason {
             2 => Self::TornTail,
             4 => Self::JournalReplaced,
             5 => Self::JournalUnavailableAtStart,
+            6 => Self::AppendRefused,
             _ => Self::UncleanStop,
         }
     }
@@ -675,6 +789,9 @@ pub struct Journal {
     /// A close entry failed: the retention ledger is poisoned until it is
     /// reopened, which the next rollover does first (ADR-0115, point 1).
     reopen_retention: bool,
+    /// Host time of the first append refused while the journal stayed
+    /// open, until the next write records it as an unknown interval.
+    refused_since: Option<u64>,
     /// The records the open read, for tests.
     #[cfg(test)]
     pub(crate) scanned: Vec<JournalRecord>,
@@ -810,6 +927,7 @@ impl Journal {
             settings,
             retention: None,
             reopen_retention: false,
+            refused_since: None,
             #[cfg(test)]
             scanned: scan.all.clone(),
             operations: scan.operations,
@@ -1062,11 +1180,35 @@ impl Journal {
             self.count_failure(now);
             return Err(JournalError::Unavailable);
         }
+        // Appends refused while the journal stayed open are an unknown
+        // interval, recorded before anything else is (karyos#773 review):
+        // a product told `journal unavailable` imports against it.
+        if let Some(from) = self.refused_since.take() {
+            let mut gap = JournalRecord::new(Kind::UnknownInterval, now);
+            gap.expected = from;
+            gap.code = GapReason::AppendRefused.code();
+            match self.write(&gap, now, true) {
+                Ok(position) => {
+                    self.gap = Some(Gap {
+                        position,
+                        reason: GapReason::AppendRefused,
+                        from,
+                        to: now,
+                    });
+                }
+                Err(error) => {
+                    self.refused_since = Some(from);
+                    return Err(error);
+                }
+            }
+        }
         // A segment left is closed, its time recorded, before this record
         // is written (ADR-0115, point 1). A close that could not be made
         // writes nothing and is tried again at the next append.
         if let Err(error) = self.close_before(record, now) {
-            if !matches!(error, JournalError::NotClosed) {
+            if matches!(error, JournalError::NotClosed) {
+                let _ = self.refused_since.get_or_insert(now);
+            } else {
                 self.recorder = None;
             }
             self.count_failure(now);
@@ -1144,6 +1286,27 @@ impl Journal {
             self.integrity = None;
             self.failed_seals = self.failed_seals.saturating_add(1);
         }
+    }
+
+    /// Records that the journal could not be opened at an earlier start,
+    /// at host time `from`, as an unknown interval up to `now`, durably
+    /// (the outage marker's record; karyos#773 review).
+    ///
+    /// # Errors
+    ///
+    /// As [`Journal::append_durable`].
+    pub fn record_outage(&mut self, from: u64, now: u64) -> Result<u64, JournalError> {
+        let mut record = JournalRecord::new(Kind::UnknownInterval, now);
+        record.expected = from;
+        record.code = GapReason::JournalUnavailableAtStart.code();
+        let position = self.append_durable(&record, now)?;
+        self.gap = Some(Gap {
+            position,
+            reason: GapReason::JournalUnavailableAtStart,
+            from,
+            to: now,
+        });
+        Ok(position)
     }
 
     /// Records the agent's clean stop, durably, as its last record: the

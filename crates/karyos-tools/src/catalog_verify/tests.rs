@@ -1834,7 +1834,10 @@ fn a_group_gets_time_evidence_from_the_calibration_journal_on_disk() {
     assert_eq!(
         sender
             .waiter()
-            .wait_durable(3, std::time::Duration::from_secs(5)),
+            // Each write is synced (`SyncPolicy::Every`): on a loaded host
+            // running the whole suite in parallel, 5 s was not always
+            // enough for three syncs. The wait only bounds a stall.
+            .wait_durable(3, std::time::Duration::from_secs(60)),
         Ok(3)
     );
     // The range is sealed and waits: the journal holds no completeness

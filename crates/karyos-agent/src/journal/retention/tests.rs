@@ -845,8 +845,18 @@ fn test_journal_a_rollover_that_cannot_close_writes_no_successor_record() {
         assert!(closes(&journal).is_empty(), "{failure}");
         assert_eq!(journal.failed_appends(), failed + 1, "{failure}");
         drop(clock);
-        // Retried at the next append.
+        // Retried at the next append, the refusal recorded first as an
+        // unknown interval (karyos#773 review).
         let position = journal.append(&record, 12).unwrap();
+        let gap = journal.gap().unwrap();
+        assert_eq!(
+            (gap.reason, gap.from),
+            (crate::journal::GapReason::AppendRefused, 11),
+            "{failure}: the refusal is an unknown interval"
+        );
+        // The interval's small record still fits before the boundary; the
+        // refused record is the successor's first.
+        assert!(gap.position < SEG, "{failure}");
         assert_eq!(position, SEG, "{failure}: the successor's first record");
         assert!(closes(&journal).contains_key(&0), "{failure}: closed");
         drop(journal);
@@ -1130,5 +1140,32 @@ fn a_close_time_later_than_the_clock_is_not_expired() {
         reason(&journal.purge_journal(1, SEG, authorised(), 2)),
         "not_expired"
     );
+    cleanup(&[&dir, &copy]);
+}
+
+/// R-CORE-14 (karyos#725): after a purge, a history cursor below the new
+/// retention floor is refused with the floor, never answered with an
+/// empty page, and a read without a cursor starts at the floor.
+#[test]
+fn a_history_cursor_below_the_floor_is_refused_with_it() {
+    use crate::journal::{HistoryCursor, HistoryRefusal};
+
+    let (mut journal, dir, copy) = filled("history-floor", Some(expired()));
+    let first = journal.history(None, 1).unwrap();
+    assert_eq!(first.floor, 0);
+    let old = HistoryCursor::new(first.recording, first.records[0].next);
+    assert_eq!(
+        journal.purge_journal(1, SEG, authorised(), 2),
+        RetentionReply::Done { evidenced: true }
+    );
+    assert_eq!(
+        journal.history(Some(old), 1),
+        Err(HistoryRefusal::BelowFloor {
+            recording: first.recording,
+            floor: SEG
+        })
+    );
+    let page = journal.history(None, 1).unwrap();
+    assert_eq!((page.floor, page.records[0].position), (SEG, SEG));
     cleanup(&[&dir, &copy]);
 }
