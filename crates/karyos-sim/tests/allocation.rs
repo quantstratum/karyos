@@ -422,3 +422,54 @@ fn a_probed_cores_ready_recycling_is_counted_in_its_ready_stage() {
         .unwrap();
     assert!(ready.allocations >= 1, "{:?}", measured.stages);
 }
+
+/// Codex review of docs#1080 (C5 v3 coverage): the driver's persistence
+/// of a Ready (the log's append and sync) is counted in the probed core's
+/// Advance stage, not left outside every stage.
+#[test]
+fn a_probed_cores_persistence_is_counted_in_its_advance_stage() {
+    use std::path::Path;
+
+    use karyos_cluster::RaftLog;
+    use karyos_sim::disk::SimDisk;
+    use karyos_sim::harness::core::drive_into;
+    use karyos_sim::harness::node::LOG_DIR;
+    use karyos_sim::harness::probe::{Probed, measure_with};
+    use karyos_sim::harness::workloads::geometry;
+
+    let _serial = serial();
+    let mut log =
+        RaftLog::create(SimDisk::new(), Path::new(LOG_DIR), geometry().unwrap(), 1).unwrap();
+    let mut core = Probed::<Prepared>::recover(1, &[1], &mut LogView::new(&mut log));
+    let mut buf: ReadyBuf<()> = ReadyBuf::default();
+    buf.ready.entries.reserve(4);
+    buf.reserve_spare(4);
+    let ((), measured) = measure_with(|| {
+        core.tick(0, &mut LogView::new(&mut log));
+        drive_into(
+            &mut core,
+            &mut log,
+            &mut buf,
+            (None, None),
+            &mut |_, (), _| {},
+            &mut |_, _| {},
+            &mut |_| {},
+        )
+        .unwrap();
+    })
+    .unwrap();
+    // Prepared's own advance does nothing: what the stage counts is the
+    // log's.
+    let advance = measured
+        .stages
+        .iter()
+        .find(|(stage, _)| *stage == Stage::AdvanceLeader)
+        .map(|(_, counts)| *counts)
+        .unwrap();
+    assert!(
+        advance.allocations + advance.frees >= 1,
+        "{:?}",
+        measured.stages
+    );
+    assert_eq!(log.durable_index(), Some(1));
+}

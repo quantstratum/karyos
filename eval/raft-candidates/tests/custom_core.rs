@@ -14,7 +14,7 @@ use karyos_sim::harness::core::{
 };
 use karyos_sim::harness::custom::{Custom, Message};
 use karyos_sim::harness::node::Observation;
-use karyos_sim::harness::probe::measure;
+use karyos_sim::harness::probe::{Stage, measure};
 use karyos_sim::harness::workloads::{self, Case, W1, W2};
 use karyos_sim::net::NodeId;
 use karyos_sys::alloc_count::CountingAllocator;
@@ -188,9 +188,20 @@ fn the_replication_path_allocates_nothing_after_the_warm_up() {
     let report = measure::<Custom>(case, 1).unwrap();
     assert!(report.entries > 0, "nothing past the warm-up");
     println!("custom W1 {}: {report:?}", case.name);
-    assert_eq!(
-        (report.counts.allocations, report.counts.frees),
-        (0, 0),
-        "{report:?}"
-    );
+    // The driver's persistence counts in the Advance stage (C5 v3): in the
+    // simulator it runs on SimDisk, whose crash model journals every write
+    // (the same for every variant, declared in the run record), so Advance
+    // is measured on processes, over the real disk. Every other stage is
+    // the core's and the harness's, and allocates nothing.
+    for (stage, counts) in &report.stages {
+        if matches!(stage, Stage::AdvanceLeader | Stage::AdvanceFollower) {
+            continue;
+        }
+        assert_eq!(
+            (counts.allocations, counts.frees),
+            (0, 0),
+            "stage {}: {report:?}",
+            stage.name()
+        );
+    }
 }

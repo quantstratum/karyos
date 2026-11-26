@@ -278,6 +278,14 @@ impl<C: ConsensusCore> ConsensusCore for Probed<C> {
         });
     }
 
+    /// The driver's persistence of a Ready, counted in the Advance stage
+    /// that reports it (C5 v3 coverage).
+    fn persisting<R>(&mut self, persist: impl FnOnce() -> R) -> R {
+        self.counted((Stage::AdvanceLeader, Stage::AdvanceFollower), |_| {
+            persist()
+        })
+    }
+
     /// The Ready's recycling, counted in the Ready stage: the entries
     /// going back to the pool can grow it (C5 v3 coverage).
     fn recycle_ready(&mut self, out: &mut ReadyBuf<Self::Message>) {

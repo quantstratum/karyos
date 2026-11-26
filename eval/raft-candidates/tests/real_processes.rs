@@ -740,10 +740,68 @@ mod w1 {
         // prefilled to the case's bounds, a reply's pooled bytes and its
         // kept frame, allocate nothing (C5 v3), shown on the custom core.
         if core == "custom" {
-            assert_eq!(
-                stage_total(&ran.probes, "apply"),
-                (0, 0),
-                "{core} {}: the application: {:?}",
+            // The custom core on processes past the warm-up (C5 v3, run
+            // record): its own and the harness's stages allocate and free
+            // nothing.
+            for stage in [
+                "step_leader",
+                "step_follower",
+                "tick",
+                "ready_leader",
+                "ready_follower",
+                "apply",
+                "other",
+                "unattributed",
+            ] {
+                assert_eq!(
+                    stage_total(&ran.probes, stage),
+                    (0, 0),
+                    "{core} {}: stage {stage}: {:?}",
+                    case.name,
+                    ran.probes
+                );
+            }
+            // What the run record declares, capped near what was measured
+            // at the v3 run commit, so a regression shows (per entry,
+            // summed over the servers):
+            // - advance: C4's persistence on the real disk (the log's
+            //   append, sync and hard state), about 1.7 allocations and
+            //   1.4 frees per server; capped at 2 each.
+            // - propose: the leader's pooled entry buffers, which leave
+            //   with each sent append and are never handed back (the
+            //   frozen manifest), about 1.1 to 2.2; capped at 3, no free.
+            // - encoding: those sent appends freed, about 2.6 per peer;
+            //   capped at 3 per peer, no allocation.
+            let servers = u64::try_from(ran.probes.len()).unwrap();
+            let entries: u64 = ran
+                .probes
+                .iter()
+                .map(|probe| probe.entries)
+                .max()
+                .unwrap_or(0);
+            let (leader, follower) = (
+                stage_total(&ran.probes, "advance_leader"),
+                stage_total(&ran.probes, "advance_follower"),
+            );
+            let advance = (leader.0 + follower.0, leader.1 + follower.1);
+            let cap = 2 * entries * servers;
+            assert!(
+                advance.0 <= cap && advance.1 <= cap,
+                "{core} {}: advance {advance:?} over {cap}: {:?}",
+                case.name,
+                ran.probes
+            );
+            let propose = stage_total(&ran.probes, "propose");
+            assert!(
+                propose.0 <= 3 * entries && propose.1 == 0,
+                "{core} {}: propose {propose:?}: {:?}",
+                case.name,
+                ran.probes
+            );
+            let encoding = stage_total(&ran.probes, "encoding");
+            assert!(
+                encoding.0 == 0 && encoding.1 <= 3 * entries * (servers - 1),
+                "{core} {}: encoding {encoding:?}: {:?}",
                 case.name,
                 ran.probes
             );

@@ -698,6 +698,19 @@ pub trait ConsensusCore: Sized {
     /// What the node should do now, if anything.
     fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Self::Message>>;
 
+    /// Runs `persist`, the driver's persistence of this core's Ready (the
+    /// log's truncation, append, sync and hard state), just before
+    /// [`ConsensusCore::advance`] reports it. The work is the Advance's, so
+    /// a probed core counts it in its Advance stage
+    /// ([`crate::harness::probe::Probed`]; C5 v3 coverage). The default
+    /// only runs it; no core overrides it.
+    fn persisting<R>(&mut self, persist: impl FnOnce() -> R) -> R
+    where
+        Self: Sized,
+    {
+        persist()
+    }
+
     /// Empties `out` for the next [`ConsensusCore::ready_into`]
     /// ([`ReadyBuf::recycle`]): [`drive`] calls it before each Ready and
     /// after it is done with one. Its work (the entries going back to the
@@ -1108,21 +1121,24 @@ fn take<C: ConsensusCore, D: Disk + Clone>(
             }
             DriveFault::None => {}
         }
-        // 2. Persistence.
-        if let Some(from) = ready.truncate_from {
-            log.truncate_suffix(from)?;
-        }
-        let durable = if ready.entries.is_empty() && ready.truncate_from.is_none() {
-            log.durable_index()
-        } else {
-            if !ready.entries.is_empty() {
-                let _ = log.append(&ready.entries)?;
+        // 2. Persistence, counted with the Advance that reports it.
+        let durable = core.persisting(|| -> Result<_, DriveError> {
+            if let Some(from) = ready.truncate_from {
+                log.truncate_suffix(from)?;
             }
-            log.sync()?
-        };
-        if let Some(state) = ready.hard_state {
-            log.save_hard_state(state)?;
-        }
+            let durable = if ready.entries.is_empty() && ready.truncate_from.is_none() {
+                log.durable_index()
+            } else {
+                if !ready.entries.is_empty() {
+                    let _ = log.append(&ready.entries)?;
+                }
+                log.sync()?
+            };
+            if let Some(state) = ready.hard_state {
+                log.save_hard_state(state)?;
+            }
+            Ok(durable)
+        })?;
         // 3. Reported to the core.
         let persisted = Persisted {
             durable,
