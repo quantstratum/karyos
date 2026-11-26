@@ -672,7 +672,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 super::wire::Protected::Auth(auth) => wire
                     .publication(auth, config.stream.buffer.stream_id)
                     .map(|_| ()),
-                super::wire::Protected::Enc(enc) => wire.enc_publication(enc).map(|_| ()),
+                super::wire::Protected::Enc(enc) => wire
+                    .enc_publication(enc, Some(config.stream.buffer.stream_id))
+                    .map(|_| ()),
             };
             if let Err(error) = checked {
                 if error

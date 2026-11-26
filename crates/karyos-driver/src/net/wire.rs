@@ -501,6 +501,9 @@ pub(crate) struct PublicationBinding {
 pub(crate) struct EncFiles {
     pub(crate) channel: Vec<KeyFile>,
     pub(crate) pairwise: Vec<KeyFile>,
+    /// The channel file epoch the view signs and sends with now
+    /// (wire-key-files.md 2.3): the only one a new sealer takes (H8-06).
+    pub(crate) signing: u32,
 }
 
 /// The keys an encrypted subscription binds.
@@ -999,8 +1002,11 @@ impl WireKeys {
     }
 
     /// The `profile_id=16` files `channel` names, valid now (ADR-0114
-    /// section 4a): every verifying epoch of its channel key (of
-    /// `stream_id`, when given) and of its receiver's pairwise key. A
+    /// section 4a): every verifying epoch of its channel key whose
+    /// `channel_id` is the configured one (and of `stream_id`, when given),
+    /// and of its pairwise key whose `receiver_id` and `publisher_id` are
+    /// the configured ones (wire-key-files.md 2.2; H8-03), and the channel
+    /// epoch that signs now, which must be one of them (H8-06). A
     /// missing key is refused as [`AuthRefusal::ChannelKey`] or
     /// [`AuthRefusal::PairwiseKey`], a file of the other class as
     /// [`AuthRefusal::KeyClass`].
@@ -1026,10 +1032,18 @@ impl WireKeys {
                     file.purpose == purpose
                         && match file.scope {
                             Scope::Channel {
-                                stream_id: stream, ..
-                            } => stream_id.is_none_or(|wanted| wanted == stream),
-                            Scope::Pairwise { receiver_id, .. } => {
+                                channel_id,
+                                stream_id: stream,
+                            } => {
+                                channel_id == channel.channel_id
+                                    && stream_id.is_none_or(|wanted| wanted == stream)
+                            }
+                            Scope::Pairwise {
+                                receiver_id,
+                                publisher_id,
+                            } => {
                                 receiver_id == channel.receiver_id
+                                    && publisher_id == channel.publisher_id
                             }
                             Scope::Authority { .. } => false,
                         }
@@ -1046,29 +1060,42 @@ impl WireKeys {
             }
             Ok(named.into_iter().take(limit).map(duplicate).collect())
         };
+        let channel_files: Vec<KeyFile> = select(
+            channel.channel_key_id,
+            Purpose::Channel,
+            AuthRefusal::ChannelKey,
+            CHANNEL_FILES,
+        )?;
+        let pairwise = select(
+            channel.pairwise_key_id,
+            Purpose::Pairwise,
+            AuthRefusal::PairwiseKey,
+            PAIRWISE_FILES,
+        )?;
+        // Sending selects by the signing window, never by the wider verify
+        // window (H8-06): no file of the selected ones signs now, nothing
+        // can be sent, and the channel is refused.
+        let signing = view
+            .signing(channel.channel_key_id)
+            .map(|file| file.file_epoch)
+            .filter(|epoch| channel_files.iter().any(|file| file.file_epoch == *epoch))
+            .ok_or_else(|| refused(AuthRefusal::ChannelKey))?;
         Ok(EncFiles {
-            channel: select(
-                channel.channel_key_id,
-                Purpose::Channel,
-                AuthRefusal::ChannelKey,
-                CHANNEL_FILES,
-            )?,
-            pairwise: select(
-                channel.pairwise_key_id,
-                Purpose::Pairwise,
-                AuthRefusal::PairwiseKey,
-                PAIRWISE_FILES,
-            )?,
+            channel: channel_files,
+            pairwise,
+            signing,
         })
     }
 
     /// The publication side of the encrypted `channel` at admission: its
-    /// channel files and its one receiver's pairwise files.
+    /// channel files (of `stream_id`, once the publication's stream is
+    /// known) and its one receiver's pairwise files.
     pub(crate) fn enc_publication(
         &self,
         channel: &EncryptedChannel,
+        stream_id: Option<i32>,
     ) -> Result<EncFiles, DriverError> {
-        self.enc_files(channel, None)
+        self.enc_files(channel, stream_id)
     }
 
     /// The sender binding of the encrypted `publication` of `channel`: its
@@ -1078,10 +1105,12 @@ impl WireKeys {
         channel: &EncryptedChannel,
         publication: &crate::sessions::send::Publication,
     ) -> Result<PublicationBinding, DriverError> {
-        let files = self.enc_publication(channel)?;
+        // The channel file's stream restriction holds on the publisher too
+        // (H8-03): the publication's own stream.
+        let files = self.enc_publication(channel, Some(publication.alias.stream_id))?;
         let keys: Vec<&KeyFile> = files.channel.iter().collect();
         let pairwise: Vec<&KeyFile> = files.pairwise.iter().collect();
-        let enc = crate::agents::roles::publish_enc::PublicationEnc::new(
+        let mut enc = crate::agents::roles::publish_enc::PublicationEnc::new(
             publication.endpoint,
             publication.alias,
             publication.identity,
@@ -1090,6 +1119,8 @@ impl WireKeys {
             crate::wire_enc::monotonic_ns,
         )
         .map_err(|error| enc_refused(error, AuthRefusal::ChannelKey))?;
+        enc.sign_with(files.signing)
+            .map_err(|error| enc_refused(error, AuthRefusal::ChannelKey))?;
         Ok(PublicationBinding {
             sender: crate::agents::roles::Binding::EncPublication { enc: Box::new(enc) },
             follow: None,

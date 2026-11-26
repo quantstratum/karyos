@@ -494,13 +494,19 @@ fn published_keys_keep_their_meaning() {
                     delta: Duration::from_micros(100),
                 })
             ),
-            Key::ChannelKeyId | Key::PairwiseKeyId | Key::ReceiverId => assert_eq!(
-                udp("karyos:udp?endpoint=10.0.0.5:1|mtu=1408|security=encrypted|channel-key=3|pairwise-key=9|receiver-id=77")
+            Key::ChannelKeyId
+            | Key::PairwiseKeyId
+            | Key::ReceiverId
+            | Key::ChannelId
+            | Key::PublisherId => assert_eq!(
+                udp("karyos:udp?endpoint=10.0.0.5:1|mtu=1408|security=encrypted|channel-key=3|pairwise-key=9|receiver-id=77|channel-id=7|publisher-id=5")
                     .security,
                 Security::Encrypted(EncryptedChannel {
                     channel_key_id: 3,
                     pairwise_key_id: 9,
                     receiver_id: 77,
+                    channel_id: 7,
+                    publisher_id: 5,
                 })
             ),
         }
@@ -1216,7 +1222,7 @@ fn path_skew_is_a_bounded_duration() {
     );
 }
 
-const ENC_KEYS: &str = "channel-key=3|pairwise-key=4|receiver-id=42";
+const ENC_KEYS: &str = "channel-key=3|pairwise-key=4|receiver-id=42|channel-id=7|publisher-id=5";
 
 /// ADR-0114 sections 6 and 11: an `encrypted` channel above `mtu` 1408 is
 /// refused at parse for its MTU, before anything else; at or below it the
@@ -1248,6 +1254,8 @@ fn an_encrypted_channel_takes_mtu_at_most_1408() {
                 channel_key_id: 3,
                 pairwise_key_id: 4,
                 receiver_id: 42,
+                channel_id: 7,
+                publisher_id: 5,
             })
         );
     }
@@ -1321,7 +1329,13 @@ fn the_etf_declaration_is_checked() {
 #[test]
 fn an_encrypted_channel_needs_its_keys_and_one_unicast_receiver() {
     let base = "karyos:udp?endpoint=10.0.0.5:1|security=encrypted";
-    for missing in ["channel-key", "pairwise-key", "receiver-id"] {
+    for missing in [
+        "channel-key",
+        "pairwise-key",
+        "receiver-id",
+        "channel-id",
+        "publisher-id",
+    ] {
         let keys: Vec<&str> = ENC_KEYS
             .split('|')
             .filter(|kv| !kv.starts_with(missing))
@@ -1341,6 +1355,10 @@ fn an_encrypted_channel_needs_its_keys_and_one_unicast_receiver() {
         "channel-key=3|pairwise-key=04|receiver-id=42",
         "channel-key=3|pairwise-key=4|receiver-id=0",
         "channel-key=3|pairwise-key=4|receiver-id=18446744073709551616",
+        "channel-key=3|pairwise-key=4|receiver-id=42|channel-id=0|publisher-id=5",
+        "channel-key=3|pairwise-key=4|receiver-id=42|channel-id=7|publisher-id=0",
+        "channel-key=3|pairwise-key=4|receiver-id=42|channel-id=07|publisher-id=5",
+        "channel-key=3|pairwise-key=4|receiver-id=42|channel-id=7|publisher-id=18446744073709551616",
     ] {
         assert!(
             matches!(
@@ -1352,13 +1370,15 @@ fn an_encrypted_channel_needs_its_keys_and_one_unicast_receiver() {
     }
     assert_eq!(
         udp(&format!(
-            "{base}|channel-key=4294967295|pairwise-key=1|receiver-id=18446744073709551615"
+            "{base}|channel-key=4294967295|pairwise-key=1|receiver-id=18446744073709551615|channel-id=18446744073709551615|publisher-id=1"
         ))
         .security,
         Security::Encrypted(EncryptedChannel {
             channel_key_id: u32::MAX,
             pairwise_key_id: 1,
             receiver_id: u64::MAX,
+            channel_id: u64::MAX,
+            publisher_id: 1,
         })
     );
     for other in [
@@ -1377,7 +1397,13 @@ fn an_encrypted_channel_needs_its_keys_and_one_unicast_receiver() {
             "{other}"
         );
     }
-    for key in ["channel-key=3", "pairwise-key=4", "receiver-id=42"] {
+    for key in [
+        "channel-key=3",
+        "pairwise-key=4",
+        "receiver-id=42",
+        "channel-id=7",
+        "publisher-id=5",
+    ] {
         let name = key.split('=').next().unwrap();
         for class in ["", "|security=trusted"] {
             assert_eq!(

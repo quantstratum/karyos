@@ -143,7 +143,8 @@ impl PublicationEnc {
             None,
             KeyContext {
                 domain: Domain::Setup,
-                key_epoch: self.keys.current_epoch(),
+                // Sending takes the signing epoch (H8-06).
+                key_epoch: self.keys.signing_epoch().ok_or(EncKeyError::NoKey)?,
                 party_epoch: 0,
                 session_id: self.alias.session_id,
                 stream_id: self.alias.stream_id,
@@ -157,6 +158,21 @@ impl PublicationEnc {
         self.setup = Some(setup);
         self.bootstrap = Some(bootstrap);
         Ok(())
+    }
+
+    /// Sends under the channel file epoch `epoch`, the one the admission
+    /// view signs with (H8-06): its domain 5 keys are made again under it,
+    /// before anything was sealed.
+    ///
+    /// # Errors
+    ///
+    /// [`EncKeyError::NoKey`] when that epoch is not held; or as
+    /// [`Self::rekey`].
+    pub(crate) fn sign_with(&mut self, epoch: u32) -> Result<(), EncKeyError> {
+        if !self.keys.set_signing(epoch) {
+            return Err(EncKeyError::NoKey);
+        }
+        self.rekey()
     }
 
     /// Takes `identity`, the fresh incarnation identity of section 10 step
@@ -181,13 +197,20 @@ impl PublicationEnc {
     /// pairwise file is revoked or expired, so the publication neither
     /// announces nor accepts its receiver's controls (fail closed). Its
     /// domain 1 sealer is the `Outbound`'s ([`super::SenderRole::apply_keys`]).
+    /// The retired boot ids of a file epoch that no longer verifies go
+    /// (section 7, H8-07); those of every epoch still accepted stay.
     pub(crate) fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
-        self.keys.retain(keys);
-        self.pairwise.retain(keys);
         // Rotation: a newly admitted epoch serves the next answers,
-        // bindings and scratch derivations.
+        // bindings and scratch derivations, admitted before its
+        // predecessor goes.
         self.keys.admit(keys);
         self.pairwise.admit(keys);
+        self.keys.retain(keys);
+        self.pairwise.retain(keys);
+        self.keys.follow_signing(keys);
+        if let Some(oldest) = self.keys.oldest_epoch() {
+            self.retired.expire(oldest);
+        }
         if let Some(setup) = &mut self.setup {
             setup.apply_keys(keys);
         }
@@ -303,7 +326,7 @@ impl PublicationEnc {
                 return Err(EncRejection::RetiredBoot);
             }
         }
-        let context = self.receiver_context(&receiver, nonce);
+        let context = self.receiver_context(&receiver, nonce, opened.header.key_epoch);
         let opener = EncOpener::new(&self.keys, Some(&self.pairwise), context, now)
             .map_err(|_| EncRejection::Pairwise)?;
         if let Some(old) = self.bound.take() {
@@ -365,11 +388,17 @@ impl PublicationEnc {
             .ok_or(EncRejection::InnerRejected)
     }
 
-    /// The domain 4 context of `receiver` under the challenge `nonce`.
-    fn receiver_context(&self, receiver: &ReceiverIdentity, nonce: [u8; 16]) -> KeyContext {
+    /// The domain 4 context of `receiver` under the challenge `nonce`, at
+    /// `key_epoch`, the current one its RSP_SETUP verified under.
+    fn receiver_context(
+        &self,
+        receiver: &ReceiverIdentity,
+        nonce: [u8; 16],
+        key_epoch: u32,
+    ) -> KeyContext {
         KeyContext {
             domain: Domain::Receiver,
-            key_epoch: self.keys.current_epoch(),
+            key_epoch,
             party_epoch: 0,
             session_id: self.alias.session_id,
             stream_id: self.alias.stream_id,
@@ -397,7 +426,8 @@ impl PublicationEnc {
             None,
             KeyContext {
                 domain: Domain::Sender,
-                key_epoch: self.keys.current_epoch(),
+                // Sending takes the signing epoch (H8-06).
+                key_epoch: self.keys.signing_epoch().ok_or(EncKeyError::NoKey)?,
                 party_epoch: 0,
                 session_id: self.alias.session_id,
                 stream_id: self.alias.stream_id,
@@ -413,23 +443,33 @@ impl PublicationEnc {
     }
 
     /// Seals `answer` as an ENC ANSWER (variant 3, section 6a) in domain 5
-    /// into `out`, stating the current file epoch and `party_epoch`, the
-    /// session sealer's current one. Every answer on an `encrypted`
-    /// channel is a variant 3. `None` when it does not encode or seal:
-    /// nothing is sent.
+    /// into `out`, stating the epochs the session sealer actually holds
+    /// (`session`, its key and party epochs), which must be the domain 5
+    /// sealer's own key epoch, so the body and the envelope agree (H8-06);
+    /// with no session sealer yet, the domain 5 sealer's key epoch and
+    /// `party_epoch` 0. Every answer on an `encrypted` channel is a
+    /// variant 3. `None` when the epochs disagree or it does not encode or
+    /// seal: nothing is sent.
     pub(crate) fn seal_answer(
         &mut self,
         answer: SetupAnswer,
-        party_epoch: u16,
+        session: Option<(u32, u16)>,
         out: &mut [u8],
     ) -> Option<usize> {
+        let setup = self.setup.as_mut()?;
+        let key_epoch = setup.context().key_epoch;
+        let party_epoch = match session {
+            None => 0,
+            Some((session_epoch, party_epoch)) if session_epoch == key_epoch => party_epoch,
+            Some(_) => return None,
+        };
         let enc = EncAnswer {
             answer,
-            key_epoch: self.keys.current_epoch(),
+            key_epoch,
             party_epoch,
         };
         let length = enc.encode(out).ok()?;
-        self.setup.as_mut()?.seal(out, length).ok()
+        setup.seal(out, length).ok()
     }
 
     /// Seals an encoded SETUP ANNOUNCE (the first `frames` bytes of `out`)
@@ -788,18 +828,15 @@ impl<T: StreamTerms> SenderRole<T> {
         let index = self.enc.publications.iter().position(|publication| {
             publication.endpoint == endpoint && publication.alias == alias
         })?;
-        let party_epoch = self
+        let session = self
             .publications
             .iter()
             .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
-            .and_then(|outbound| outbound.enc_party_epoch())
-            .unwrap_or(0);
+            .and_then(|outbound| outbound.enc_epochs());
         let mut bytes = [0_u8; crate::wire_enc::MAX_SEALED];
         let publication = self.enc.publications.get_mut(index)?;
         let length = match control {
-            Control::SetupAnswer(answer) => {
-                publication.seal_answer(*answer, party_epoch, &mut bytes)
-            }
+            Control::SetupAnswer(answer) => publication.seal_answer(*answer, session, &mut bytes),
             _ => control
                 .encode(&mut bytes)
                 .ok()

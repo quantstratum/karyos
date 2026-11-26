@@ -199,9 +199,11 @@ fn an_envelope_on_a_stream_that_is_not_encrypted_is_unexpected() {
 }
 
 /// A verified ANNOUNCE takes the encrypted path (here no trusted
-/// subscription exists, so it sets nothing up). A SOLICIT whose target
-/// publication is not known (no binding, no DATA naming one) cannot be
-/// keyed in domain 6 and is refused, never sent bare.
+/// subscription exists, so it sets nothing up) and names its publication
+/// as the target of its alias (H8-02): a SOLICIT on that alias is keyed in
+/// domain 6 under it, and a CHALLENGE to it shares that one key. A SOLICIT
+/// with no verified target is refused, never sent bare
+/// (`a_solicit_goes_sealed_in_domain_6_with_its_trailer`).
 #[test]
 fn a_verified_announce_passes_and_a_solicit_is_never_bare() {
     let mut rig = rig();
@@ -225,7 +227,7 @@ fn a_verified_announce_passes_and_a_solicit_is_never_bare() {
     });
     let mut seal = intake.enc_rsp_seal(EndpointId(1), &solicit).unwrap();
     let mut buffer = [0_u8; 256];
-    assert_eq!(seal.seal_control(&mut buffer, 56), None);
+    assert!(seal.seal_control(&mut buffer, 56).is_some());
     // A CHALLENGE is sealed in domain 6 with the pairwise trailer, under
     // one sealer per target.
     let challenge = Control::Challenge(karyos_protocol::network::RspChallenge {
@@ -242,7 +244,7 @@ fn a_verified_announce_passes_and_a_solicit_is_never_bare() {
     let sealed = seal.seal_control(&mut buffer, length).unwrap();
     assert_eq!(sealed, length + 84 + 20);
     let again = intake.enc_rsp_seal(EndpointId(1), &challenge).unwrap();
-    assert_eq!(intake.role.enc.subscriptions[0].rsp.len(), 1);
+    assert_eq!(intake.role.enc.rsp.len(), 1);
     drop(again);
     // A stream that is not encrypted has no encrypted sealer.
     let mut other = challenge;
@@ -537,7 +539,7 @@ fn a_solicit_goes_sealed_in_domain_6_with_its_trailer() {
         stream_id: 6,
     };
     role.enc
-        .targets
+        .verified
         .push((EndpointId(1), unbound, publication_of(&IDENTITY)));
     let bytes = seal_with(&mut role, &solicit(unbound)).unwrap();
     assert_eq!(
@@ -585,18 +587,20 @@ fn an_unrelated_dropped_file_keeps_the_rsp_sequence() {
         .unwrap(),
     );
     let target = publication_of(&IDENTITY);
-    let mut sealer = role.enc.subscriptions[0]
-        .rsp_sealer(target, ALIAS, [4; 16])
+    let mut sealer = role
+        .enc
+        .rsp_sealer(0, target, ALIAS, [4; 16], true)
         .unwrap();
     assert_eq!(sequence_of(&mut sealer), 0);
     role.enc.apply_keys(&FixedKeys {
         files: vec![second_epoch(), pairwise()],
     });
-    let mut again = role.enc.subscriptions[0]
-        .rsp_sealer(target, ALIAS, [4; 16])
+    let mut again = role
+        .enc
+        .rsp_sealer(0, target, ALIAS, [4; 16], true)
         .unwrap();
     assert_eq!(sequence_of(&mut again), 1, "the sequence continues");
-    assert_eq!(role.enc.subscriptions[0].rsp.len(), 1);
+    assert_eq!(role.enc.rsp.len(), 1);
 }
 
 /// H8 finding 4 and ADR-0114 nonces: a domain 6 sealer whose own pairwise
@@ -614,22 +618,24 @@ fn a_withdrawn_rsp_sealer_is_never_rebuilt() {
         SubscriptionEnc::new(EndpointId(1), 6, &[&channel(0x11)], &[&pairwise()], 66).unwrap(),
     );
     let target = publication_of(&IDENTITY);
-    let mut sealer = role.enc.subscriptions[0]
-        .rsp_sealer(target, ALIAS, [4; 16])
+    let mut sealer = role
+        .enc
+        .rsp_sealer(0, target, ALIAS, [4; 16], true)
         .unwrap();
     assert_eq!(sequence_of(&mut sealer), 0);
     role.enc.apply_keys(&FixedKeys {
         files: vec![channel(0x11)],
     });
     for _ in 0..2 {
-        let mut again = role.enc.subscriptions[0]
-            .rsp_sealer(target, ALIAS, [4; 16])
+        let mut again = role
+            .enc
+            .rsp_sealer(0, target, ALIAS, [4; 16], true)
             .unwrap();
         let mut bytes = vec![0_u8; MAX_SEALED];
         let length = announce().encode(&mut bytes).unwrap();
         assert!(again.seal_control(&mut bytes, length).is_none());
     }
-    assert_eq!(role.enc.subscriptions[0].rsp.len(), 1, "no rebuild");
+    assert_eq!(role.enc.rsp.len(), 1, "no rebuild");
 }
 
 /// A receive role whose VM generation signal the test changes.
@@ -657,7 +663,7 @@ fn a_vm_generation_change_closes_every_image_and_redraws_the_boot_id() {
     let mut role = bound();
     let sessions = session_end();
     role.enc
-        .targets
+        .verified
         .push((EndpointId(1), ALIAS, publication_of(&IDENTITY)));
     role.enc
         .answers
@@ -671,9 +677,9 @@ fn a_vm_generation_change_closes_every_image_and_redraws_the_boot_id() {
     role.on_generation_change(&sessions, AFTER);
     assert_eq!(role.enc_generation(), 1);
     assert_eq!(role.enc_images(), 0);
-    assert!(role.enc.answers.is_empty() && role.enc.targets.is_empty());
+    assert!(role.enc.answers.is_empty() && role.enc.verified.is_empty());
     let subscription = &role.enc.subscriptions[0];
-    assert!(subscription.rsp.is_empty() && subscription.bootstrap.is_none());
+    assert!(role.enc.rsp.is_empty() && subscription.bootstrap.is_none());
     assert_ne!(role.boot_id(), old);
     assert_ne!(role.boot_id(), [0, 0]);
     assert!(!crate::wire_enc::quiesced(), "the only role redrew");
@@ -792,4 +798,377 @@ fn an_invalid_tag_setup_flood_allocates_nothing_and_changes_nothing() {
     moved.datagrams = counters.datagrams;
     assert_eq!(moved, counters, "nothing but the datagram count");
     assert_eq!(rig.role.enc.unattributed, EncRejections::default());
+}
+
+fn challenge_of(identity: Identity) -> Control {
+    Control::Challenge(karyos_protocol::network::RspChallenge {
+        alias: ALIAS,
+        identity,
+        challenge: ChallengeBlock {
+            receiver_boot_id: [7, 8],
+            nonce: [9, 9],
+        },
+    })
+}
+
+/// The sealer `enc_rsp_seal` gives `control` on endpoint 1 of `rig`.
+fn rsp_seal_of(rig: &mut Rig, control: &Control) -> SharedSealer {
+    let mut intake = Intake {
+        endpoint: EndpointId(1),
+        now: 1_000,
+        role: &mut rig.role,
+        sessions: &rig.sessions,
+        work: 0,
+    };
+    intake.enc_rsp_seal(EndpointId(1), control).unwrap()
+}
+
+/// H8-01: a subscription removed and made again within one receiver boot
+/// gets the domain 6 sealer the role made for that key before, so its
+/// sequence continues: the same (key, nonce) is never sealed twice.
+#[test]
+fn a_recreated_subscription_continues_its_rsp_sequence() {
+    let mut rig = rig();
+    let mut announcer = setup_sealer(0x11);
+    rig.inject(&sealed(&mut announcer, &announce()));
+    let challenge = challenge_of(IDENTITY);
+    assert_eq!(sequence_of(&mut rsp_seal_of(&mut rig, &challenge)), 0);
+    for replace in [false, true] {
+        if !replace {
+            rig.role.enc.unsubscribe(EndpointId(1), 6);
+        }
+        rig.role.enc.subscribe(
+            SubscriptionEnc::new(EndpointId(1), 6, &[&channel(0x11)], &[&pairwise()], 66).unwrap(),
+        );
+        rig.inject(&sealed(&mut announcer, &announce()));
+    }
+    assert_eq!(
+        sequence_of(&mut rsp_seal_of(&mut rig, &challenge)),
+        1,
+        "the sequence continues across the subscription's replacement"
+    );
+    assert_eq!(rig.role.enc.rsp.len(), 1);
+}
+
+/// H8-02: domain 1 headers no verified datagram backs (forged, under
+/// another key, each naming a fresh publication on a fresh alias) record no
+/// target and make no domain 6 sealer, however many; the SOLICITs they
+/// could cause are refused. A legitimate publication's verified ANNOUNCE is
+/// then still challenged, sealed in domain 6.
+#[test]
+fn forged_headers_take_no_rsp_slot_and_a_verified_target_is_still_challenged() {
+    use karyos_protocol::network::RspSolicit;
+
+    let mut rig = rig();
+    let forged_keys = ChannelKeys::new(&[&channel(0x99)]).unwrap();
+    let mut buffer = [0_u8; 512];
+    for n in 0..=u64::try_from(RSP_SEALERS).unwrap() {
+        let session_id = 100 + i32::try_from(n).unwrap();
+        let alias = Alias {
+            session_id,
+            stream_id: 6,
+        };
+        let publication = PublicationIdentity {
+            driver_id: [9; 16],
+            registration_id: 10 + n,
+            incarnation: 1,
+        };
+        let mut forger = EncSealer::new(
+            &forged_keys,
+            None,
+            KeyContext {
+                domain: Domain::Sender,
+                key_epoch: 1,
+                party_epoch: 0,
+                session_id,
+                stream_id: 6,
+                publication,
+                receiver: None,
+                salt: Salt::Challenge {
+                    receiver_boot_id: [1; 16],
+                    nonce: [2; 16],
+                },
+            },
+            monotonic_ns,
+        )
+        .unwrap();
+        rig.inject(&sealed(&mut forger, &announce()));
+        let solicit = Control::Solicit(RspSolicit {
+            alias,
+            challenge: ChallengeBlock {
+                receiver_boot_id: [7, 8],
+                nonce: [9, 9],
+            },
+        });
+        let length = solicit.encode(&mut buffer).unwrap();
+        assert_eq!(
+            rsp_seal_of(&mut rig, &solicit).seal_control(&mut buffer, length),
+            None
+        );
+    }
+    assert!(rig.role.enc.rsp.is_empty(), "no persistent sealer");
+    assert!(rig.role.enc.verified.is_empty(), "no persistent target");
+    // A CHALLENGE to an identity no verified datagram named is refused too.
+    let mut stranger = IDENTITY;
+    stranger.registration_id = 99;
+    let challenge = challenge_of(stranger);
+    let length = challenge.encode(&mut buffer).unwrap();
+    assert_eq!(
+        rsp_seal_of(&mut rig, &challenge).seal_control(&mut buffer, length),
+        None
+    );
+    rig.inject(&sealed(&mut setup_sealer(0x11), &announce()));
+    let challenge = challenge_of(IDENTITY);
+    let length = challenge.encode(&mut buffer).unwrap();
+    assert!(
+        rsp_seal_of(&mut rig, &challenge)
+            .seal_control(&mut buffer, length)
+            .is_some(),
+        "the legitimate target is challenged"
+    );
+}
+
+/// H8-08 (section 6b): an answer that echoes the outstanding challenge
+/// but is refused for any later reason (another term, an envelope under
+/// another file epoch, one verified only under the previous file epoch, a
+/// lower pair) consumes nothing and moves nothing: the legitimate answer
+/// still resynchronises.
+#[test]
+fn a_refused_resync_answer_leaves_the_challenge_to_the_legitimate_one() {
+    let mut terms = enc_answer(2, 3, NONCE);
+    terms.answer.term.mtu = 1024;
+    let mut identity = enc_answer(2, 3, NONCE);
+    identity.answer.identity.incarnation = 2;
+    let refusals = [
+        (terms, 2, true),
+        (identity, 2, true),
+        (enc_answer(2, 3, NONCE), 1, true),
+        (enc_answer(2, 3, NONCE), 2, false),
+        (enc_answer(1, 0, NONCE), 1, true),
+    ];
+    for (answer, envelope, current) in refusals {
+        let mut role = bound();
+        if answer.key_epoch == 1 {
+            role.enc.images[0].opener.resync(1, 4, 0).unwrap();
+        }
+        let before = role.enc.images[0].opener.epochs();
+        assert_eq!(
+            role.enc.resync(0, &answer, envelope, current, BOOT, 1_500),
+            Err(EncRejection::ResyncRefused)
+        );
+        assert_eq!(role.enc.images[0].opener.epochs(), before, "nothing moved");
+        assert_eq!(
+            role.enc.images[0].resync,
+            Some((NONCE, 1_000)),
+            "not consumed"
+        );
+        assert_eq!(
+            role.enc
+                .resync(0, &enc_answer(2, 5, NONCE), 2, true, BOOT, 1_600),
+            Ok(())
+        );
+        assert_eq!(role.enc.images[0].opener.epochs(), (2, 5));
+        assert!(
+            role.enc.images[0].resync.is_none(),
+            "consumed with the move"
+        );
+    }
+}
+
+/// H8-09 (section 10 step 2): a VM generation change withdraws every
+/// domain 6 sealer through its shared object, so a clone a queued control
+/// holds is erased with it, before the role reports itself redrawn.
+#[test]
+fn a_vm_generation_change_withdraws_every_queued_rsp_sealer() {
+    let mut role = bound();
+    let queued = role
+        .enc
+        .rsp_sealer(0, publication_of(&IDENTITY), ALIAS, [4; 16], true)
+        .unwrap();
+    assert!(!queued.is_withdrawn());
+    let sessions = session_end();
+    let injector = watched(&mut role);
+    injector.change();
+    role.on_generation_change(&sessions, AFTER);
+    assert_eq!(role.enc_generation(), 1);
+    assert!(queued.is_withdrawn(), "the queued clone is erased");
+    assert!(
+        role.enc.rsp.is_empty(),
+        "the table is free under the new boot"
+    );
+}
+
+/// One step of [`no_sealer_repeats_a_key_and_nonce_within_a_boot`].
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    /// Seals the CHALLENGE to target 0 or 1 in domain 6.
+    Challenge(u8),
+    /// Establishes an image: a fresh nonce, its domain 4 sealer.
+    Establish,
+    /// Seals with the domain 4 sealer of image `n` (modulo the count).
+    Control(u8),
+    /// Rolls the `party_epoch` of image `n`'s domain 4 sealer, or of
+    /// target `n`'s domain 6 sealer.
+    RollD4(u8),
+    RollD6(u8),
+    /// Rotates the channel file: epoch 2 admitted and signing.
+    RotateFile,
+    /// Replaces the subscription with a new one of the same files.
+    Replace,
+    /// Removes the subscription, then makes it again.
+    RemoveRecreate,
+}
+
+fn step() -> impl proptest::strategy::Strategy<Value = Step> {
+    use proptest::prelude::*;
+    prop_oneof![
+        (0_u8..2).prop_map(Step::Challenge),
+        Just(Step::Establish),
+        any::<u8>().prop_map(Step::Control),
+        any::<u8>().prop_map(Step::RollD4),
+        (0_u8..2).prop_map(Step::RollD6),
+        Just(Step::RotateFile),
+        Just(Step::Replace),
+        Just(Step::RemoveRecreate),
+    ]
+}
+
+fn run_steps(steps: &[Step]) -> Vec<crate::wire_enc::SealedRecord> {
+    use crate::wire_auth::FixedKeys;
+
+    let mut rig = rig();
+    let identities = [IDENTITY, {
+        let mut other = IDENTITY;
+        other.registration_id = 4;
+        other
+    }];
+    for identity in identities {
+        rig.inject(&announce_under(identity));
+    }
+    let mut controls: Vec<SharedSealer> = Vec::new();
+    let mut buffer = [0_u8; 512];
+    let frames = 64;
+    crate::wire_enc::record_seals();
+    for step in steps {
+        match *step {
+            Step::Challenge(target) => {
+                let challenge = challenge_of(identities[usize::from(target)]);
+                let _ = rsp_seal_of(&mut rig, &challenge).seal_control(&mut buffer, frames);
+            }
+            Step::Establish => {
+                let Some(nonce) = rig.role.nonces.nonce() else {
+                    continue;
+                };
+                rig.role
+                    .enc
+                    .answers
+                    .push((EndpointId(1), ALIAS, enc_answer(1, 0, nonce)));
+                let key = BindingKey {
+                    endpoint: EndpointId(1),
+                    source: rig.source,
+                    alias: ALIAS,
+                };
+                let slot = SlotRef {
+                    slot: controls.len().try_into().unwrap(),
+                    generation: 1,
+                };
+                if let Ok(Some(sealer)) = rig.role.enc_keys(&key, IDENTITY, slot, 66, nonce, 1_000)
+                {
+                    controls.push(sealer);
+                }
+            }
+            Step::Control(n) | Step::RollD4(n) if !controls.is_empty() => {
+                let at = usize::from(n) % controls.len();
+                if matches!(step, Step::RollD4(_)) {
+                    controls[at].roll_for_test();
+                } else {
+                    let _ = controls[at].seal_control(&mut buffer, frames);
+                }
+            }
+            Step::Control(_) | Step::RollD4(_) => {}
+            Step::RollD6(target) => {
+                let challenge = challenge_of(identities[usize::from(target)]);
+                rsp_seal_of(&mut rig, &challenge).roll_for_test();
+            }
+            Step::RotateFile => {
+                rig.role.enc.apply_keys(&FixedKeys {
+                    files: vec![channel(0x11), second_epoch(), pairwise()],
+                });
+                for control in &mut controls {
+                    control.apply_keys(&FixedKeys {
+                        files: vec![channel(0x11), second_epoch(), pairwise()],
+                    });
+                }
+            }
+            Step::Replace | Step::RemoveRecreate => {
+                if matches!(step, Step::RemoveRecreate) {
+                    rig.role.enc.unsubscribe(EndpointId(1), 6);
+                }
+                rig.role.enc.subscribe(
+                    SubscriptionEnc::new(EndpointId(1), 6, &[&channel(0x11)], &[&pairwise()], 66)
+                        .unwrap(),
+                );
+                for identity in identities {
+                    rig.inject(&announce_under(identity));
+                }
+            }
+        }
+    }
+    crate::wire_enc::take_seals()
+}
+
+/// A verified domain 5 ANNOUNCE of `identity`, under its own key.
+fn announce_under(identity: Identity) -> Vec<u8> {
+    let keys = ChannelKeys::new(&[&channel(0x11)]).unwrap();
+    let mut sealer = EncSealer::new(
+        &keys,
+        None,
+        KeyContext {
+            domain: Domain::Setup,
+            key_epoch: 1,
+            party_epoch: 0,
+            session_id: ALIAS.session_id,
+            stream_id: ALIAS.stream_id,
+            publication: publication_of(&identity),
+            receiver: None,
+            salt: Salt::Empty,
+        },
+        monotonic_ns,
+    )
+    .unwrap();
+    let mut control = announce();
+    if let Control::SetupAnnounce(setup) = &mut control {
+        setup.identity = identity;
+    }
+    sealed(&mut sealer, &control)
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+    /// H8-01 and ADR-0114 section 6: within one receiver boot, across any
+    /// sequence of subscription replacements, removals and re-creations,
+    /// `party_epoch` rolls, file epoch rotations and seals in domains 4
+    /// and 6, no two seals share a key context and an envelope sequence,
+    /// so no (key, nonce) pair is ever used twice.
+    #[test]
+    fn no_sealer_repeats_a_key_and_nonce_within_a_boot(
+        steps in proptest::collection::vec(step(), 1..48)
+    ) {
+        // The receiver's own sealers: domains 4 and 6.
+        let seals: Vec<_> = run_steps(&steps)
+            .into_iter()
+            .filter(|record| record.context.domain.is_receiver())
+            .collect();
+        for (at, record) in seals.iter().enumerate() {
+            for other in &seals[..at] {
+                proptest::prop_assert!(
+                    !(other.context == record.context && other.seq == record.seq),
+                    "(key, nonce) reused: {:?} seq {}",
+                    record.context,
+                    record.seq
+                );
+            }
+        }
+    }
 }

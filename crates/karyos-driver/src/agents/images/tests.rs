@@ -9509,12 +9509,7 @@ fn a_refused_successor_keeps_the_driver_stopped() {
         "no fresh identity, and the old one is not used"
     );
     assert_eq!(
-        rig.agents
-            .sender
-            .role
-            .outbound_mut(0)
-            .unwrap()
-            .enc_party_epoch(),
+        rig.agents.sender.role.outbound_mut(0).unwrap().enc_epochs(),
         None,
         "no session sealer"
     );
@@ -11292,4 +11287,91 @@ fn an_invalid_tag_flood_on_an_encrypted_image_allocates_nothing() {
     assert_eq!(rig.agents.receiver.role.enc_epochs(slot), epochs);
     let second: Vec<Vec<u8>> = (4..8u8).map(|i| vec![i; 100]).collect();
     assert_eq!(enc_deliver(&mut rig, &mut subscriber, &second), second);
+}
+
+/// H8-04 (ADR-0114 sections 8 and 9): a correctly tagged domain 1 batch
+/// its bound image would refuse (here a term offset past the term) is
+/// refused inside the precommit check, so it marks no sequence: the
+/// genuine datagram sent at that sequence is then still accepted, not
+/// refused as a duplicate.
+#[test]
+fn a_tagged_batch_its_image_would_refuse_marks_no_sequence() {
+    use karyos_protocol::protection::aes_gcm_siv::{Domain, EncRejection};
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, b) = encrypted_rig();
+    crate::wire_enc::record_seals();
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let first: Vec<Vec<u8>> = (0..3u8).map(|i| vec![i; 100]).collect();
+    assert_eq!(enc_deliver(&mut rig, &mut subscriber, &first), first);
+    rig.sender_stopped = true;
+    let seals = crate::wire_enc::take_seals();
+    let last = seals
+        .iter()
+        .rfind(|record| record.context.domain == Domain::Sender && record.frames.len() > 32)
+        .unwrap()
+        .clone();
+    let next = seals
+        .iter()
+        .filter(|record| record.context == last.context)
+        .map(|record| record.seq)
+        .max()
+        .unwrap()
+        + 1;
+    let mut bad = last.clone();
+    bad.seq = next;
+    bad.frames[8..12].copy_from_slice(&0x7FFF_FFE0_i32.to_le_bytes());
+    let mut good = last;
+    good.seq = next;
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let refusals = |rig: &Rig| {
+        rig.agents
+            .receiver
+            .role
+            .enc_rejections(b, alias().stream_id)
+            .unwrap()
+    };
+    let before = refusals(&rig);
+    for record in [&bad, &good] {
+        let receiver = &mut rig.agents.receiver;
+        receiver
+            .role
+            .inject_datagram(&receiver.sessions, b, source, &replayed(record), rig.now);
+    }
+    let after = refusals(&rig);
+    assert_eq!(
+        after.get(EncRejection::InnerRejected),
+        before.get(EncRejection::InnerRejected) + 1,
+        "the malformed batch is refused before the mark: {after:?}"
+    );
+    assert_eq!(
+        after.get(EncRejection::Duplicate),
+        before.get(EncRejection::Duplicate),
+        "its sequence was not consumed: {after:?}"
+    );
+    assert_eq!(after.total(), before.total() + 1, "{after:?}");
+}
+
+/// H8-09 (ADR-0114 section 10 step 2): a VM generation change withdraws an
+/// encrypted image's domain 4 sealer through its shared object, so the
+/// clone a queued control holds is erased with it, before the role reports
+/// itself redrawn.
+#[test]
+fn a_vm_generation_change_erases_a_queued_domain_4_sealer() {
+    use crate::wire_enc::VmGenerationWatch;
+    use crate::wire_enc::vm_generation::InjectedSignal;
+
+    let (mut rig, _b) = encrypted_rig();
+    let slot = established(&mut rig);
+    let queued = rig.agents.receiver.role.enc_seal(slot).unwrap();
+    assert!(!queued.is_withdrawn());
+    let (signal, injector) = InjectedSignal::new();
+    rig.agents
+        .receiver
+        .role
+        .enc_watch(VmGenerationWatch::new(Box::new(signal)));
+    injector.change();
+    rig.until(true, |rig| rig.agents.receiver.role.enc_generation() == 1);
+    assert!(queued.is_withdrawn(), "the queued clone is erased");
 }

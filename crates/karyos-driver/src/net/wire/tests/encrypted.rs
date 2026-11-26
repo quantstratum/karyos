@@ -41,11 +41,18 @@ fn enc_files() -> Vec<(&'static str, String)> {
     ]
 }
 
+/// The configured `channel_id` of the encrypted channel.
+const CHANNEL_ID: u64 = 7;
+/// The configured `publisher_id` of its publishing driver.
+const PUBLISHER_ID: u64 = 5;
+
 fn enc(channel_key_id: u32, pairwise_key_id: u32) -> Security {
     Security::Encrypted(EncryptedChannel {
         channel_key_id,
         pairwise_key_id,
         receiver_id: RECEIVER,
+        channel_id: CHANNEL_ID,
+        publisher_id: PUBLISHER_ID,
     })
 }
 
@@ -501,6 +508,63 @@ fn an_encrypted_channel_with_no_inner_budget_is_refused_typed() {
             .add_network_publication(config, &udp(unicast(), encrypted()))
             .unwrap_err(),
         refused(AuthRefusal::Mtu)
+    );
+    nothing_created(&publisher);
+}
+
+/// H8-03 (wire-key-files.md 2.2): admission uses a channel file only for
+/// the configured `channel_id` (and, on the publisher too, its stream),
+/// and a pairwise file only for the configured `publisher_id`. Each
+/// mismatched field alone refuses admission, typed, on each role that
+/// checks it, and creates nothing.
+#[test]
+fn encrypted_admission_checks_every_scope_field_of_its_files() {
+    let channel_of = |channel_id: u64, stream_id: i32| {
+        enc_channel_key(stream_id).replace("channel_id=7", &format!("channel_id={channel_id}"))
+    };
+    let pairwise_of = |publisher_id: u64| {
+        enc_pairwise_key().replace("publisher_id=5", &format!("publisher_id={publisher_id}"))
+    };
+    let channel = udp(Destination::Unicast(ANY_PORT), encrypted());
+    for (channel_file, pairwise_file, refusal) in [
+        (
+            channel_of(CHANNEL_ID + 1, STREAM),
+            pairwise_of(PUBLISHER_ID),
+            AuthRefusal::ChannelKey,
+        ),
+        (
+            channel_of(CHANNEL_ID, STREAM),
+            pairwise_of(PUBLISHER_ID + 1),
+            AuthRefusal::PairwiseKey,
+        ),
+    ] {
+        let files = [
+            ("13-1.key", channel_file.as_str()),
+            ("19-1.key", pairwise_file.as_str()),
+        ];
+        let (mut publisher, _) = keyed(&files);
+        assert_eq!(
+            publish(&mut publisher, unicast(), encrypted()),
+            refused(refusal)
+        );
+        nothing_created(&publisher);
+        let (mut subscriber, _) = keyed(&files);
+        assert_eq!(
+            subscribe(&mut subscriber, &channel, RECEIVER),
+            refused(refusal)
+        );
+        nothing_created(&subscriber);
+    }
+    // The publication's own stream: a channel file of another stream.
+    let other = channel_of(CHANNEL_ID, STREAM + 1);
+    let pairwise = pairwise_of(PUBLISHER_ID);
+    let (mut publisher, _) = keyed(&[
+        ("13-1.key", other.as_str()),
+        ("19-1.key", pairwise.as_str()),
+    ]);
+    assert_eq!(
+        publish(&mut publisher, unicast(), encrypted()),
+        refused(AuthRefusal::ChannelKey)
     );
     nothing_created(&publisher);
 }

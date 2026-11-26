@@ -463,6 +463,9 @@ pub trait ControlSeal {
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize>;
     /// Withdraws and erases its key: it seals nothing again (H8 finding 4).
     fn withdraw(&mut self);
+    /// Moves to its next `party_epoch` now, as a budget would (tests).
+    #[cfg(test)]
+    fn roll_for_test(&mut self) {}
     /// Re-keys it to `file` after a routine file epoch rotation, under the
     /// same party. The default withdraws (fail closed): a sealer that
     /// cannot move to another file never keeps the old key.
@@ -601,6 +604,12 @@ impl SharedSealer {
 }
 
 impl SharedSealer {
+    /// Whether its key was withdrawn for every holder (tests).
+    #[cfg(test)]
+    pub(crate) fn is_withdrawn(&self) -> bool {
+        self.withdrawn.load(core::sync::atomic::Ordering::Acquire)
+    }
+
     /// Binds it to the current key `generation`: once that moves, it
     /// seals nothing (H8 finding 4).
     #[must_use]
@@ -639,6 +648,14 @@ impl ControlSeal for SharedSealer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .withdraw();
+    }
+
+    #[cfg(test)]
+    fn roll_for_test(&mut self) {
+        self.sealer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .roll_for_test();
     }
 
     /// Re-keys the shared key for every holder at once.

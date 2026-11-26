@@ -336,11 +336,13 @@ impl<T: StreamTerms> Outbound<T> {
         Ok(())
     }
 
-    /// The current `party_epoch` of the session's encrypted sealer, which
-    /// its ENC ANSWER states.
-    pub(crate) fn enc_party_epoch(&self) -> Option<u16> {
+    /// The key and party epochs the session's encrypted sealer holds, which
+    /// its ENC ANSWER states (H8-06).
+    pub(crate) fn enc_epochs(&self) -> Option<(u32, u16)> {
         match &self.auth {
-            SenderAuth::Encrypting(sealer) => Some(sealer.context().party_epoch),
+            SenderAuth::Encrypting(sealer) => {
+                Some((sealer.context().key_epoch, sealer.context().party_epoch))
+            }
             _ => None,
         }
     }

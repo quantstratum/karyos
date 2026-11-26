@@ -1334,3 +1334,142 @@ fn a_restored_publisher_with_a_new_driver_id_opens_no_old_datagram() {
         .is_err()
     );
 }
+
+/// H8-06 (wire-key-files.md 2.3): a sealer sends only under the epoch
+/// the key set signs with. A successor inside its early verify allowance
+/// (it verifies, the lineage names it, but its predecessor still signs)
+/// moves nothing; once it signs the sealer moves to it; and once no held
+/// file signs (signing expiry) the sealer is withdrawn although its file
+/// still verifies.
+#[test]
+fn a_sealer_sends_under_the_signing_epoch_only() {
+    use crate::wire_auth::SplitKeys;
+
+    let mut sealer = sender();
+    let _ = seal(&mut sealer, &frame(DATA));
+    let both = || vec![channel_file(1, 0x11), channel_file(2, 0x22)];
+    sealer.apply_keys(&SplitKeys {
+        signing: Some(channel_file(1, 0x11)),
+        verifying: both(),
+        current: Some(2),
+    });
+    assert_eq!(
+        sealer.context().key_epoch,
+        1,
+        "the successor only verifies yet"
+    );
+    assert_eq!(header(&seal(&mut sealer, &frame(DATA))).unwrap().seq, 1);
+    let mut keys = keys();
+    keys.admit(&SplitKeys {
+        signing: None,
+        verifying: both(),
+        current: Some(2),
+    });
+    keys.follow_signing(&SplitKeys {
+        signing: Some(channel_file(1, 0x11)),
+        verifying: both(),
+        current: Some(2),
+    });
+    assert_eq!((keys.current_epoch(), keys.signing_epoch()), (2, Some(1)));
+    sealer.apply_keys(&SplitKeys {
+        signing: Some(channel_file(2, 0x22)),
+        verifying: both(),
+        current: Some(2),
+    });
+    assert_eq!(sealer.context().key_epoch, 2, "it signs now");
+    sealer.apply_keys(&SplitKeys {
+        signing: None,
+        verifying: vec![channel_file(2, 0x22)],
+        current: Some(2),
+    });
+    assert!(sealer.is_withdrawn(), "signing expired");
+    let mut bytes = vec![0_u8; MAX_SEALED];
+    assert_eq!(sealer.seal(&mut bytes, 32), Err(EncSendError::Withdrawn));
+}
+
+/// H8-05: a pairwise-only rotation reaches the pairwise keys cached in an
+/// existing domain 4 sealer and opener: the sealer trails under the new
+/// epoch with its sequence continued, the opener verifies it with its
+/// window kept; removing the retired predecessor withdraws neither, and
+/// one key set that admits a successor and drops its predecessor at once
+/// keeps both serving.
+#[test]
+fn a_pairwise_only_rotation_reaches_existing_sealers_and_openers() {
+    use crate::wire_auth::FixedKeys;
+    use karyos_protocol::frame::FrameType;
+
+    let sm = frame(FrameType::Sm.code());
+    let mut sealer = EncSealer::new(
+        &keys(),
+        Some(&pairs(0x21)),
+        context(Domain::Receiver),
+        clock,
+    )
+    .unwrap();
+    let mut opener = EncOpener::new(
+        &keys(),
+        Some(&pairs(0x21)),
+        context(Domain::Receiver),
+        clock(),
+    )
+    .unwrap();
+    let mut channel = EncChannel::default();
+    let first = seal(&mut sealer, &sm);
+    open(&mut opener, &mut channel, &first).unwrap();
+    let apply = |sealer: &mut EncSealer, opener: &mut EncOpener, files: Vec<KeyFile>| {
+        let set = FixedKeys { files };
+        sealer.apply_keys(&set);
+        opener.apply_keys(&set);
+        assert!(!sealer.is_withdrawn() && !opener.is_withdrawn());
+    };
+    apply(
+        &mut sealer,
+        &mut opener,
+        vec![
+            channel_file(1, 0x11),
+            pairwise_file(66, 1, 0x21),
+            pairwise_file(66, 2, 0x42),
+        ],
+    );
+    assert_eq!(
+        sealer.key().pairwise_epochs()[0],
+        Some(2),
+        "the new epoch trails"
+    );
+    let second = seal(&mut sealer, &sm);
+    assert_eq!(header(&second).unwrap().seq, 1, "the sequence continues");
+    open(&mut opener, &mut channel, &second).unwrap();
+    apply(
+        &mut sealer,
+        &mut opener,
+        vec![channel_file(1, 0x11), pairwise_file(66, 2, 0x42)],
+    );
+    assert_eq!(
+        open(&mut opener, &mut channel, &second),
+        Err(EncRejection::Duplicate)
+    );
+    let third = seal(&mut sealer, &sm);
+    open(&mut opener, &mut channel, &third).unwrap();
+    apply(
+        &mut sealer,
+        &mut opener,
+        vec![channel_file(1, 0x11), pairwise_file(66, 3, 0x63)],
+    );
+    assert_eq!(sealer.key().pairwise_epochs(), [Some(3), None]);
+    let fourth = seal(&mut sealer, &sm);
+    assert_eq!(header(&fourth).unwrap().seq, 3);
+    open(&mut opener, &mut channel, &fourth).unwrap();
+    // A datagram trailed under the removed epoch no longer verifies.
+    let mut old = EncSealer::new(
+        &keys(),
+        Some(&pairs(0x21)),
+        context(Domain::Receiver),
+        clock,
+    )
+    .unwrap();
+    old.key().set_next_seq(9);
+    assert_eq!(
+        open(&mut opener, &mut channel, &seal(&mut old, &sm)),
+        Err(EncRejection::Pairwise)
+    );
+}

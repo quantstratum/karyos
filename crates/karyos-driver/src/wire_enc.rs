@@ -340,6 +340,11 @@ fn erase(key: &mut AesGcmSiv, erase: KeyContext) {
 #[derive(Debug, Clone)]
 pub struct ChannelKeys {
     files: [Option<Secret>; CHANNEL_FILES],
+    /// The held epoch the key set signs and sends with (wire-key-files.md
+    /// 2.3, H8-06): every new sealer takes it, never the highest epoch that
+    /// only verifies early. `None` once no held file signs: nothing new is
+    /// sealed.
+    signing: Option<u32>,
 }
 
 impl ChannelKeys {
@@ -364,7 +369,57 @@ impl ChannelKeys {
         {
             return Err(EncKeyError::Files);
         }
-        Ok(Self { files: slots })
+        let mut keys = Self {
+            files: slots,
+            signing: None,
+        };
+        // Until a key set names its signing file, the highest held signs:
+        // admission sets the one the view signs with
+        // ([`ChannelKeys::set_signing`]), and every key set applied
+        // follows it ([`ChannelKeys::follow_signing`]).
+        keys.signing = Some(keys.current_epoch());
+        Ok(keys)
+    }
+
+    /// The epoch every new sealer takes (H8-06); `None` once no held file
+    /// signs.
+    #[must_use]
+    pub fn signing_epoch(&self) -> Option<u32> {
+        self.signing
+    }
+
+    /// Makes `epoch` the signing epoch; `false`, with nothing changed,
+    /// when it is not held.
+    pub fn set_signing(&mut self, epoch: u32) -> bool {
+        if self.ikm(epoch).is_none() {
+            return false;
+        }
+        self.signing = Some(epoch);
+        true
+    }
+
+    /// Takes the signing epoch from `keys`, the file it signs with for this
+    /// `key_id` (its signing window, not its verify window; H8-06), or
+    /// none when that file is not held or no file signs.
+    pub fn follow_signing(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        self.signing = self
+            .key_id()
+            .and_then(|key_id| keys.signing(key_id))
+            .map(|file| file.file_epoch)
+            .filter(|epoch| self.ikm(*epoch).is_some());
+    }
+
+    /// The lowest held epoch: every file epoch below it no longer verifies
+    /// (H8-07).
+    #[must_use]
+    pub fn oldest_epoch(&self) -> Option<u32> {
+        self.files.iter().flatten().map(|file| file.epoch).min()
+    }
+
+    /// Drops every file and the signing epoch (a withdrawal).
+    fn clear(&mut self) {
+        self.files = [None, None];
+        self.signing = None;
     }
 
     /// The current `key_epoch`: the highest file epoch held. Only it
@@ -392,6 +447,9 @@ impl ChannelKeys {
                 dropped = true;
             }
         }
+        if self.signing.is_some_and(|epoch| self.ikm(epoch).is_none()) {
+            self.signing = None;
+        }
         dropped
     }
 
@@ -405,7 +463,7 @@ impl ChannelKeys {
     }
 
     /// The `key_id` of its files; `None` once every file is gone.
-    fn key_id(&self) -> Option<u32> {
+    pub(crate) fn key_id(&self) -> Option<u32> {
         self.files.iter().flatten().map(|file| file.key_id).next()
     }
 
@@ -700,6 +758,29 @@ fn derive_into(
     }
 }
 
+/// Replaces the pairwise keys of a receiver domain `key` with those
+/// `files` now hold for its receiver and publication, the highest epoch
+/// sealing (H8-05): a pairwise-only rotation, or the removal of a retired
+/// pairwise file, reaches the key without touching its AEAD key, sequence
+/// or replay window. A key of domain 1 or 5 is left as it is.
+///
+/// # Errors
+///
+/// [`EncKeyError::Receiver`] when no file names its receiver any more.
+fn refresh_pairwise(key: &mut AesGcmSiv, files: Option<&PairwiseFiles>) -> Result<(), EncKeyError> {
+    let context = *key.context();
+    let Some(receiver) = context.receiver.filter(|_| context.domain.is_receiver()) else {
+        return Ok(());
+    };
+    let files = files.ok_or(EncKeyError::Receiver)?;
+    let ([first, second], _) = files.keys(&receiver, &context.publication)?;
+    match (first, second) {
+        (Some(a), Some(b)) => Ok(key.set_pairwise(&[a, b])?),
+        (Some(a), None) => Ok(key.set_pairwise(&[a])?),
+        _ => Err(EncKeyError::Receiver),
+    }
+}
+
 /// The selector fields of an envelope header: untrusted until its tag
 /// verifies (section 2). They select a key to try and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -965,7 +1046,7 @@ impl EncSealer {
     /// roll or re-key is refused with [`EncSendError::Withdrawn`].
     pub fn withdraw(&mut self) {
         self.withdrawn = true;
-        self.keys.files = [None, None];
+        self.keys.clear();
         self.pairwise = None;
         erase(&mut self.key, self.erase);
     }
@@ -977,33 +1058,42 @@ impl EncSealer {
     }
 
     /// Applies the key store's current key set (H8 finding 4): files no
-    /// longer named are erased, and once its own key epoch, or any of its
-    /// pairwise files, is revoked or expired it is withdrawn (fail
-    /// closed).
+    /// longer named are erased; once its own key epoch is revoked or
+    /// expired, or no held file signs any more (signing expiry, H8-06), or
+    /// no pairwise file of its receiver is left, it is withdrawn (fail
+    /// closed). Its pairwise keys follow the files held, so a pairwise-only
+    /// rotation reaches it with its sequence kept (H8-05).
     pub fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
         if self.withdrawn {
             return;
         }
         // Only its own key matters: the channel file of its key epoch and,
-        // in a receiver domain, the pairwise file that seals (the highest
-        // epoch of its receiver). An unrelated file dropped leaves it, and
-        // its sequence, as it is: a rebuilt sealer would reuse nonces.
+        // in a receiver domain, the pairwise files of its receiver. An
+        // unrelated file dropped leaves it, and its sequence, as it is: a
+        // rebuilt sealer would reuse nonces. A successor is admitted before
+        // its predecessor goes, so one key set that does both keeps the
+        // pairwise side served (H8-05).
         let epoch = self.key.context().key_epoch;
-        let sealing = self.key.context().receiver.and_then(|receiver| {
-            let [highest, _] = self.pairwise.as_ref()?.epochs_of(receiver.receiver_id);
-            highest.map(|epoch| (receiver.receiver_id, epoch))
-        });
+        self.keys.admit(keys);
+        if let Some(pairwise) = self.pairwise.as_mut() {
+            pairwise.admit(keys);
+        }
         self.keys.retain(keys);
         if let Some(pairwise) = self.pairwise.as_mut() {
             pairwise.retain(keys);
         }
-        let pairwise_lost = sealing.is_some_and(|(receiver_id, epoch)| {
-            !self
-                .pairwise
-                .as_ref()
-                .is_some_and(|pairwise| pairwise.epochs_of(receiver_id).contains(&Some(epoch)))
-        });
-        if pairwise_lost || self.keys.ikm(epoch).is_none() {
+        self.keys.follow_signing(keys);
+        // Sending is the signing window's only (H8-06): no file signing, or
+        // a signing epoch below its own, and it seals nothing again.
+        let Some(signing) = self
+            .keys
+            .signing_epoch()
+            .filter(|signing| *signing >= epoch && self.keys.ikm(epoch).is_some())
+        else {
+            self.withdraw();
+            return;
+        };
+        if refresh_pairwise(&mut self.key, self.pairwise.as_ref()).is_err() {
             self.withdraw();
             return;
         }
@@ -1011,16 +1101,7 @@ impl EncSealer {
         // set signs with becomes the sealer's key epoch at the next
         // datagram, `party_epoch` 0, under a key whose context names the
         // new epoch, so its sequence restarting at 0 reuses no nonce.
-        self.keys.admit(keys);
-        if let Some(pairwise) = self.pairwise.as_mut() {
-            pairwise.admit(keys);
-        }
-        let signing = self
-            .keys
-            .key_id()
-            .and_then(|key_id| keys.current_epoch(key_id))
-            .filter(|signing| *signing > epoch && self.keys.ikm(*signing).is_some());
-        if let Some(signing) = signing {
+        if signing > epoch {
             let mut next = *self.key.context();
             next.key_epoch = signing;
             next.party_epoch = 0;
@@ -1348,7 +1429,7 @@ impl EncOpener {
     /// [`EncRejection::ResyncRefused`].
     pub fn withdraw(&mut self) {
         self.withdrawn = true;
-        self.keys.files = [None, None];
+        self.keys.clear();
         self.pairwise = None;
         self.previous = None;
         self.spare = None;
@@ -1364,35 +1445,35 @@ impl EncOpener {
 
     /// Applies the key store's current key set (H8 finding 4): files no
     /// longer named are erased; a previous epoch whose file is gone is
-    /// dropped; once its current key epoch, or any of its pairwise files,
-    /// is revoked or expired it is withdrawn (fail closed).
+    /// dropped; once its current key epoch is revoked or expired, or no
+    /// pairwise file of its receiver is left, it is withdrawn (fail
+    /// closed). Its committed keys verify the pairwise trailers of exactly
+    /// the files held: a pairwise-only rotation is admitted and a removed
+    /// pairwise file stops verifying, with every AEAD key, sequence and
+    /// replay window kept (H8-05).
     pub fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
         if self.withdrawn {
             return;
         }
-        // Every pairwise file of its receiver verifies a trailer, so losing
-        // any of them withdraws it; another receiver's file does not.
-        let receiver = self.current.key.context().receiver;
-        let held = receiver.and_then(|receiver| {
-            Some((
-                receiver.receiver_id,
-                self.pairwise.as_ref()?.epochs_of(receiver.receiver_id),
-            ))
-        });
+        // Successors first, so one key set that admits a successor and
+        // drops its predecessor keeps the receiver served.
+        self.keys.admit(keys);
+        if let Some(pairwise) = self.pairwise.as_mut() {
+            pairwise.admit(keys);
+        }
         self.keys.retain(keys);
         if let Some(pairwise) = self.pairwise.as_mut() {
             pairwise.retain(keys);
         }
-        let pairwise_lost = held.is_some_and(|(receiver_id, held)| {
-            let now = self
-                .pairwise
-                .as_ref()
-                .map_or([None, None], |pairwise| pairwise.epochs_of(receiver_id));
-            held.iter()
-                .flatten()
-                .any(|epoch| !now.contains(&Some(*epoch)))
-        });
-        if pairwise_lost || self.keys.ikm(self.epochs().0).is_none() {
+        if self.keys.ikm(self.epochs().0).is_none()
+            || refresh_pairwise(&mut self.current.key, self.pairwise.as_ref()).is_err()
+        {
+            self.withdraw();
+            return;
+        }
+        if let Some((slot, _)) = self.previous.as_mut()
+            && refresh_pairwise(&mut slot.key, self.pairwise.as_ref()).is_err()
+        {
             self.withdraw();
             return;
         }
@@ -1412,10 +1493,6 @@ impl EncOpener {
         // Rotation (section 6): a newly admitted file epoch is the next
         // epoch at `party_epoch` 0; the first datagram fully accepted under
         // it promotes, and the current one stays for the 10 s overlap.
-        self.keys.admit(keys);
-        if let Some(pairwise) = self.pairwise.as_mut() {
-            pairwise.admit(keys);
-        }
     }
 
     /// The current epoch pair.
