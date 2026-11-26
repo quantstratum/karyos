@@ -422,3 +422,98 @@ mod tests {
         assert!(!MembershipEntry::is_one(b"command"));
     }
 }
+
+/// Golden vectors P-1 to P-11 of design/cluster-service-container.md §4.1,
+/// derived from the documents alone (ADR-0087, ADR-0121, #712).
+#[cfg(test)]
+mod golden {
+    use super::*;
+
+    /// A schema 5 template 2 message: the envelope, then the two counts and
+    /// seven ids, little endian.
+    fn message(version: u16, block_length: u16, voters: u8, learners: u8, ids: [u64; MAX_MEMBERS]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(70);
+        for half in [5u16, 2, version, block_length] {
+            bytes.extend_from_slice(&half.to_le_bytes());
+        }
+        bytes.extend_from_slice(&70u32.to_le_bytes());
+        bytes.extend_from_slice(&[voters, learners]);
+        for id in ids {
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn hex(text: &str) -> Vec<u8> {
+        text.split_whitespace()
+            .map(|pair| u8::from_str_radix(pair, 16).unwrap_or_default())
+            .collect()
+    }
+
+    const P1: &str = "05 00 02 00 02 00 3a 00 46 00 00 00 03 00 01 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
+    const P2: &str = "05 00 02 00 02 00 3a 00 46 00 00 00 03 01 01 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00 04 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
+
+    #[test]
+    fn the_golden_memberships_encode_to_their_bytes_and_back() {
+        let p1 = MembershipEntry(Membership::new(&[1, 2, 3], &[]).expect("P-1"));
+        let p2 = MembershipEntry(Membership::new(&[1, 2, 3], &[4]).expect("P-2"));
+        assert_eq!(p1.to_vec(), hex(P1), "P-1");
+        assert_eq!(p2.to_vec(), hex(P2), "P-2");
+        assert_eq!(message(2, 58, 3, 0, [1, 2, 3, 0, 0, 0, 0]), hex(P1));
+        assert_eq!(MembershipEntry::decode(&hex(P1)), Ok(p1));
+        assert_eq!(MembershipEntry::decode(&hex(P2)), Ok(p2));
+    }
+
+    #[test]
+    fn the_golden_refusals_refuse_with_their_errors() {
+        let out_of_range = Err(CodecError::ValueOutOfRange { field: "membership" });
+        let cases: [(&str, Vec<u8>); 7] = [
+            ("P-3", message(2, 58, 0, 0, [0; MAX_MEMBERS])),
+            ("P-4", message(2, 58, 6, 0, [1, 2, 3, 4, 5, 6, 0])),
+            ("P-5", message(2, 58, 3, 3, [1, 2, 3, 4, 5, 6, 0])),
+            ("P-6", message(2, 58, 3, 0, [1, 0, 3, 0, 0, 0, 0])),
+            ("P-7", message(2, 58, 3, 0, [1, 3, 3, 0, 0, 0, 0])),
+            ("P-8", message(2, 58, 3, 0, [1, 3, 2, 0, 0, 0, 0])),
+            ("P-9", message(2, 58, 3, 0, [1, 2, 3, 9, 0, 0, 0])),
+        ];
+        for (name, bytes) in cases {
+            assert_eq!(MembershipEntry::decode(&bytes), out_of_range, "{name}");
+        }
+        let p10 = message(2, 57, 3, 0, [1, 2, 3, 0, 0, 0, 0]);
+        assert_eq!(
+            MembershipEntry::decode(&p10),
+            Err(CodecError::UnsupportedSchema { schema: 5, template: 2, version: 2 }),
+            "P-10"
+        );
+        let full = hex(P1);
+        let p11 = full.get(..69).unwrap_or_default();
+        assert_eq!(
+            MembershipEntry::decode(p11),
+            Err(CodecError::MessageLength { declared: 70, actual: 69 }),
+            "P-11"
+        );
+    }
+
+    #[test]
+    fn the_pinned_readings_hold() {
+        // Version 1 decodes the same membership (ADR-0121 decision 7).
+        assert_eq!(
+            MembershipEntry::decode(&message(1, 58, 3, 0, [1, 2, 3, 0, 0, 0, 0])),
+            MembershipEntry::decode(&hex(P1))
+        );
+        // One voter decodes; the 3-voter floor is the core's, not the codec's.
+        assert!(MembershipEntry::decode(&message(2, 58, 1, 0, [7, 0, 0, 0, 0, 0, 0])).is_ok());
+        // Learners need not sort after voters.
+        assert!(MembershipEntry::decode(&message(2, 58, 3, 1, [5, 6, 7, 1, 0, 0, 0])).is_ok());
+        // A voter also named as a learner is refused.
+        assert_eq!(
+            MembershipEntry::decode(&message(2, 58, 3, 1, [1, 2, 3, 3, 0, 0, 0])),
+            Err(CodecError::ValueOutOfRange { field: "membership" })
+        );
+        // An unused slot after the learners must be zero.
+        assert_eq!(
+            MembershipEntry::decode(&message(2, 58, 3, 1, [1, 2, 3, 4, 9, 0, 0])),
+            Err(CodecError::ValueOutOfRange { field: "membership" })
+        );
+    }
+}
