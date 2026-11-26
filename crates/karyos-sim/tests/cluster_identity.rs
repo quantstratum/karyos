@@ -26,7 +26,7 @@ use karyos_cluster::cluster_identity::{ClusterId, IdentityRecord};
 use karyos_sim::cluster::{ClusterSim, Node, Outbox};
 use karyos_sim::disk::{SimDisk, Survives};
 use karyos_sim::harness::node::{
-    ClientNode, HARNESS_CLUSTER, Member, Observation, Op, Recorder, Ret, ServerNode, Shared, Wire,
+    ClientNode, HARNESS_CLUSTER, HARNESS_STANDBY, Member, Observation, Op, Recorder, Ret, ServerNode, Shared, Wire,
 };
 use karyos_sim::harness::reference::{LEADER, Message as Msg, Reference as Fixed};
 use karyos_sim::harness::standby::Fencing;
@@ -224,4 +224,43 @@ fn an_isolated_rebuild_replies_to_nobody_and_refuses_promotion() {
         observed(&recorder, |o| matches!(o, Observation::Promoted { .. })),
         0
     );
+}
+
+/// Codex review of karyos#1283: a client that moved to the promoted
+/// standby keeps naming the standby's identity after a delayed answer of
+/// the old primary, which it refuses as stale.
+#[test]
+fn a_stale_answer_does_not_move_the_client_back_to_the_primary() {
+    let recorder: Shared = Rc::new(RefCell::new(Recorder::default()));
+    let mut client = ClientNode::new(9, 5, appends(2), Rc::clone(&recorder));
+    let mut out: Outbox<Wire<Msg>> = Outbox::new();
+    let answer = |cluster, sequence: u64, generation| Wire::<Msg>::Response {
+        cluster,
+        sequence,
+        bytes: Ret::Appended(sequence).canonical(),
+        index: sequence,
+        generation,
+    };
+    client.tick(0, &mut out);
+    client.deliver(5, answer(HARNESS_STANDBY, 1, 2), 1, &mut out);
+    out.clear();
+    client.tick(2, &mut out);
+    client.deliver(0, answer(HARNESS_CLUSTER, 2, 1), 3, &mut out);
+    out.clear();
+    // The open request, resent after its retry interval, still names the
+    // standby.
+    client.tick(1_000_000, &mut out);
+    let named: Vec<_> = out
+        .iter()
+        .filter_map(|(_, wire)| match wire {
+            Wire::Request(cluster, _) => Some(*cluster),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(named, vec![HARNESS_STANDBY]);
+    assert!(recorder
+        .borrow()
+        .observations
+        .iter()
+        .any(|o| matches!(o, Observation::StaleGeneration { client: 9, generation: 1 })));
 }

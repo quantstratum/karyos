@@ -628,3 +628,44 @@ fn failover_to_the_standby_follows_one_generation_mark() {
     assert_eq!(client.generation(), 2);
     assert_eq!(client.leader(), Some(NEW));
 }
+
+/// Codex review of karyos#1283: after a failover to the standby, a delayed
+/// registration of the old primary's generation is stale: it changes neither
+/// the session nor the identity requests name.
+#[test]
+fn a_stale_registration_changes_nothing() {
+    let accepted = Accepted {
+        primary: LIVE,
+        standby: Some(STANDBY),
+    };
+    let mut table = SessionTable::new(config(4)).unwrap();
+    let session = table.register(9, 1, 0).unwrap();
+    let mut client = ClusterClient::new(9, Some(OLD), accepted);
+    assert!(events(|sink| client.registered(session, live(1), sink).unwrap()).is_empty());
+    let promoted = Stamp {
+        cluster: STANDBY,
+        generation: 2,
+    };
+    let standby = SessionTable::new(config(4)).unwrap().register(9, 3, 0).unwrap();
+    let _ = events(|sink| client.leader_changed(Some(NEW), promoted, sink));
+    assert!(events(|sink| client.registered(standby, promoted, sink).unwrap()).is_empty());
+    let late = SessionTable::new(config(4)).unwrap().register(9, 7, 0).unwrap();
+    let seen = events(|sink| {
+        assert_eq!(
+            client.registered(late, live(1), sink),
+            Err(RegisterError::StaleGeneration {
+                generation: 1,
+                highest: 2
+            })
+        );
+    });
+    assert_eq!(
+        seen,
+        vec![Event::StaleGeneration {
+            generation: 1,
+            highest: 2
+        }]
+    );
+    let sent = client.submit().unwrap();
+    assert_eq!((sent.cluster, sent.key.epoch), (STANDBY, 3));
+}

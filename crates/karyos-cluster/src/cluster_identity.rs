@@ -418,4 +418,18 @@ mod tests {
         assert_eq!(first, rebuild_identity(source, 40, 3, [1; 32]));
         assert_ne!(first, rebuild_identity(source, 41, 3, [1; 32]));
     }
+
+    /// The derivation's vector (ADR-0123 decision 2): SHA-256 over the
+    /// 25-byte domain, the source, the index and term little endian, and
+    /// the nonce, 105 bytes in all; computed independently.
+    #[test]
+    fn the_rebuild_identity_matches_its_vector() {
+        let identity = rebuild_identity(ClusterId([7; 32]), 290, 3, [1; 32]);
+        let expected: [u8; 32] = [
+            0x7f, 0x50, 0x72, 0x3a, 0x28, 0xe7, 0x57, 0x59, 0xe8, 0x85, 0x39, 0x82, 0x56, 0xc5,
+            0x1d, 0xc5, 0x9c, 0xb0, 0x7f, 0x87, 0x7f, 0x32, 0x55, 0x18, 0xf9, 0x33, 0xea, 0x85,
+            0xbe, 0x65, 0x50, 0xef,
+        ];
+        assert_eq!(identity, ClusterId(expected));
+    }
 }

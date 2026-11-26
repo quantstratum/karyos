@@ -231,10 +231,39 @@ fn report(command: &str, report: &Report) -> String {
     if command == "export" {
         let _ = writeln!(out, "retention={:?}", report.retention);
     }
+    if let (Some(identity), Some(nonce)) = (report.identity, report.nonce) {
+        let source = identity.isolated_from.map_or([0; 32], |source| source.0);
+        let _ = writeln!(
+            out,
+            "identity={} isolated_from={} nonce={}",
+            hex(&identity.identity.0),
+            hex(&source),
+            hex(&nonce)
+        );
+    }
     for item in report.not_included {
         let _ = writeln!(out, "not included: {item}");
     }
     out
+}
+
+/// `bytes` as lowercase hex.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
+}
+
+/// A rebuild identity's nonce: 32 bytes from the operating system's
+/// random source (ADR-0123 decision 2), fresh for every rebuild.
+fn nonce() -> Result<[u8; 32], String> {
+    use std::io::Read;
+    let mut nonce = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut random| random.read_exact(&mut nonce))
+        .map_err(|error| format!("reading the rebuild nonce from /dev/urandom: {error}"))?;
+    Ok(nonce)
 }
 
 /// Runs `karyos-backup <args>`: what to print, or the error.
@@ -278,6 +307,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
                         log: &log,
                         snapshots: &snapshots,
                         geometry,
+                        nonce: nonce()?,
                     },
                 )
                 .map_err(|error| error.to_string())?;

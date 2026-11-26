@@ -4110,19 +4110,23 @@ impl<M> Node<Wire<M>> for ClientNode {
         | Wire::Refused { cluster, .. }
         | Wire::Busy { cluster, .. }
         | Wire::Redirect { cluster, .. } = &message
+            && !self.accepted.accepts(*cluster)
         {
-            if !self.accepted.accepts(*cluster) {
-                self.recorder
-                    .borrow_mut()
-                    .observations
-                    .push(Observation::ForeignCluster {
-                        client: self.id,
-                        cluster: *cluster,
-                    });
-                return;
-            }
-            self.to_standby = *cluster != self.accepted.primary;
+            self.recorder
+                .borrow_mut()
+                .observations
+                .push(Observation::ForeignCluster {
+                    client: self.id,
+                    cluster: *cluster,
+                });
+            return;
         }
+        let standby = match &message {
+            Wire::Response { cluster, .. } | Wire::Redirect { cluster, .. } => {
+                Some(*cluster != self.accepted.primary)
+            }
+            _ => None,
+        };
         match message {
             Wire::Response { generation, .. } if generation < self.generation => {
                 self.recorder
@@ -4140,6 +4144,8 @@ impl<M> Node<Wire<M>> for ClientNode {
                 index,
                 generation,
             } if open == Some(sequence) => {
+                // Accepted: later requests name this answer's cluster.
+                self.to_standby = standby.unwrap_or(self.to_standby);
                 // Bytes that do not decode are no answer: the retry asks
                 // again.
                 let Some(ret) = Ret::decode(&bytes) else {
@@ -4179,6 +4185,7 @@ impl<M> Node<Wire<M>> for ClientNode {
             Wire::Refused { sequence, .. } if open == Some(sequence) => self.refused = true,
             Wire::Redirect { server, .. } => {
                 self.server = server;
+                self.to_standby = standby.unwrap_or(self.to_standby);
                 // An open request goes to the new server at once.
                 self.refused = self.open.is_some();
             }

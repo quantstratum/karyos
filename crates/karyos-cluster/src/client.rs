@@ -269,6 +269,15 @@ pub enum SubmitError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RegisterError {
+    /// The registration's generation is below the highest seen: nothing
+    /// changed.
+    #[error("generation {generation} is below the highest seen, {highest}")]
+    StaleGeneration {
+        /// Its generation.
+        generation: u64,
+        /// The highest seen.
+        highest: u64,
+    },
     /// The registration came from a cluster identity the client does not
     /// accept: no session opened.
     #[error("the registration came from a cluster the client does not accept")]
@@ -361,6 +370,19 @@ impl ClusterClient {
             });
         }
         let generation = from.generation;
+        // A registration of a generation below the highest seen is stale,
+        // like any answer: it changes neither the session nor the identity
+        // requests are sent to.
+        if generation < self.generation {
+            sink(Event::StaleGeneration {
+                generation,
+                highest: self.generation,
+            });
+            return Err(RegisterError::StaleGeneration {
+                generation,
+                highest: self.generation,
+            });
+        }
         if let Some(held) = self.session {
             if registered.epoch < held.epoch {
                 return Err(RegisterError::Stale {

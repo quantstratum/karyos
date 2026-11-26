@@ -212,6 +212,7 @@ fn a_rebuild_matches_its_source_up_to_the_reported_top() {
     assert_ne!(identity.identity, ClusterId(CLUSTER));
     assert_eq!(report.identity, Some(identity));
     assert_eq!(exported.identity, None);
+    assert_eq!((report.nonce, exported.nonce), (Some([7; 32]), None));
     assert_eq!(
         IdentityRecord::load(&mut StdDisk, &log_dir).unwrap(),
         Some(identity)
@@ -633,4 +634,37 @@ fn a_section_the_service_check_refuses_is_refused_before_anything_is_written() {
         )
         .is_ok()
     );
+}
+
+/// Codex review of karyos#1283: an export under the all-zero identity,
+/// which no identity record can name as a source, is refused before the
+/// rebuild writes anything.
+#[test]
+fn a_rebuild_of_the_zero_identity_is_refused_unwritten() {
+    let source_dir = TempDir::new("zero-source");
+    let (mut log, snapshots) = source(&source_dir.0);
+    let mut bucket = Bucket::default();
+    let _ = backup::export(
+        &snapshots,
+        &mut log,
+        &mut bucket,
+        [0; 32],
+        Retention::until(u64::MAX),
+    )
+    .unwrap();
+    let dir = TempDir::new("zero-rebuilt");
+    let (log_dir, snap_dir) = target(&dir.0);
+    let refused = backup::rebuild(
+        &mut bucket,
+        [0; 32],
+        &Target {
+            disk: &StdDisk,
+            log: &log_dir,
+            snapshots: &snap_dir,
+            geometry: geometry(),
+            nonce: [7; 32],
+        },
+    );
+    assert!(matches!(refused, Err(BackupError::ZeroIdentity)), "{refused:?}");
+    assert!(files(&dir.0).is_empty(), "a refused rebuild wrote");
 }

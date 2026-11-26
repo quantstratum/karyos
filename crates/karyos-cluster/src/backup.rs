@@ -192,12 +192,21 @@ pub struct Report {
     pub retention: Enforcement,
     /// A rebuild's: the identity record it wrote. An export's: none.
     pub identity: Option<IdentityRecord>,
+    /// A rebuild's: the nonce its identity was derived with, so an auditor
+    /// recomputes the identity from the source, the top and it (ADR-0123
+    /// decision 2). An export's: none.
+    pub nonce: Option<[u8; 32]>,
 }
 
 /// Why an export or a rebuild did not complete.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BackupError {
+    /// The export's cluster identity is all zero, which no identity record
+    /// names as a source (ADR-0123 decision 1): refused before anything is
+    /// written.
+    #[error("the export's cluster identity is all zero: no rebuild can name it as its source")]
+    ZeroIdentity,
     /// The rebuild's identity record could not be written.
     #[error("the rebuild's cluster identity: {0}")]
     Identity(IdentityError),
@@ -476,6 +485,7 @@ pub fn export<D: Disk + Clone, E: Disk + Clone>(
         not_included: NOT_INCLUDED,
         retention: enforced,
         identity: None,
+        nonce: None,
     })
 }
 
@@ -813,6 +823,9 @@ pub fn rebuild_with<D: Disk + Clone>(
     target: &Target<'_, D>,
     check: &mut SectionCheck<'_>,
 ) -> Result<Report, BackupError> {
+    if cluster == [0; 32] {
+        return Err(BackupError::ZeroIdentity);
+    }
     for dir in [target.log, target.snapshots] {
         let names = target
             .disk
@@ -879,6 +892,7 @@ pub fn rebuild_with<D: Disk + Clone>(
         .map_err(BackupError::Identity)?;
     Ok(Report {
         identity: Some(identity),
+        nonce: Some(target.nonce),
         base: manifest.base,
         top: manifest.top,
         entries,
