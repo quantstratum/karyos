@@ -23,6 +23,7 @@
 #[cfg(feature = "backup")]
 pub mod backup;
 pub mod client;
+pub mod cluster_identity;
 pub mod consensus;
 pub mod dedup;
 mod file;
@@ -31,6 +32,7 @@ pub mod hard_state;
 pub mod log;
 pub mod mark;
 pub mod membership;
+pub mod peer_frame;
 pub mod service;
 pub mod snapshot;
 pub mod standby;

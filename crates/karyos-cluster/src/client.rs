@@ -45,6 +45,17 @@
 //!   or by [`ClusterClient::leader_changed`]; an answer or an announcement
 //!   of a lower one is refused ([`Event::StaleGeneration`]) and changes
 //!   nothing.
+//! - **Cluster identity.** The client is built with the identities it
+//!   accepts ([`Accepted`]): the live cluster's and, when one exists, its
+//!   standby's (quantstratum-docs: karyos/adr/0123-cluster-identity.md,
+//!   decisions 4 and 6). Every registration, answer and announcement
+//!   arrives with its server's identity and generation ([`Stamp`]); one
+//!   of another identity is refused ([`Event::ForeignCluster`]) before
+//!   anything else and changes nothing, whatever generation it claims. The
+//!   generation high-water mark is one across the accepted set, so after a
+//!   promoted standby's higher generation the old primary is refused as
+//!   stale. Every request it sends names the identity it is for
+//!   ([`Send::cluster`]), which a server checks before journalling it.
 //! - **Expiry.** A session the cluster no longer holds reaches the caller
 //!   as [`Event::Expired`], never as a retry: every request still
 //!   outstanding is unknown, and the client registers again.
@@ -52,6 +63,7 @@
 //!   the window at registration; nothing after that allocates (the
 //!   Cluster's hard gate): events go to a caller's sink, not into a vector.
 
+use crate::cluster_identity::ClusterId;
 use crate::dedup::{DedupConfig, Registered, Request};
 
 /// What names one send of a request: its session's epoch, its sequence,
@@ -72,10 +84,51 @@ pub struct Key {
 pub struct Send {
     /// The server.
     pub to: u64,
+    /// The cluster the request is for: the server refuses it, unjournalled,
+    /// under any other identity (ADR-0123 decision 4).
+    pub cluster: ClusterId,
     /// The request.
     pub request: Request,
     /// Its key.
     pub key: Key,
+}
+
+/// The identity and generation of the server a registration, answer or
+/// announcement came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamp {
+    /// The server's cluster identity.
+    pub cluster: ClusterId,
+    /// The server's cluster generation.
+    pub generation: u64,
+}
+
+/// The cluster identities a client accepts, configured before it
+/// registers and never learnt from the wire (ADR-0123 decision 4): the
+/// live cluster's and, when it has one, its standby's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Accepted {
+    /// The live cluster.
+    pub primary: ClusterId,
+    /// Its standby, if any.
+    pub standby: Option<ClusterId>,
+}
+
+impl Accepted {
+    /// Only `primary`.
+    #[must_use]
+    pub const fn only(primary: ClusterId) -> Self {
+        Self {
+            primary,
+            standby: None,
+        }
+    }
+
+    /// Whether `cluster` is accepted.
+    #[must_use]
+    pub fn accepts(&self, cluster: ClusterId) -> bool {
+        cluster == self.primary || self.standby == Some(cluster)
+    }
 }
 
 /// What the cluster answered a request with.
@@ -156,6 +209,12 @@ pub enum Event {
         /// The highest seen.
         highest: u64,
     },
+    /// A registration, answer or announcement from a cluster identity the
+    /// client does not accept: refused, nothing changed (ADR-0123).
+    ForeignCluster {
+        /// The identity it came from.
+        received: ClusterId,
+    },
     /// The cluster refused `sequence` for a full window: not applied; the
     /// caller retries it later.
     Busy {
@@ -210,6 +269,13 @@ pub enum SubmitError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RegisterError {
+    /// The registration came from a cluster identity the client does not
+    /// accept: no session opened.
+    #[error("the registration came from a cluster the client does not accept")]
+    ForeignCluster {
+        /// The identity it came from.
+        received: ClusterId,
+    },
     /// Its epoch is below the session held: a stale answer.
     #[error("epoch {epoch} is below the session's {held}")]
     Stale {
@@ -243,25 +309,33 @@ pub struct ClusterClient {
     next_sequence: u64,
     leader: Option<u64>,
     generation: u64,
+    /// The identities accepted.
+    accepted: Accepted,
+    /// The identity requests are sent to: the one of the latest accepted
+    /// stamp, the primary's until one arrives.
+    cluster: ClusterId,
     /// The outstanding requests, oldest first, at most the window.
     outstanding: Vec<Slot>,
 }
 
 impl ClusterClient {
-    /// Client `client`, with no session yet, sending to `leader` if known.
+    /// Client `client`, with no session yet, sending to `leader` if known
+    /// and accepting only the `accepted` cluster identities.
     #[must_use]
-    pub const fn new(client: u64, leader: Option<u64>) -> Self {
+    pub const fn new(client: u64, leader: Option<u64>, accepted: Accepted) -> Self {
         Self {
             client,
             session: None,
             next_sequence: 0,
             leader,
             generation: 0,
+            accepted,
+            cluster: accepted.primary,
             outstanding: Vec::new(),
         }
     }
 
-    /// The session the cluster opened for the client, in `generation`: its
+    /// The session the cluster opened for the client, from `from`: its
     /// epoch and its advertised bounds, which the client holds to from now
     /// on. A newer session replaces the one held, every request still
     /// outstanding reported unknown to `sink`; the same one again changes
@@ -275,9 +349,18 @@ impl ClusterClient {
     pub fn registered(
         &mut self,
         registered: Registered,
-        generation: u64,
+        from: Stamp,
         sink: &mut (impl FnMut(Event) + ?Sized),
     ) -> Result<(), RegisterError> {
+        if !self.accepted.accepts(from.cluster) {
+            sink(Event::ForeignCluster {
+                received: from.cluster,
+            });
+            return Err(RegisterError::ForeignCluster {
+                received: from.cluster,
+            });
+        }
+        let generation = from.generation;
         if let Some(held) = self.session {
             if registered.epoch < held.epoch {
                 return Err(RegisterError::Stale {
@@ -291,6 +374,7 @@ impl ClusterClient {
             self.report_unknown(sink);
         }
         self.generation = self.generation.max(generation);
+        self.cluster = from.cluster;
         self.session = Some(Session {
             epoch: registered.epoch,
             bounds: registered.config,
@@ -334,6 +418,7 @@ impl ClusterClient {
     fn send(&self, session: Session, to: u64, slot: Slot) -> Send {
         Send {
             to,
+            cluster: self.cluster,
             request: Request::new(
                 self.client,
                 session.epoch,
@@ -391,14 +476,20 @@ impl ClusterClient {
         Ok(self.send(session, leader, slot))
     }
 
-    /// The answer to the send named `key` from a server of `generation`.
+    /// The answer to the send named `key` from the server `from`.
     pub fn replied(
         &mut self,
         key: Key,
-        generation: u64,
+        from: Stamp,
         reply: Reply,
         sink: &mut (impl FnMut(Event) + ?Sized),
     ) {
+        if !self.accepted.accepts(from.cluster) {
+            return sink(Event::ForeignCluster {
+                received: from.cluster,
+            });
+        }
+        let generation = from.generation;
         let Some(session) = self.session.filter(|session| session.epoch == key.epoch) else {
             // An answer of another session: nothing of this one changes.
             return;
@@ -418,6 +509,7 @@ impl ClusterClient {
             });
         }
         self.generation = generation;
+        self.cluster = from.cluster;
         let Some(slot) = self.outstanding.get(at).copied() else {
             return;
         };
@@ -491,16 +583,22 @@ impl ClusterClient {
         });
     }
 
-    /// The leader changed to `leader` in `generation`, as the client
+    /// The leader changed to `leader`, announced by `from`, as the client
     /// learned other than by a redirect (a new leader's announcement, a
     /// promoted standby): every request still outstanding may have been
     /// applied by the old one, so each is unknown, and none is resent.
     pub fn leader_changed(
         &mut self,
         leader: Option<u64>,
-        generation: u64,
+        from: Stamp,
         sink: &mut (impl FnMut(Event) + ?Sized),
     ) {
+        if !self.accepted.accepts(from.cluster) {
+            return sink(Event::ForeignCluster {
+                received: from.cluster,
+            });
+        }
+        let generation = from.generation;
         if generation < self.generation {
             return sink(Event::StaleGeneration {
                 generation,
@@ -508,6 +606,7 @@ impl ClusterClient {
             });
         }
         self.generation = generation;
+        self.cluster = from.cluster;
         self.leader = leader;
         self.report_unknown(sink);
     }
