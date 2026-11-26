@@ -97,6 +97,54 @@ fn append_sync_and_hard_state_save_allocate_nothing_once_warm() {
     );
 }
 
+/// impl-c2's measurement of karyos#691, exactly: batches of four 64-byte
+/// entries, each batch appended, synced and its first index saved as the
+/// commit; 25 batches warm, 50 measured, on `StdDisk` with the harness's
+/// geometry. Before this change: 2.76 allocations and 2.00 frees per entry.
+#[test]
+fn the_c5_measurement_workload_allocates_nothing_once_warm() {
+    const WARM: u64 = 25;
+    const MEASURED: u64 = 50;
+    let dir = TempDir::new("c5");
+    // `karyos_sim::harness::workloads::geometry()`.
+    let geometry = Geometry::new(64 * 1024, 1024 * 1024).unwrap();
+    let mut log = RaftLog::create(StdDisk, &dir.0, geometry, 1).unwrap();
+    let batch = |from: u64| -> Vec<Entry> {
+        (from..from + 4)
+            .map(|index| Entry {
+                index,
+                term: 1,
+                event_time: index,
+                payload: vec![7; 64],
+            })
+            .collect()
+    };
+    let batches: Vec<Vec<Entry>> = (0..WARM + MEASURED).map(|at| batch(1 + 4 * at)).collect();
+    log.reserve(usize::try_from(4 * (WARM + MEASURED)).unwrap())
+        .unwrap();
+    let step = |log: &mut RaftLog<StdDisk>, batch: &[Entry]| {
+        log.append(batch).unwrap();
+        log.sync().unwrap();
+        log.save_hard_state(HardState {
+            current_term: 1,
+            voted_for: None,
+            commit: Some(batch[0].index),
+        })
+        .unwrap();
+    };
+    let (warm, measured) = batches.split_at(usize::try_from(WARM).unwrap());
+    for batch in warm {
+        step(&mut log, batch);
+    }
+    let ((), seen) = count(|| {
+        for batch in measured {
+            step(&mut log, batch);
+        }
+    });
+    assert_eq!(seen, 0, "{seen} allocations, reallocations and frees");
+    assert_eq!(log.durable_index(), Some(4 * (WARM + MEASURED)));
+}
+
 /// karyos#1285 review: a reservation the index cannot hold is a typed
 /// refusal, not a panic, and the log appends on after it.
 #[test]
