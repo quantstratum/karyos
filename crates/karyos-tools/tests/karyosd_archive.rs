@@ -1363,7 +1363,9 @@ fn karyosd_records_its_trace_journal_with_time_evidence() {
     // requirement for clock domain 5 (karyos#1128).
     let (code, shown) = verify(None);
     assert!(
-        shown.contains("clock domain 5: 1000000000:1000 (recorded)"),
+        shown.contains(
+            "clock domain 5: declared 1000000000:1000, applied 1000000000:1000 (recorded)"
+        ),
         "{shown}"
     );
     assert_eq!(code, Some(0), "{shown}");
@@ -1383,9 +1385,10 @@ fn karyosd_records_its_trace_journal_with_time_evidence() {
     let (code, shown) = verify(Some("1:1000"));
     assert_eq!(code, Some(0), "{shown}");
     assert!(
-        shown.contains("overridden by --time-requirement"),
+        shown.contains("declared 1000000000:1000, applied 1:1000 (--time-requirement)"),
         "{shown}"
     );
+    assert!(!shown.contains("looser"), "{shown}");
     assert!(shown.ends_with("time verdict: not_met\n"), "{shown}");
 
     let _ = std::fs::remove_dir_all(&root);

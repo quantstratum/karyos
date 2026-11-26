@@ -1137,7 +1137,9 @@ fn verify_judges_entries_against_the_requirement_their_recording_carries() {
     assert!(out.contains("clock 5:77 met\n"), "{out}");
     assert!(out.contains("clock 5:77 not_met\n"), "{out}");
     assert!(
-        out.contains("time requirement of recording 7 clock domain 5: 1000:1 (recorded)"),
+        out.contains(
+            "time requirement of recording 7 clock domain 5: declared 1000:1, applied 1000:1 (recorded)"
+        ),
         "{out}"
     );
     assert!(out.ends_with("time verdict: not_met\n"), "{out}");
@@ -1149,11 +1151,29 @@ fn verify_judges_entries_against_the_requirement_their_recording_carries() {
     // says so.
     let (status, out, _) = time_run(&archive, &["--time-requirement", "1000:1"]);
     assert_eq!(status, 1, "{out}");
+    // Both shown, always; looser than declared is flagged: 1000 ns
+    // against recording 8's 100, but not against recording 7's 1000.
     assert!(
-        out.contains("time requirement of recording 8 clock domain 5: 100:1 (recorded, overridden by --time-requirement)"),
+        out.contains("time requirement of recording 8 clock domain 5: declared 100:1, applied 1000:1 (--time-requirement, looser than declared)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("time requirement of recording 7 clock domain 5: declared 1000:1, applied 1000:1 (--time-requirement)"),
         "{out}"
     );
     assert!(!out.contains("not_met"), "{out}");
+    // Coarser granularity alone is looser too; stricter on both is not.
+    let (_, out, _) = time_run(&archive, &["--time-requirement", "100:2"]);
+    assert!(
+        out.contains("declared 100:1, applied 100:2 (--time-requirement, looser than declared)"),
+        "{out}"
+    );
+    let (_, out, _) = time_run(&archive, &["--time-requirement", "10:1"]);
+    assert!(!out.contains("looser"), "{out}");
+    assert!(
+        out.contains("declared 1000:1, applied 10:1 (--time-requirement)"),
+        "{out}"
+    );
 }
 
 fn time_run(archive: &Archive, extra: &[&str]) -> (u8, String, String) {

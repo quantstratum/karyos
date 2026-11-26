@@ -96,7 +96,11 @@ Usage: karyos-catalog verify <dir> [--trust FILE] [--anchors HEX=DIR]...
                  their clock domain (karyosd --archive-time-requirement),
                  when --time-anchors is given; with it, the flag is the
                  verifier's own requirement and overrides what the
-                 recordings carry, each override reported
+                 recordings carry. Each recording's declared
+                 requirement is always shown beside the applied one, and
+                 an applied one looser than declared (a larger divergence
+                 or a coarser granularity) is flagged looser than
+                 declared
   --recording ID the time verdict of recording ID alone: its entries,
                  uncovered ranges and losses; needs --time-requirement
                  or --time-anchors
@@ -472,8 +476,9 @@ pub struct TimeReport {
     /// The requirements the recordings carry, by recording (karyos#1128):
     /// they decide the verdicts unless `--time-requirement` overrides them.
     pub recorded: Vec<(u64, karyos_trace::stream::TimeRequirement)>,
-    /// Whether `--time-requirement` overrode them.
-    pub overridden: bool,
+    /// The requirement `--time-requirement` applied instead of them, if
+    /// given.
+    pub applied: Option<Requirement>,
     /// The combined verdict: `not_met` over `no_evidence` over `met`.
     pub verdict: Verdict,
 }
@@ -617,7 +622,7 @@ pub fn time_report(args: &VerifyArgs) -> Result<Option<TimeReport>, VerifyError>
         gaps,
         losses,
         recorded,
-        overridden: args.time_requirement.is_some(),
+        applied: args.time_requirement,
         verdict,
     }))
 }
@@ -818,6 +823,13 @@ const fn verdict_name(verdict: Verdict) -> &'static str {
     }
 }
 
+/// Whether `applied` is looser than `declared`: a larger divergence or a
+/// coarser granularity (ADR-0119).
+fn looser(applied: &Requirement, declared: &karyos_trace::stream::TimeRequirement) -> bool {
+    applied.max_divergence_ns > declared.max_divergence_ns
+        || applied.max_granularity_ns > declared.max_granularity_ns
+}
+
 /// The time report as text lines.
 #[must_use]
 pub fn time_text(report: &TimeReport) -> String {
@@ -839,18 +851,31 @@ pub fn time_text(report: &TimeReport) -> String {
             "time recording {subject} [{start}, {end}) uncovered no_evidence"
         );
     }
-    for (recording, requirement) in &report.recorded {
+    // Both the declared requirement and the applied one, always; an
+    // applied one looser than declared is flagged (ADR-0119).
+    for (recording, declared) in &report.recorded {
+        let (applied, source) = match report.applied {
+            Some(applied) => (
+                (applied.max_divergence_ns, applied.max_granularity_ns),
+                if looser(&applied, declared) {
+                    "--time-requirement, looser than declared"
+                } else {
+                    "--time-requirement"
+                },
+            ),
+            None => (
+                (declared.max_divergence_ns, declared.max_granularity_ns),
+                "recorded",
+            ),
+        };
         let _ = writeln!(
             out,
-            "time requirement of recording {recording} clock domain {}: {}:{} ({})",
-            requirement.domain,
-            requirement.max_divergence_ns,
-            requirement.max_granularity_ns,
-            if report.overridden {
-                "recorded, overridden by --time-requirement"
-            } else {
-                "recorded"
-            }
+            "time requirement of recording {recording} clock domain {}: declared {}:{}, applied {}:{} ({source})",
+            declared.domain,
+            declared.max_divergence_ns,
+            declared.max_granularity_ns,
+            applied.0,
+            applied.1,
         );
     }
     for loss in &report.losses {
