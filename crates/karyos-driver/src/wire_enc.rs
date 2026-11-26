@@ -400,7 +400,9 @@ impl ActivationFloors {
                 at
             }
             None => {
-                keys.activated = u32::MAX;
+                // Blocked, not an epoch: `u32::MAX` is a valid file epoch
+                // (H8-22).
+                keys.blocked = true;
                 return;
             }
         };
@@ -435,6 +437,9 @@ pub struct ChannelKeys {
     /// a successor's activation, which selects the predecessor to sign
     /// again, never lets the predecessor bind again.
     activated: u32,
+    /// The role's activation table had no room for its key id: it binds
+    /// nothing, at any epoch (H8-22).
+    blocked: bool,
 }
 
 impl ChannelKeys {
@@ -463,6 +468,7 @@ impl ChannelKeys {
             files: slots,
             signing: None,
             activated: 0,
+            blocked: false,
         };
         // Until a key set names its signing file, the highest held signs:
         // admission sets the one the view signs with
@@ -534,9 +540,13 @@ impl ChannelKeys {
     }
 
     /// The active binding epoch (H8-12, H8-17): the signing epoch, never
-    /// below the highest epoch seen to sign; `None` with no file signing.
+    /// below the highest epoch seen to sign; `None` with no file signing,
+    /// or for a key id the role's activation table has no room for.
     #[must_use]
     pub fn binding_epoch(&self) -> Option<u32> {
+        if self.blocked {
+            return None;
+        }
         self.signing.map(|signing| signing.max(self.activated))
     }
 

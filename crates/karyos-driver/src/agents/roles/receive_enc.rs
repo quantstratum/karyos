@@ -42,9 +42,11 @@
 
 use std::net::SocketAddr;
 
+use karyos_protocol::frame::Lane;
 use karyos_protocol::network::encrypted::{EncAnswer, EncSetup, decode_setup};
 use karyos_protocol::network::{
-    Alias, ChallengeBlock, Control, Datagram, Identity, RspSolicit, TermParams, classify,
+    Alias, ChallengeBlock, Control, Datagram, Identity, Receiver, RspSolicit, RttmKind, TermParams,
+    classify,
 };
 use karyos_protocol::protection::aes_gcm_siv::{
     AesGcmSiv, Domain, EncRejection, KeyContext, MAX_PLAINTEXT, PublicationIdentity,
@@ -331,6 +333,9 @@ pub(crate) struct ReceiverEnc {
     /// The VM generation signal, read once the role has an encrypted
     /// incarnation (section 10).
     watch: Option<VmGenerationWatch>,
+    /// The role's place in the fence, from its first watch on; dropped
+    /// with the role, it leaves the fence (H8-21).
+    registration: Option<vm_generation::Registration>,
     /// The VM generation the role last redrew its identity for.
     seen: u64,
 }
@@ -722,8 +727,8 @@ impl ReceiverEnc {
     /// Reads the signal with `watch`, the platform's or a test's, and
     /// registers the role with the fence from the current generation on.
     pub(crate) fn watch(&mut self, watch: VmGenerationWatch) {
-        if self.watch.is_none() {
-            vm_generation::register();
+        if self.registration.is_none() {
+            self.registration = Some(vm_generation::Registration::enter());
             self.seen = vm_generation::generation();
         }
         self.watch = Some(watch);
@@ -754,6 +759,50 @@ impl ReceiverEnc {
     fn redrawn(&mut self) {
         self.rsp.clear();
         self.floors.clear();
+    }
+}
+
+/// What a domain 1 datagram of a bound image is checked against inside
+/// its open, read from the image and the session table before it.
+#[derive(Debug, Clone, Copy)]
+struct SenderChecks {
+    /// The bound image's incarnation.
+    identity: Identity,
+    /// This receiver's block for the image.
+    receiver: Receiver,
+    /// The datagram's key is a path row of the image.
+    path: bool,
+    /// The image is active and not aborted.
+    live: bool,
+}
+
+/// The checks of a domain 1 sender control its handler makes and that
+/// change nothing (H8-20): PATH_HB its path row and incarnation
+/// (`Intake::control`); ERR NAK_REPLY the image's incarnation, its
+/// receiver block and a lane `lane_open` admits
+/// (`Intake::nak_reply`); RTTM REPLY its path row, incarnation and
+/// receiver block (`Intake::rttm_reply`). Run inside the open,
+/// before the sequence is marked or an epoch promoted; any other control
+/// is refused.
+fn sender_control_admissible(
+    control: &Control,
+    checks: &SenderChecks,
+    lane_open: impl Fn(Lane) -> bool,
+) -> bool {
+    match control {
+        Control::PathHeartbeat(heartbeat) => checks.path && heartbeat.identity == checks.identity,
+        Control::NakReply(reply) => {
+            reply.identity == checks.identity
+                && reply.receiver == checks.receiver
+                && lane_open(reply.range.lane)
+        }
+        Control::Rttm(rttm) => {
+            matches!(rttm.kind, RttmKind::Reply { .. })
+                && checks.path
+                && rttm.identity == checks.identity
+                && rttm.receiver == checks.receiver
+        }
+        _ => false,
     }
 }
 
@@ -926,8 +975,8 @@ impl<T: StreamTerms> Intake<'_, T> {
         out: &mut [u8; MAX_PLAINTEXT],
     ) -> Result<(), EncRejection> {
         let head = header(bytes)?;
-        let Some((slot, params)) = self
-            .bound_image(source, alias)
+        let bound = self.bound_image(source, alias);
+        let Some((slot, params)) = bound
             .and_then(|image| self.role.images.get(image))
             .map(|image| (image.slot, image.params))
         else {
@@ -949,6 +998,35 @@ impl<T: StreamTerms> Intake<'_, T> {
             return Err(EncRejection::Binding);
         };
         let now = self.now;
+        // What the handlers check that changes nothing, read before the
+        // open so that it runs inside it (H8-15, H8-20).
+        let key = BindingKey {
+            endpoint: self.endpoint,
+            source,
+            alias,
+        };
+        let path = self
+            .role
+            .sessions
+            .paths()
+            .lookup(key)
+            .is_some_and(|(at, _)| at == slot);
+        let active = self.role.sessions.is_active(slot);
+        let receiver_boot_id = self.role.sessions.boot_id();
+        let installed = bound
+            .and_then(|index| self.role.images.get(index))
+            .ok_or(EncRejection::Binding)?;
+        let checks = SenderChecks {
+            identity: installed.identity,
+            receiver: Receiver {
+                receiver_boot_id,
+                receiver_id: installed.receiver_id,
+            },
+            path,
+            live: active && installed.aborted.is_none(),
+        };
+        let (owner, term_length) = (&*installed.owner, installed.term_length);
+        let lane_open = |lane: Lane| super::window_end(owner, lane, term_length).is_some();
         let enc = &mut self.role.enc;
         let image = enc
             .images
@@ -965,16 +1043,21 @@ impl<T: StreamTerms> Intake<'_, T> {
         let opened = image.opener.open(bytes, out, rate, now, |frames| {
             // The whole check of the bound image's data path runs here,
             // before the mark: a correctly tagged batch it would refuse
-            // (lanes, term offsets, lengths) marks no sequence and
-            // promotes no epoch (H8-04).
+            // (an image no longer active or aborted, lanes, term offsets,
+            // lengths) marks no sequence and promotes no epoch (H8-04). So
+            // does every check a sender control's handler makes (H8-20).
             data = match classify(frames) {
                 Ok(Datagram::DataBatch(batch) | Datagram::Heartbeat(batch))
                     if batch.alias() == alias
+                        && checks.live
                         && ValidatedDatagram::parse(frames, &params).is_ok() =>
                 {
                     Some(true)
                 }
-                Ok(Datagram::Control(control)) if sender_frame_alias(&control) == Some(alias) => {
+                Ok(Datagram::Control(control))
+                    if sender_frame_alias(&control) == Some(alias)
+                        && sender_control_admissible(&control, &checks, lane_open) =>
+                {
                     Some(false)
                 }
                 _ => None,
@@ -1316,7 +1399,9 @@ impl<T: StreamTerms> ReceiverRole<T> {
         // publisher binds the new boot id (ADR-0086 section 7). While the
         // fence is held no authenticated image installs.
         self.enc.seen = current;
-        vm_generation::redrawn(current);
+        if let Some(registration) = self.enc.registration.as_mut() {
+            registration.redrawn(current);
+        }
     }
 
     /// Reads the signal with `watch` instead of the platform's (tests).

@@ -977,6 +977,7 @@ fn a_refused_domain_4_control_marks_nothing_and_promotes_nothing() {
     .unwrap();
     sender.publications.push(path);
     sender.enc.publish(publication());
+    sender.bind(EndpointId(1), destination, &plain_answer(), None, clock());
     let mut receiver = peer(5, 0x22, 1, &keys());
     assert!(open(&mut sender.enc.publications[0], &receiver.challenge()).is_ok());
     let (mut sealer, _) = receiver.data_keys();
@@ -1223,4 +1224,159 @@ fn a_sender_without_publications_still_releases_the_fence() {
     assert_eq!(senders[0].enc_generation(), current, "reported redrawn");
     assert_eq!(senders[1].enc_generation(), current);
     assert!(!vm_generation::quiesced(), "the fence released");
+}
+
+/// Registered sender roles, each with its own injected signal (H8-21).
+fn registered_senders(
+    count: usize,
+) -> (
+    Vec<super::super::SenderRole>,
+    Vec<crate::wire_enc::vm_generation::SignalInjector>,
+) {
+    let mut senders: Vec<super::super::SenderRole> = (0..count)
+        .map(|_| {
+            super::super::roles(&crate::agents::AgentConfig::default())
+                .unwrap()
+                .0
+        })
+        .collect();
+    let mut injectors = Vec::new();
+    for sender in &mut senders {
+        sender.enc.publish(publication());
+        let (signal, injector) = crate::wire_enc::vm_generation::InjectedSignal::new();
+        sender.enc.watch(VmGenerationWatch::new(Box::new(signal)));
+        sender.on_generation_change(0);
+        injectors.push(injector);
+    }
+    (senders, injectors)
+}
+
+/// H8-21 (section 10): a role that stops (its driver closed, the role
+/// dropped with its contexts) leaves the fence. Two roles watch the same
+/// VM; one is dropped; the change the other observes releases the fence
+/// once the survivor alone has redrawn.
+#[test]
+fn a_stopped_role_never_holds_the_fence() {
+    use crate::wire_enc::vm_generation;
+
+    let (mut senders, injectors) = registered_senders(2);
+    drop(senders.remove(0));
+    injectors[1].change();
+    senders[0].on_generation_change(vm_generation::POLL_INTERVAL_NS);
+    assert!(vm_generation::generation() > 0);
+    assert!(!vm_generation::quiesced(), "the fence released");
+}
+
+/// H8-21: leaving takes back exactly what the role counted. Of three
+/// roles, one redraws for the change and then stops: its report goes with
+/// it, so the fence stays held until both others are accounted for, the
+/// second by its report and the third by its own stop.
+#[test]
+fn a_role_that_stops_after_its_report_takes_its_report_back() {
+    use crate::wire_enc::vm_generation;
+
+    let (mut senders, injectors) = registered_senders(3);
+    injectors[0].change();
+    senders[0].on_generation_change(vm_generation::POLL_INTERVAL_NS);
+    assert!(vm_generation::quiesced());
+    drop(senders.remove(0));
+    assert!(vm_generation::quiesced(), "one of two left reported");
+    senders[0].on_generation_change(vm_generation::POLL_INTERVAL_NS);
+    assert!(vm_generation::quiesced(), "the third has not");
+    senders[0].on_generation_change(2 * vm_generation::POLL_INTERVAL_NS);
+    assert!(vm_generation::quiesced(), "a second report counts once");
+    drop(senders.remove(1));
+    assert!(!vm_generation::quiesced(), "the survivor alone remains");
+}
+
+/// H8-15 (sections 8 and 9): an SM goes inside the domain 4 open only to a
+/// runtime binding of its receiver, and an RTTM only as a REQUEST. The
+/// runtime binding expires while the encrypted context stays bound; under
+/// the receiver's next `party_epoch` its SM, and an RTTM REPLY, are refused
+/// and change nothing: no epoch moves, and once bound again the very SM,
+/// and the REQUEST sealed at the REPLY's sequence, open.
+#[test]
+fn a_next_epoch_sm_without_a_runtime_binding_marks_nothing() {
+    use karyos_protocol::network::{Rttm, RttmKind};
+
+    let (mut sender, _): (super::super::SenderRole, super::super::ReceiverRole) =
+        super::super::roles(&crate::agents::AgentConfig::default()).unwrap();
+    let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 0,
+        mtu: 1408,
+    };
+    let (mut path, _log) =
+        crate::agents::data::testing::outbound(EndpointId(1), ALIAS, destination, term, 1, false);
+    path.set_destinations(
+        crate::agents::data::DEFAULT_MAX_DESTINATIONS,
+        &[destination],
+        &[],
+        Some(true),
+    )
+    .unwrap();
+    sender.publications.push(path);
+    sender.enc.publish(publication());
+    sender.bind(EndpointId(1), destination, &plain_answer(), None, clock());
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    assert!(open(&mut sender.enc.publications[0], &receiver.challenge()).is_ok());
+    let (mut sealer, _) = receiver.data_keys();
+    sealer.roll_now();
+    let rttm = |kind| {
+        Control::Rttm(Rttm {
+            alias: ALIAS,
+            identity: IDENTITY,
+            receiver: Receiver {
+                receiver_boot_id: [5, 5],
+                receiver_id: 66,
+            },
+            probe_id: 1,
+            kind,
+        })
+    };
+    let sm = seal_control(&mut sealer, &receiver.sm());
+    sealer.key().set_next_seq(100);
+    let reply = seal_control(
+        &mut sealer,
+        &rttm(RttmKind::Reply {
+            service_delay_ns: 0,
+        }),
+    );
+    sealer.key().set_next_seq(100);
+    let request = seal_control(&mut sealer, &rttm(RttmKind::Request));
+    // The runtime binding expires; the encrypted receiver stays bound.
+    sender.expire_bindings(u64::MAX / 2);
+    assert!(sender.bindings.is_empty());
+    assert!(sender.enc.publications[0].bound_receiver().is_some());
+    assert!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &sm)
+            .is_none()
+    );
+    sender.bind(EndpointId(1), destination, &plain_answer(), None, clock());
+    assert!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &reply)
+            .is_none()
+    );
+    let publication = &sender.enc.publications[0];
+    assert_eq!(publication.bound_epochs(), Some((1, 0)), "nothing promoted");
+    assert_eq!(
+        publication
+            .channel
+            .rejections
+            .get(EncRejection::InnerRejected),
+        2
+    );
+    for (bytes, control) in [(&sm, receiver.sm()), (&request, rttm(RttmKind::Request))] {
+        assert_eq!(
+            sender
+                .open_sealed_from(EndpointId(1), destination, bytes)
+                .map(|(control, _)| control),
+            Some(control),
+            "its sequence was never marked"
+        );
+    }
+    assert_eq!(sender.enc.publications[0].bound_epochs(), Some((1, 1)));
 }

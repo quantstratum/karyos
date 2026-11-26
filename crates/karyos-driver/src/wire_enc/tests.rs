@@ -1790,3 +1790,43 @@ fn no_unused_opener_slot_keeps_a_schedule() {
     assert!(!opener.has_previous());
     assert!(opener.unused_erased(), "after expiry");
 }
+
+fn channel_of(key_id: u32, epoch: u32) -> KeyFile {
+    let secret: String = (0..KEY_LEN).map(|_| "33".to_owned()).collect();
+    let text = format!(
+        "format=karyos-wire-key-v1\nkey_id={key_id}\nfile_epoch={epoch}\npurpose=channel\nprofile_id=16\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret={secret}\nchannel_id=7\nstream_id=6\n"
+    );
+    parse(&format!("{key_id}-{epoch}.key"), text.as_bytes()).unwrap()
+}
+
+/// H8-22 (section 7): with the activation table full, a key set of one
+/// more key id binds nothing, at an ordinary epoch and at `u32::MAX`
+/// alike, even once it signs; a tracked key id still binds, `u32::MAX`
+/// included.
+#[test]
+fn a_full_activation_table_binds_nothing_for_an_untracked_key_id() {
+    let mut floors = ActivationFloors::default();
+    for key_id in 100..100 + u32::try_from(ACTIVATION_FLOORS).unwrap() {
+        let mut held = ChannelKeys::new(&[&channel_of(key_id, 1)]).unwrap();
+        floors.hold(&mut held);
+        assert!(held.binds(1), "tracked {key_id}");
+    }
+    for epoch in [1, 2, u32::MAX] {
+        let mut keys = ChannelKeys::new(&[&channel_of(7, epoch)]).unwrap();
+        assert!(keys.binds(epoch), "unheld, it binds");
+        floors.hold(&mut keys);
+        assert_eq!(keys.binding_epoch(), None, "epoch {epoch}");
+        assert!(!keys.binds(epoch), "epoch {epoch}");
+        assert!(keys.set_signing(epoch));
+        assert!(!keys.binds(epoch), "epoch {epoch}, signing");
+        assert_eq!(floors.floor(7), None);
+    }
+    let mut tracked = ChannelKeys::new(&[&channel_of(100, u32::MAX)]).unwrap();
+    floors.hold(&mut tracked);
+    assert!(tracked.binds(u32::MAX));
+    assert_eq!(
+        floors.floor(100),
+        Some(0),
+        "tracked, with no epoch seen to sign yet"
+    );
+}

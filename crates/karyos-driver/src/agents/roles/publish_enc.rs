@@ -555,6 +555,9 @@ pub(crate) struct SenderEnc {
     /// The VM generation signal, read once the role has an encrypted
     /// publication (section 10).
     watch: Option<VmGenerationWatch>,
+    /// The role's place in the fence, from its first watch on; dropped
+    /// with the role, it leaves the fence (H8-21).
+    registration: Option<vm_generation::Registration>,
     /// The VM generation the role last redrew its identities for.
     seen: u64,
     /// Per channel key id, the highest file epoch seen to sign this boot:
@@ -575,8 +578,8 @@ impl SenderEnc {
     /// Reads the signal with `watch`, the platform's or a test's, and
     /// registers the role with the fence from the current generation on.
     pub(crate) fn watch(&mut self, watch: VmGenerationWatch) {
-        if self.watch.is_none() {
-            vm_generation::register();
+        if self.registration.is_none() {
+            self.registration = Some(vm_generation::Registration::enter());
             self.seen = vm_generation::generation();
         }
         self.watch = Some(watch);
@@ -680,7 +683,9 @@ impl<T: StreamTerms> SenderRole<T> {
             if self.auth_successors(current) && self.redraw(current) {
                 self.reidentify_auth(current);
                 self.enc.seen = current;
-                vm_generation::redrawn(current);
+                if let Some(registration) = self.enc.registration.as_mut() {
+                    registration.redrawn(current);
+                }
             }
         }
         // Step 4, only under the identity of the current generation.
@@ -979,10 +984,16 @@ impl<T: StreamTerms> SenderRole<T> {
 /// registrant), and the publication's incarnation `identity`. A NAK
 /// or RTTM REQUEST needs, as [`SenderRole::nak`] and the RTTM reply do, a
 /// binding on `endpoint` of its source, boot id, incarnation and receiver
-/// id (any while unconfirmed), and a NAK a repairing publication. Run
-/// inside the domain 4 open, before the sequence is marked or an epoch
-/// promoted (H8-15); a refused control changes no state. Any other
-/// control is refused: none is a receiver's domain 4 control.
+/// id (any while unconfirmed), and a NAK a repairing publication (an
+/// RTTM REPLY has no receiver alias, so it never gets here). An SM needs,
+/// as [`SenderRole::status`] finds it (`sm_binding`), a runtime binding
+/// of its receiver: one of its SM source, else one with none yet, either
+/// naming its receiver id or none, else an ANSWER-created one with room
+/// for an adoption (H8-15: an expired binding leaves the encrypted context
+/// bound). Run inside the domain 4
+/// open, before the sequence is marked or an epoch promoted; a refused
+/// control changes no state. Any other control is refused: none is a
+/// receiver's domain 4 control.
 fn receiver_control_admissible<T: StreamTerms>(
     outbound: Option<&crate::agents::data::Outbound<T>>,
     source: Option<SocketAddr>,
@@ -1017,7 +1028,7 @@ fn receiver_control_admissible<T: StreamTerms>(
         Control::Rttm(rttm) => return bound(rttm.alias, rttm.identity, rttm.receiver),
         _ => return false,
     };
-    if status.identity != identity {
+    if status.identity != identity || !sm_bound(bindings, endpoint, source, status) {
         return false;
     }
     let lanes = u8::try_from(outbound.readers().len()).ok() == Some(status.lanes.count());
@@ -1029,6 +1040,51 @@ fn receiver_control_admissible<T: StreamTerms>(
             || outbound.registration().is_some()
     });
     lanes && tag && eligible
+}
+
+/// Whether an SM from `source` has a runtime binding to go to, as
+/// `SenderRole::sm_binding` decides, changing nothing; its receiver id
+/// matches, as [`SenderRole::status`] then requires. `None` (tests only)
+/// takes any binding of the receiver.
+fn sm_bound(
+    bindings: &[super::ReceiverBinding],
+    endpoint: EndpointId,
+    source: Option<SocketAddr>,
+    status: &karyos_protocol::network::StatusMessage,
+) -> bool {
+    let source = source.map(crate::sessions::rate::normalized);
+    let receiver = |binding: &&super::ReceiverBinding| {
+        binding.endpoint == endpoint
+            && binding.alias == status.alias
+            && binding.boot_id == status.receiver.receiver_boot_id
+            && binding.identity == status.identity
+    };
+    let held = bindings
+        .iter()
+        .filter(receiver)
+        .find(|binding| source.is_none_or(|source| binding.sm_source == Some(source)))
+        .or_else(|| {
+            bindings
+                .iter()
+                .filter(receiver)
+                .find(|binding| binding.sm_source.is_none())
+        });
+    if let Some(binding) = held {
+        return binding
+            .receiver_id
+            .is_none_or(|id| id == status.receiver.receiver_id);
+    }
+    bindings
+        .iter()
+        .filter(receiver)
+        .find(|binding| binding.parent.is_none())
+        .is_some_and(|parent| {
+            bindings
+                .iter()
+                .filter(|binding| binding.parent.is_some() && binding.parent == Some(parent.id))
+                .count()
+                < super::MAX_ADOPTIONS
+        })
 }
 
 fn control_receiver(control: &Control) -> Option<Receiver> {

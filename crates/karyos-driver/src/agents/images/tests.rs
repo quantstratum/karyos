@@ -11524,6 +11524,157 @@ fn a_tagged_batch_its_image_would_refuse_marks_no_sequence() {
     assert_eq!(after.total(), before.total() + 1, "{after:?}");
 }
 
+/// H8-20 (ADR-0114 sections 8 and 9): each domain 1 sender control is
+/// checked inside the open as its handler would check it (PATH_HB its path
+/// and incarnation; ERR NAK_REPLY its incarnation, receiver block and lane;
+/// RTTM REPLY its path, incarnation and receiver block). Under the next
+/// `party_epoch`, a correctly tagged control naming another incarnation,
+/// another receiver block or a lane the image does not have is refused
+/// before the mark: the epochs stay, and the genuine control sealed at the
+/// same sequence then opens and promotes.
+#[test]
+fn a_next_epoch_sender_control_its_handler_would_refuse_marks_nothing() {
+    use karyos_protocol::frame::Lane;
+    use karyos_protocol::network::{
+        Control, Datagram, NakRange, NakReply, NakReplyReason, PathHeartbeat, Receiver, Rttm,
+        RttmKind, classify,
+    };
+    use karyos_protocol::protection::aes_gcm_siv::{Domain, EncRejection};
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, b) = encrypted_rig();
+    crate::wire_enc::record_seals();
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let first: Vec<Vec<u8>> = (0..3u8).map(|i| vec![i; 100]).collect();
+    assert_eq!(enc_deliver(&mut rig, &mut subscriber, &first), first);
+    rig.sender_stopped = true;
+    let seals = crate::wire_enc::take_seals();
+    let data = seals
+        .iter()
+        .rfind(|record| record.context.domain == Domain::Sender)
+        .unwrap()
+        .clone();
+    let receiver = seals
+        .iter()
+        .filter(|record| record.context.domain == Domain::Receiver)
+        .find_map(|record| match classify(&record.frames) {
+            Ok(Datagram::Control(Control::Status(status))) => Some(status.receiver),
+            _ => None,
+        })
+        .unwrap();
+    let identity = identity();
+    let other = Identity {
+        incarnation: identity.incarnation + 1,
+        ..identity
+    };
+    let stranger = Receiver {
+        receiver_id: receiver.receiver_id + 1,
+        ..receiver
+    };
+    let heartbeat = |identity| {
+        Control::PathHeartbeat(PathHeartbeat {
+            alias: alias(),
+            identity,
+        })
+    };
+    let reply = |identity, receiver, lane| {
+        Control::NakReply(NakReply {
+            alias: alias(),
+            identity,
+            receiver,
+            range: NakRange {
+                lane,
+                length: 64,
+                start: 0,
+            },
+            reason: NakReplyReason::RangeUnavailable { lowest_retained: 0 },
+        })
+    };
+    let rttm = |identity, receiver| {
+        Control::Rttm(Rttm {
+            alias: alias(),
+            identity,
+            receiver,
+            probe_id: 9,
+            kind: RttmKind::Reply {
+                service_delay_ns: 0,
+            },
+        })
+    };
+    let lane_3 = Lane::try_new(3).unwrap();
+    let cases = [
+        (vec![heartbeat(other)], heartbeat(identity)),
+        (
+            vec![
+                reply(other, receiver, Lane::ZERO),
+                reply(identity, stranger, Lane::ZERO),
+                reply(identity, receiver, lane_3),
+            ],
+            reply(identity, receiver, Lane::ZERO),
+        ),
+        (
+            vec![rttm(other, receiver), rttm(identity, stranger)],
+            rttm(identity, receiver),
+        ),
+    ];
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let refusals = |rig: &Rig| {
+        rig.agents
+            .receiver
+            .role
+            .enc_rejections(b, alias().stream_id)
+            .unwrap()
+    };
+    let mut context = data.context;
+    for (refused, genuine) in cases {
+        context.party_epoch += 1;
+        let sealed = |control: &Control, seq: u64| {
+            let mut record = data.clone();
+            let mut frames = vec![0_u8; 512];
+            let length = control.encode(&mut frames).unwrap();
+            frames.truncate(length);
+            record.context = context;
+            record.seq = seq;
+            record.frames = frames;
+            replayed(&record)
+        };
+        let epochs = rig.agents.receiver.role.enc_epochs(slot);
+        let before = refusals(&rig);
+        for (seq, control) in (0..).zip(&refused) {
+            let receiver = &mut rig.agents.receiver;
+            receiver.role.inject_datagram(
+                &receiver.sessions,
+                b,
+                source,
+                &sealed(control, seq),
+                rig.now,
+            );
+            assert_eq!(
+                rig.agents.receiver.role.enc_epochs(slot),
+                epochs,
+                "{control:?} promoted"
+            );
+        }
+        let after = refusals(&rig);
+        assert_eq!(
+            after.get(EncRejection::InnerRejected),
+            before.get(EncRejection::InnerRejected) + u64::try_from(refused.len()).unwrap(),
+            "{after:?}"
+        );
+        let receiver = &mut rig.agents.receiver;
+        receiver
+            .role
+            .inject_datagram(&receiver.sessions, b, source, &sealed(&genuine, 0), rig.now);
+        assert_eq!(
+            rig.agents.receiver.role.enc_epochs(slot),
+            Some((context.key_epoch, context.party_epoch)),
+            "{genuine:?} opens: its sequence was never marked"
+        );
+        assert_eq!(refusals(&rig).total(), after.total(), "{genuine:?}");
+    }
+}
+
 /// H8-09 (ADR-0114 section 10 step 2): a VM generation change withdraws an
 /// encrypted image's domain 4 sealer through its shared object, so the
 /// clone a queued control holds is erased with it, before the role reports

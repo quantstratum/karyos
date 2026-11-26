@@ -260,6 +260,70 @@ pub fn redrawn(generation: u64) {
     });
 }
 
+/// A role's place in the fence for as long as it holds an encrypted
+/// incarnation: made by [`Registration::enter`], it counts the role among
+/// the roles the fence waits for, and dropped (the role stopped or gone,
+/// its contexts erased with it) it leaves, so a stopped driver never holds
+/// the fence for the others (H8-21). It remembers the generation it
+/// reported, so its leaving takes back exactly what it counted.
+#[derive(Debug)]
+pub struct Registration {
+    /// The generation this role is counted as redrawn for, if any.
+    counted: Option<u64>,
+}
+
+impl Registration {
+    /// Registers a role from the current generation on: one made during a
+    /// change starts fresh, so it counts as redrawn.
+    #[must_use]
+    pub fn enter() -> Self {
+        let counted = with_fence(|fence| {
+            fence.registered = fence.registered.saturating_add(1);
+            (fence.released != fence.generation).then(|| {
+                fence.redrawn = fence.redrawn.saturating_add(1);
+                fence.generation
+            })
+        });
+        Self { counted }
+    }
+
+    /// Reports that the role closed its incarnations and redrew its
+    /// identities for `generation`, once: the last registered role
+    /// releases the fence. A report for an earlier generation, or a second
+    /// one, changes nothing.
+    pub fn redrawn(&mut self, generation: u64) {
+        let counted = self.counted;
+        let counts = with_fence(|fence| {
+            let counts = generation == fence.generation
+                && fence.released != fence.generation
+                && counted != Some(generation);
+            if counts {
+                fence.redrawn = fence.redrawn.saturating_add(1);
+                fence.release_if_done();
+            }
+            counts
+        });
+        if counts {
+            self.counted = Some(generation);
+        }
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        let counted = self.counted;
+        with_fence(|fence| {
+            fence.registered = fence.registered.saturating_sub(1);
+            if counted == Some(fence.generation) {
+                fence.redrawn = fence.redrawn.saturating_sub(1);
+            }
+            if fence.released != fence.generation {
+                fence.release_if_done();
+            }
+        });
+    }
+}
+
 /// Generations a successor is kept for after the one it was drawn for:
 /// every role steps at its next duty and the embedded driver at its next
 /// `do_work`, so a caller this far behind is stuck, and fails closed.
