@@ -10996,3 +10996,5 @@ fn a_full_or_unreadable_abort_record_fails_closed() {
 }
 /// H8 round 4: insufficient evidence raised and missing properties (karyos#648).
 mod invariants_r4;
+/// H8 round 6: the round 5 review's evidence rows R5-06, R5-10, R5-11 (karyos#648).
+mod invariants_r6;
