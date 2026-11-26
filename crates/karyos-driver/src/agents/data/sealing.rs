@@ -414,6 +414,17 @@ impl<T: StreamTerms> Outbound<T> {
         }
     }
 
+    /// Whether [`Outbound::install_enc_sealer`] would install `sealer`,
+    /// changing nothing (H8-25).
+    pub(crate) fn admits_enc_sealer(&self, sealer: &EncSealer) -> bool {
+        let state = match &self.auth {
+            SenderAuth::EncPending => true,
+            SenderAuth::Encrypting(current) => current.context().salt != sealer.context().salt,
+            SenderAuth::Off | SenderAuth::Pending | SenderAuth::Sealing(_) => false,
+        };
+        state && sealer.domain() == EncDomain::Sender
+    }
+
     /// Installs the session's domain 1 sealer of an encrypted publication,
     /// made at establishment. A new binding replaces it; its own sealer
     /// is never installed twice, so no envelope sequence restarts under

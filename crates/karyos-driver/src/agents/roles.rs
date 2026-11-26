@@ -1624,6 +1624,10 @@ struct Chain {
     /// The establishment's challenge nonce: it salts the image's unicast
     /// session keys (ADR-0086 section 4).
     nonce: [u64; 2],
+    /// An encrypted establishment's accepted ENC ANSWER: its image takes
+    /// its keys at the stated epochs. Held with the chain, so it lives
+    /// exactly as long as the installation it serves (H8-27).
+    enc: Option<karyos_protocol::network::encrypted::EncAnswer>,
 }
 
 /// An installed image: its receive owner, binding, SM cadence and
@@ -4128,7 +4132,14 @@ impl<T: StreamTerms> ReceiverRole<T> {
         };
         // An encrypted subscription's image takes its keys at its verified
         // ENC ANSWER's epochs, or is not installed (fail closed).
-        let Ok(enc_seal) = self.enc_keys(&key, identity, installed, named, chain.nonce, now) else {
+        let Ok(enc_seal) = self.enc_keys(
+            &key,
+            identity,
+            installed,
+            named,
+            (chain.nonce, chain.enc),
+            now,
+        ) else {
             return Err(Some(chain.retire));
         };
         // The remote abort its publication admits, bound now (ADR-0118);
@@ -6244,6 +6255,11 @@ impl<T: StreamTerms> Intake<'_, T> {
                     role.sessions
                         .announce(key, &announce, now, &mut role.nonces)
                 {
+                    // Accepted: an encrypted one's publication is now a
+                    // verified target (H8-26).
+                    self.role
+                        .enc
+                        .accept_announce(endpoint, announce.alias, &announce.identity);
                     // A multicast key's CHALLENGE leaves from the driver's
                     // unicast control endpoint, as its SOLICITs do: the
                     // drivers of one host share the group port, and from it
@@ -6348,6 +6364,9 @@ impl<T: StreamTerms> Intake<'_, T> {
                         joins,
                         chain,
                     };
+                    // Only the accepted ENC ANSWER is kept, with its
+                    // chain (H8-23, H8-27).
+                    let enc = self.role.enc.take_accepted(endpoint, answer.alias, nonce);
                     // At most one per session slot, so within `max_images`.
                     self.role.chains.push(Chain {
                         slot,
@@ -6358,9 +6377,8 @@ impl<T: StreamTerms> Intake<'_, T> {
                         initial_term_id: term.initial_term_id,
                         joins,
                         nonce,
+                        enc,
                     });
-                    // Only the accepted ENC ANSWER is kept (H8-23).
-                    self.role.enc.accept_answer(endpoint, answer.alias, nonce);
                     // The conductor gone: the driver is stopping.
                     let _ = sessions.events.post(create, event);
                     self.role.count(|c| &mut c.create_image);
@@ -7359,7 +7377,8 @@ impl<T: StreamTerms> SenderRole<T> {
         endpoint: EndpointId,
         bytes: &[u8],
     ) -> Option<(Control, Option<Establishing>)> {
-        self.open_sealed(endpoint, None, bytes)
+        let now = (self.clock)();
+        self.open_sealed(endpoint, None, bytes, now)
     }
 
     /// Opens a sealed receiver control from `source` as the duty does
@@ -7371,7 +7390,8 @@ impl<T: StreamTerms> SenderRole<T> {
         source: SocketAddr,
         bytes: &[u8],
     ) -> Option<(Control, Option<Establishing>)> {
-        self.open_sealed(endpoint, Some(source), bytes)
+        let now = (self.clock)();
+        self.open_sealed(endpoint, Some(source), bytes, now)
     }
 
     /// Installs the sealer of a verified establishment, as the answer
@@ -9179,6 +9199,7 @@ impl<T: StreamTerms> SenderRole<T> {
         endpoint: EndpointId,
         source: Option<SocketAddr>,
         bytes: &[u8],
+        now: u64,
     ) -> Option<(Control, Option<Establishing>)> {
         // Nothing is opened under a stale or unapplied key view (H8 R3-1).
         if !self
@@ -9189,7 +9210,7 @@ impl<T: StreamTerms> SenderRole<T> {
             return None;
         }
         if crate::wire_enc::is_envelope(bytes) {
-            return self.open_enc(endpoint, source, bytes);
+            return self.open_enc(endpoint, source, bytes, now);
         }
         // Nothing binds or is answered while a VM generation change is not
         // released (karyos#648): the publications stay stopped.
@@ -9600,7 +9621,7 @@ impl<T: StreamTerms> SenderRole<T> {
                     source,
                     bytes,
                     seen,
-                } => match self.open_sealed(endpoint, Some(source), bytes.get()) {
+                } => match self.open_sealed(endpoint, Some(source), bytes.get(), now) {
                     Some((control, establishing)) => (
                         ControlItem::Incoming {
                             endpoint,

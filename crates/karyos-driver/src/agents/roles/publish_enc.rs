@@ -48,6 +48,12 @@ struct Bound {
     opener: EncOpener,
 }
 
+/// A new binding a verified RSP_SETUP staged: its domain 4 keys, made
+/// but not yet the publication's. [`PublicationEnc::commit`] retires the
+/// old boot and binds it; dropped, it changes nothing (H8-25).
+#[derive(Debug)]
+pub(crate) struct Staged(Bound);
+
 /// What the publisher does after a verified RSP_SETUP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EncEstablishing {
@@ -249,17 +255,55 @@ impl PublicationEnc {
     /// # Errors
     ///
     /// The [`EncRejection`].
+    #[cfg(test)]
     pub(crate) fn open_checked(
         &mut self,
         datagram: &[u8],
         out: &mut [u8; MAX_PLAINTEXT],
         admit: &dyn Fn(&Control) -> bool,
     ) -> Result<EncOpened, EncRejection> {
+        let (opened, staged) = self.open_staged(datagram, out, admit)?;
+        if let Some(staged) = staged {
+            self.commit(staged)?;
+        }
+        Ok(opened)
+    }
+
+    /// Opens as [`Self::open_checked`], but a new binding is only staged:
+    /// nothing of it is the publication's until [`Self::commit`], which
+    /// the caller runs once the answer and the runtime binding are
+    /// admitted (H8-25).
+    ///
+    /// # Errors
+    ///
+    /// The [`EncRejection`].
+    pub(crate) fn open_staged(
+        &mut self,
+        datagram: &[u8],
+        out: &mut [u8; MAX_PLAINTEXT],
+        admit: &dyn Fn(&Control) -> bool,
+    ) -> Result<(EncOpened, Option<Staged>), EncRejection> {
         let result = self.open_uncounted(datagram, out, admit);
-        if let Err(reason) = result {
-            self.channel.rejections.bump(reason);
+        if let Err(reason) = &result {
+            self.channel.rejections.bump(*reason);
         }
         result
+    }
+
+    /// Commits a staged binding: the bound receiver's boot id is retired
+    /// and the staged one bound, all or nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`EncRejection::RetiredBoot`] when the retired table is full (the
+    /// staging checked it); nothing changes.
+    pub(crate) fn commit(&mut self, staged: Staged) -> Result<(), EncRejection> {
+        if let Some(old) = &self.bound {
+            self.retired
+                .retire(&old.receiver, self.keys.current_epoch())?;
+        }
+        self.bound = Some(staged.0);
+        Ok(())
     }
 
     fn open_uncounted(
@@ -267,7 +311,7 @@ impl PublicationEnc {
         datagram: &[u8],
         out: &mut [u8; MAX_PLAINTEXT],
         admit: &dyn Fn(&Control) -> bool,
-    ) -> Result<EncOpened, EncRejection> {
+    ) -> Result<(EncOpened, Option<Staged>), EncRejection> {
         // Section 10: nothing is opened after a VM generation change.
         if quiesced() {
             return Err(EncRejection::VmGeneration);
@@ -278,7 +322,9 @@ impl PublicationEnc {
         }
         match head.domain {
             Domain::RspSetup => self.rsp_setup(datagram, out),
-            Domain::Receiver => self.receiver(datagram, out, head.receiver, admit),
+            Domain::Receiver => self
+                .receiver(datagram, out, head.receiver, admit)
+                .map(|opened| (opened, None)),
             Domain::Sender | Domain::Setup => Err(EncRejection::Domain),
         }
     }
@@ -287,7 +333,7 @@ impl PublicationEnc {
         &mut self,
         datagram: &[u8],
         out: &mut [u8; MAX_PLAINTEXT],
-    ) -> Result<EncOpened, EncRejection> {
+    ) -> Result<(EncOpened, Option<Staged>), EncRejection> {
         let now = (self.clock)();
         let (alias, identity) = (self.alias, self.identity);
         let mut found = None;
@@ -334,13 +380,16 @@ impl PublicationEnc {
         let nonce = id128(challenge.nonce);
         if let Some(bound) = &self.bound {
             if bound.receiver == receiver {
-                return Ok(EncOpened::RspSetup(
-                    control,
-                    EncEstablishing {
-                        receiver,
-                        nonce: bound.nonce,
-                        bind: false,
-                    },
+                return Ok((
+                    EncOpened::RspSetup(
+                        control,
+                        EncEstablishing {
+                            receiver,
+                            nonce: bound.nonce,
+                            bind: false,
+                        },
+                    ),
+                    None,
                 ));
             }
             if bound.receiver.receiver_id != receiver.receiver_id {
@@ -354,22 +403,22 @@ impl PublicationEnc {
         let context = self.receiver_context(&receiver, nonce, opened.header.key_epoch);
         let opener = EncOpener::new(&self.keys, Some(&self.pairwise), context, now)
             .map_err(|_| EncRejection::Pairwise)?;
-        if let Some(old) = self.bound.take() {
-            self.retired
-                .retire(&old.receiver, self.keys.current_epoch())?;
-        }
-        self.bound = Some(Bound {
-            receiver,
-            nonce,
-            opener,
-        });
-        Ok(EncOpened::RspSetup(
-            control,
-            EncEstablishing {
+        // Staged: the old boot is retired and this one bound only by
+        // `commit`, once the answer is admitted (H8-25).
+        Ok((
+            EncOpened::RspSetup(
+                control,
+                EncEstablishing {
+                    receiver,
+                    nonce,
+                    bind: true,
+                },
+            ),
+            Some(Staged(Bound {
                 receiver,
                 nonce,
-                bind: true,
-            },
+                opener,
+            })),
         ))
     }
 
@@ -833,11 +882,19 @@ impl<T: StreamTerms> SenderRole<T> {
     /// `source` is the datagram's source: with the publication's lane
     /// count, tag and destinations it is checked inside the open, before
     /// anything is marked (H8-15). `None` (tests only) skips the source.
+    ///
+    /// Admit, then commit (H8-24, H8-25): a NAK is admitted only if its
+    /// handler would queue or answer it at `now`; a new binding's
+    /// CHALLENGE or SOLICIT only if its ANSWER would go (route, session,
+    /// answer rate) and its runtime binding would be kept. Only then is
+    /// the old boot retired, the domain 4 opener bound and the domain 1
+    /// sealer installed; a refused one changes none of them.
     pub(super) fn open_enc(
         &mut self,
         endpoint: EndpointId,
         source: Option<SocketAddr>,
         bytes: &[u8],
+        now: u64,
     ) -> Option<(Control, Option<Establishing>)> {
         let alias = header(bytes).map(|head| Alias {
             session_id: head.session_id,
@@ -853,15 +910,19 @@ impl<T: StreamTerms> SenderRole<T> {
         // What `adopt` would find for one more binding (H8-15): taken
         // before the open, which changes no binding.
         let room = self.room_for(endpoint, alias, None);
-        let Some(publication) = self
-            .enc
-            .publications
-            .iter_mut()
-            .find(|publication| publication.endpoint == endpoint && publication.alias == alias)
+        // The NAK handler's own refusals before admission, read once: an
+        // aborting incarnation and a spent cycle budget (H8-24).
+        let naks = !self.incarnation_aborting(endpoint, alias)
+            && self.naks_this_cycle < self.repair.naks_per_cycle;
+        let Some(at) =
+            self.enc.publications.iter().position(|publication| {
+                publication.endpoint == endpoint && publication.alias == alias
+            })
         else {
             self.enc.unattributed.bump(EncRejection::Binding);
             return None;
         };
+        let publication = self.enc.publications.get_mut(at)?;
         let outbound = self
             .publications
             .iter()
@@ -870,33 +931,111 @@ impl<T: StreamTerms> SenderRole<T> {
         let (identity, bindings) = (publication.identity, &self.bindings);
         let admit = |control: &Control| {
             receiver_control_admissible(
-                outbound, source, identity, bindings, room, endpoint, control,
+                outbound,
+                source,
+                identity,
+                bindings,
+                (room, naks, now),
+                endpoint,
+                control,
             )
         };
         let mut out = [0_u8; MAX_PLAINTEXT];
-        match publication.open_checked(bytes, &mut out, &admit) {
-            Ok(EncOpened::Receiver(control)) => Some((control, None)),
-            Ok(EncOpened::RspSetup(control, establishing)) => {
-                if establishing.bind {
+        match publication.open_staged(bytes, &mut out, &admit) {
+            Ok((EncOpened::Receiver(control), _)) => Some((control, None)),
+            Ok((EncOpened::RspSetup(control, establishing), staged)) => {
+                if let Some(staged) = staged {
+                    // Admit: everything that could still refuse it.
                     let sealer = publication.data_sealer(&establishing).ok()?;
+                    let installable = self
+                        .publications
+                        .iter()
+                        .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+                        .is_some_and(|outbound| outbound.admits_enc_sealer(&sealer));
+                    let answered = source.is_none_or(|source| {
+                        self.enc_answer_admitted(endpoint, source, &control, now)
+                    });
+                    if !(installable && answered) {
+                        self.count(|c| &mut c.establishment_refused);
+                        return None;
+                    }
+                    // Commit: the binding, then the session sealer.
+                    self.enc.publications.get_mut(at)?.commit(staged).ok()?;
                     let fence = std::sync::Arc::clone(&self.key_generation);
-                    let installed = self
+                    if let Some(outbound) = self
                         .publications
                         .iter_mut()
                         .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
-                        .is_some_and(|outbound| {
-                            let installed = outbound.install_enc_sealer(sealer).is_ok();
-                            outbound.set_key_fence(fence);
-                            installed
-                        });
-                    if !installed {
-                        return None;
+                    {
+                        // Admitted above: it installs.
+                        let _ = outbound.install_enc_sealer(sealer);
+                        outbound.set_key_fence(fence);
                     }
                 }
                 Some((control, None))
             }
             Err(_) => None,
         }
+    }
+
+    /// Whether [`SenderRole::answer_for`] would answer the domain 6
+    /// CHALLENGE or SOLICIT `control` from `source` at `now`, and
+    /// [`SenderRole::bind`] keep its runtime binding, as they decide it
+    /// for a static unicast publication, charging nothing (H8-25): its
+    /// route, a destination's source on a multi-destination one, the
+    /// session's identity, joins and answer rate, and a binding already
+    /// held for its tuple or room for one (a free one, or an eviction).
+    /// A dynamic publication, whose answer takes a registrant's path,
+    /// is refused: an encrypted one never is (fail closed). Only the
+    /// bindings due by `now` expire, as `bind` expires them.
+    fn enc_answer_admitted(
+        &mut self,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        control: &Control,
+        now: u64,
+    ) -> bool {
+        let (alias, boot_id) = match control {
+            Control::Challenge(challenge) => {
+                (challenge.alias, challenge.challenge.receiver_boot_id)
+            }
+            Control::Solicit(solicit) => (solicit.alias, solicit.challenge.receiver_boot_id),
+            _ => return false,
+        };
+        let Some((_, joins)) = self.route_of(endpoint, alias) else {
+            return false;
+        };
+        if self.registration_of(endpoint, alias) {
+            return false;
+        }
+        let normal = crate::sessions::rate::normalized(source);
+        if self.destinations_of(endpoint, alias) == Some(true)
+            && !self.sends_to(endpoint, alias, normal)
+        {
+            return false;
+        }
+        if !self
+            .sessions
+            .would_answer(endpoint, source, now, control, joins.count())
+        {
+            return false;
+        }
+        let Some(identity) = self.sessions.identity(endpoint, alias) else {
+            return false;
+        };
+        self.expire_bindings(now);
+        let held = self.bindings.iter().any(|held| {
+            held.parent.is_none()
+                && held.endpoint == endpoint
+                && held.alias == alias
+                && held.solicited_from == normal
+                && held.boot_id == boot_id
+                && held.identity == identity
+        });
+        held || matches!(
+            self.room_for(endpoint, alias, None),
+            super::Room::Free | super::Room::Evict(_)
+        )
     }
 }
 
@@ -989,7 +1128,10 @@ impl<T: StreamTerms> SenderRole<T> {
 /// registrant), and the publication's incarnation `identity`. A NAK
 /// or RTTM REQUEST needs, as [`SenderRole::nak`] and the RTTM reply do, a
 /// binding on `endpoint` of its source, boot id, incarnation and receiver
-/// id (any while unconfirmed), and a NAK a repairing publication (an
+/// id (any while unconfirmed), and a NAK a repairing publication, `naks`
+/// (its incarnation not aborting, the cycle's NAK budget not spent) and
+/// an outcome of its repair admission and job table at `now` other than
+/// a drop ([`crate::agents::data::Outbound::nak_admissible`], H8-24) (an
 /// RTTM REPLY has no receiver alias, so it never gets here). An SM needs,
 /// as [`SenderRole::status`] finds it (`sm_binding`), a runtime binding
 /// of its receiver: one of its SM source, else one with none yet, either
@@ -1005,7 +1147,7 @@ fn receiver_control_admissible<T: StreamTerms>(
     source: Option<SocketAddr>,
     identity: Identity,
     bindings: &[super::ReceiverBinding],
-    room: super::Room,
+    (room, naks, now): (super::Room, bool, u64),
     endpoint: EndpointId,
     control: &Control,
 ) -> bool {
@@ -1030,7 +1172,14 @@ fn receiver_control_admissible<T: StreamTerms>(
     let status = match control {
         Control::Status(status) => status,
         Control::Nak(nak) => {
-            return outbound.repairs() && bound(nak.alias, nak.identity, nak.receiver);
+            return naks
+                && outbound.repairs()
+                && bound(nak.alias, nak.identity, nak.receiver)
+                && outbound.nak_admissible(
+                    source.map(crate::sessions::rate::normalized),
+                    nak,
+                    now,
+                );
         }
         Control::Rttm(rttm) => return bound(rttm.alias, rttm.identity, rttm.receiver),
         _ => return false,

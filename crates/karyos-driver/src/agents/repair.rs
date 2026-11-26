@@ -560,6 +560,35 @@ impl RepairPath {
         }
     }
 
+    /// Whether [`Self::nak_on`] would queue or answer `nak` (an outcome
+    /// other than a drop), in the same context, changing nothing: a domain
+    /// 4 open decides with it before the NAK's sequence is marked or an
+    /// epoch promoted (H8-24).
+    #[must_use]
+    pub fn would_take<T: StreamTerms>(
+        &self,
+        nak: &Nak,
+        requester: Requester,
+        reader: Option<&LaneReader<T>>,
+        sent_high: u64,
+        lane_count: u8,
+        now: u64,
+    ) -> bool {
+        let ctx = NakContext {
+            reliable: true,
+            lane_count,
+            requester,
+            floor: reader.map_or(0, LaneReader::<T>::floor),
+            nak_bound: sent_high,
+            term_length: self.term_length,
+        };
+        match self.admission.would_admit(nak, &ctx, now) {
+            Admitted::Dropped(_) => false,
+            Admitted::Reply(_) => true,
+            Admitted::Pass(request) => self.jobs.would_take(&request, Domain::Group, now),
+        }
+    }
+
     /// Whether `nak` on route `route` at `now` is a copy of a NAK another
     /// route carried within `path_skew_window` (RP-11). It is decided on
     /// the validated receiver and the exact interval, before the NAK

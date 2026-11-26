@@ -79,6 +79,10 @@ fn rig() -> Rig {
     role.enc.subscribe(
         SubscriptionEnc::new(EndpointId(1), 6, &[&channel(0x11)], &[&pairwise()], 66).unwrap(),
     );
+    // Its stream is subscribed: a verified ANNOUNCE is accepted, and only
+    // then a verified target (H8-26).
+    role.subscriptions
+        .push((EndpointId(1), 6, 1 << 20, true, false));
     let (sessions, _link) = session_rings(std::num::NonZeroUsize::new(4).unwrap());
     Rig {
         role,
@@ -665,9 +669,20 @@ fn a_vm_generation_change_closes_every_image_and_redraws_the_boot_id() {
     role.enc
         .verified
         .push((EndpointId(1), ALIAS, publication_of(&IDENTITY)));
-    role.enc
-        .answers
-        .push((EndpointId(1), ALIAS, enc_answer(2, 0, NONCE)));
+    role.chains.push(super::super::Chain {
+        slot: SlotRef {
+            slot: 9,
+            generation: 1,
+        },
+        retire: sessions.events.reserve().unwrap(),
+        lane_count: 1,
+        term_length: 65_536,
+        mtu: 1408,
+        initial_term_id: 0,
+        joins: karyos_protocol::network::Lanes::new(&[0]).unwrap(),
+        nonce: NONCE,
+        enc: Some(enc_answer(2, 0, NONCE)),
+    });
     let injector = watched(&mut role);
     let old = role.boot_id();
     role.on_generation_change(&sessions, 0);
@@ -677,7 +692,7 @@ fn a_vm_generation_change_closes_every_image_and_redraws_the_boot_id() {
     role.on_generation_change(&sessions, AFTER);
     assert_eq!(role.enc_generation(), 1);
     assert_eq!(role.enc_images(), 0);
-    assert!(role.enc.answers.is_empty() && role.enc.verified.is_empty());
+    assert!(role.chains.iter().all(|chain| chain.enc.is_none()) && role.enc.verified.is_empty());
     let subscription = &role.enc.subscriptions[0];
     assert!(role.enc.rsp.is_empty() && subscription.bootstrap.is_none());
     assert_ne!(role.boot_id(), old);
@@ -1075,10 +1090,6 @@ fn run_steps(steps: &[Step]) -> Vec<crate::wire_enc::SealedRecord> {
                 let Some(nonce) = rig.role.nonces.nonce() else {
                     continue;
                 };
-                rig.role
-                    .enc
-                    .answers
-                    .push((EndpointId(1), ALIAS, enc_answer(1, 0, nonce)));
                 let key = BindingKey {
                     endpoint: EndpointId(1),
                     source: rig.source,
@@ -1088,8 +1099,14 @@ fn run_steps(steps: &[Step]) -> Vec<crate::wire_enc::SealedRecord> {
                     slot: controls.len().try_into().unwrap(),
                     generation: 1,
                 };
-                if let Ok(Some(sealer)) = rig.role.enc_keys(&key, IDENTITY, slot, 66, nonce, 1_000)
-                {
+                if let Ok(Some(sealer)) = rig.role.enc_keys(
+                    &key,
+                    IDENTITY,
+                    slot,
+                    66,
+                    (nonce, Some(enc_answer(1, 0, nonce))),
+                    1_000,
+                ) {
                     controls.push(sealer);
                 }
             }
@@ -1242,7 +1259,18 @@ fn a_forged_first_alias_never_pins_the_target() {
         &challenge_on(IDENTITY, ALIAS_2),
     );
     assert_eq!((forged.session_id, forged.seq), (ALIAS_2.session_id, 0));
-    rig.inject(&announce_on(IDENTITY, ALIAS));
+    // Its pending challenge holds the identity until it expires: the
+    // session table refuses the genuine ANNOUNCE before then, which then
+    // records no target (H8-26).
+    let later = 2_000 + crate::sessions::receive::SessionConfig::default().setup_challenge_timeout;
+    rig.role.sessions.timers(later);
+    rig.role.inject_datagram(
+        &rig.sessions,
+        EndpointId(1),
+        rig.source,
+        &announce_on(IDENTITY, ALIAS),
+        later,
+    );
     assert_eq!(rig.rejections().total(), 0, "both announces verified");
     let genuine = challenge_on(IDENTITY, ALIAS);
     let mut seal = rsp_seal_of(&mut rig, &genuine);
@@ -1469,6 +1497,8 @@ fn establishment_binds_through_the_signing_epoch_around_activation() {
                 .unwrap(),
             );
             role.enc.apply_keys(&view);
+            role.subscriptions
+                .push((EndpointId(1), 6, 1 << 20, true, false));
             let (sessions, _link) = session_rings(std::num::NonZeroUsize::new(4).unwrap());
             let source: SocketAddr = "10.0.0.2:4000".parse().unwrap();
             role.inject_datagram(&sessions, EndpointId(1), source, &announce_at(epoch), 1_000);
@@ -1624,6 +1654,8 @@ fn a_backward_clock_step_never_lets_the_predecessor_bind_again() {
         for signing in [1, 2, 1] {
             role.enc.apply_keys(&view(signing, &[1, 2]));
         }
+        role.subscriptions
+            .push((EndpointId(1), 6, 1 << 20, true, false));
         let (sessions, _link) = session_rings(std::num::NonZeroUsize::new(4).unwrap());
         let source: SocketAddr = "10.0.0.2:4000".parse().unwrap();
         role.inject_datagram(&sessions, EndpointId(1), source, &announce_at(epoch), 1_000);
@@ -1668,6 +1700,8 @@ fn a_recreated_subscription_keeps_the_activation_floor() {
         role.encrypt_subscription(made());
         assert_eq!(role.enc.activation.floor(3), Some(2));
         role.enc.apply_keys(&view(1, &[1, 2]));
+        role.subscriptions
+            .push((EndpointId(1), 6, 1 << 20, true, false));
         let (sessions, _link) = session_rings(std::num::NonZeroUsize::new(4).unwrap());
         let source: SocketAddr = "10.0.0.2:4000".parse().unwrap();
         role.inject_datagram(&sessions, EndpointId(1), source, &announce_at(epoch), 1_000);
@@ -1696,4 +1730,311 @@ fn role_maintenance_erases_the_previous_key_after_its_overlap() {
         "erased at its end"
     );
     assert_eq!(role.enc.images[0].opener.epochs(), (1, 3));
+}
+
+/// The identity `n` of the H8-26 and H8-27 tests: one publication each.
+fn identity_n(n: u64) -> Identity {
+    let mut identity = IDENTITY;
+    identity.registration_id = 100 + n;
+    identity
+}
+
+/// The alias `n` of the rig's stream.
+fn alias_n(n: u64) -> Alias {
+    Alias {
+        session_id: 200 + i32::try_from(n).unwrap(),
+        stream_id: 6,
+    }
+}
+
+/// A verified domain 5 ENC ANSWER of `identity` on `alias` echoing
+/// `challenge`, at epoch pair (1, `party_epoch`).
+fn answer_on(
+    identity: Identity,
+    alias: Alias,
+    challenge: ChallengeBlock,
+    party_epoch: u16,
+) -> Vec<u8> {
+    let keys = ChannelKeys::new(&[&channel(0x11)]).unwrap();
+    let mut sealer = EncSealer::new(
+        &keys,
+        None,
+        KeyContext {
+            domain: Domain::Setup,
+            key_epoch: 1,
+            party_epoch: 0,
+            session_id: alias.session_id,
+            stream_id: alias.stream_id,
+            publication: publication_of(&identity),
+            receiver: None,
+            salt: Salt::Empty,
+        },
+        monotonic_ns,
+    )
+    .unwrap();
+    let answer = EncAnswer {
+        answer: karyos_protocol::network::SetupAnswer {
+            alias,
+            identity,
+            term: term(),
+            challenge,
+            joins: karyos_protocol::network::Lanes::new(&[1 << 20]).unwrap(),
+        },
+        key_epoch: 1,
+        party_epoch,
+    };
+    let mut bytes = vec![0_u8; MAX_SEALED];
+    let length = answer.encode(&mut bytes).unwrap();
+    let sealed = sealer.seal(&mut bytes, length).unwrap();
+    bytes.truncate(sealed);
+    bytes
+}
+
+/// A verified ANNOUNCE of `identity` on `alias` with `term_length`.
+fn announce_with(identity: Identity, alias: Alias, term_length: u32) -> Vec<u8> {
+    let keys = ChannelKeys::new(&[&channel(0x11)]).unwrap();
+    let mut sealer = EncSealer::new(
+        &keys,
+        None,
+        KeyContext {
+            domain: Domain::Setup,
+            key_epoch: 1,
+            party_epoch: 0,
+            session_id: alias.session_id,
+            stream_id: alias.stream_id,
+            publication: publication_of(&identity),
+            receiver: None,
+            salt: Salt::Empty,
+        },
+        monotonic_ns,
+    )
+    .unwrap();
+    let control = Control::SetupAnnounce(SetupAnnounce {
+        alias,
+        identity,
+        term: TermParams {
+            term_length,
+            ..term()
+        },
+        lane_count: 1,
+    });
+    sealed(&mut sealer, &control)
+}
+
+/// A receiver role subscribed to stream 6 on endpoint 1, whose session
+/// rings take many chains.
+fn subscribed() -> (super::super::ReceiverRole, super::super::SessionEnd) {
+    let rig = rig();
+    let (sessions, _link) = session_rings(std::num::NonZeroUsize::new(128).unwrap());
+    (rig.role, sessions)
+}
+
+/// The source `n` of the tests.
+fn source_n(n: u64) -> SocketAddr {
+    SocketAddr::from(([10, 0, 0, u8::try_from(n).unwrap() + 10], 4000))
+}
+
+/// The challenge block the role posted for `identity` on `alias`.
+fn posted(role: &super::super::ReceiverRole, identity: Identity, alias: Alias) -> ChallengeBlock {
+    role.posted_challenges()
+        .iter()
+        .rev()
+        .find_map(|(_, control)| match control {
+            Control::Challenge(challenge)
+                if challenge.identity == identity && challenge.alias == alias =>
+            {
+                Some(challenge.challenge)
+            }
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// H8-26: an ANNOUNCE that verifies in domain 5 records its publication
+/// as a verified target only once the subscription and session handler
+/// accept it. One whose term exceeds the subscription's maximum, and one
+/// the session table refuses (its source's pending challenges are full),
+/// change no target: the alias keeps the target it had, the refused one
+/// is never a SOLICIT target, and no domain 6 sealer can be made for it.
+#[test]
+fn a_refused_announce_records_no_verified_target() {
+    let (mut role, sessions) = subscribed();
+    let source = source_n(0);
+    role.inject_datagram(
+        &sessions,
+        EndpointId(1),
+        source,
+        &announce_under(IDENTITY),
+        1_000,
+    );
+    let ours = publication_of(&IDENTITY);
+    assert!(
+        role.enc
+            .is_verified(ours, ALIAS, EndpointId(1), EndpointId(1))
+    );
+    let before = role.enc.verified.clone();
+    // An oversized term.
+    let other = identity_n(1);
+    let large = announce_with(other, ALIAS, 1 << 24);
+    role.inject_datagram(&sessions, EndpointId(1), source_n(1), &large, 1_000);
+    assert_eq!(role.counters().term_too_large, 1);
+    assert_eq!(role.enc.verified, before, "no target replaced");
+    assert_eq!(
+        role.enc.solicit_target(ALIAS, EndpointId(1), EndpointId(1)),
+        Some(ours)
+    );
+    assert!(
+        !role
+            .enc
+            .is_verified(publication_of(&other), ALIAS, EndpointId(1), EndpointId(1))
+    );
+    // A session refusal: this source's pending challenges are full.
+    let per_source = crate::sessions::receive::SessionConfig::default().max_pending_per_source;
+    for n in 1..u64::try_from(per_source).unwrap() {
+        role.inject_datagram(
+            &sessions,
+            EndpointId(1),
+            source,
+            &announce_on(identity_n(10 + n), alias_n(n)),
+            1_000,
+        );
+    }
+    let before = role.enc.verified.clone();
+    let refused = identity_n(30);
+    let challenges = role.posted_challenges().len();
+    role.inject_datagram(
+        &sessions,
+        EndpointId(1),
+        source,
+        &announce_on(refused, alias_n(30)),
+        1_000,
+    );
+    assert_eq!(role.posted_challenges().len(), challenges, "refused");
+    assert_eq!(role.enc.verified, before, "no target recorded or evicted");
+    assert_eq!(
+        role.enc
+            .solicit_target(alias_n(30), EndpointId(1), EndpointId(1)),
+        None,
+        "a later header cannot use it"
+    );
+    let index = role.enc.subscription(EndpointId(1), 6).unwrap();
+    let create = role.enc.is_verified(
+        publication_of(&refused),
+        alias_n(30),
+        EndpointId(1),
+        EndpointId(1),
+    );
+    assert!(!create);
+    assert!(
+        role.enc
+            .rsp_sealer(
+                index,
+                publication_of(&refused),
+                alias_n(30),
+                [3; 16],
+                create
+            )
+            .is_none(),
+        "no domain 6 sealer for it"
+    );
+}
+
+/// Answers every challenge posted for `(identity, alias, source)` and
+/// returns how many chains hold an accepted answer of their own nonce.
+fn answer_all(
+    role: &mut super::super::ReceiverRole,
+    sessions: &super::super::SessionEnd,
+    pending: &[(Identity, Alias, SocketAddr)],
+) {
+    for (n, (identity, alias, source)) in pending.iter().enumerate() {
+        let challenge = posted(role, *identity, *alias);
+        let party = u16::try_from(n).unwrap();
+        role.inject_datagram(
+            sessions,
+            EndpointId(1),
+            *source,
+            &answer_on(*identity, *alias, challenge, party),
+            1_000,
+        );
+    }
+}
+
+/// Every pending chain installs at its own accepted answer's epochs.
+fn install_all(role: &mut super::super::ReceiverRole, pending: &[(Identity, Alias, SocketAddr)]) {
+    assert_eq!(role.chains.len(), pending.len());
+    for (n, (identity, alias, source)) in pending.iter().enumerate() {
+        let challenge = posted(role, *identity, *alias);
+        let at = role
+            .chains
+            .iter()
+            .position(|chain| chain.nonce == challenge.nonce)
+            .unwrap();
+        let chain = role.chains.swap_remove(at);
+        let answer = chain.enc.unwrap();
+        assert_eq!(answer.answer.identity, *identity);
+        assert_eq!(answer.party_epoch, u16::try_from(n).unwrap());
+        let key = BindingKey {
+            endpoint: EndpointId(1),
+            source: *source,
+            alias: *alias,
+        };
+        assert!(
+            matches!(
+                role.enc_keys(
+                    &key,
+                    *identity,
+                    chain.slot,
+                    66,
+                    (chain.nonce, chain.enc),
+                    1_000
+                ),
+                Ok(Some(_))
+            ),
+            "{n}"
+        );
+        assert_eq!(
+            role.enc_epochs(chain.slot),
+            Some((1, u16::try_from(n).unwrap()))
+        );
+    }
+}
+
+/// H8-27: an accepted ENC ANSWER is held with its slot's reserved chain,
+/// never evicted by another. Two establishments on one endpoint and alias
+/// (two sources, two identities), and twelve pending across aliases and
+/// sources, more than the eight the old table held, each install at their
+/// own accepted epochs.
+#[test]
+fn every_accepted_pending_establishment_installs_at_its_own_answer() {
+    let (mut role, sessions) = subscribed();
+    let same: Vec<_> = (0..2)
+        .map(|n| (identity_n(n), ALIAS, source_n(n)))
+        .collect();
+    for (identity, alias, source) in &same {
+        role.inject_datagram(
+            &sessions,
+            EndpointId(1),
+            *source,
+            &announce_on(*identity, *alias),
+            1_000,
+        );
+    }
+    answer_all(&mut role, &sessions, &same);
+    install_all(&mut role, &same);
+
+    let (mut role, sessions) = subscribed();
+    let many: Vec<_> = (0..12)
+        .map(|n| (identity_n(n), alias_n(n), source_n(n / 4)))
+        .collect();
+    for (identity, alias, source) in &many {
+        role.inject_datagram(
+            &sessions,
+            EndpointId(1),
+            *source,
+            &announce_on(*identity, *alias),
+            1_000,
+        );
+    }
+    answer_all(&mut role, &sessions, &many);
+    install_all(&mut role, &many);
 }

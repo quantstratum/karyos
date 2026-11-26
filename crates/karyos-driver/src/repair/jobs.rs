@@ -357,6 +357,32 @@ impl Jobs {
         Joined::Created(job_ref(at, generation))
     }
 
+    /// Whether [`Self::join_or_create_on`] would take `request` in
+    /// `domain` at `now` (create or join a job), changing nothing: a
+    /// lingering key or a full table refuses it (H8-24).
+    #[must_use]
+    pub fn would_take(&self, request: &Request, domain: Domain, now: u64) -> bool {
+        let key = JobKey {
+            lane: request.lane,
+            start: request.start,
+            length: request.length,
+            domain,
+        };
+        let linger = self.config.repair_linger;
+        if self
+            .lingers
+            .iter()
+            .flatten()
+            .any(|entry| entry.key == key && age_ns(now, entry.since) < linger)
+        {
+            return false;
+        }
+        self.slots.iter().any(|slot| {
+            slot.job.is_some_and(|job| job.key == key)
+                || (!slot.retired && slot.job.is_none() && slot.generation.checked_add(1).is_some())
+        })
+    }
+
     /// A sender-initiated catch-up job over `length` bytes of `lane` from
     /// `start` (MD-20, karyos#802): no admission, no requester and no ERR,
     /// in a free slot of the table like any job, so it counts against the

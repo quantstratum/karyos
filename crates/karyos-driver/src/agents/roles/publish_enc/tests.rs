@@ -123,6 +123,17 @@ impl Peer {
         seal_control(&mut self.rsp, &control)
     }
 
+    fn solicit(&mut self) -> Vec<u8> {
+        let control = Control::Solicit(karyos_protocol::network::RspSolicit {
+            alias: ALIAS,
+            challenge: ChallengeBlock {
+                receiver_boot_id: [self.boot, self.boot],
+                nonce: self.nonce,
+            },
+        });
+        seal_control(&mut self.rsp, &control)
+    }
+
     fn data_keys(&self) -> (EncSealer, PairwiseFiles) {
         let files = PairwiseFiles::new(&[&pairwise(0x22)]).unwrap();
         let keys = ChannelKeys::new(&[&channel(1, 0x11)]).unwrap();
@@ -1083,6 +1094,7 @@ fn a_next_epoch_nak_or_rttm_from_an_unbound_source_marks_nothing() {
         IDENTITY,
     )
     .unwrap();
+    expect_receiver(&mut path, destination, 5);
     sender.publications.push(path);
     sender.enc.publish(publication());
     sender.bind(EndpointId(1), destination, &plain_answer(), None, clock());
@@ -1446,4 +1458,253 @@ fn a_next_epoch_sm_with_no_room_for_its_adoption_marks_nothing() {
         "its sequence was never marked"
     );
     assert_eq!(sender.enc.publications[0].bound_epochs(), Some((1, 1)));
+}
+
+/// Attaches a membership to `path` expecting the receiver of boot `boot`
+/// from `source`, as an answer does: its NAK's requester is known, which
+/// the NAK handler (and so the domain 4 open) requires (H8-24).
+fn expect_receiver(path: &mut crate::agents::data::Outbound, source: SocketAddr, boot: u64) {
+    use crate::membership::{Membership, MembershipConfig, Roles, SmKey};
+
+    let mut membership = Membership::new(
+        MembershipConfig::new(1, 1408, 32_768),
+        IDENTITY,
+        ALIAS,
+        &Roles::default(),
+        0,
+    )
+    .unwrap();
+    let key = SmKey {
+        endpoint: EndpointId(1),
+        alias: ALIAS,
+        source,
+        identity: IDENTITY,
+        receiver: Receiver {
+            receiver_boot_id: [boot, boot],
+            receiver_id: 66,
+        },
+    };
+    membership.expect(&key, &[0], clock()).unwrap();
+    path.attach_membership(Box::new(membership));
+}
+
+/// H8-24: a next-epoch NAK is admitted inside the domain 4 open only if
+/// its handler would queue or answer it. Naming lane 1 of a one-lane
+/// publication (repair admission's step 1 `Context`), or arriving with
+/// the cycle's NAK budget spent, it marks nothing and promotes nothing;
+/// a valid NAK at the same sequence then opens.
+#[test]
+fn a_next_epoch_nak_its_handler_would_drop_marks_nothing() {
+    let (mut sender, _): (super::super::SenderRole, super::super::ReceiverRole) =
+        super::super::roles(&crate::agents::AgentConfig::default()).unwrap();
+    let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 0,
+        mtu: 1408,
+    };
+    let (mut path, _log) =
+        crate::agents::data::testing::outbound(EndpointId(1), ALIAS, destination, term, 1, true);
+    path.enable_repair(
+        &crate::agents::repair::RepairConfig::default(),
+        term.term_length,
+        IDENTITY,
+    )
+    .unwrap();
+    expect_receiver(&mut path, destination, 5);
+    sender.publications.push(path);
+    sender.enc.publish(publication());
+    sender.bind(EndpointId(1), destination, &plain_answer(), None, clock());
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    assert!(open(&mut sender.enc.publications[0], &receiver.challenge()).is_ok());
+    // Two sealers of the same keys: the same sequence under the next
+    // party epoch, once with an unavailable lane and once valid.
+    let (mut bad, _) = receiver.data_keys();
+    let (mut good, _) = receiver.data_keys();
+    bad.roll_now();
+    good.roll_now();
+    let mut lane_one = receiver.nak();
+    if let Control::Nak(nak) = &mut lane_one {
+        nak.range.lane = Lane::try_new(1).unwrap();
+    }
+    let lane_one = seal_control(&mut bad, &lane_one);
+    let valid = seal_control(&mut good, &receiver.nak());
+    assert!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &lane_one)
+            .is_none()
+    );
+    assert_eq!(
+        sender.enc.publications[0].bound_epochs(),
+        Some((1, 0)),
+        "nothing promoted"
+    );
+    let spent = sender.repair.naks_per_cycle;
+    sender.naks_this_cycle = spent;
+    assert!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &valid)
+            .is_none(),
+        "a spent cycle budget"
+    );
+    assert_eq!(sender.enc.publications[0].bound_epochs(), Some((1, 0)));
+    assert_eq!(
+        sender.enc.publications[0]
+            .channel
+            .rejections
+            .get(EncRejection::InnerRejected),
+        2
+    );
+    sender.naks_this_cycle = 0;
+    assert_eq!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &valid)
+            .map(|(control, _)| control),
+        Some(receiver.nak()),
+        "its sequence was never marked"
+    );
+    assert_eq!(sender.enc.publications[0].bound_epochs(), Some((1, 1)));
+}
+
+/// What could refuse a domain 6 establishment after its open (H8-25).
+#[derive(Debug, Clone, Copy)]
+enum Refusal {
+    /// The source's `setup_answer_rate` bucket is spent.
+    AnswerRate,
+    /// The runtime binding table is full of confirmed bindings.
+    BindingTable,
+}
+
+/// An encrypted unicast publication with its session, answering.
+fn answering() -> (
+    super::super::SenderRole,
+    SocketAddr,
+    crate::agents::data::testing::TestLog,
+) {
+    let (mut sender, _): (super::super::SenderRole, super::super::ReceiverRole) =
+        super::super::roles(&crate::agents::AgentConfig::default()).unwrap();
+    let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 0,
+        mtu: 1408,
+    };
+    let (mut path, log) =
+        crate::agents::data::testing::outbound(EndpointId(1), ALIAS, destination, term, 1, false);
+    path.require_enc().unwrap();
+    sender.clock = clock;
+    sender.publications.push(path);
+    sender
+        .sessions
+        .add(crate::sessions::send::Publication {
+            endpoint: EndpointId(1),
+            alias: ALIAS,
+            identity: IDENTITY,
+            term,
+            lane_count: 1,
+        })
+        .unwrap();
+    sender.enc.publish(publication());
+    (sender, destination, log)
+}
+
+/// Opens `bytes` from `source` and answers it, as the duty does.
+fn establish(
+    sender: &mut super::super::SenderRole,
+    source: SocketAddr,
+    bytes: &[u8],
+) -> Option<Control> {
+    let (control, _) = sender.open_sealed_from(EndpointId(1), source, bytes)?;
+    sender
+        .answer_for(EndpointId(1), source, clock(), control)
+        .map(|(_, answer)| answer)
+}
+
+/// The salt of the session's installed domain 1 sealer.
+fn session_salt(sender: &mut super::super::SenderRole) -> Option<Salt> {
+    let sealer = sender.publications[0].lend_enc_sealer()?;
+    let salt = sealer.context().salt;
+    sender.publications[0].return_enc_sealer(sealer);
+    Some(salt)
+}
+
+/// H8-25: a verified CHALLENGE or SOLICIT naming a new boot id is
+/// admitted, then committed. Refused by the answer rate or by a full
+/// runtime binding table, it retires no boot, replaces no domain 4 opener,
+/// installs no domain 1 sealer and binds nothing, and no ANSWER goes; once
+/// the refusal clears, the same genuine datagram establishes.
+#[test]
+fn a_refused_domain_6_establishment_changes_nothing() {
+    for refusal in [Refusal::AnswerRate, Refusal::BindingTable] {
+        for solicit in [false, true] {
+            let (mut sender, destination, _log) = answering();
+            let mut first = peer(5, 0x22, 1, &keys());
+            assert!(establish(&mut sender, destination, &first.challenge()).is_some());
+            let mut second = peer(6, 0x22, 1, &keys());
+            let bytes = if solicit {
+                second.solicit()
+            } else {
+                second.challenge()
+            };
+            let salt = session_salt(&mut sender);
+            match refusal {
+                Refusal::AnswerRate => {
+                    let joins = Lanes::new(&[0]).unwrap();
+                    let other = karyos_protocol::network::RspSolicit {
+                        alias: ALIAS,
+                        challenge: ChallengeBlock {
+                            receiver_boot_id: [9, 9],
+                            nonce: [9, 9],
+                        },
+                    };
+                    while sender
+                        .sessions
+                        .solicit(EndpointId(1), destination, clock(), &other, |_| joins)
+                        .is_ok()
+                    {}
+                }
+                Refusal::BindingTable => {
+                    sender.max_bindings = 1;
+                    sender.bindings[0].last_sm = Some(clock());
+                }
+            }
+            let bindings: Vec<_> = sender
+                .bindings
+                .iter()
+                .map(|binding| (binding.boot_id, binding.solicited_from, binding.last_sm))
+                .collect();
+            assert!(
+                establish(&mut sender, destination, &bytes).is_none(),
+                "{refusal:?} {solicit}"
+            );
+            let publication = &sender.enc.publications[0];
+            assert_eq!(publication.bound_receiver(), Some(first.receiver));
+            assert!(!publication.retired.contains(&first.receiver));
+            assert_eq!(session_salt(&mut sender), salt, "no sealer installed");
+            let after: Vec<_> = sender
+                .bindings
+                .iter()
+                .map(|binding| (binding.boot_id, binding.solicited_from, binding.last_sm))
+                .collect();
+            assert_eq!(after, bindings, "nothing bound");
+            match refusal {
+                Refusal::AnswerRate => NOW.with(|now| now.set(now.get() + SECOND_NS)),
+                Refusal::BindingTable => sender.max_bindings = 2,
+            }
+            assert!(
+                establish(&mut sender, destination, &bytes).is_some(),
+                "{refusal:?} {solicit}"
+            );
+            let publication = &sender.enc.publications[0];
+            assert_eq!(publication.bound_receiver(), Some(second.receiver));
+            assert!(publication.retired.contains(&first.receiver));
+            assert_ne!(session_salt(&mut sender), salt);
+            assert!(
+                sender
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.boot_id == [6, 6])
+            );
+        }
+    }
 }

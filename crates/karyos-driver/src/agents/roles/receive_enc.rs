@@ -308,13 +308,16 @@ pub(crate) struct ReceiverEnc {
     /// The local encrypted publications, by endpoint and alias: their
     /// receivers' envelopes go to the sender undecoded.
     published: Vec<(EndpointId, Alias)>,
-    /// The verified ENC ANSWERs whose images are being installed: the
-    /// image takes its keys at the stated epochs, or is not installed.
-    answers: Vec<(EndpointId, Alias, EncAnswer)>,
-    /// The verified ENC ANSWER the session handler is deciding: it enters
-    /// `answers` only if the handler accepts it ([`Self::accept_answer`]),
-    /// so a refused one changes no pending establishment (H8-23).
+    /// The verified ENC ANSWER the session handler is deciding: it goes
+    /// with its slot's reserved chain only if the handler accepts it
+    /// ([`Self::take_accepted`]), so a refused one changes no pending
+    /// establishment (H8-23). The chain holds it until its image is
+    /// installed or the chain goes, never evicted by another (H8-27).
     deciding: Option<(EndpointId, Alias, EncAnswer)>,
+    /// The publication a verified ANNOUNCE names while the session handler
+    /// decides it: noted as verified only if the handler accepts it
+    /// ([`Self::accept_announce`], H8-26).
+    announcing: Option<(EndpointId, Alias, PublicationIdentity)>,
     /// The (alias, publication) pairs a verified domain 5 SETUP named, by
     /// endpoint: the only targets a new domain 6 sealer is made for, and
     /// the SOLICIT target of DATA for an alias with no binding. Bounded,
@@ -739,22 +742,40 @@ impl ReceiverEnc {
     }
 
     /// The ENC ANSWER being decided for `alias` on `endpoint`, accepted
-    /// by the session handler with the challenge `nonce`: kept for its
-    /// image's installation, and its publication noted as verified
-    /// (H8-23). Nothing for a plain answer.
-    pub(super) fn accept_answer(&mut self, endpoint: EndpointId, alias: Alias, nonce: [u64; 2]) {
-        let Some(deciding) = self.deciding.take_if(|(at, named, answer)| {
+    /// by the session handler with the challenge `nonce`: returned for its
+    /// slot's reserved chain, which keeps it for the image's installation
+    /// (H8-27), and its publication noted as verified (H8-23). `None` for
+    /// a plain answer.
+    pub(super) fn take_accepted(
+        &mut self,
+        endpoint: EndpointId,
+        alias: Alias,
+        nonce: [u64; 2],
+    ) -> Option<EncAnswer> {
+        let (_, _, answer) = self.deciding.take_if(|(at, named, answer)| {
             (*at, *named) == (endpoint, alias) && answer.answer.challenge.nonce == nonce
-        }) else {
-            return;
-        };
-        self.answers
-            .retain(|(at, named, _)| (*at, *named) != (endpoint, alias));
-        if self.answers.len() >= RSP_TARGETS {
-            self.answers.remove(0);
+        })?;
+        self.note_verified(endpoint, alias, publication_of(&answer.answer.identity));
+        Some(answer)
+    }
+
+    /// The ANNOUNCE being decided for `alias` on `endpoint`, of
+    /// `identity`, accepted by the session handler (it challenges): its
+    /// publication is noted as verified (H8-26). Nothing for a plain one.
+    pub(super) fn accept_announce(
+        &mut self,
+        endpoint: EndpointId,
+        alias: Alias,
+        identity: &Identity,
+    ) {
+        let publication = publication_of(identity);
+        if self
+            .announcing
+            .take_if(|held| *held == (endpoint, alias, publication))
+            .is_some()
+        {
+            self.note_verified(endpoint, alias, publication);
         }
-        self.note_verified(endpoint, alias, publication_of(&deciding.2.answer.identity));
-        self.answers.push(deciding);
     }
 
     /// Section 10 step 2: drops every derived key and sequence, which
@@ -767,8 +788,8 @@ impl ReceiverEnc {
     /// refusing bare frames and re-establish under the fresh identity.
     fn close(&mut self) {
         self.images.clear();
-        self.answers.clear();
         self.deciding = None;
+        self.announcing = None;
         self.verified.clear();
         for entry in &mut self.rsp {
             ControlSeal::withdraw(&mut entry.sealer);
@@ -1227,14 +1248,15 @@ impl<T: StreamTerms> Intake<'_, T> {
             return Err(EncRejection::Epoch);
         }
         // A verified identity: the only kind a domain 6 sealer is made for.
-        // An answer's is noted only once accepted (H8-23).
+        // An answer's or an announcement's is noted only once accepted
+        // (H8-23, H8-26).
         match setup {
             EncSetup::Announce(announce) => {
-                let endpoint = self.endpoint;
-                self.role
-                    .enc
-                    .note_verified(endpoint, alias, publication_of(&announce.identity));
+                self.drain_own_queue();
+                let publication = publication_of(&announce.identity);
+                self.role.enc.announcing = Some((self.endpoint, alias, publication));
                 self.verified_control(source, Control::SetupAnnounce(announce));
+                self.role.enc.announcing = None;
             }
             EncSetup::Answer(answer) => {
                 // Queued controls first: only this answer's outcome may
@@ -1381,6 +1403,11 @@ impl<T: StreamTerms> ReceiverRole<T> {
             }
         }
         self.enc.close();
+        // The answers the pending chains hold go too: no image installs
+        // at the old boot's establishment (H8-27).
+        for chain in &mut self.chains {
+            chain.enc = None;
+        }
         for image in &mut self.images {
             if let Some(seal) = image.enc_seal.as_mut() {
                 ControlSeal::withdraw(seal);
@@ -1469,7 +1496,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
         identity: Identity,
         slot: SlotRef,
         receiver_id: u64,
-        nonce: [u64; 2],
+        (nonce, accepted): ([u64; 2], Option<EncAnswer>),
         now: u64,
     ) -> Result<Option<SharedSealer>, EncRejection> {
         let Some(index) = self.enc.subscription(key.endpoint, key.alias.stream_id) else {
@@ -1479,16 +1506,10 @@ impl<T: StreamTerms> ReceiverRole<T> {
         self.enc
             .images
             .retain(|held| images.iter().any(|image| image.slot == held.slot));
-        let at = self
-            .enc
-            .answers
-            .iter()
-            .position(|(endpoint, alias, answer)| {
-                (*endpoint, *alias) == (key.endpoint, key.alias)
-                    && answer.answer.identity == identity
-                    && answer.answer.challenge.nonce == nonce
-            });
-        let Some((_, _, answer)) = at.map(|at| self.enc.answers.remove(at)) else {
+        // The accepted answer its chain kept (H8-27).
+        let Some(answer) = accepted.filter(|answer| {
+            answer.answer.identity == identity && answer.answer.challenge.nonce == nonce
+        }) else {
             self.enc.unattributed.bump(EncRejection::Binding);
             return Err(EncRejection::Binding);
         };

@@ -460,6 +460,34 @@ impl SendSessions {
         )
     }
 
+    /// Whether [`SendSessions::challenge`] or [`SendSessions::solicit`]
+    /// would answer `control` from `source` at `now` with `joins` lanes of
+    /// join points, charging nothing (H8-25).
+    pub(crate) fn would_answer(
+        &mut self,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        now: u64,
+        control: &karyos_protocol::network::Control,
+        joins: u8,
+    ) -> bool {
+        use karyos_protocol::network::Control;
+        let (alias, identity) = match control {
+            Control::Challenge(challenge) => (challenge.alias, Some(challenge.identity)),
+            Control::Solicit(solicit) => (solicit.alias, None),
+            _ => return false,
+        };
+        let Some(publication) = self
+            .find(endpoint, alias)
+            .map(|session| session.publication)
+        else {
+            return false;
+        };
+        identity.is_none_or(|identity| identity == publication.identity)
+            && joins == publication.lane_count
+            && self.rates.would_admit(source, now).is_ok()
+    }
+
     fn answer(
         &mut self,
         publication: &Publication,

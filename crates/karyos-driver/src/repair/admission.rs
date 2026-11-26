@@ -241,67 +241,29 @@ impl Admission {
     /// Admits `nak` in `ctx` at `now`: steps 1 to 5, then the ERR linger
     /// for an answer.
     pub fn admit(&mut self, nak: &Nak, ctx: &NakContext, now: u64) -> Admitted {
-        let lane = nak.range.lane.get();
-        let start = nak.range.start;
-        let length = nak.range.length;
-        // 1. Context.
-        if !ctx.reliable {
-            return self.drop(Dropped::Unreliable);
-        }
-        if lane >= ctx.lane_count || ctx.requester == Requester::Unknown {
-            return self.drop(Dropped::Context);
-        }
-        let end = start.checked_add(u64::from(length));
-        // 2. Requester window.
-        match ctx.requester {
-            Requester::Unknown => return self.drop(Dropped::Context),
-            Requester::Joined { join } => {
-                if start < join {
-                    return self.drop(Dropped::BeforeSm);
-                }
-            }
-            Requester::Member {
-                join,
-                consumption,
-                window,
-            } => {
-                if start < join {
-                    return self.drop(Dropped::BelowJoin);
-                }
-                if start < consumption {
-                    return self.drop(Dropped::Stale);
-                }
-                let edge = consumption.checked_add(u64::from(window));
-                if end.zip(edge).is_none_or(|(end, edge)| end > edge) {
-                    return self.drop(Dropped::BeyondWindow);
-                }
+        match verdict(nak, ctx) {
+            Verdict::Drop(reason) => self.drop(reason),
+            Verdict::Reply(reason) => self.reply(nak, reason, now),
+            Verdict::Pass(request) => {
+                self.counts.bump(|c| &mut c.passed);
+                Admitted::Pass(request)
             }
         }
-        // 3. Term bound.
-        if !in_one_term(start, length, ctx.term_length) {
-            return self.reply(nak, NakReplyReason::RangeInvalid, now);
+    }
+
+    /// What [`Self::admit`] would answer for `nak` in `ctx` at `now`,
+    /// counting and recording nothing: a domain 4 open decides with it
+    /// before the NAK's sequence is marked (H8-24).
+    #[must_use]
+    pub fn would_admit(&self, nak: &Nak, ctx: &NakContext, now: u64) -> Admitted {
+        match verdict(nak, ctx) {
+            Verdict::Drop(reason) => Admitted::Dropped(reason),
+            Verdict::Reply(reason) => match self.err_slot(nak, now) {
+                Ok(_) => Admitted::Reply(NakReply::answering(nak, reason)),
+                Err(reason) => Admitted::Dropped(reason),
+            },
+            Verdict::Pass(request) => Admitted::Pass(request),
         }
-        // 4. Floor.
-        if start < ctx.floor {
-            return self.reply(
-                nak,
-                NakReplyReason::RangeUnavailable {
-                    lowest_retained: ctx.floor,
-                },
-                now,
-            );
-        }
-        // 5. Sent frontier.
-        if end.is_none_or(|end| end > ctx.nak_bound) {
-            return self.reply(nak, NakReplyReason::RangeInvalid, now);
-        }
-        self.counts.bump(|c| &mut c.passed);
-        Admitted::Pass(Request {
-            receiver: nak.receiver,
-            lane,
-            start,
-            length,
-        })
     }
 
     /// The ERR for a request the job table later refused at its start
@@ -332,6 +294,26 @@ impl Admission {
         Admitted::Dropped(reason)
     }
 
+    /// The linger entry an ERR for `nak` at `now` takes, or why none is
+    /// sent: the same one went within the linger, or every entry is live.
+    fn err_slot(&self, nak: &Nak, now: u64) -> Result<usize, Dropped> {
+        let linger = self.linger;
+        let live = |entry: &ErrSent| age_ns(now, entry.at) < linger;
+        let same = |entry: &ErrSent| {
+            entry.receiver == nak.receiver
+                && entry.lane == nak.range.lane.get()
+                && entry.start == nak.range.start
+                && entry.length == nak.range.length
+        };
+        if self.entries.iter().flatten().any(|e| same(e) && live(e)) {
+            return Err(Dropped::ErrLinger);
+        }
+        self.entries
+            .iter()
+            .position(|entry| entry.is_none_or(|e| !live(&e) || same(&e)))
+            .ok_or(Dropped::ErrTableFull)
+    }
+
     /// An ERR for `nak`, unless the same one went within the linger.
     fn reply(&mut self, nak: &Nak, reason: NakReplyReason, now: u64) -> Admitted {
         let sent = ErrSent {
@@ -341,21 +323,10 @@ impl Admission {
             length: nak.range.length,
             at: now,
         };
-        let linger = self.linger;
-        let live = |entry: &ErrSent| age_ns(now, entry.at) < linger;
-        let same = |entry: &ErrSent| {
-            entry.receiver == sent.receiver
-                && entry.lane == sent.lane
-                && entry.start == sent.start
-                && entry.length == sent.length
+        let slot = match self.err_slot(nak, now) {
+            Ok(at) => self.entries.get_mut(at),
+            Err(dropped) => return self.drop(dropped),
         };
-        if self.entries.iter().flatten().any(|e| same(e) && live(e)) {
-            return self.drop(Dropped::ErrLinger);
-        }
-        let slot = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.is_none_or(|e| !live(&e) || same(&e)));
         let Some(slot) = slot else {
             return self.drop(Dropped::ErrTableFull);
         };
@@ -371,6 +342,73 @@ impl Admission {
         }
         Admitted::Reply(NakReply::answering(nak, reason))
     }
+}
+
+/// What steps 1 to 5 decide for a NAK, before anything is counted.
+enum Verdict {
+    Drop(Dropped),
+    Reply(NakReplyReason),
+    Pass(Request),
+}
+
+/// Steps 1 to 5 for `nak` in `ctx`; the first failure decides.
+fn verdict(nak: &Nak, ctx: &NakContext) -> Verdict {
+    let lane = nak.range.lane.get();
+    let start = nak.range.start;
+    let length = nak.range.length;
+    // 1. Context.
+    if !ctx.reliable {
+        return Verdict::Drop(Dropped::Unreliable);
+    }
+    if lane >= ctx.lane_count || ctx.requester == Requester::Unknown {
+        return Verdict::Drop(Dropped::Context);
+    }
+    let end = start.checked_add(u64::from(length));
+    // 2. Requester window.
+    match ctx.requester {
+        Requester::Unknown => return Verdict::Drop(Dropped::Context),
+        Requester::Joined { join } => {
+            if start < join {
+                return Verdict::Drop(Dropped::BeforeSm);
+            }
+        }
+        Requester::Member {
+            join,
+            consumption,
+            window,
+        } => {
+            if start < join {
+                return Verdict::Drop(Dropped::BelowJoin);
+            }
+            if start < consumption {
+                return Verdict::Drop(Dropped::Stale);
+            }
+            let edge = consumption.checked_add(u64::from(window));
+            if end.zip(edge).is_none_or(|(end, edge)| end > edge) {
+                return Verdict::Drop(Dropped::BeyondWindow);
+            }
+        }
+    }
+    // 3. Term bound.
+    if !in_one_term(start, length, ctx.term_length) {
+        return Verdict::Reply(NakReplyReason::RangeInvalid);
+    }
+    // 4. Floor.
+    if start < ctx.floor {
+        return Verdict::Reply(NakReplyReason::RangeUnavailable {
+            lowest_retained: ctx.floor,
+        });
+    }
+    // 5. Sent frontier.
+    if end.is_none_or(|end| end > ctx.nak_bound) {
+        return Verdict::Reply(NakReplyReason::RangeInvalid);
+    }
+    Verdict::Pass(Request {
+        receiver: nak.receiver,
+        lane,
+        start,
+        length,
+    })
 }
 
 #[cfg(test)]
