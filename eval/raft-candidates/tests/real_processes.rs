@@ -754,13 +754,16 @@ mod w1 {
 
     /// The custom core's stages that count nothing past the warm-up on a
     /// process (C5 v3).
-    pub const CUSTOM_ZERO: [&str; 6] = [
+    pub const CUSTOM_ZERO: [&str; 9] = [
         "propose",
         "step_leader",
+        "step_follower",
         "tick",
         "ready_leader",
+        "ready_follower",
         "advance_leader",
         "advance_follower",
+        "encoding",
     ];
 
     /// `stage`'s allocations and frees, summed over the servers.

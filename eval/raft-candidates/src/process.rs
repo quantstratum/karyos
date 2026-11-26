@@ -67,11 +67,28 @@ use crate::record::{self, Item};
 
 /// A core whose messages cross a process boundary.
 pub trait Wire: ConsensusCore {
-    /// The message's bytes; `None` when it cannot be encoded.
-    fn encode(message: &Self::Message) -> Option<Vec<u8>>;
+    /// The message's bytes into `out`, cleared first: the runner keeps
+    /// `out`, so an encoding that writes in place allocates nothing once it
+    /// has grown (C5 v3); `false` when it cannot be encoded.
+    fn encode_into(message: &Self::Message, out: &mut Vec<u8>) -> bool;
 
     /// The message in `bytes`; `None` when they are not one.
     fn decode(bytes: &[u8]) -> Option<Self::Message>;
+
+    /// The runner's own pool of decoded messages (C5 v3): what a message is
+    /// decoded into, lent to the core's `step`
+    /// ([`ConsensusCore::step_lent`]) and taken back.
+    type Decoder;
+
+    /// A pool, prefilled: at the node's initialisation.
+    fn decoder() -> Self::Decoder;
+
+    /// The message in `bytes`, decoded into `decoder`; `None` when they are
+    /// not one.
+    fn decode_lent<'a>(
+        decoder: &'a mut Self::Decoder,
+        bytes: &[u8],
+    ) -> Option<&'a mut Self::Message>;
 
     /// An append's leader term and its entries as (index, payload bytes),
     /// read from the message itself, never from the adapter's counters
@@ -92,12 +109,25 @@ pub trait Wire: ConsensusCore {
 /// A probed core's messages are its inner core's. [`run_server`] counts
 /// their encoding and decoding itself, so this delegates only.
 impl<C: Wire> Wire for Probed<C> {
-    fn encode(message: &Self::Message) -> Option<Vec<u8>> {
-        C::encode(message)
+    fn encode_into(message: &Self::Message, out: &mut Vec<u8>) -> bool {
+        C::encode_into(message, out)
     }
 
     fn decode(bytes: &[u8]) -> Option<Self::Message> {
         C::decode(bytes)
+    }
+
+    type Decoder = C::Decoder;
+
+    fn decoder() -> Self::Decoder {
+        C::decoder()
+    }
+
+    fn decode_lent<'a>(
+        decoder: &'a mut Self::Decoder,
+        bytes: &[u8],
+    ) -> Option<&'a mut Self::Message> {
+        C::decode_lent(decoder, bytes)
     }
 
     fn appended(message: &Self::Message) -> Option<(u64, Vec<(u64, u64)>)> {
@@ -530,8 +560,109 @@ impl Connection {
     }
 }
 
-/// A message's fragments as they arrive.
-type Partial = BTreeMap<(NodeId, u32), Vec<Option<Vec<u8>>>>;
+/// The messages a node puts back together from their fragments, in
+/// buffers it keeps (C5 v3): [`MAX_PARTIAL`] slots, each with room for
+/// [`MAX_FRAGMENTS`] fragments, fragment buffers drawn from a free list
+/// and returned to it, and one buffer the whole message is joined in.
+/// Only a message larger than a datagram is cut into fragments.
+#[derive(Debug, Default)]
+struct Reassembly {
+    slots: Vec<Slot>,
+    free: Vec<Vec<u8>>,
+    whole: Vec<u8>,
+}
+
+/// One message being put back together: its sender and number, and its
+/// fragments so far.
+#[derive(Debug, Default)]
+struct Slot {
+    key: Option<(NodeId, u32)>,
+    fragments: Vec<Option<Vec<u8>>>,
+    /// When it was last added to: the oldest is reused first.
+    touched: u64,
+}
+
+/// Fragment buffers a node keeps, prefilled.
+const FRAGMENT_BUFFERS: usize = 64;
+
+impl Reassembly {
+    /// Prefilled at the node's initialisation.
+    fn new() -> Self {
+        Self {
+            slots: (0..MAX_PARTIAL)
+                .map(|_| Slot {
+                    key: None,
+                    fragments: Vec::with_capacity(usize::from(MAX_FRAGMENTS)),
+                    touched: 0,
+                })
+                .collect(),
+            free: (0..FRAGMENT_BUFFERS)
+                .map(|_| Vec::with_capacity(MAX_DATAGRAM))
+                .collect(),
+            whole: Vec::with_capacity(usize::from(MAX_FRAGMENTS).saturating_mul(FRAGMENT)),
+        }
+    }
+
+    /// Empties `slot`, its buffers back to the free list.
+    fn clear(free: &mut Vec<Vec<u8>>, slot: &mut Slot) {
+        for fragment in slot.fragments.drain(..).flatten() {
+            free.push(fragment);
+        }
+        slot.key = None;
+    }
+
+    /// Adds fragment `position` of `count` of message `key`; the whole
+    /// message's bytes once every fragment arrived.
+    fn add(
+        &mut self,
+        key: (NodeId, u32),
+        (position, count): (u16, u16),
+        chunk: &[u8],
+        clock: u64,
+    ) -> Option<&[u8]> {
+        let Self { slots, free, whole } = self;
+        let at = match slots.iter().position(|slot| slot.key == Some(key)) {
+            Some(at) => at,
+            None => {
+                // A free slot, or the one touched longest ago.
+                let at = slots
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, slot)| (slot.key.is_some(), slot.touched))
+                    .map(|(at, _)| at)?;
+                let slot = slots.get_mut(at)?;
+                Self::clear(free, slot);
+                slot.key = Some(key);
+                slot.fragments.resize_with(usize::from(count), || None);
+                at
+            }
+        };
+        let slot = slots.get_mut(at)?;
+        if slot.fragments.len() != usize::from(count) {
+            return None;
+        }
+        slot.touched = clock;
+        let mut buffer = free.pop().unwrap_or_default();
+        buffer.clear();
+        buffer.extend_from_slice(chunk);
+        if let Some(previous) = slot
+            .fragments
+            .get_mut(usize::from(position))
+            .and_then(|fragment| fragment.replace(buffer))
+        {
+            free.push(previous);
+        }
+        if slot.fragments.iter().any(Option::is_none) {
+            return None;
+        }
+        whole.clear();
+        for fragment in slot.fragments.iter().flatten() {
+            whole.extend_from_slice(fragment);
+        }
+        Self::clear(free, slot);
+        Some(whole.as_slice())
+    }
+}
 
 /// A server's state around its core and log: what `ServerNode` keeps.
 struct Serving<M> {
@@ -808,8 +939,16 @@ impl<M> Serving<M> {
 }
 
 /// The core message in a datagram's fragment, once every fragment of it
-/// arrived: decoded as the declared path's encoding stage.
-fn arrived<C: Wire>(datagram: &[u8], partial: &mut Partial) -> Option<(NodeId, C::Message)> {
+/// arrived, decoded into the node's own pool (`decoder`) to be lent to the
+/// core: the reassembly and the decoding are the declared path's encoding
+/// stage once a probed core is past its warm-up (C5 v2, "Processes"; C5
+/// v3); outside a measurement it counts nothing.
+fn arrived<'d, C: Wire>(
+    datagram: &[u8],
+    reassembly: &mut Reassembly,
+    decoder: &'d mut C::Decoder,
+    clock: u64,
+) -> Option<(NodeId, &'d mut C::Message)> {
     let (header, chunk) = datagram.split_at_checked(HEADER)?;
     let (kind, header) = header.split_first()?;
     if *kind != CORE {
@@ -824,34 +963,14 @@ fn arrived<C: Wire>(datagram: &[u8], partial: &mut Partial) -> Option<(NodeId, C
     if count == 0 || count > MAX_FRAGMENTS || position >= count {
         return None;
     }
-    if count == 1 {
-        // Decoding is the declared path's encoding stage once a probed
-        // core is past its warm-up (C5 v2, "Processes"); outside a
-        // measurement it counts nothing.
-        return probe::encoding(|| C::decode(chunk)).map(|message| (from, message));
-    }
-    // A fragment: kept until its message is whole (only a message larger
-    // than a datagram, not the common case, is put back together).
     let key = (from, u32::from_le_bytes(*number));
-    let fragments = partial
-        .entry(key)
-        .or_insert_with(|| vec![None; usize::from(count)]);
-    if fragments.len() != usize::from(count) {
-        return None;
-    }
-    if let Some(slot) = fragments.get_mut(usize::from(position)) {
-        *slot = Some(chunk.to_vec());
-    }
-    if fragments.iter().any(Option::is_none) {
-        while partial.len() > MAX_PARTIAL {
-            let _ = partial.pop_first();
-        }
-        return None;
-    }
-    let fragments = partial.remove(&key)?;
-    probe::encoding(|| {
-        let whole: Vec<u8> = fragments.into_iter().flatten().flatten().collect();
-        C::decode(&whole)
+    probe::encoding(move || {
+        let bytes = if count == 1 {
+            chunk
+        } else {
+            reassembly.add(key, (position, count), chunk, clock)?
+        };
+        C::decode_lent(decoder, bytes)
     })
     .map(|message| (from, message))
 }
@@ -867,43 +986,60 @@ fn arrived<C: Wire>(datagram: &[u8], partial: &mut Partial) -> Option<(NodeId, C
 /// buffer.
 fn send<C: Wire>(
     socket: &UdpSocket,
-    id: NodeId,
-    number: u32,
+    (id, number): (NodeId, u32),
     message: C::Message,
     address: SocketAddr,
+    buffers: &mut Buffers,
 ) -> Option<C::Message> {
     probe::encoding(|| {
-        transmit::<C>(socket, id, number, &message, address);
+        transmit::<C>(socket, (id, number), &message, address, buffers);
         // Given back for the node to return through its Ready buffer, or
         // freed here.
         C::RECLAIMS_SENT.then_some(message)
     })
 }
 
-/// `message`'s datagrams, sent to `address`.
+/// The buffers a node encodes and sends in, kept and prefilled at its
+/// initialisation (C5 v3): the message's bytes and one datagram.
+#[derive(Debug)]
+struct Buffers {
+    body: Vec<u8>,
+    datagram: Vec<u8>,
+}
+
+impl Buffers {
+    fn new() -> Self {
+        Self {
+            body: Vec::with_capacity(usize::from(MAX_FRAGMENTS).saturating_mul(FRAGMENT)),
+            datagram: Vec::with_capacity(MAX_DATAGRAM),
+        }
+    }
+}
+
+/// `message`'s datagrams, sent to `address`, encoded in `buffers`.
 fn transmit<C: Wire>(
     socket: &UdpSocket,
-    id: NodeId,
-    number: u32,
+    (id, number): (NodeId, u32),
     message: &C::Message,
     address: SocketAddr,
+    buffers: &mut Buffers,
 ) {
-    let Some(body) = C::encode(message) else {
+    let Buffers { body, datagram } = buffers;
+    if !C::encode_into(message, body) {
         return;
-    };
-    let chunks: Vec<&[u8]> = if body.is_empty() {
-        vec![body.as_slice()]
-    } else {
-        body.chunks(FRAGMENT).collect()
-    };
-    let Ok(count) = u16::try_from(chunks.len()) else {
+    }
+    let Ok(count) = u16::try_from(body.len().div_ceil(FRAGMENT).max(1)) else {
         return;
     };
     if count > MAX_FRAGMENTS {
         return;
     }
-    for (position, chunk) in (0u16..).zip(chunks) {
-        let mut datagram = Vec::with_capacity(HEADER.saturating_add(chunk.len()));
+    for position in 0..count {
+        let start = usize::from(position).saturating_mul(FRAGMENT);
+        let chunk = body
+            .get(start..start.saturating_add(FRAGMENT).min(body.len()))
+            .unwrap_or_default();
+        datagram.clear();
         datagram.push(CORE);
         datagram.extend_from_slice(&id.to_le_bytes());
         datagram.extend_from_slice(&number.to_le_bytes());
@@ -911,7 +1047,7 @@ fn transmit<C: Wire>(
         datagram.extend_from_slice(&count.to_le_bytes());
         datagram.extend_from_slice(chunk);
         // A lost datagram is the network's to lose.
-        let _ = socket.send_to(&datagram, address);
+        let _ = socket.send_to(datagram, address);
     }
 }
 
@@ -998,7 +1134,9 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
     let mut buffer = vec![0u8; MAX_DATAGRAM];
     let mut scratch = vec![0u8; 1 << 16];
     let mut outbox: Vec<(NodeId, C::Message)> = Vec::new();
-    let mut partial = Partial::new();
+    let mut reassembly = Reassembly::new();
+    let mut decoder = C::decoder();
+    let mut buffers = Buffers::new();
     let mut connections: Vec<Connection> = Vec::new();
     let mut clients: BTreeMap<NodeId, usize> = BTreeMap::new();
     let mut number = 0u32;
@@ -1042,13 +1180,15 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
                     if serving.stopped {
                         continue;
                     }
-                    if let Some((from, message)) = arrived::<C>(datagram, &mut partial) {
+                    if let Some((from, message)) =
+                        arrived::<C>(datagram, &mut reassembly, &mut decoder, now)
+                    {
                         // An isolated server's link is cut both ways.
                         if cut(&cuts, now, config.id, from) {
                             continue;
                         }
                         if serving.traces
-                            && let Some((term, index)) = C::acknowledged(&message)
+                            && let Some((term, index)) = C::acknowledged(message)
                         {
                             serving.items.push((
                                 record::now(),
@@ -1060,7 +1200,9 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
                                 },
                             ));
                         }
-                        core.step(
+                        // Lent: the node keeps the message and its buffers
+                        // (C5 v3).
+                        core.step_lent(
                             from,
                             message,
                             &mut LogView::metered(&mut log, budget.as_ref()),
@@ -1101,7 +1243,7 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
             let done = match address {
                 Some(address) => {
                     number = number.wrapping_add(1);
-                    send::<C>(&socket, config.id, number, message, address)
+                    send::<C>(&socket, (config.id, number), message, address, &mut buffers)
                 }
                 None => probe::encoding(|| C::RECLAIMS_SENT.then_some(message)),
             };

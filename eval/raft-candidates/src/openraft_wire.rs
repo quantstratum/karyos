@@ -32,6 +32,18 @@ type OLogId = openraft::LogId<Clid>;
 #[must_use]
 pub fn encode(message: &Message) -> Option<Vec<u8>> {
     let mut out = Vec::new();
+    encode_into(message, &mut out).then_some(out)
+}
+
+/// [`encode`] into `out`, cleared first: a runner that keeps `out` encodes
+/// without allocating once it has grown (C5 v3); `false` for what the
+/// adapter never sends.
+pub fn encode_into(message: &Message, out: &mut Vec<u8>) -> bool {
+    out.clear();
+    write(message, out).is_some()
+}
+
+fn write(message: &Message, out: &mut Vec<u8>) -> Option<()> {
     match message {
         Message::Request {
             id,
@@ -39,9 +51,9 @@ pub fn encode(message: &Message) -> Option<Vec<u8>> {
             request,
         } => {
             out.push(0);
-            u64_to(&mut out, *id);
-            u64_to(&mut out, *incarnation);
-            request_to(&mut out, request)?;
+            u64_to(out, *id);
+            u64_to(out, *incarnation);
+            request_to(out, request)?;
         }
         Message::Response {
             id,
@@ -50,19 +62,19 @@ pub fn encode(message: &Message) -> Option<Vec<u8>> {
             response,
         } => {
             out.push(1);
-            u64_to(&mut out, *id);
-            u64_to(&mut out, *incarnation);
-            request_to(&mut out, request)?;
+            u64_to(out, *id);
+            u64_to(out, *incarnation);
+            request_to(out, request)?;
             match response {
                 None => out.push(0),
                 Some(response) => {
                     out.push(1);
-                    response_to(&mut out, response);
+                    response_to(out, response);
                 }
             }
         }
     }
-    Some(out)
+    Some(())
 }
 
 /// Decodes a message; `None` for bytes that are not exactly one.
@@ -428,6 +440,10 @@ mod tests {
 
     fn round_trip(message: &Message) {
         let bytes = encode(message).unwrap();
+        // Into a reused buffer, longer before: the same bytes (C5 v3).
+        let mut reused = vec![0xAA; bytes.len() + 64];
+        assert!(encode_into(message, &mut reused));
+        assert_eq!(reused, bytes);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(encode(&decoded).unwrap(), bytes);
         // The values too, not only their bytes (karyos#959 review).

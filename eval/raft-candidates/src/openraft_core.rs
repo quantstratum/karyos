@@ -1330,12 +1330,26 @@ impl<const PRE_VOTE: bool, const BATCH: u64> ConsensusCore for OpenRaftCore<PRE_
 impl<const PRE_VOTE: bool, const BATCH: u64> crate::process::Wire
     for OpenRaftCore<PRE_VOTE, BATCH>
 {
-    fn encode(message: &Message) -> Option<Vec<u8>> {
-        crate::openraft_wire::encode(message)
+    fn encode_into(message: &Message, out: &mut Vec<u8>) -> bool {
+        crate::openraft_wire::encode_into(message, out)
     }
 
     fn decode(bytes: &[u8]) -> Option<Message> {
         crate::openraft_wire::decode(bytes)
+    }
+
+    /// OpenRaft's RPCs are its own types behind `Arc`s, built new by each
+    /// decode; the lent message is stepped as a clone of those `Arc`s (C5
+    /// v3: the library's types).
+    type Decoder = Option<Message>;
+
+    fn decoder() -> Self::Decoder {
+        None
+    }
+
+    fn decode_lent<'a>(decoder: &'a mut Self::Decoder, bytes: &[u8]) -> Option<&'a mut Message> {
+        *decoder = crate::openraft_wire::decode(bytes);
+        decoder.as_mut()
     }
 
     fn appended(message: &Message) -> Option<(u64, Vec<(u64, u64)>)> {

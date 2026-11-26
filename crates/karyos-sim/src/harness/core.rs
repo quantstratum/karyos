@@ -701,6 +701,16 @@ pub trait ConsensusCore: Sized {
     /// `message` from `from` arrives.
     fn step(&mut self, from: NodeId, message: Self::Message, log: &mut LogView<'_>);
 
+    /// [`ConsensusCore::step`] with `message` lent (C5 v3, "the harness and
+    /// the adapters"): the node owns it and its buffers, and takes it back
+    /// after the call, so a core that copies what it keeps frees nothing
+    /// of it. The default steps an owned clone; a core whose library takes
+    /// its messages by value moves it out instead (its library's types
+    /// then free it inside the call).
+    fn step_lent(&mut self, from: NodeId, message: &mut Self::Message, log: &mut LogView<'_>) {
+        self.step(from, message.clone(), log);
+    }
+
     /// Time passes: the node's clock reads `now`.
     fn tick(&mut self, now: u64, log: &mut LogView<'_>);
 

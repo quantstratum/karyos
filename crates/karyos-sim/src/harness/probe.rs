@@ -278,6 +278,12 @@ impl<C: ConsensusCore> ConsensusCore for Probed<C> {
         });
     }
 
+    fn step_lent(&mut self, from: NodeId, message: &mut Self::Message, log: &mut LogView<'_>) {
+        self.counted((Stage::StepLeader, Stage::StepFollower), |core| {
+            core.step_lent(from, message, log)
+        });
+    }
+
     fn tick(&mut self, now: u64, log: &mut LogView<'_>) {
         self.counted((Stage::Tick, Stage::Tick), |core| core.tick(now, log));
     }

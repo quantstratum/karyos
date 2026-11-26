@@ -918,6 +918,29 @@ impl ConsensusCore for Custom {
         recycle(entries);
     }
 
+    /// The lent append's entries copied into entries of the thread's pool,
+    /// which the core keeps; the node takes the lent message back whole
+    /// (C5 v3): nothing of it is freed here.
+    fn step_lent(&mut self, from: NodeId, message: &mut Message, log: &mut LogView<'_>) {
+        let mut entries = vector(message.entries.len());
+        for entry in &message.entries {
+            entries.push(pooled(
+                entry.index,
+                entry.term,
+                entry.event_time,
+                &entry.payload,
+            ));
+        }
+        self.step(
+            from,
+            Message {
+                core: message.core,
+                entries,
+            },
+            log,
+        );
+    }
+
     fn tick(&mut self, now: u64, log: &mut LogView<'_>) {
         self.now = self.now.max(now);
         let Some(ticked) = self.ticked else {

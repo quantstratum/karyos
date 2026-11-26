@@ -620,6 +620,13 @@ impl<const PRE_VOTE: bool, const BATCH: u64> ConsensusCore for RaftCore<PRE_VOTE
         }
     }
 
+    /// raft-rs's `RawNode::step` takes its message by value: the lent one
+    /// is moved out, and raft-rs's own types free it inside the call (C5
+    /// v3: the library's, counted).
+    fn step_lent(&mut self, from: NodeId, message: &mut Self::Message, log: &mut LogView<'_>) {
+        self.step(from, std::mem::take(message), log);
+    }
+
     fn tick(&mut self, now: u64, _log: &mut LogView<'_>) {
         let ticks = self
             .last_tick
@@ -767,12 +774,30 @@ impl<const PRE_VOTE: bool, const BATCH: u64> ConsensusCore for RaftCore<PRE_VOTE
 }
 
 impl<const PRE_VOTE: bool, const BATCH: u64> crate::process::Wire for RaftCore<PRE_VOTE, BATCH> {
-    fn encode(message: &eraftpb::Message) -> Option<Vec<u8>> {
-        protobuf::Message::write_to_bytes(message).ok()
+    fn encode_into(message: &eraftpb::Message, out: &mut Vec<u8>) -> bool {
+        out.clear();
+        protobuf::Message::write_to_vec(message, out).is_ok()
     }
 
     fn decode(bytes: &[u8]) -> Option<eraftpb::Message> {
         protobuf::Message::parse_from_bytes(bytes).ok()
+    }
+
+    /// raft-rs's messages are `protobuf` values that its `step` takes by
+    /// value: each is decoded into a new one, its entries' `Bytes`
+    /// included (the library's types; C5 v3).
+    type Decoder = Option<eraftpb::Message>;
+
+    fn decoder() -> Self::Decoder {
+        None
+    }
+
+    fn decode_lent<'a>(
+        decoder: &'a mut Self::Decoder,
+        bytes: &[u8],
+    ) -> Option<&'a mut eraftpb::Message> {
+        *decoder = protobuf::Message::parse_from_bytes(bytes).ok();
+        decoder.as_mut()
     }
 
     fn appended(message: &eraftpb::Message) -> Option<(u64, Vec<(u64, u64)>)> {
@@ -788,6 +813,31 @@ impl<const PRE_VOTE: bool, const BATCH: u64> crate::process::Wire for RaftCore<P
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// raft-rs's messages into the runner's reused buffer, longer before:
+    /// the bytes `protobuf` gives, and decoded into the runner's slot, the
+    /// same message (C5 v3).
+    #[test]
+    fn messages_encode_into_a_reused_buffer() {
+        use crate::process::Wire as _;
+        let mut message = eraftpb::Message::default();
+        message.set_msg_type(eraftpb::MessageType::MsgAppend);
+        message.term = 4;
+        message.entries.push(eraftpb::Entry {
+            index: 5,
+            data: vec![7; 40].into(),
+            ..eraftpb::Entry::default()
+        });
+        let bytes = protobuf::Message::write_to_bytes(&message).unwrap();
+        let mut out = vec![0xAA; bytes.len() + 64];
+        assert!(RaftRs::encode_into(&message, &mut out));
+        assert_eq!(out, bytes);
+        let mut decoder = RaftRs::decoder();
+        assert_eq!(
+            RaftRs::decode_lent(&mut decoder, &out).cloned(),
+            Some(message)
+        );
+    }
 
     /// The oracle's reading of raft-rs's appends (karyos#691): each
     /// entry's index and payload bytes, an accepted answer's index, and
