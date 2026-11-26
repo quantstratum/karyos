@@ -1157,6 +1157,24 @@ fn a_replayed_group_reaches_no_network_output() {
             .publication(output.lane(Lane::ZERO).unwrap())
             .unwrap(),
     ));
+    // B seeing A's stream is not A's publication being connected: that
+    // takes B's status messages reaching A, and until then the handler's
+    // answers are refused NotConnected (SPEC.md §4 connection rule), which
+    // the handler, like any, does not retry. So the live phase starts only
+    // once a probe claim is admitted; it is aborted, and B's reader skips
+    // aborted blocks, so it adds no answer.
+    loop {
+        work(&mut driver, &mut remote);
+        match real.lock().unwrap().try_claim(8).unwrap() {
+            karyos_client::ClaimOutcome::Claimed(claim) => {
+                claim.abort();
+                break;
+            }
+            karyos_client::ClaimOutcome::NotConnected => {}
+            other => panic!("the probe claim: {other:?}"),
+        }
+        stall.check("A's output never connected");
+    }
     let port = DriverPort(std::sync::Arc::clone(&real));
     let mut gateway = Gateway::new(port, clock, sender, Capture::Strict, 1, 4096, 4).unwrap();
     let identity = SourceIdentity::new(1, STREAM, 1, Lane::ZERO);
