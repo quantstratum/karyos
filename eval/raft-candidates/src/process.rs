@@ -172,9 +172,9 @@ pub const TICK_MS: u64 = 10;
 /// ticks.
 pub const MAX_READS_PER_LOOP: usize = 256;
 
-/// Sent messages a node gives back to its core between two drives, at
-/// most without growing the Ready buffer's room for them.
-const SENT_ROOM: usize = 4096;
+/// Messages the outbox holds between two sends without growing, reserved
+/// at the node's initialisation.
+const OUTBOX_ROOM: usize = 4096;
 
 /// The W1 cases a real-process run takes: the harness's frozen W1
 /// (`W1::skeleton().cases()`, every process count, payload and client
@@ -808,7 +808,7 @@ impl<M> Serving<M> {
                         Observation::Released { node, to, release },
                     );
                 }
-                out.push((to, message));
+                outbox_push(out, to, message);
             },
             &mut |entry, applying| {
                 // The application is the declared path's apply stage once
@@ -817,8 +817,7 @@ impl<M> Serving<M> {
                 // test service, prefilled to the case's bounds and
                 // answering into the node's kept response buffer, so it
                 // allocates nothing (C5 v3).
-                let applied = probe::application(|| service.apply_into(entry, response));
-                let response = applied.is_some().then(|| response.clone());
+                let (applied, response) = answer(service, entry, response);
                 let mut items = items.borrow_mut();
                 if let (Some(applied), Some(bytes)) = (applied, &response)
                     && pending.remove(&(applied.client, applied.sequence))
@@ -844,15 +843,13 @@ impl<M> Serving<M> {
                             at: now,
                         },
                     );
-                    replies.push((
+                    queue_reply(
+                        replies,
                         applied.client,
-                        Harness::Response {
-                            sequence: applied.sequence,
-                            bytes: bytes.clone(),
-                            index: entry.index,
-                            generation: FIRST_GENERATION,
-                        },
-                    ));
+                        applied.sequence,
+                        bytes,
+                        entry.index,
+                    );
                 }
                 observe(
                     &mut items,
@@ -1045,6 +1042,49 @@ fn transmit<C: Wire>(
     }
 }
 
+/// Queues `message` to `to` on the runner's send outbox, counted as the
+/// encoding: what grows the outbox is the send path's (C5 v3 coverage).
+pub fn outbox_push<M>(out: &mut Vec<(NodeId, M)>, to: NodeId, message: M) {
+    probe::encoding(|| out.push((to, message)));
+}
+
+/// `entry` applied by `service`, its answer written into the kept
+/// `response`, and the answer's copy a client reply carries: both counted
+/// as the application (C5 v3 coverage).
+pub fn answer(
+    service: &mut TestService,
+    entry: &karyos_cluster::Entry,
+    response: &mut Vec<u8>,
+) -> (Option<karyos_sim::harness::node::Applied>, Option<Vec<u8>>) {
+    probe::application(|| {
+        let applied = service.apply_into(entry, response);
+        let copy = applied.is_some().then(|| response.clone());
+        (applied, copy)
+    })
+}
+
+/// A client's reply, its bytes copied, queued to send: counted as the
+/// application (C5 v3 coverage).
+pub fn queue_reply<M>(
+    replies: &mut Vec<(NodeId, Harness<M>)>,
+    client: NodeId,
+    sequence: u64,
+    bytes: &[u8],
+    index: u64,
+) {
+    probe::application(|| {
+        replies.push((
+            client,
+            Harness::Response {
+                sequence,
+                bytes: bytes.to_vec(),
+                index,
+                generation: FIRST_GENERATION,
+            },
+        ));
+    });
+}
+
 /// Runs server `config.id` of core `C`, serving `config.case`'s clients,
 /// until the test's stop and the case's quiet period after it.
 ///
@@ -1128,7 +1168,10 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
     let start = Instant::now();
     let mut buffer = vec![0u8; MAX_DATAGRAM];
     let mut scratch = vec![0u8; 1 << 16];
-    let mut outbox: Vec<(NodeId, C::Message)> = Vec::new();
+    // Room for the messages of the Readys between two sends, at
+    // initialisation; what still grows it is counted as the encoding
+    // ([`outbox_push`]).
+    let mut outbox: Vec<(NodeId, C::Message)> = Vec::with_capacity(OUTBOX_ROOM);
     let mut reassembly = Reassembly::new();
     let mut decoder = C::decoder();
     let mut buffers = Buffers::new();
@@ -1235,27 +1278,26 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
                 .filter(|_| !cut(&cuts, now, config.id, to));
             // A message not sent (a cut link, an unknown peer) is done with
             // all the same.
-            let done = match address {
+            match address {
                 Some(address) => {
                     number = number.wrapping_add(1);
-                    send::<C>(&socket, (config.id, number), message, address, &mut buffers)
+                    send::<C>(&socket, (config.id, number), message, address, &mut buffers);
                 }
-                None => probe::encoding(|| C::RECLAIMS_SENT.then_some(message)),
-            };
-            // Back to the core through the node's Ready buffer, counted
-            // with the encoding that finished with it (C5 v3).
-            if let Some(message) = done {
-                probe::encoding(|| serving.ready.give_sent(message));
+                None => probe::encoding(|| drop(message)),
             }
         }
-        for (client, message) in serving.replies.drain(..) {
-            if let (Some(connection), Some(framed)) = (
-                clients.get(&client).and_then(|at| connections.get_mut(*at)),
-                frame(client, &message),
-            ) {
-                connection.queue(&framed);
+        // Framing and queueing an answer is the application's, counted
+        // with it (C5 v3 coverage).
+        probe::application(|| {
+            for (client, message) in serving.replies.drain(..) {
+                if let (Some(connection), Some(framed)) = (
+                    clients.get(&client).and_then(|at| connections.get_mut(*at)),
+                    frame(client, &message),
+                ) {
+                    connection.queue(&framed);
+                }
             }
-        }
+        });
         for connection in &mut connections {
             connection.flush();
         }

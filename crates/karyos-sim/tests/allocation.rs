@@ -318,3 +318,107 @@ fn a_recycled_ready_buf_reuses_its_buffers() {
     .unwrap();
     assert_eq!(counts, SetCounts::default());
 }
+
+/// A core that is past the warm-up from its first call, leads, and readies
+/// one prepared entry, filling the Ready without allocating.
+#[derive(Debug)]
+struct Prepared(Option<karyos_cluster::Entry>);
+
+impl ConsensusCore for Prepared {
+    type Message = ();
+
+    fn recover(_id: NodeId, _peers: &[NodeId], _log: &mut LogView<'_>) -> Self {
+        Self(Some(karyos_cluster::Entry {
+            index: 1,
+            term: 1,
+            event_time: 0,
+            payload: vec![7; 64],
+        }))
+    }
+
+    fn propose(&mut self, _command: Vec<u8>, _log: &mut LogView<'_>) -> Result<(), Refused> {
+        Ok(())
+    }
+
+    fn step(&mut self, _from: NodeId, _message: (), _log: &mut LogView<'_>) {}
+
+    fn tick(&mut self, _now: u64, _log: &mut LogView<'_>) {}
+
+    fn ready(&mut self, _log: &mut LogView<'_>) -> Option<Ready<()>> {
+        None
+    }
+
+    fn ready_into(&mut self, out: &mut ReadyBuf<()>, _log: &mut LogView<'_>) -> bool {
+        match self.0.take() {
+            Some(entry) => {
+                out.ready.entries.push(entry);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn advance(&mut self, _persisted: Persisted, _log: &mut LogView<'_>) {}
+
+    fn term(&self) -> u64 {
+        1
+    }
+
+    fn leads(&self) -> bool {
+        true
+    }
+
+    fn received(&self) -> Option<u64> {
+        None
+    }
+
+    fn committed(&self) -> Option<u64> {
+        Some(WARMUP)
+    }
+}
+
+/// Codex review of docs#1080 (C5 v3 coverage): the driver's recycling of
+/// a Ready, which grows the pool its entries go back to, is counted in
+/// the probed core's Ready stage, not left outside every stage.
+#[test]
+fn a_probed_cores_ready_recycling_is_counted_in_its_ready_stage() {
+    use std::path::Path;
+
+    use karyos_cluster::RaftLog;
+    use karyos_sim::disk::SimDisk;
+    use karyos_sim::harness::core::drive_into;
+    use karyos_sim::harness::node::LOG_DIR;
+    use karyos_sim::harness::probe::{Probed, measure_with};
+    use karyos_sim::harness::workloads::geometry;
+
+    let _serial = serial();
+    let mut log =
+        RaftLog::create(SimDisk::new(), Path::new(LOG_DIR), geometry().unwrap(), 1).unwrap();
+    let mut core = Probed::<Prepared>::recover(1, &[1], &mut LogView::new(&mut log));
+    // Room for the Ready's one entry: filling it allocates nothing, and the
+    // pool it goes back to starts empty.
+    let mut buf: ReadyBuf<()> = ReadyBuf::default();
+    buf.ready.entries.reserve(4);
+    let ((), measured) = measure_with(|| {
+        // Past the warm-up from this first call.
+        core.tick(0, &mut LogView::new(&mut log));
+        drive_into(
+            &mut core,
+            &mut log,
+            &mut buf,
+            (None, None),
+            &mut |_, (), _| {},
+            &mut |_, _| {},
+            &mut |_| {},
+        )
+        .unwrap();
+    })
+    .unwrap();
+    let ready = measured
+        .stages
+        .iter()
+        .find(|(stage, _)| *stage == Stage::ReadyLeader)
+        .map(|(_, counts)| *counts)
+        .unwrap();
+    assert!(ready.allocations >= 1, "{:?}", measured.stages);
+}

@@ -278,6 +278,14 @@ impl<C: ConsensusCore> ConsensusCore for Probed<C> {
         });
     }
 
+    /// The Ready's recycling, counted in the Ready stage: the entries
+    /// going back to the pool can grow it (C5 v3 coverage).
+    fn recycle_ready(&mut self, out: &mut ReadyBuf<Self::Message>) {
+        self.counted((Stage::ReadyLeader, Stage::ReadyFollower), |core| {
+            core.recycle_ready(out);
+        });
+    }
+
     fn step_lent(&mut self, from: NodeId, message: &mut Self::Message, log: &mut LogView<'_>) {
         self.counted((Stage::StepLeader, Stage::StepFollower), |core| {
             core.step_lent(from, message, log)
