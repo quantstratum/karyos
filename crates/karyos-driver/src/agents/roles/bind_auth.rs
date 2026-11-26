@@ -17,7 +17,9 @@ use std::sync::Arc;
 use karyos_protocol::network::Alias;
 
 use super::publish_auth::{AbortAuthority, PublicationAuth};
+use super::publish_enc::PublicationEnc;
 use super::receive_auth::SubscriptionAuth;
+use super::receive_enc::SubscriptionEnc;
 use super::{AbortScope, ReceiverRole, SenderRole};
 use karyos_io::sockets::ops::SocketOps;
 
@@ -48,6 +50,19 @@ pub(crate) enum Binding {
     /// Receiver: a local authenticated publication, whose receivers'
     /// envelopes go to the sender undecoded.
     Published { endpoint: EndpointId, alias: Alias },
+    /// Sender: an encrypted publication's keys (ADR-0114).
+    EncPublication { enc: Box<PublicationEnc> },
+    /// Receiver: a local encrypted publication, whose receivers'
+    /// envelopes go to the sender undecoded (ADR-0114).
+    EncPublished { endpoint: EndpointId, alias: Alias },
+    /// Receiver: an encrypted subscription's keys and the view to apply at
+    /// once (ADR-0114).
+    EncSubscription {
+        enc: Box<SubscriptionEnc>,
+        view: Arc<KeyView>,
+        /// Its installation id, which its cleanup names.
+        installation: u64,
+    },
     /// Receiver: the subscription's keys, the authority whose aborts and
     /// guard it admits, and the view to apply at once.
     Subscription {
@@ -110,8 +125,13 @@ impl<T: StreamTerms> SenderRole<T> {
     /// Holds a publication's binding, replacing any earlier one of its
     /// key; refuses a receiver's.
     pub(super) fn bind_auth(&mut self, binding: Binding) -> bool {
-        let Binding::Publication { mut auth, abort } = binding else {
-            return false;
+        let (mut auth, abort) = match binding {
+            Binding::Publication { auth, abort } => (auth, abort),
+            Binding::EncPublication { enc } => {
+                self.encrypt_publication(*enc);
+                return true;
+            }
+            _ => return false,
         };
         auth.abort = abort;
         self.publication_auth
@@ -132,6 +152,7 @@ impl<T: StreamTerms> SenderRole<T> {
     ) -> Option<(Reservation, AgentEvent<O, T>)> {
         let key = match &binding {
             Binding::Publication { auth, .. } => Some((auth.endpoint, auth.alias)),
+            Binding::EncPublication { enc } => Some((enc.endpoint, enc.alias)),
             _ => None,
         };
         let registration = match &add {
@@ -160,6 +181,7 @@ impl<T: StreamTerms> SenderRole<T> {
         if let (Some(key), Some((_, AgentEvent::PublicationRefused { .. }))) = (key, &answer) {
             self.publication_auth
                 .retain(|held| (held.endpoint, held.alias) != key);
+            self.enc.unpublish(key.0, key.1);
         } else if let (Some((endpoint, alias)), Some(registration)) = (key, registration) {
             self.publication_installs
                 .retain(|(held, at, _)| (*held, *at) != (endpoint, alias));
@@ -189,6 +211,7 @@ impl<T: StreamTerms> SenderRole<T> {
             .retain(|(held, at, _)| (*held, *at) != (endpoint, alias));
         self.publication_auth
             .retain(|held| (held.endpoint, held.alias) != (endpoint, alias));
+        self.enc.unpublish(endpoint, alias);
     }
 
     /// Whether the publication `alias` on `endpoint` is of the
@@ -214,6 +237,9 @@ impl<T: StreamTerms> ReceiverRole<T> {
             Binding::Subscription {
                 auth, installation, ..
             } => Some((auth.endpoint, auth.stream_id, *installation)),
+            Binding::EncSubscription {
+                enc, installation, ..
+            } => Some((enc.endpoint, enc.stream_id, *installation)),
             _ => None,
         };
         if !self.bind_auth(binding) {
@@ -265,7 +291,24 @@ impl<T: StreamTerms> ReceiverRole<T> {
     /// control budget cannot be reserved (nothing of it is kept then).
     pub(super) fn bind_auth(&mut self, binding: Binding) -> bool {
         match binding {
-            Binding::Publication { .. } => false,
+            Binding::Publication { .. } | Binding::EncPublication { .. } => false,
+            Binding::EncPublished { endpoint, alias } => {
+                self.encrypt_published(endpoint, alias);
+                true
+            }
+            Binding::EncSubscription {
+                enc,
+                view,
+                installation,
+            } => {
+                let (endpoint, stream_id) = (enc.endpoint, enc.stream_id);
+                self.unbind(endpoint, stream_id);
+                self.encrypt_subscription(*enc);
+                self.auth_installs.push((endpoint, stream_id, installation));
+                // Its keys follow the view they were checked against.
+                self.apply_keys(&*view);
+                true
+            }
             Binding::Unfollow {
                 guard_id,
                 control,
@@ -445,6 +488,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
         let key = (endpoint, stream_id);
         self.subscription_auth
             .retain(|held| (held.endpoint, held.stream_id) != key);
+        self.enc.unsubscribe(endpoint, stream_id);
         self.auth_installs
             .retain(|(held, stream, _)| (*held, *stream) != key);
         self.abort_scopes

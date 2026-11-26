@@ -728,7 +728,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // authority's control budget reserved; anything else is refused
         // before the receiver learns of the key (karyos#648).
         let mut identity = options.0;
-        let auth = match super::wire::authenticated(channel.security)? {
+        let auth = match super::wire::protected(channel.security)? {
             None => None,
             Some(auth) => {
                 // As at the publisher: no etf declaration (karyos#648).
@@ -744,8 +744,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     && channel.paths.is_empty()
                     && !dynamic
                     && register_at(channel).is_none()
-                    && identity.is_none_or(|held| held.receiver_id.get() == auth.receiver_id);
-                let receiver_id = core::num::NonZeroU64::new(auth.receiver_id).filter(|_| single);
+                    && identity.is_none_or(|held| held.receiver_id.get() == auth.receiver_id());
+                let receiver_id = core::num::NonZeroU64::new(auth.receiver_id()).filter(|_| single);
                 let Some(receiver_id) = receiver_id else {
                     return Err(DriverError::AuthenticatedRefused {
                         reason: crate::error::AuthRefusal::Ambiguous,
@@ -755,18 +755,26 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     receiver_id,
                     group_tag: identity.map_or(0, |held| held.group_tag),
                 });
-                let keys = net
+                let wire = net
                     .wire_keys_mut()
                     .ok_or(DriverError::AuthenticatedRefused {
                         reason: crate::error::AuthRefusal::NoKeyStore,
-                    })?
-                    .subscription(&auth, stream_id)?;
-                Some((auth, keys))
+                    })?;
+                Some(match auth {
+                    super::wire::Protected::Auth(auth) => super::wire::SubscriptionGrant::Auth(
+                        auth,
+                        wire.subscription(&auth, stream_id)?,
+                    ),
+                    super::wire::Protected::Enc(enc) => super::wire::SubscriptionGrant::Enc(
+                        enc,
+                        wire.enc_subscription(&enc, stream_id)?,
+                    ),
+                })
             }
         };
         let peer = auth
             .as_ref()
-            .and_then(|(auth, _)| auth.authority)
+            .and_then(|grant| grant.channel().authority())
             .map(|authority| authority.control);
         // The channel's NAK control groups join the driver's one table
         // first, so the subscription's join finds them (karyos#654).

@@ -2658,8 +2658,10 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 if let Some(index) = found {
                     self.published.swap_remove(index);
                 }
-                // An authenticated alias's binding goes with it (karyos#648).
+                // An authenticated or encrypted alias's binding goes with it
+                // (karyos#648, ADR-0114).
                 self.published_auth.retain(|held| *held != entry);
+                self.enc.unpublish(endpoint, alias);
                 Some((reply, configured(found.is_some())))
             }
             AgentCommand::RemovePublication { reply, .. }

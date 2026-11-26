@@ -638,13 +638,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(net) = self.net.as_mut() else {
             return Err(DriverError::NetworkUnavailable);
         };
-        // An authenticated channel serves one unicast receiver with its
-        // keys valid now; anything else is refused before anything exists
-        // (karyos#648; ADR-0086 open point 6, ADR-0076 clause 4).
-        let auth = super::wire::authenticated(channel.security)?;
+        // An authenticated or encrypted channel serves one unicast
+        // receiver with its keys valid now; anything else is refused
+        // before anything exists (karyos#648; ADR-0086 open point 6,
+        // ADR-0076 clause 4, ADR-0114 section 11).
+        let auth = super::wire::protected(channel.security)?;
         if let Some(auth) = &auth {
-            // The etf route under the authenticated class is not designed
-            // yet: refused, typed and counted (karyos#648).
+            // The etf route under a protected class is not designed yet:
+            // refused, typed and counted (karyos#648).
             if channel.etf.is_some() {
                 if let Some(wire) = net.wire_keys_mut() {
                     wire.count_etf_refused();
@@ -668,7 +669,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 .ok_or(DriverError::AuthenticatedRefused {
                     reason: crate::error::AuthRefusal::NoKeyStore,
                 })?;
-            if let Err(error) = wire.publication(auth) {
+            let checked = match auth {
+                super::wire::Protected::Auth(auth) => wire.publication(auth).map(|_| ()),
+                super::wire::Protected::Enc(enc) => wire.enc_publication(enc).map(|_| ()),
+            };
+            if let Err(error) = checked {
                 if error
                     == (DriverError::AuthenticatedRefused {
                         reason: crate::error::AuthRefusal::GenerationChange,
@@ -1389,7 +1394,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 // sends nothing without them (karyos#648).
                 let binding = match &auth {
                     None => None,
-                    Some(auth) => {
+                    // An encrypted incarnation likewise (ADR-0114): its
+                    // sender sends nothing until an establishment installs
+                    // its domain 1 sealer.
+                    Some(super::wire::Protected::Enc(enc)) => {
+                        outbound
+                            .require_enc()
+                            .map_err(|_| DriverError::AuthenticatedRefused {
+                                reason: crate::error::AuthRefusal::Ambiguous,
+                            })?;
+                        let wire =
+                            net.wire_keys_mut()
+                                .ok_or(DriverError::AuthenticatedRefused {
+                                    reason: crate::error::AuthRefusal::NoKeyStore,
+                                })?;
+                        Some(wire.enc_publication_binding(enc, &publication(endpoint))?)
+                    }
+                    Some(super::wire::Protected::Auth(auth)) => {
                         outbound
                             .require_auth()
                             .map_err(|_| DriverError::AuthenticatedRefused {

@@ -450,9 +450,10 @@ pub(crate) struct SenderChannel {
     /// A `control-mode=dynamic` publication's registration policy
     /// (karyos#644); `None` otherwise.
     pub(crate) registration: Option<crate::sessions::register::RegistrationPolicy>,
-    /// An authenticated channel's key ids, receiver and authority, bound
-    /// again for each incarnation (karyos#648); `None` for a trusted one.
-    pub(crate) auth: Option<karyos_protocol::channel::AuthenticatedChannel>,
+    /// An authenticated or encrypted channel's key ids, receiver and
+    /// authority, bound again for each incarnation (karyos#648, ADR-0114);
+    /// `None` for a trusted one.
+    pub(crate) auth: Option<wire::Protected>,
     /// The etf queue of a timed publication on the `etf` route (ADR-0109);
     /// `None` otherwise.
     pub(crate) etf: Option<karyos_io::backend::EtfQueue>,
@@ -590,9 +591,9 @@ struct NetSubscription {
     /// admitted. A second handle naming `nak-control` must ask for the same
     /// ones (karyos#1086 review).
     control_admitted: ControlAdmitted,
-    /// The authenticated channel every handle of the key shares
-    /// (karyos#648); `None` for a trusted one.
-    auth: Option<karyos_protocol::channel::AuthenticatedChannel>,
+    /// The authenticated or encrypted channel every handle of the key
+    /// shares (karyos#648, ADR-0114); `None` for a trusted one.
+    auth: Option<wire::Protected>,
     /// Its binding's installation id, which its removal names (H8 R3-5).
     auth_installation: u64,
     /// Handles of this key; the receiver's entry goes with the last.
@@ -1534,13 +1535,10 @@ impl<T: StreamTerms> Network<T> {
         max_term_length: u32,
         (reliable, own_port, names_control): (bool, bool, bool),
         (identity, conflated, register_at, path_skew): KeyOptions,
-        auth: Option<(
-            karyos_protocol::channel::AuthenticatedChannel,
-            wire::SubscriptionKeys,
-        )>,
+        auth: Option<wire::SubscriptionGrant>,
     ) -> Result<NetworkSubscription, DriverError> {
         let group = multicast.is_some();
-        let channel_auth = auth.as_ref().map(|(channel, _)| *channel);
+        let channel_auth = auth.as_ref().map(wire::SubscriptionGrant::channel);
         // A URI subscription on port 0 (`own_port`) asks for an ephemeral
         // port of its own (karyos#656): never another's endpoint, which an
         // address with port 0 would otherwise match. The embedded calls
@@ -1695,11 +1693,17 @@ impl<T: StreamTerms> Network<T> {
         // the receiver never establishes an image of the key without it
         // (karyos#648).
         // In the same command as the add, one ring slot (H8 R3-5).
-        let auth_installation = auth.as_ref().map_or(0, |(_, keys)| keys.installation);
+        let auth_installation = auth
+            .as_ref()
+            .map_or(0, wire::SubscriptionGrant::installation);
         let bound = match auth {
             None => Ok(None),
-            Some((channel, keys)) => {
+            Some(wire::SubscriptionGrant::Auth(channel, keys)) => {
                 Self::subscription_binding(endpoint, stream_id, channel, keys).map(Some)
+            }
+            Some(wire::SubscriptionGrant::Enc(channel, keys)) => {
+                wire::WireKeys::enc_subscription_binding(endpoint, stream_id, &channel, keys)
+                    .map(|binding| Some(Box::new(crate::agents::roles::AuthBinding(binding))))
             }
         };
         let binding = match bound {
@@ -2311,7 +2315,7 @@ impl<T: StreamTerms> Network<T> {
             .subscriptions
             .get(index)
             .and_then(|entry| entry.auth)
-            .and_then(|auth| auth.authority)
+            .and_then(wire::Protected::authority)
             .map(|authority| authority.control);
         match self.subscriptions.get_mut(index) {
             // Another handle still holds the receiver's entry.
@@ -2977,6 +2981,7 @@ impl<T: StreamTerms> Network<T> {
             // receivers' envelopes never reach the bare path (karyos#648).
             // In one command with its add (H8 R3-5).
             let authenticated = auth.is_some();
+            let encrypted = auth.as_ref().is_some_and(|binding| binding.encrypted);
             let posted = self.links.receiver.post(|reply| {
                 let add = AgentCommand::AddPublishedAlias {
                     reply,
@@ -2984,13 +2989,19 @@ impl<T: StreamTerms> Network<T> {
                     alias,
                 };
                 if authenticated {
+                    let published = if encrypted {
+                        crate::agents::roles::Binding::EncPublished {
+                            endpoint: path,
+                            alias,
+                        }
+                    } else {
+                        crate::agents::roles::Binding::Published {
+                            endpoint: path,
+                            alias,
+                        }
+                    };
                     AgentCommand::AddAuthenticated {
-                        binding: Box::new(crate::agents::roles::AuthBinding(
-                            crate::agents::roles::Binding::Published {
-                                endpoint: path,
-                                alias,
-                            },
-                        )),
+                        binding: Box::new(crate::agents::roles::AuthBinding(published)),
                         add: Box::new(add),
                     }
                 } else {

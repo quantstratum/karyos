@@ -1418,6 +1418,10 @@ mod invariants;
 /// H8 unit-level invariants raised to end-to-end proofs (karyos#648).
 mod invariants_e2e;
 
+/// The admission of encrypted channels and their delivery end to end
+/// (ADR-0114).
+mod encrypted;
+
 /// H8 RLD-4: freshness is granted only once a reload has completed and
 /// both roles have applied its view, and it runs the revocation bound
 /// from the start of that reload's read. A conductor that stalls, or a

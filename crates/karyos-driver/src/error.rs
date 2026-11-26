@@ -114,6 +114,11 @@ pub enum AuthRefusal {
     /// ADR-0114 section 10).
     #[error("a VM generation change is not released")]
     GenerationChange,
+    /// A key file the channel names serves the other protection class:
+    /// an `encrypted` channel names only `profile_id=16` channel and
+    /// pairwise files (ADR-0114 section 4a, one class per file).
+    #[error("a key file of the other protection class")]
+    KeyClass,
 }
 
 /// Errors returned by the embedded driver.

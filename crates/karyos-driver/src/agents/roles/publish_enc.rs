@@ -14,8 +14,8 @@
 //! the receiver's domain 4 opener and the session's domain 1 sealer. A
 //! receiver's SM, NAK and RTTM REQUEST open under that committed domain 4
 //! key in the receive order of section 8. A refusal changes nothing but
-//! its counter. Nothing makes a publication encrypted yet: the class is
-//! still refused at parse.
+//! its counter. A publication is made encrypted by its admission binding
+//! (`Binding::EncPublication`).
 
 use karyos_protocol::network::encrypted::EncAnswer;
 use karyos_protocol::network::{
@@ -102,10 +102,6 @@ impl PublicationEnc {
     ///
     /// [`EncKeyError`] when a file is of the other class or purpose, or
     /// the identity is invalid.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no encrypted channel opens yet")
-    )]
     pub(crate) fn new(
         endpoint: EndpointId,
         alias: Alias,
@@ -491,11 +487,19 @@ impl SenderEnc {
         self.watch = Some(watch);
     }
 
-    /// Makes the publication `publication` names encrypted (tests); its
-    /// `Outbound` must have been made encrypted too.
-    #[cfg(test)]
+    /// Makes the publication `publication` names encrypted, replacing an
+    /// earlier one of its key; its `Outbound` must have been made
+    /// encrypted too.
     pub(crate) fn publish(&mut self, publication: PublicationEnc) {
+        self.unpublish(publication.endpoint, publication.alias);
         self.publications.push(publication);
+    }
+
+    /// Drops the encrypted publication `alias` on `endpoint`, its keys
+    /// erased on drop.
+    pub(crate) fn unpublish(&mut self, endpoint: EndpointId, alias: Alias) {
+        self.publications
+            .retain(|publication| (publication.endpoint, publication.alias) != (endpoint, alias));
     }
 
     /// The rejections of the encrypted publication `alias` on `endpoint`.
@@ -689,9 +693,8 @@ impl<T: StreamTerms> SenderRole<T> {
             .map(PublicationEnc::identity)
     }
 
-    /// Makes the publication `publication` names encrypted (tests); its
+    /// Makes the publication `publication` names encrypted; its
     /// `Outbound` must be made encrypted too, before any traffic.
-    #[cfg(test)]
     pub(crate) fn encrypt_publication(&mut self, publication: PublicationEnc) {
         self.enc.publish(publication);
     }

@@ -22,12 +22,15 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use karyos_protocol::channel::{AuthenticatedChannel, Security};
+use karyos_protocol::channel::{
+    AuthenticatedChannel, ChannelAuthority, EncryptedChannel, Security,
+};
 
 use crate::error::{AuthRefusal, DriverError};
 use crate::wire_auth::{KeySet, MAX_FILE_EPOCHS, StoreKeys};
+use crate::wire_enc::{CHANNEL_FILES, EncKeyError, PAIRWISE_FILES};
 use crate::wire_keys::store::{FileError, Files, KeyStore, RELOAD_INTERVAL_S, Report};
-use crate::wire_keys::{KeyFile, Material, Purpose, Scope};
+use crate::wire_keys::{Class, KeyFile, Material, Purpose, Scope};
 
 /// How often the conductor re-reads the key set for expiry, in seconds.
 pub const TICK_S: i64 = 1;
@@ -68,21 +71,60 @@ impl Files for Dir {
     }
 }
 
-/// The authenticated channel `security` names; `None` for a trusted one.
+/// The protected class of a channel and what it binds at admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Protected {
+    /// The authenticated class (ADR-0086).
+    Auth(AuthenticatedChannel),
+    /// The encrypted class (ADR-0114).
+    Enc(EncryptedChannel),
+}
+
+impl Protected {
+    /// The abort and guard authority it names; never one for the
+    /// encrypted class.
+    pub(crate) fn authority(self) -> Option<ChannelAuthority> {
+        match self {
+            Self::Auth(channel) => channel.authority,
+            Self::Enc(_) => None,
+        }
+    }
+
+    /// Its single unicast receiver.
+    pub(crate) fn receiver_id(self) -> u64 {
+        match self {
+            Self::Auth(channel) => channel.receiver_id,
+            Self::Enc(channel) => channel.receiver_id,
+        }
+    }
+}
+
+/// The protected channel `security` names; `None` for a trusted one.
 ///
 /// # Errors
 ///
 /// [`DriverError::UnsupportedChannel`] for any other class: never run as
 /// trusted (fail closed).
-pub(crate) fn authenticated(
-    security: Security,
-) -> Result<Option<AuthenticatedChannel>, DriverError> {
+pub(crate) fn protected(security: Security) -> Result<Option<Protected>, DriverError> {
     match security {
         Security::Trusted => Ok(None),
         #[cfg(feature = "test-hooks")]
-        Security::Authenticated(channel) => Ok(Some(channel)),
+        Security::Authenticated(channel) => Ok(Some(Protected::Auth(channel))),
+        Security::Encrypted(channel) => Ok(Some(Protected::Enc(channel))),
         _ => Err(DriverError::UnsupportedChannel),
     }
+}
+
+/// The refusal of an encrypted key set the roles' constructors refused.
+fn enc_refused(error: EncKeyError, missing: AuthRefusal) -> DriverError {
+    refused(match error {
+        EncKeyError::Class => AuthRefusal::KeyClass,
+        EncKeyError::VmGeneration => AuthRefusal::GenerationChange,
+        EncKeyError::Files
+        | EncKeyError::Receiver
+        | EncKeyError::NoKey
+        | EncKeyError::Context(_) => missing,
+    })
 }
 
 fn refused(reason: AuthRefusal) -> DriverError {
@@ -321,6 +363,57 @@ pub(crate) struct PublicationBinding {
     /// The receiver's follow of its remote guard, and the word the
     /// publication's admission and gate read.
     pub(crate) follow: Option<(crate::agents::roles::Binding, Arc<karyos_client::HeapWords>)>,
+    /// Whether it is of the encrypted class: its alias is bound on the
+    /// receiver as an encrypted one.
+    pub(crate) encrypted: bool,
+}
+
+/// The `profile_id=16` files an encrypted channel binds: up to
+/// [`CHANNEL_FILES`] epochs of its channel key and up to
+/// [`PAIRWISE_FILES`] of its one receiver's pairwise key.
+#[derive(Debug)]
+pub(crate) struct EncFiles {
+    pub(crate) channel: Vec<KeyFile>,
+    pub(crate) pairwise: Vec<KeyFile>,
+}
+
+/// The keys an encrypted subscription binds.
+#[derive(Debug)]
+pub(crate) struct EncKeys {
+    pub(crate) files: EncFiles,
+    /// The view the binding applies at once.
+    pub(crate) view: Arc<KeyView>,
+    /// The binding's installation id, which its cleanup names.
+    pub(crate) installation: u64,
+}
+
+/// What a protected subscription binds, checked at admission.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "made once per subscription admission and consumed at once"
+)]
+pub(crate) enum SubscriptionGrant {
+    Auth(AuthenticatedChannel, SubscriptionKeys),
+    Enc(EncryptedChannel, EncKeys),
+}
+
+impl SubscriptionGrant {
+    /// The channel it was granted for.
+    pub(crate) fn channel(&self) -> Protected {
+        match self {
+            Self::Auth(channel, _) => Protected::Auth(*channel),
+            Self::Enc(channel, _) => Protected::Enc(*channel),
+        }
+    }
+
+    /// Its installation id.
+    pub(crate) fn installation(&self) -> u64 {
+        match self {
+            Self::Auth(_, keys) => keys.installation,
+            Self::Enc(_, keys) => keys.installation,
+        }
+    }
 }
 
 /// The keys an authenticated subscription binds.
@@ -740,6 +833,150 @@ impl WireKeys {
         Ok(PublicationBinding {
             sender: crate::agents::roles::Binding::Publication { auth, abort },
             follow,
+            encrypted: false,
+        })
+    }
+
+    /// The `profile_id=16` files `channel` names, valid now (ADR-0114
+    /// section 4a): every verifying epoch of its channel key (of
+    /// `stream_id`, when given) and of its receiver's pairwise key. A
+    /// missing key is refused as [`AuthRefusal::ChannelKey`] or
+    /// [`AuthRefusal::PairwiseKey`], a file of the other class as
+    /// [`AuthRefusal::KeyClass`].
+    fn enc_files(
+        &self,
+        channel: &EncryptedChannel,
+        stream_id: Option<i32>,
+    ) -> Result<EncFiles, DriverError> {
+        let view = &*self.view;
+        if crate::wire_enc::vm_generation::quiesced() {
+            return Err(refused(AuthRefusal::GenerationChange));
+        }
+        self.fresh()?;
+        if self.store.is_disabled() {
+            return Err(refused(AuthRefusal::KeyStoreDisabled));
+        }
+        let select = |key_id: u32, purpose: Purpose, missing: AuthRefusal, limit: usize| {
+            let named: Vec<&KeyFile> = view
+                .verifying(key_id)
+                .into_iter()
+                .flatten()
+                .filter(|file| {
+                    file.purpose == purpose
+                        && match file.scope {
+                            Scope::Channel {
+                                stream_id: stream, ..
+                            } => stream_id.is_none_or(|wanted| wanted == stream),
+                            Scope::Pairwise { receiver_id, .. } => {
+                                receiver_id == channel.receiver_id
+                            }
+                            Scope::Authority { .. } => false,
+                        }
+                })
+                .collect();
+            if named.is_empty() {
+                return Err(refused(missing));
+            }
+            if named
+                .iter()
+                .any(|file| file.serves(Class::Encrypted, purpose).is_err())
+            {
+                return Err(refused(AuthRefusal::KeyClass));
+            }
+            Ok(named.into_iter().take(limit).map(duplicate).collect())
+        };
+        Ok(EncFiles {
+            channel: select(
+                channel.channel_key_id,
+                Purpose::Channel,
+                AuthRefusal::ChannelKey,
+                CHANNEL_FILES,
+            )?,
+            pairwise: select(
+                channel.pairwise_key_id,
+                Purpose::Pairwise,
+                AuthRefusal::PairwiseKey,
+                PAIRWISE_FILES,
+            )?,
+        })
+    }
+
+    /// The publication side of the encrypted `channel` at admission: its
+    /// channel files and its one receiver's pairwise files.
+    pub(crate) fn enc_publication(
+        &self,
+        channel: &EncryptedChannel,
+    ) -> Result<EncFiles, DriverError> {
+        self.enc_files(channel, None)
+    }
+
+    /// The sender binding of the encrypted `publication` of `channel`: its
+    /// keys, checked again against the current view.
+    pub(crate) fn enc_publication_binding(
+        &mut self,
+        channel: &EncryptedChannel,
+        publication: &crate::sessions::send::Publication,
+    ) -> Result<PublicationBinding, DriverError> {
+        let files = self.enc_publication(channel)?;
+        let keys: Vec<&KeyFile> = files.channel.iter().collect();
+        let pairwise: Vec<&KeyFile> = files.pairwise.iter().collect();
+        let enc = crate::agents::roles::publish_enc::PublicationEnc::new(
+            publication.endpoint,
+            publication.alias,
+            publication.identity,
+            &keys,
+            &pairwise,
+            crate::wire_enc::monotonic_ns,
+        )
+        .map_err(|error| enc_refused(error, AuthRefusal::ChannelKey))?;
+        Ok(PublicationBinding {
+            sender: crate::agents::roles::Binding::EncPublication { enc: Box::new(enc) },
+            follow: None,
+            encrypted: true,
+        })
+    }
+
+    /// The subscription side of the encrypted `channel` to `stream_id` at
+    /// admission: its channel files of that stream and its own pairwise
+    /// files, with the view to apply and the binding's installation id.
+    pub(crate) fn enc_subscription(
+        &mut self,
+        channel: &EncryptedChannel,
+        stream_id: i32,
+    ) -> Result<EncKeys, DriverError> {
+        if crate::wire_enc::vm_generation::quiesced() {
+            self.count_generation_refused();
+        }
+        let files = self.enc_files(channel, Some(stream_id))?;
+        Ok(EncKeys {
+            files,
+            view: Arc::clone(&self.view),
+            installation: self.next_installation(),
+        })
+    }
+
+    /// The receiver binding of the encrypted subscription to `stream_id`
+    /// on `endpoint`, from the keys checked at admission.
+    pub(crate) fn enc_subscription_binding(
+        endpoint: crate::agents::EndpointId,
+        stream_id: i32,
+        channel: &EncryptedChannel,
+        keys: EncKeys,
+    ) -> Result<crate::agents::roles::Binding, DriverError> {
+        let files: Vec<&KeyFile> = keys.files.channel.iter().collect();
+        let pairwise: Vec<&KeyFile> = keys.files.pairwise.iter().collect();
+        let enc = crate::agents::roles::receive_enc::SubscriptionEnc::new(
+            endpoint,
+            stream_id,
+            &files,
+            &pairwise,
+            channel.receiver_id,
+        )
+        .map_err(|error| enc_refused(error, AuthRefusal::PairwiseKey))?;
+        Ok(crate::agents::roles::Binding::EncSubscription {
+            enc: Box::new(enc),
+            view: keys.view,
+            installation: keys.installation,
         })
     }
 

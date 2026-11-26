@@ -37,8 +37,8 @@
 //! (`enc_vm_generation`).
 //!
 //! An outer `0x21` on a stream that is not
-//! encrypted is dropped and counted (`enc_unexpected`). Nothing makes a
-//! subscription encrypted yet: the class is still refused at parse.
+//! encrypted is dropped and counted (`enc_unexpected`). A subscription is
+//! made encrypted by its admission binding (`Binding::EncSubscription`).
 
 use std::net::SocketAddr;
 
@@ -148,10 +148,6 @@ impl SubscriptionEnc {
     /// # Errors
     ///
     /// [`EncKeyError`].
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no encrypted channel opens yet")
-    )]
     pub(crate) fn new(
         endpoint: EndpointId,
         stream_id: i32,
@@ -355,17 +351,31 @@ impl ReceiverEnc {
         }
     }
 
-    /// Makes a subscription encrypted (tests).
-    #[cfg(test)]
+    /// Makes a subscription encrypted, replacing an earlier one of its
+    /// key.
     pub(crate) fn subscribe(&mut self, subscription: SubscriptionEnc) {
+        self.unsubscribe(subscription.endpoint, subscription.stream_id);
         self.subscriptions.push(subscription);
     }
 
-    /// Marks the local publication `alias` on `endpoint` encrypted
-    /// (tests).
-    #[cfg(test)]
+    /// Drops the encrypted subscription to `stream_id` on `endpoint`, its
+    /// keys erased on drop.
+    pub(crate) fn unsubscribe(&mut self, endpoint: EndpointId, stream_id: i32) {
+        self.subscriptions
+            .retain(|sub| (sub.endpoint, sub.stream_id) != (endpoint, stream_id));
+    }
+
+    /// Marks the local publication `alias` on `endpoint` encrypted.
     pub(crate) fn publish(&mut self, endpoint: EndpointId, alias: Alias) {
-        self.published.push((endpoint, alias));
+        if !self.published.contains(&(endpoint, alias)) {
+            self.published.push((endpoint, alias));
+        }
+    }
+
+    /// The local publication `alias` on `endpoint` is no longer encrypted
+    /// (it went).
+    pub(crate) fn unpublish(&mut self, endpoint: EndpointId, alias: Alias) {
+        self.published.retain(|held| *held != (endpoint, alias));
     }
 
     /// The rejections of the encrypted subscription to `stream_id` on
@@ -1036,15 +1046,13 @@ impl<T: StreamTerms> ReceiverRole<T> {
         Ok(Some(SharedSealer::of(sealer)))
     }
 
-    /// Makes the subscription to `stream_id` on `endpoint` encrypted
-    /// (tests): before any traffic.
-    #[cfg(test)]
+    /// Makes the subscription to `stream_id` on `endpoint` encrypted:
+    /// before any traffic.
     pub(crate) fn encrypt_subscription(&mut self, subscription: SubscriptionEnc) {
         self.enc.subscribe(subscription);
     }
 
-    /// Marks the local publication `alias` on `endpoint` encrypted (tests).
-    #[cfg(test)]
+    /// Marks the local publication `alias` on `endpoint` encrypted.
     pub(crate) fn encrypt_published(&mut self, endpoint: EndpointId, alias: Alias) {
         self.enc.publish(endpoint, alias);
     }
