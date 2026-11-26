@@ -1314,3 +1314,6 @@ impl Protection for AesGcmSiv {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod h7_tests;

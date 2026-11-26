@@ -28,6 +28,8 @@ pub mod hmac_key;
 pub mod hmac_sha256;
 pub mod replay;
 pub mod signed;
+#[cfg(test)]
+pub(crate) mod timing;
 
 pub use self::aes_gcm_siv::AesGcmSiv;
 pub use hmac_sha256::HmacSha256;
