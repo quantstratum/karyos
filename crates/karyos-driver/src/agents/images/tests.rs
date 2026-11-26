@@ -11893,3 +11893,6 @@ fn a_blocked_key_read_stops_live_agents_within_the_bound() {
     keys.set_stalled(false);
     conductor.join().unwrap();
 }
+
+/// H8 round 6: the round 5 review's evidence rows R5-06, R5-10, R5-11 (karyos#648).
+mod invariants_r6;
