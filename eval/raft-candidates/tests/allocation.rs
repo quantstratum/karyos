@@ -30,7 +30,7 @@ use karyos_sim::harness::probe::{Measured, Probed, Stage, measure_with};
 use karyos_sim::harness::workloads::geometry;
 use karyos_sim::harness::workloads::{self, Case, W1};
 use karyos_sim::net::NodeId;
-use karyos_sys::alloc_count::{CountingAllocator, SetCounts};
+use karyos_sys::alloc_count::{CountingAllocator, SetCounts, enroll, window};
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -295,4 +295,90 @@ fn the_runners_send_outbox_is_counted_as_the_encoding() {
         "{:?}",
         measured.stages
     );
+}
+
+/// Codex review of docs#1080 (C5 v3): a reply framed into the server's
+/// kept frame, prefilled for the largest answer, allocates nothing.
+#[test]
+fn a_reply_framed_into_the_kept_frame_allocates_nothing() {
+    use karyos_sim::harness::node::Wire as Harness;
+    let _serial = serial();
+    let message: Harness<()> = Harness::Response {
+        sequence: 1,
+        bytes: vec![7; 9],
+        index: 4,
+        generation: 1,
+    };
+    let mut framed = Vec::with_capacity(256);
+    let (ok, counts) = window(|| {
+        let _enrolled = enroll();
+        process::frame_into(3, &message, &mut framed)
+    })
+    .unwrap();
+    assert!(ok);
+    assert_eq!(counts, SetCounts::default());
+    assert_eq!(Some(framed), process::frame(3, &message));
+}
+
+/// Docs#1080 review (C5 v3): an append's read back under declared limits
+/// compares the library's entries in place, for both library adapters:
+/// once its kept buffers fit, it allocates and frees nothing.
+#[test]
+fn the_read_back_compares_in_place_and_allocates_nothing() {
+    use karyos_cluster::Entry;
+    use karyos_raft_eval::openraft_core::{Command, TypeConfig, sent_entries as open_sent};
+    use karyos_raft_eval::raft_rs::{ReadBack, read_back, sent_entries, to_raft};
+
+    type Clid =
+        <<TypeConfig as openraft::RaftTypeConfig>::LeaderId as openraft::vote::RaftLeaderId>::Committed;
+
+    let _serial = serial();
+    let mut log = RaftLog::create(
+        SimDisk::new(),
+        std::path::Path::new(LOG_DIR),
+        geometry().unwrap(),
+        1,
+    )
+    .unwrap();
+    let entries: Vec<Entry> = (1..=2)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            event_time: 0,
+            payload: vec![7; 32],
+        })
+        .collect();
+    let _ = log.append(&entries).unwrap();
+    let _ = log.sync().unwrap();
+    let raft: Vec<raft::eraftpb::Entry> = entries.iter().map(to_raft).collect();
+    let open: Vec<<TypeConfig as openraft::RaftTypeConfig>::Entry> = entries
+        .iter()
+        .map(|entry| openraft::Entry {
+            log_id: openraft::LogId::new(Clid::new(1), entry.index - 1),
+            payload: openraft::EntryPayload::Normal(Command(entry.payload.clone())),
+        })
+        .collect();
+    let mut reads = ReadBack::default();
+    // The kept buffers grow once.
+    assert!(read_back(
+        sent_entries(&raft),
+        &mut LogView::new(&mut log),
+        &mut reads
+    ));
+    let (both, counts) = window(|| {
+        let _enrolled = enroll();
+        read_back(sent_entries(&raft), &mut LogView::new(&mut log), &mut reads)
+            && read_back(open_sent(&open), &mut LogView::new(&mut log), &mut reads)
+    })
+    .unwrap();
+    assert!(both);
+    assert_eq!(counts, SetCounts::default());
+    // A mismatch is still caught in place.
+    let mut other = raft.clone();
+    other[1].data = vec![8; 32].into();
+    assert!(!read_back(
+        sent_entries(&other),
+        &mut LogView::new(&mut log),
+        &mut reads
+    ));
 }

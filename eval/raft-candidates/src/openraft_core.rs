@@ -184,6 +184,29 @@ fn to_harness(entry: &OEntry) -> Option<Entry> {
     })
 }
 
+/// OpenRaft's `entries` as [`crate::raft_rs::Sent`], borrowed: a normal
+/// entry's command in place; a membership entry, which OpenRaft holds as
+/// a configuration, encoded (C5 v3). An index past `u64::MAX` saturates:
+/// the caller refuses such an append first.
+pub fn sent_entries(entries: &[OEntry]) -> impl Iterator<Item = crate::raft_rs::Sent<'_>> + Clone {
+    entries.iter().map(|entry| crate::raft_rs::Sent {
+        index: entry.log_id.index.saturating_add(1),
+        term: entry.log_id.leader_id.term,
+        event_time: 0,
+        payload: match &entry.payload {
+            EntryPayload::Blank => std::borrow::Cow::Borrowed(&[]),
+            EntryPayload::Normal(command) => std::borrow::Cow::Borrowed(command.0.as_slice()),
+            EntryPayload::Membership(membership) => {
+                let voters: Vec<NodeId> = membership
+                    .voter_ids()
+                    .filter_map(|id| NodeId::try_from(id).ok())
+                    .collect();
+                std::borrow::Cow::Owned(encode_configuration(&voters, &[]))
+            }
+        },
+    })
+}
+
 /// [`to_harness`], a normal entry's payload copied into a buffer from
 /// `spare` (plan issue 073, karyos#691); a membership entry is encoded anew.
 fn to_harness_into(spare: &mut Vec<Entry>, entry: &OEntry) -> Option<Entry> {
@@ -1211,8 +1234,11 @@ impl<const PRE_VOTE: bool, const BATCH: u64> ConsensusCore for OpenRaftCore<PRE_
                     request: Request::Append(rpc),
                     ..
                 } => {
-                    let sent: Option<Vec<Entry>> = rpc.entries.iter().map(to_harness).collect();
-                    sent.is_some_and(|sent| crate::raft_rs::read_back(&sent, log, reads))
+                    // Compared in place, no entry copied (C5 v3).
+                    rpc.entries
+                        .iter()
+                        .all(|entry| entry.log_id.index.checked_add(1).is_some())
+                        && crate::raft_rs::read_back(sent_entries(&rpc.entries), log, reads)
                 }
                 _ => true,
             });

@@ -279,14 +279,56 @@ fn from_raft_into<M>(out: &mut ReadyBuf<M>, entry: &eraftpb::Entry) -> Entry {
     out.entry(entry.index, entry.term, event_time, entry.data.as_ref())
 }
 
+/// An entry of an outgoing append as C4's log would hold it, borrowed
+/// from the library's message: [`read_back`] compares it in place, so
+/// the read back copies no payload (C5 v3).
+#[derive(Debug, Clone)]
+pub struct Sent<'a> {
+    /// Its harness index.
+    pub index: u64,
+    /// Its term.
+    pub term: u64,
+    /// Its event time.
+    pub event_time: u64,
+    /// Its payload, borrowed unless the library holds it in another form.
+    pub payload: std::borrow::Cow<'a, [u8]>,
+}
+
+impl Sent<'_> {
+    fn is(&self, logged: &Entry) -> bool {
+        logged.index == self.index
+            && logged.term == self.term
+            && logged.event_time == self.event_time
+            && logged.payload.as_slice() == &*self.payload
+    }
+}
+
+/// raft-rs's `entries` as [`Sent`], borrowed.
+pub fn sent_entries(entries: &[eraftpb::Entry]) -> impl Iterator<Item = Sent<'_>> + Clone {
+    entries.iter().map(|entry| {
+        let context: &[u8] = entry.context.as_ref();
+        Sent {
+            index: entry.index,
+            term: entry.term,
+            event_time: <[u8; 8]>::try_from(context).map_or(0, u64::from_le_bytes),
+            payload: std::borrow::Cow::Borrowed(entry.data.as_ref()),
+        }
+    })
+}
+
 /// Whether the entries of an outgoing append, `sent`, that C4's log holds
 /// were read back through the metered `log` within the duty's budget and
 /// equal the log's (karyos#975, karyos#1040): both adapters send an append
 /// only when this holds. Entries past the log (a leader's own, sent
 /// before its persistence) are no log read; a read the budget cut short,
-/// a read error or a mismatch is not a read back.
-pub(crate) fn read_back(sent: &[Entry], log: &mut LogView<'_>, reads: &mut ReadBack) -> bool {
-    let (Some(first), Some(last)) = (sent.first(), sent.last()) else {
+/// a read error or a mismatch is not a read back. `sent` is compared in
+/// place, its entries never collected (C5 v3).
+pub fn read_back<'a>(
+    sent: impl Iterator<Item = Sent<'a>> + Clone,
+    log: &mut LogView<'_>,
+    reads: &mut ReadBack,
+) -> bool {
+    let (Some(first), Some(last)) = (sent.clone().next(), sent.clone().last()) else {
         return true;
     };
     let Some(end) = last.index.checked_add(1) else {
@@ -307,10 +349,13 @@ pub(crate) fn read_back(sent: &[Entry], log: &mut LogView<'_>, reads: &mut ReadB
         return false;
     }
     let read = &reads.read;
-    let matches = read.iter().zip(sent).all(|(logged, sent)| logged == sent);
+    let matches = read
+        .iter()
+        .zip(sent.clone())
+        .all(|(logged, sent)| sent.is(logged));
     // Every entry past what was read must be one the log does not hold
     // yet: a shorter read cut by the budget is not a read back.
-    let unread = sent.get(read.len()).map(|entry| entry.index);
+    let unread = sent.clone().nth(read.len()).map(|entry| entry.index);
     let held = unread.is_some_and(|index| log.last_index().is_some_and(|last| index <= last));
     matches && !held
 }
@@ -319,7 +364,7 @@ pub(crate) fn read_back(sent: &[Entry], log: &mut LogView<'_>, reads: &mut ReadB
 /// entries read back and the log's read window, reused by
 /// `LogView::entries_into` once they fit (C5 v2, "Borrowed forms").
 #[derive(Debug, Default)]
-pub(crate) struct ReadBack {
+pub struct ReadBack {
     /// The entries the last read back took from the log.
     read: Vec<Entry>,
     /// The log's read window.
@@ -474,8 +519,7 @@ impl<const PRE_VOTE: bool, const BATCH: u64> RaftCore<PRE_VOTE, BATCH> {
         if message.get_msg_type() != eraftpb::MessageType::MsgAppend {
             return true;
         }
-        let sent: Vec<Entry> = message.entries.iter().map(from_raft).collect();
-        read_back(&sent, log, reads)
+        read_back(sent_entries(&message.entries), log, reads)
     }
 
     /// Stops the core: a mirror write failed, so raft-rs's view of its
