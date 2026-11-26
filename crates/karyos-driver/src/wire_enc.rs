@@ -1853,6 +1853,23 @@ pub fn publication_of(identity: &karyos_protocol::network::Identity) -> Publicat
     }
 }
 
+/// The control schema identity block of a publication identity: the
+/// inverse of [`publication_of`].
+#[must_use]
+pub fn identity_of(publication: &PublicationIdentity) -> karyos_protocol::network::Identity {
+    let (low, high) = publication.driver_id.split_at(8);
+    let word = |bytes: &[u8]| {
+        let mut out = [0_u8; 8];
+        out.copy_from_slice(bytes);
+        u64::from_le_bytes(out)
+    };
+    karyos_protocol::network::Identity {
+        driver_id: [word(low), word(high)],
+        registration_id: publication.registration_id,
+        incarnation: publication.incarnation,
+    }
+}
+
 /// The largest envelope a sealed control carries: the encrypted header
 /// and tag with the pairwise trailer (104 bytes), above the authenticated
 /// envelope (48 bytes). The control path's fixed buffers add it to the

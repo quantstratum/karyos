@@ -1055,3 +1055,14 @@ fn a_rotation_admits_the_served_receivers_pairwise_epoch() {
     assert!(!files.admit(&set(vec![other])));
     assert_eq!(files.epochs_of(77), [None, None]);
 }
+
+/// [`identity_of`] inverts [`publication_of`].
+#[test]
+fn identity_of_inverts_publication_of() {
+    let identity = karyos_protocol::network::Identity {
+        driver_id: [0x0102_0304_0506_0708, 0x1112_1314_1516_1718],
+        registration_id: 7,
+        incarnation: 9,
+    };
+    assert_eq!(identity_of(&publication_of(&identity)), identity);
+}

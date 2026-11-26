@@ -721,3 +721,33 @@ fn without_a_signal_no_image_closes() {
     assert_eq!(role.enc_images(), 1);
     assert_eq!(role.boot_id(), old);
 }
+
+/// ADR-0114 section 7, "Retired publication identities": while a retired
+/// full identity is inside its `alias_quarantine`, its encrypted traffic is
+/// dropped and counted (`enc_retired_party`) before any derivation, and
+/// nothing else counts it; once the quarantine has passed, the same
+/// identity's SETUP opens again.
+#[test]
+fn a_retired_identity_is_dropped_for_its_quarantine_without_a_derivation() {
+    let mut rig = rig();
+    let mut sealer = setup_sealer(0x11);
+    let first = sealed(&mut sealer, &announce());
+    let second = sealed(&mut sealer, &announce());
+    let quarantine = crate::sessions::receive::SessionConfig::default().alias_quarantine;
+    rig.role.sessions.quarantine_for_test(IDENTITY, 1_000);
+    rig.inject(&first);
+    let rejections = rig.rejections();
+    assert_eq!(rejections.get(EncRejection::RetiredParty), 1);
+    assert_eq!(rejections.total(), 1, "nothing else counts it");
+    // Past the quarantine the identity is no longer retired.
+    rig.role.inject_datagram(
+        &rig.sessions,
+        EndpointId(1),
+        rig.source,
+        &second,
+        1_000 + quarantine,
+    );
+    let rejections = rig.rejections();
+    assert_eq!(rejections.get(EncRejection::RetiredParty), 1);
+    assert_eq!(rejections.total(), 1);
+}

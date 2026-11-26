@@ -60,8 +60,8 @@ use crate::sessions::NonceSource;
 use crate::wire_enc::vm_generation;
 use crate::wire_enc::{
     ChannelKeys, EncChannel, EncKeyError, EncOpener, EncRejections, EncSealer, PairwiseFiles,
-    VmGenerationWatch, check_resync, header, id128, is_envelope, monotonic_ns, open_bootstrap_in,
-    publication_of, quiesced,
+    VmGenerationWatch, check_resync, header, id128, identity_of, is_envelope, monotonic_ns,
+    open_bootstrap_in, publication_of, quiesced,
 };
 use crate::wire_keys::KeyFile;
 
@@ -523,6 +523,18 @@ impl<T: StreamTerms> Intake<'_, T> {
         };
         let mut out = [0_u8; MAX_PLAINTEXT];
         let result = match header(bytes) {
+            // Section 7, "Retired publication identities": traffic naming a
+            // full identity inside its `alias_quarantine` selects a key the
+            // receiver no longer holds; it is dropped before any derivation.
+            Ok(head)
+                if head.publication.is_some_and(|publication| {
+                    self.role
+                        .sessions
+                        .is_quarantined(&identity_of(&publication), self.now)
+                }) =>
+            {
+                Err(EncRejection::RetiredParty)
+            }
             Ok(head) if head.domain == Domain::Setup => {
                 self.enc_setup(source, alias, index, bytes, &mut out)
             }

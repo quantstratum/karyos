@@ -646,6 +646,29 @@ impl ReceiveSessions {
             .filter(|entry| entry.generation == slot.generation)
     }
 
+    /// Whether `identity` is a retired full identity still inside its
+    /// `alias_quarantine` at `now` (SPEC.md section 5; ADR-0114 section 7,
+    /// "Retired publication identities").
+    #[must_use]
+    pub fn is_quarantined(&self, identity: &Identity, now: u64) -> bool {
+        self.quarantined(identity, now)
+    }
+
+    /// Puts `identity` in a free slot as retired at `now` (tests).
+    #[cfg(test)]
+    pub(crate) fn quarantine_for_test(&mut self, identity: Identity, now: u64) {
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.state == State::Free)
+            .expect("a free slot");
+        slot.state = State::Retired {
+            identity,
+            retired_at: now,
+            reclaimed: false,
+        };
+    }
+
     fn quarantined(&self, identity: &Identity, now: u64) -> bool {
         self.slots.iter().any(|slot| match slot.state {
             State::Retired {
