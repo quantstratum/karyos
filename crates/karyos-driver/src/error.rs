@@ -119,6 +119,11 @@ pub enum AuthRefusal {
     /// pairwise files (ADR-0114 section 4a, one class per file).
     #[error("a key file of the other protection class")]
     KeyClass,
+    /// An `encrypted` channel whose MTU less the encrypted envelope
+    /// leaves a log MTU below the smallest a receiver accepts (ADR-0114
+    /// section 11).
+    #[error("the channel MTU leaves no encrypted inner budget")]
+    Mtu,
 }
 
 /// Errors returned by the embedded driver.
