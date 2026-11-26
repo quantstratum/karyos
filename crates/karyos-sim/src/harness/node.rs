@@ -68,6 +68,7 @@ use super::core::{
     Limits, LogView, NotLeader, ReadBudget, ReadyBuf, Refused, Release, SnapshotBase, Step,
     TransferRefused, Unsupported, drive_inner,
 };
+use super::failover::FailoverClient;
 use super::standby::{
     self, ExternalLease, FEED_BATCH_BYTES, FEED_PERIOD, FIRST_GENERATION, FeedEntry, FeedFault,
     FeedRefusal, Fencing, PromotionReport, STATUS_INTERVAL,
@@ -1080,6 +1081,23 @@ pub enum Observation {
         index: u64,
         /// The answering server's generation.
         generation: u64,
+    },
+    /// A Cluster client's failover state told its node `event`
+    /// ([`super::failover`]; karyos#720).
+    ClientEvent {
+        /// The client.
+        client: NodeId,
+        /// The event.
+        event: karyos_cluster::client::Event,
+    },
+    /// A Cluster client's node, as its caller, retried its request
+    /// `sequence` (the Cluster client's, from 0): unknown, or refused for
+    /// now.
+    ClientRetry {
+        /// The client.
+        client: NodeId,
+        /// The Cluster client's sequence.
+        sequence: u64,
     },
     /// A client rejected an answer of a generation below one it has seen.
     StaleGeneration {
@@ -3839,6 +3857,8 @@ pub struct ClientNode {
     /// tests): a faulty client.
     #[cfg(feature = "test-hooks")]
     corrupts_reads: bool,
+    /// Its failover is the Cluster client's: every call goes to it.
+    failover: Option<Box<FailoverClient>>,
 }
 
 impl ClientNode {
@@ -3857,7 +3877,29 @@ impl ClientNode {
             generation: 0,
             #[cfg(feature = "test-hooks")]
             corrupts_reads: false,
+            failover: None,
         }
+    }
+
+    /// The client with its failover the Cluster client's
+    /// ([`FailoverClient`]; karyos#720), over its script, server and retry
+    /// interval as set so far.
+    #[must_use]
+    pub fn with_cluster_client(mut self) -> Self {
+        self.failover = Some(Box::new(FailoverClient::new(
+            self.id,
+            self.server,
+            self.script.clone(),
+            Rc::clone(&self.recorder),
+            self.retry_after,
+        )));
+        self
+    }
+
+    /// Its Cluster client's node, if its failover is the Cluster client's.
+    #[must_use]
+    pub fn failover(&self) -> Option<&FailoverClient> {
+        self.failover.as_deref()
     }
 
     /// The client recording each read with a value no one wrote: a faulty
@@ -3872,6 +3914,9 @@ impl ClientNode {
     /// Its open request's sequence number, if one waits for its answer.
     #[must_use]
     pub fn open(&self) -> Option<u64> {
+        if let Some(failover) = &self.failover {
+            return failover.open();
+        }
         self.open.as_ref().map(|(command, _)| command.sequence)
     }
 
@@ -3885,12 +3930,18 @@ impl ClientNode {
     /// Whether every request of its script was answered.
     #[must_use]
     pub fn done(&self) -> bool {
+        if let Some(failover) = &self.failover {
+            return failover.done();
+        }
         self.open.is_none() && self.next == self.script.len()
     }
 }
 
 impl<M> Node<Wire<M>> for ClientNode {
     fn tick(&mut self, now: u64, out: &mut Outbox<Wire<M>>) {
+        if let Some(failover) = self.failover.as_mut() {
+            return failover.tick(now, out);
+        }
         if let Some((command, sent)) = self.open.as_mut() {
             let due = now
                 .checked_sub(*sent)
@@ -3927,7 +3978,10 @@ impl<M> Node<Wire<M>> for ClientNode {
         self.open = Some((command, now));
     }
 
-    fn deliver(&mut self, _from: NodeId, message: Wire<M>, _now: u64, _out: &mut Outbox<Wire<M>>) {
+    fn deliver(&mut self, from: NodeId, message: Wire<M>, now: u64, out: &mut Outbox<Wire<M>>) {
+        if let Some(failover) = self.failover.as_mut() {
+            return failover.deliver(from, message, now, out);
+        }
         let open = self.open.as_ref().map(|(command, _)| command.sequence);
         match message {
             Wire::Response { generation, .. } if generation < self.generation => {

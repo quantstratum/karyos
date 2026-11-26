@@ -15,6 +15,8 @@
 //! - [`node`]: a server node (a core, C4's log over a simulated disk, the
 //!   deterministic test service) and a scripted client node, over one wire
 //!   type, with the [`node::Recorder`] they report to.
+//! - [`failover`]: a scripted client whose failover is the Cluster
+//!   client's (`karyos_cluster::client::ClusterClient`; karyos#720).
 //! - [`check`]: the recorded history through C3, and the safety checks.
 //! - [`reference`](mod@reference): a harness fixture core with a fixed leader and no
 //!   elections.
@@ -31,6 +33,7 @@ pub mod core;
 pub mod corpus;
 pub mod custom;
 pub mod delivery;
+pub mod failover;
 pub mod membership;
 pub mod node;
 #[cfg(feature = "alloc-probe")]
