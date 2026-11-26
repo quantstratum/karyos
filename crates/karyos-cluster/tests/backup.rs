@@ -665,6 +665,9 @@ fn a_rebuild_of_the_zero_identity_is_refused_unwritten() {
             nonce: [7; 32],
         },
     );
-    assert!(matches!(refused, Err(BackupError::ZeroIdentity)), "{refused:?}");
+    assert!(
+        matches!(refused, Err(BackupError::ZeroIdentity)),
+        "{refused:?}"
+    );
     assert!(files(&dir.0).is_empty(), "a refused rebuild wrote");
 }

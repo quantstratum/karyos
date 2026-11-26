@@ -26,7 +26,8 @@ use karyos_cluster::cluster_identity::{ClusterId, IdentityRecord};
 use karyos_sim::cluster::{ClusterSim, Node, Outbox};
 use karyos_sim::disk::{SimDisk, Survives};
 use karyos_sim::harness::node::{
-    ClientNode, HARNESS_CLUSTER, HARNESS_STANDBY, Member, Observation, Op, Recorder, Ret, ServerNode, Shared, Wire,
+    ClientNode, HARNESS_CLUSTER, HARNESS_STANDBY, Member, Observation, Op, Recorder, Ret,
+    ServerNode, Shared, Wire,
 };
 use karyos_sim::harness::reference::{LEADER, Message as Msg, Reference as Fixed};
 use karyos_sim::harness::standby::Fencing;
@@ -258,9 +259,11 @@ fn a_stale_answer_does_not_move_the_client_back_to_the_primary() {
         })
         .collect();
     assert_eq!(named, vec![HARNESS_STANDBY]);
-    assert!(recorder
-        .borrow()
-        .observations
-        .iter()
-        .any(|o| matches!(o, Observation::StaleGeneration { client: 9, generation: 1 })));
+    assert!(recorder.borrow().observations.iter().any(|o| matches!(
+        o,
+        Observation::StaleGeneration {
+            client: 9,
+            generation: 1
+        }
+    )));
 }

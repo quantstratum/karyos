@@ -646,10 +646,16 @@ fn a_stale_registration_changes_nothing() {
         cluster: STANDBY,
         generation: 2,
     };
-    let standby = SessionTable::new(config(4)).unwrap().register(9, 3, 0).unwrap();
+    let standby = SessionTable::new(config(4))
+        .unwrap()
+        .register(9, 3, 0)
+        .unwrap();
     let _ = events(|sink| client.leader_changed(Some(NEW), promoted, sink));
     assert!(events(|sink| client.registered(standby, promoted, sink).unwrap()).is_empty());
-    let late = SessionTable::new(config(4)).unwrap().register(9, 7, 0).unwrap();
+    let late = SessionTable::new(config(4))
+        .unwrap()
+        .register(9, 7, 0)
+        .unwrap();
     let seen = events(|sink| {
         assert_eq!(
             client.registered(late, live(1), sink),
