@@ -947,6 +947,10 @@ impl ConsensusCore for Custom {
         MembershipEntry::is_one(payload)
     }
 
+    fn configuration_stamp(&self) -> Option<u64> {
+        Some(self.core.configuration_changes())
+    }
+
     fn configuration(&self) -> Option<Configuration> {
         let membership = self.core.membership();
         Some(Configuration {

@@ -1531,6 +1531,8 @@ pub struct ServerNode<C: ConsensusCore> {
     led: Option<u64>,
     /// The configuration last recorded.
     configuration: Option<Configuration>,
+    /// The core's configuration stamp when it was last asked.
+    configuration_stamp: Option<u64>,
     /// Why the disk cannot come back, when its crash could not be taken.
     lost: Option<String>,
     recorder: Shared,
@@ -1708,6 +1710,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             commit,
             led: None,
             configuration: None,
+            configuration_stamp: None,
             lost: None,
             recorder,
             generation: FIRST_GENERATION,
@@ -1763,6 +1766,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             commit: None,
             led: None,
             configuration: None,
+            configuration_stamp: None,
             lost: None,
             recorder,
             generation: FIRST_GENERATION,
@@ -2763,7 +2767,13 @@ impl<C: ConsensusCore> ServerNode<C> {
                 out.push((to, Wire::FeedAck { verified }));
             }
         }
-        if let Some(configuration) = core.configuration()
+        // Asked only when the core says it may have moved: building it
+        // allocates, and the replication path must not (ADR-0105).
+        let stamp = core.configuration_stamp();
+        let moved = stamp.is_none() || stamp != self.configuration_stamp;
+        self.configuration_stamp = stamp;
+        if moved
+            && let Some(configuration) = core.configuration()
             && self.configuration.as_ref() != Some(&configuration)
         {
             let entry_term = configuration.index.and_then(|index| log.term(index));
@@ -2917,7 +2927,9 @@ impl<C: ConsensusCore> ServerNode<C> {
             standby.verified = None;
             standby.proposed = None;
         }
-        // Recorded at every start, so a check compares it with the log.
+        // Recorded at every start, so a check compares it with the log; the
+        // new core's stamp starts again.
+        self.configuration_stamp = core.configuration_stamp();
         if let Some(configuration) = core.configuration() {
             let entry_term = configuration.index.and_then(|index| log.term(index));
             self.record_configuration(configuration, entry_term);

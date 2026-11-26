@@ -754,6 +754,8 @@ pub struct Core {
     latest: Option<(u64, Membership)>,
     /// One per member, in `members` order: voters, then learners.
     peers: [Peer; MAX_MEMBERS],
+    /// How many times `members` was taken anew.
+    changes: u64,
     elapsed: u32,
     timeout: u32,
     rng: u64,
@@ -789,6 +791,7 @@ impl Core {
             prior: None,
             latest: None,
             peers,
+            changes: 0,
             elapsed: 0,
             timeout: 0,
             rng: config.seed ^ config.id.wrapping_mul(0x9E37_79B9_7F4A_7C15),
@@ -855,6 +858,15 @@ impl Core {
     #[must_use]
     pub const fn membership(&self) -> Membership {
         self.members
+    }
+
+    /// How many times its membership was taken anew (each configuration
+    /// entry, truncation or restore): a driver that reports the membership
+    /// looks again only when it moved, so the replication path allocates
+    /// nothing for it.
+    #[must_use]
+    pub const fn configuration_changes(&self) -> u64 {
+        self.changes
     }
 
     /// The index of the configuration entry it acts under; `None` for the
@@ -992,6 +1004,7 @@ impl Core {
         }
         self.members = members;
         self.peers = peers;
+        self.changes = self.changes.wrapping_add(1);
     }
 
     /// The configuration entries at or past `from` are gone from the log:

@@ -742,6 +742,13 @@ pub trait ConsensusCore: Sized {
         None
     }
 
+    /// A stamp that moves whenever [`ConsensusCore::configuration`] may
+    /// answer differently, for a core that can tell without building it;
+    /// `None`, the default, has the node ask every time.
+    fn configuration_stamp(&self) -> Option<u64> {
+        None
+    }
+
     /// The node compacted its log below a snapshot at `base`: entries at
     /// or below it may no longer be in the log (W5).
     ///
