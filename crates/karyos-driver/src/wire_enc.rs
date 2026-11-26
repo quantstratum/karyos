@@ -1120,7 +1120,11 @@ impl EncSealer {
         if self.domain().is_bootstrap() {
             self.charge_bootstrap(now_ns)?;
         }
-        let protected = u64::try_from(HEADER_LEN.saturating_add(frames)).unwrap_or(u64::MAX);
+        // The protected bytes as the seal charges them: the header, the
+        // frames and, in domains 4 and 6, the pairwise trailer.
+        let trailer = self.key.overhead().saturating_sub(ENVELOPE_LEN);
+        let protected = u64::try_from(HEADER_LEN.saturating_add(frames).saturating_add(trailer))
+            .unwrap_or(u64::MAX);
         if self.must_roll(protected, now_ns) {
             self.roll(now_ns)?;
         }
