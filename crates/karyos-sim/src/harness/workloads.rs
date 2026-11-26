@@ -557,7 +557,8 @@ pub enum Action {
     /// its leader (but those of [`Case::stay_on_primary`]); refused, and
     /// recorded so, when it is not.
     Promote(Fencing),
-    /// An action on whichever server leads when it acts (karyos#712): the
+    /// An action on whichever primary server leads when it acts
+    /// (karyos#712; never a standby server, karyos#713): the
     /// harness waits up to [`LEADER_WAIT`] steps for one, and records
     /// whom it acted on ([`Observation::Triggered`]).
     Leader(LeaderAction),
@@ -1354,9 +1355,16 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                     LeaderAction::MuteNextLeaderAcks => acted.map(|(_, term)| term),
                     _ => None,
                 };
+                // The primary's leader: a standby server leads only its
+                // own group (karyos#713).
+                let primary: Vec<NodeId> = joined
+                    .iter()
+                    .copied()
+                    .filter(|id| !standby.contains(id))
+                    .collect();
                 let mut waited = 0;
                 let (leader, term) = loop {
-                    if let Some(found) = current_leader(&sim, &joined)
+                    if let Some(found) = current_leader(&sim, &primary)
                         .filter(|(_, term)| floor.is_none_or(|floor| *term > floor))
                     {
                         break found;
