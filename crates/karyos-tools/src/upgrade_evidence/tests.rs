@@ -223,9 +223,8 @@ fn test_each_semantic_change_is_a_divergence() {
     }
 }
 
-/// The one normalisation: a command type only the new version knows is
-/// refused by both, under the same active version, and compares equal;
-/// the raw refusals differ only in `required`.
+/// A command type only the new version knows is refused by both binaries
+/// with byte-identical outcomes, with no normalisation.
 #[test]
 fn test_a_new_command_type_is_refused_alike_by_both() {
     let entries = vec![
@@ -252,11 +251,8 @@ fn test_a_new_command_type_is_refused_alike_by_both() {
     let left = replay(&mut old, entries.clone());
     let right = replay(&mut new, entries);
     assert_eq!(compare(&left, &right), Ok(3));
-    assert!(
-        left[1]
-            .outcome
-            .contains("VersionInactive { required: above")
-    );
+    assert_eq!(left[1].outcome, right[1].outcome);
+    assert!(left[1].outcome.contains("VersionInactive { active"));
 }
 
 fn journals(scratch: &Scratch, name: &str, steps: &[Step], manifest: &str) -> Journal {

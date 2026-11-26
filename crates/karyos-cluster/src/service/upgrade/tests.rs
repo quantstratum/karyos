@@ -209,11 +209,13 @@ impl ClusteredService for Versioned {
             .push((context.index(), context.active_version(), seen));
     }
 
-    /// Command `[9]` needs version 2; `[8]` is a type no version knows;
+    /// Command `[9]` needs version 2, and a binary that supports only
+    /// version 1 does not know it; `[8]` is a type no version knows;
     /// every other runs from version 1.
     fn required_version(&self, command: &[u8]) -> Option<u32> {
         match command.first() {
-            Some(9) => Some(2),
+            Some(9) if self.supported >= 2 => Some(2),
+            Some(9) => None,
             Some(8) => None,
             _ => Some(1),
         }
@@ -475,14 +477,12 @@ fn test_a_command_the_active_version_cannot_run_is_refused_when_applied() {
     assert_eq!(
         container.apply(&request(7, 0, &[9])),
         Ok(Applied::CoreRefused(CoreRefusal::VersionInactive {
-            required: Some(2),
             active: ActiveVersion::INITIAL
         }))
     );
     assert_eq!(
         container.apply(&request(8, 0, &[8])),
         Ok(Applied::CoreRefused(CoreRefusal::VersionInactive {
-            required: None,
             active: ActiveVersion::INITIAL
         }))
     );
@@ -897,4 +897,26 @@ fn test_the_leader_that_appended_a_stop_refuses_every_proposal() {
     new.restore(10, &reads(&old)).unwrap();
     assert_eq!(new.propose_activation(&resume, &mut core), Ok(()));
     assert_eq!(core.0, 2);
+}
+
+/// While versions are mixed, a command only the new version knows applies
+/// as the same refusal on an old and a new binary: the outcome carries
+/// only the log's active version, not each binary's reading of the
+/// version the command needs (ADR-0122 decision 3).
+#[test]
+fn test_a_new_command_type_applies_identically_on_an_old_and_a_new_binary() {
+    let mut old = up_to(1, 6);
+    let mut new = up_to(2, 6);
+    let left = old.apply(&request(7, 0, &[9]));
+    let right = new.apply(&request(7, 0, &[9]));
+    assert_eq!(
+        left,
+        Ok(Applied::CoreRefused(CoreRefusal::VersionInactive {
+            active: ActiveVersion::INITIAL
+        }))
+    );
+    assert_eq!(left, right);
+    assert_eq!(format!("{left:?}"), format!("{right:?}"));
+    assert_eq!(old.applied(), new.applied());
+    assert!(old.service().seen.is_empty() && new.service().seen.is_empty());
 }

@@ -37,13 +37,10 @@
 //! false alarm, never a missed one). The generated inputs cover what the
 //! generator draws, not every input; the seeds name exactly which.
 //!
-//! **One normalisation.** An apply-time
-//! [`CoreRefusal::VersionInactive`] carries the version the command
-//! needs as the binary knows it: the old binary names a command type the
-//! new version adds as unknown (`None`), the new one as its version. Both
-//! refuse it, the same way, under the same active version; the observation
-//! records `required` as "above the active version" so that this one field
-//! is not compared. Every other field of every outcome is.
+//! **No normalisation.** Every field of every outcome is compared. An
+//! apply-time [`CoreRefusal::VersionInactive`](karyos_cluster::service::CoreRefusal::VersionInactive) carries only the active
+//! version, which the log fixes, so a command type only the new version
+//! knows is refused identically by both binaries.
 //!
 //! **A declaration is not evidence** (SPEC.md:711): a service's statement
 //! that a version is compatible, its `supported_version` or
@@ -69,8 +66,7 @@ use karyos_archive::segment::{Geometry, SyncPolicy};
 use karyos_cluster::log::{Entry, RaftLog};
 use karyos_cluster::service::{
     Activation, ActiveVersion, Applied, ApplyError, ClusteredService, ContainerConfig, Context,
-    CoordinatedStop, CoreRefusal, Envelope, ServiceContainer, ServiceSnapshot, SessionBounds,
-    SnapshotFull,
+    CoordinatedStop, Envelope, ServiceContainer, ServiceSnapshot, SessionBounds, SnapshotFull,
 };
 use karyos_cluster::{DedupConfig, Request};
 
@@ -498,17 +494,11 @@ impl ClusteredService for Reference {
     }
 }
 
-/// The text of an entry's outcome, as recorded: its typed result, with
-/// `CoreRefusal::VersionInactive`'s `required` recorded as above the
-/// active version (the module's one normalisation).
+/// The text of an entry's outcome, as recorded: its typed result's
+/// `Debug` text, unnormalised.
 #[must_use]
 pub fn outcome_text(result: &Result<Applied<'_>, ApplyError>) -> String {
-    match result {
-        Ok(Applied::CoreRefused(CoreRefusal::VersionInactive { active, .. })) => {
-            format!("Ok(CoreRefused(VersionInactive {{ required: above, active: {active:?} }}))")
-        }
-        other => format!("{other:?}"),
-    }
+    format!("{result:?}")
 }
 
 /// One recorded step: the entry and the text of its outcome; the last

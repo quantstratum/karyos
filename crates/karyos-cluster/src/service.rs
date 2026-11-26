@@ -1062,8 +1062,10 @@ impl<S: ClusteredService> ServiceContainer<S> {
         self.stop_appended || self.versions.stop.is_some()
     }
 
-    /// Whether the active version runs `command`: `Ok`, or the refusal.
-    fn admits(&self, command: &[u8]) -> Result<(), CoreRefusal> {
+    /// Whether the active version runs `command`: `Ok`, or the version it
+    /// needs as this binary reads it (`None`: not known to the active
+    /// version).
+    fn admits(&self, command: &[u8]) -> Result<(), Option<u32>> {
         let active = self.versions.active;
         let required = if VERSION > active.schema {
             None
@@ -1072,7 +1074,7 @@ impl<S: ClusteredService> ServiceContainer<S> {
         };
         match required {
             Some(required) if required <= active.service => Ok(()),
-            required => Err(CoreRefusal::VersionInactive { required, active }),
+            required => Err(required),
         }
     }
 
@@ -1222,9 +1224,12 @@ impl<S: ClusteredService> ServiceContainer<S> {
             return Err(ProposeRefused::Stopping);
         }
         if let Envelope::Request { command, .. } = envelope
-            && let Err(CoreRefusal::VersionInactive { required, active }) = self.admits(command)
+            && let Err(required) = self.admits(command)
         {
-            return Err(ProposeRefused::VersionInactive { required, active });
+            return Err(ProposeRefused::VersionInactive {
+                required,
+                active: self.versions.active,
+            });
         }
         if matches!(envelope, Envelope::Register { .. }) && !self.bounds_logged && core.leads() {
             return Err(ProposeRefused::BoundsPending);
@@ -1323,8 +1328,11 @@ impl<S: ClusteredService> ServiceContainer<S> {
             },
         };
         if let Some(Envelope::Request { command, .. }) = envelope
-            && let Err(refusal) = self.admits(command)
+            && self.admits(command).is_err()
         {
+            let refusal = CoreRefusal::VersionInactive {
+                active: self.versions.active,
+            };
             return Ok(self.refused(entry, refusal));
         }
         self.applied = Some(entry.index);

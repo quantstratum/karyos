@@ -244,13 +244,13 @@ pub(super) fn is_core_template(bytes: &[u8], template: u16) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CoreRefusal {
-    /// A command the active version cannot run: it needs service version
-    /// `required` (`None`: a command type, or a schema 2 version, the
-    /// active version does not know) above `active`.
-    #[error("the command needs version {required:?}, the active one is {active:?}")]
+    /// A command the active version cannot run. It carries only the
+    /// active version, which the log fixes: the version the command needs
+    /// is the binary's own reading (an older binary does not know a
+    /// command type a newer one adds), so it would differ between
+    /// replicas while versions are mixed.
+    #[error("the active version {active:?} cannot run the command")]
     VersionInactive {
-        /// The service version the command needs.
-        required: Option<u32>,
         /// The active version.
         active: ActiveVersion,
     },

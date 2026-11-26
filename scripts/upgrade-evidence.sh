@@ -19,6 +19,11 @@
 #
 # It builds `karyos-tools` at both revisions (each in its own git worktree,
 # removed at the end), and with each:
+#   0. writes its `--versions` object. Before any replay counts, the new
+#      build's `karyos-tools compat` decides the pair in both directions
+#      (R-CORE-36, karyos#732); anything but interoperate on every
+#      surface the pair uses fails it (exit 1). Both decision objects are
+#      kept with the evidence;
 #   1. replays a copy of the recorded Cluster log in <log-dir> (from index
 #      1) into a recording group journal: each entry's payload and its
 #      typed outcome, then the composed snapshot;
@@ -30,7 +35,7 @@
 # and one such diff per seed. Any difference, or a pair that is not
 # comparable, fails it (exit 1). The evidence, recorded in
 # <out>/evidence.txt with the upgrade: the log replayed, both revisions,
-# the seeds, every diff's result.
+# the seeds, the two compat decisions and every diff's result.
 #
 # What a clean result does not say (karyos/testing/
 # contract-traceability-phase-3.md, the output diff row; plan issue 071):
@@ -38,8 +43,7 @@
 # CRC-32C, not byte by byte. The outcomes are compared as the text of
 # their typed values (Debug), so a change of that text alone shows as a
 # difference. The generated inputs are what the seeds draw, not every
-# input. An apply-time VersionInactive refusal's `required` is not
-# compared: each binary names a version not active as it knows it.
+# input. Every field of every outcome is compared, with no normalisation.
 #
 # A service's declaration (its supported_version or required_version
 # included) is not evidence (SPEC.md:711): only a clean run of this
@@ -92,6 +96,8 @@ for side in old new; do
     (cd "$work/$side" && CARGO_TARGET_DIR=$target/upgrade-evidence-$side \
         cargo build --locked --quiet -p karyos-tools --bin karyos-tools)
     tools=$target/upgrade-evidence-$side/debug/karyos-tools
+    mkdir -p "$out/$side"
+    "$tools" --versions >"$out/$side/versions.json"
     cp -R "$log_dir" "$work/log-$side"
     "$tools" upgrade-evidence replay --log "$work/log-$side" --geometry "$geometry" \
         --supported "$supported" --manifest "$side $rev" --out "$out/$side/log"
@@ -103,6 +109,19 @@ for side in old new; do
 done
 replay=$target/upgrade-evidence-new/debug/karyos-tools
 
+# The wire compatibility matrix first (R-CORE-36, karyos#732): the two
+# builds' --versions objects, in both directions, by the new build's
+# matrix, must interoperate on every surface the pair uses before the
+# replay counts as evidence. Both decisions are kept with the evidence.
+compat_failed=0
+for pair in old-new new-old; do
+    from=${pair%-*} to=${pair#*-} code=0
+    "$replay" compat "$out/$from/versions.json" "$out/$to/versions.json" \
+        >"$out/compat-$pair.json" 2>&1 || code=$?
+    [ "$code" -eq 0 ] || compat_failed=1
+    echo "compat $from -> $to: exit $code" >>"$work/compat.txt"
+done
+
 evidence=$out/evidence.txt
 {
     echo "rolling-upgrade evidence (SPEC.md section 9; karyos#716)"
@@ -112,7 +131,14 @@ evidence=$out/evidence.txt
     echo "seeds:    $first..$last, $count entries each, max service $max_service"
     echo "geometry: $geometry"
     echo "compared with: karyos-tools replay diff (karyos-replay diff) at $new"
+    cat "$work/compat.txt"
+    echo "compat decisions: $out/compat-old-new.json, $out/compat-new-old.json"
 } >"$evidence"
+if [ $compat_failed -ne 0 ]; then
+    echo "result:   NOT COMPATIBLE: karyos-tools compat does not decide interoperate both ways; not evidence for this upgrade" >>"$evidence"
+    cat "$evidence"
+    exit 1
+fi
 failed=0
 compare() {
     local name=$1 code=0 result
