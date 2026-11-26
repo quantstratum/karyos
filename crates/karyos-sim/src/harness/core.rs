@@ -690,6 +690,16 @@ pub trait ConsensusCore: Sized {
     /// What the node should do now, if anything.
     fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Self::Message>>;
 
+    /// Empties `out` for the next [`ConsensusCore::ready_into`]
+    /// ([`ReadyBuf::recycle`]): [`drive`] calls it before each Ready and
+    /// after it is done with one. Its work (the entries going back to the
+    /// pool, which can grow it) is the Ready's, so a probed core counts it
+    /// in its Ready stage ([`crate::harness::probe::Probed`]; C5 v3
+    /// coverage). The default only recycles; no core overrides it.
+    fn recycle_ready(&mut self, out: &mut ReadyBuf<Self::Message>) {
+        out.recycle();
+    }
+
     /// [`ConsensusCore::ready`], filled into the node's `out`, which
     /// [`drive`] hands over empty ([`ReadyBuf::recycle`]) (plan issue 073,
     /// karyos#691): whether the core had anything ready. A core that fills
@@ -1018,10 +1028,10 @@ pub(crate) fn drive_inner<C: ConsensusCore, D: Disk + Clone>(
     observe: &mut dyn FnMut(Step),
 ) -> Result<(), DriveError> {
     let mut readies = 0usize;
-    buf.recycle();
+    core.recycle_ready(buf);
     while core.ready_into(buf, &mut LogView::metered(log, budget).with_base(base)) {
         if readies == MAX_READIES {
-            buf.recycle();
+            core.recycle_ready(buf);
             return Err(DriveError::WorkBudget { readies });
         }
         // Below MAX_READIES, so it does not overflow.
@@ -1033,7 +1043,7 @@ pub(crate) fn drive_inner<C: ConsensusCore, D: Disk + Clone>(
             (budget, base, fault),
             (send, apply, observe),
         );
-        buf.recycle();
+        core.recycle_ready(buf);
         result?;
     }
     Ok(())

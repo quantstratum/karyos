@@ -18,11 +18,19 @@
 use std::io::Write as _;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use karyos_cluster::RaftLog;
 use karyos_raft_eval::openraft_core::{OpenRaftBatch16, VARIANT as OPENRAFT_VARIANT};
+use karyos_raft_eval::process;
 use karyos_raft_eval::raft_rs::{RaftRsBatch16, VARIANT};
+use karyos_sim::disk::SimDisk;
+use karyos_sim::harness::core::{ConsensusCore, LogView, Persisted, Ready, Refused};
+use karyos_sim::harness::node::LOG_DIR;
 use karyos_sim::harness::probe::{AllocationReport, WARMUP, measure};
+use karyos_sim::harness::probe::{Measured, Probed, Stage, measure_with};
+use karyos_sim::harness::workloads::geometry;
 use karyos_sim::harness::workloads::{self, Case, W1};
-use karyos_sys::alloc_count::CountingAllocator;
+use karyos_sim::net::NodeId;
+use karyos_sys::alloc_count::{CountingAllocator, SetCounts};
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -201,4 +209,90 @@ fn the_c5_v3_allocation_lines() {
             stages.join(","),
         );
     }
+}
+
+/// A core past the warm-up from its first call: driving it once opens the
+/// probe's between-calls stages ([`probe::encoding`], [`probe::application`]).
+#[derive(Debug)]
+struct Past;
+
+impl ConsensusCore for Past {
+    type Message = ();
+
+    fn recover(_id: NodeId, _peers: &[NodeId], _log: &mut LogView<'_>) -> Self {
+        Self
+    }
+
+    fn propose(&mut self, _command: Vec<u8>, _log: &mut LogView<'_>) -> Result<(), Refused> {
+        Ok(())
+    }
+
+    fn step(&mut self, _from: NodeId, _message: (), _log: &mut LogView<'_>) {}
+
+    fn tick(&mut self, _now: u64, _log: &mut LogView<'_>) {}
+
+    fn ready(&mut self, _log: &mut LogView<'_>) -> Option<Ready<()>> {
+        None
+    }
+
+    fn advance(&mut self, _persisted: Persisted, _log: &mut LogView<'_>) {}
+
+    fn term(&self) -> u64 {
+        1
+    }
+
+    fn leads(&self) -> bool {
+        true
+    }
+
+    fn received(&self) -> Option<u64> {
+        None
+    }
+
+    fn committed(&self) -> Option<u64> {
+        Some(WARMUP)
+    }
+}
+
+/// `stage`'s counts in `measured`.
+fn staged(measured: &Measured, stage: Stage) -> SetCounts {
+    measured
+        .stages
+        .iter()
+        .find(|(name, _)| *name == stage)
+        .map(|(_, counts)| *counts)
+        .unwrap()
+}
+
+/// Runs `run` in a measurement, past a probed core's warm-up.
+fn past_warmup(run: impl FnOnce()) -> Measured {
+    let mut log = RaftLog::create(
+        SimDisk::new(),
+        std::path::Path::new(LOG_DIR),
+        geometry().unwrap(),
+        1,
+    )
+    .unwrap();
+    let mut core = Probed::<Past>::recover(1, &[1], &mut LogView::new(&mut log));
+    let ((), measured) = measure_with(|| {
+        core.tick(0, &mut LogView::new(&mut log));
+        run();
+    })
+    .unwrap();
+    measured
+}
+
+/// Codex review of docs#1080 (C5 v3 coverage): what grows the runner's
+/// send outbox is counted as the encoding.
+#[test]
+fn the_runners_send_outbox_is_counted_as_the_encoding() {
+    let _serial = serial();
+    let mut outbox: Vec<(NodeId, u8)> = Vec::new();
+    let measured = past_warmup(|| process::outbox_push(&mut outbox, 2, 7));
+    assert_eq!(outbox, [(2, 7)]);
+    assert!(
+        staged(&measured, Stage::Encoding).allocations >= 1,
+        "{:?}",
+        measured.stages
+    );
 }

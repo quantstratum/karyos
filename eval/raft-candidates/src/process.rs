@@ -173,6 +173,10 @@ pub const TICK_MS: u64 = 10;
 /// ticks.
 pub const MAX_READS_PER_LOOP: usize = 256;
 
+/// Messages the outbox holds between two sends without growing, reserved
+/// at the node's initialisation.
+const OUTBOX_ROOM: usize = 4096;
+
 /// The W1 cases a real-process run takes: the harness's frozen W1
 /// (`W1::skeleton().cases()`, every process count, payload and client
 /// count of ADR-0043), so every value of a run is its [`Case`]'s.
@@ -850,7 +854,7 @@ impl<M> Serving<M> {
                         Observation::Released { node, to, release },
                     );
                 }
-                out.push((to, message));
+                outbox_push(out, to, message);
             },
             &mut |entry, applying| {
                 // The application is the declared path's apply stage once
@@ -1097,6 +1101,12 @@ fn transmit<C: Wire>(
     }
 }
 
+/// Queues `message` to `to` on the runner's send outbox, counted as the
+/// encoding: what grows the outbox is the send path's (C5 v3 coverage).
+pub fn outbox_push<M>(out: &mut Vec<(NodeId, M)>, to: NodeId, message: M) {
+    probe::encoding(|| out.push((to, message)));
+}
+
 /// Runs server `config.id` of core `C`, serving `config.case`'s clients,
 /// until the test's stop and the case's quiet period after it.
 ///
@@ -1181,7 +1191,10 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
     let start = Instant::now();
     let mut buffer = vec![0u8; MAX_DATAGRAM];
     let mut scratch = vec![0u8; 1 << 16];
-    let mut outbox: Vec<(NodeId, C::Message)> = Vec::new();
+    // Room for the messages of the Readys between two sends, at
+    // initialisation; what still grows it is counted as the encoding
+    // ([`outbox_push`]).
+    let mut outbox: Vec<(NodeId, C::Message)> = Vec::with_capacity(OUTBOX_ROOM);
     let mut reassembly = Reassembly::new();
     let mut decoder = C::decoder();
     let mut buffers = Buffers::new();
