@@ -1188,6 +1188,73 @@ impl<T: StreamTerms> Network<T> {
         posted
     }
 
+    /// The local authenticated publication aliases the Shared receiver
+    /// holds bound (tests).
+    #[cfg(test)]
+    pub(crate) fn published_bound(&self) -> Option<usize> {
+        match &self.agents {
+            Agents::Shared(agents) => Some(agents.published_bound()),
+            Agents::Threads(_) | Agents::Closed => None,
+        }
+    }
+
+    /// The Shared sender's registered SETUP sessions and those deferred
+    /// while admission-pending (tests).
+    #[cfg(test)]
+    pub(crate) fn registered_sessions(&self) -> Option<(usize, usize)> {
+        match &self.agents {
+            Agents::Shared(agents) => Some(agents.registered_sessions()),
+            Agents::Threads(_) | Agents::Closed => None,
+        }
+    }
+
+    /// The Shared receiver's first authenticated image: its binding, its
+    /// incarnation and whether it was aborted (tests).
+    #[cfg(test)]
+    pub(crate) fn auth_image(
+        &self,
+    ) -> Option<(
+        crate::sessions::receive::BindingKey,
+        karyos_protocol::network::Identity,
+        bool,
+    )> {
+        match &self.agents {
+            Agents::Shared(agents) => agents.auth_image(),
+            Agents::Threads(_) | Agents::Closed => None,
+        }
+    }
+
+    /// Hands the Shared receiver `bytes` as a datagram from `key`'s source
+    /// on its endpoint, now, through the receiver's own intake (tests):
+    /// what a socket delivers from that source.
+    #[cfg(test)]
+    pub(crate) fn inject_received(
+        &mut self,
+        key: crate::sessions::receive::BindingKey,
+        bytes: &[u8],
+    ) {
+        let now = (self.clock)();
+        if let Agents::Shared(agents) = &mut self.agents {
+            agents.inject_received(key, bytes, now);
+        }
+    }
+
+    /// Fills the sender's command ring with pings (tests); returns how
+    /// many it took.
+    #[cfg(test)]
+    pub(crate) fn fill_sender_ring(&self) -> usize {
+        let mut posted = 0;
+        while self
+            .links
+            .sender
+            .post(|reply| AgentCommand::Ping { reply, token: 0 })
+            .is_ok()
+        {
+            posted += 1;
+        }
+        posted
+    }
+
     /// Posts `count` pings to the receiver (tests).
     #[cfg(test)]
     pub(crate) fn ping_receiver(&self, count: usize) {
@@ -1899,6 +1966,9 @@ impl<T: StreamTerms> Network<T> {
             authority,
             view: keys.view,
             installation: keys.installation,
+            aborted: keys.aborted.map(|aborted| {
+                Box::new(aborted) as Box<dyn crate::remote_guard::AbortRecord + Send>
+            }),
         })))
     }
 
@@ -3575,26 +3645,58 @@ impl<T: StreamTerms> Network<T> {
             .unwrap_or_default()
     }
 
-    /// Handles the sender's `SenderAbortEnded` for `registration` as an
-    /// event would (tests): returns whether it retired the publication.
+    /// Posts the sender's `SenderAbortEnded` for incarnation `incarnation`
+    /// of the publication `registration` into the sender agent's event
+    /// ring, where the conductor's duty takes it as any agent event
+    /// (tests): returns whether the ring took it.
     #[cfg(test)]
-    pub(crate) fn abort_ended(&mut self, registration: u64) -> bool {
-        let retired = self
+    pub(crate) fn post_abort_ended(&self, registration: u64, incarnation: u64) -> bool {
+        let Some(entry) = self
             .publications
-            .iter_mut()
+            .iter()
             .find(|entry| entry.registration == registration)
-            .is_some_and(retire_aborted);
-        let mut stale = Stale {
-            queue: &mut self.stale_aliases,
-            overflows: &mut self.stale_overflows,
+        else {
+            return false;
         };
-        post_removals(
-            &self.links,
-            &mut self.publications,
-            &mut stale,
-            self.publication_linger,
-        );
-        retired
+        self.links.sender.post_event(AgentEvent::SenderAbortEnded {
+            endpoint: entry.endpoint,
+            alias: entry.alias,
+            identity: karyos_protocol::network::Identity {
+                driver_id: entry.traced.driver,
+                registration_id: registration,
+                incarnation,
+            },
+            interrupted: true,
+            lanes: None,
+        })
+    }
+
+    /// The endpoint and alias of the publication `registration` (tests).
+    #[cfg(test)]
+    pub(crate) fn key_of(&self, registration: u64) -> Option<(EndpointId, Alias)> {
+        self.publications
+            .iter()
+            .find(|entry| entry.registration == registration)
+            .map(|entry| (entry.endpoint, entry.alias))
+    }
+
+    /// Whether the Shared sender holds a session of `alias` on
+    /// `endpoint`, and whether its receiver still publishes it (tests).
+    #[cfg(test)]
+    pub(crate) fn alias_held(&self, endpoint: EndpointId, alias: Alias) -> Option<(bool, bool)> {
+        match &self.agents {
+            Agents::Shared(agents) => Some(agents.alias_held(endpoint, alias)),
+            Agents::Threads(_) | Agents::Closed => None,
+        }
+    }
+
+    /// The incarnation of the publication `registration` (tests).
+    #[cfg(test)]
+    pub(crate) fn incarnation_of(&self, registration: u64) -> Option<u64> {
+        self.publications
+            .iter()
+            .find(|entry| entry.registration == registration)
+            .map(|entry| entry.traced.incarnation)
     }
 
     pub(crate) fn publication_state(&self, registration: u64) -> Option<NetworkPublicationState> {
@@ -4512,14 +4614,17 @@ fn publication_answer<T: StreamTerms>(
         // goes to quarantine as for any retired session (guards-and-abort.md,
         // Session abort, sender step 5). A publication already being removed
         // or reincarnated keeps that course.
+        // Only its exact incarnation: a report delayed across a
+        // replacement retires nothing else (H8).
         AgentEvent::SenderAbortEnded {
             endpoint,
             alias,
-            registration,
-            interrupted: _,
+            identity,
+            ..
         } => {
-            if let Some(entry) = find(publications, endpoint, alias, registration)
+            if let Some(entry) = find(publications, endpoint, alias, identity.registration_id)
                 .and_then(|index| publications.get_mut(index))
+                && entry.traced.incarnation == identity.incarnation
             {
                 retire_aborted(entry);
             }

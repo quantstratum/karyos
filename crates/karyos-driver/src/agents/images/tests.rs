@@ -108,6 +108,8 @@ struct Setup {
     /// A remote guard's spec: the publication is admission-pending until
     /// the guard's word first reads open.
     remote_guard: Option<super::super::data::GuardSpec>,
+    /// The publication's incarnation, when not `identity()`'s.
+    incarnation: Option<u64>,
 }
 
 impl Setup {
@@ -145,6 +147,7 @@ impl Default for Setup {
             solicit: false,
             auth: false,
             remote_guard: None,
+            incarnation: None,
         }
     }
 }
@@ -181,6 +184,9 @@ struct Rig {
     /// The sender agent no longer runs: its publisher is silent, no DATA
     /// and no heartbeat of any kind.
     sender_stopped: bool,
+    /// The sender's event ring is kept full before each duty and not read:
+    /// every report it posts is refused.
+    events_full: bool,
 }
 
 impl Rig {
@@ -221,6 +227,7 @@ impl Rig {
             now: 0,
             trace_events: Vec::new(),
             sender_stopped: false,
+            events_full: false,
         };
         let loopback = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
         let a = rig
@@ -324,7 +331,10 @@ impl Rig {
                 publication: Publication {
                     endpoint: a,
                     alias: alias(),
-                    identity: identity(),
+                    identity: Identity {
+                        incarnation: setup.incarnation.unwrap_or(identity().incarnation),
+                        ..identity()
+                    },
                     term: term(setup.term_length),
                     lane_count: 2,
                 },
@@ -367,6 +377,7 @@ impl Rig {
             now: 0,
             trace_events: Vec::new(),
             sender_stopped: false,
+            events_full: false,
         };
         let loopback = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
         let mut open = || {
@@ -463,10 +474,22 @@ impl Rig {
                 let _ = conductor.duty_cycle().unwrap();
             }
         }
+        if self.events_full {
+            let filler = || crate::agents::AgentEvent::SenderSessionDrained {
+                endpoint: EndpointId(u32::MAX),
+                alias: alias(),
+                registration: 0,
+            };
+            while self.links.sender.post_event(filler()) {}
+        }
         if self.sender_stopped {
             self.agents.receiver.do_work(self.now).unwrap();
         } else {
             self.agents.do_work(self.now).unwrap();
+        }
+        if self.events_full {
+            std::thread::sleep(Duration::from_micros(200));
+            return;
         }
         let trace_events = &mut self.trace_events;
         self.endpoints.poll(
@@ -481,6 +504,7 @@ impl Rig {
                         | crate::agents::AgentEvent::NetworkJournalRefused { .. }
                         | crate::agents::AgentEvent::NetworkJournalClosed { .. }
                         | crate::agents::AgentEvent::SenderAbortEnded { .. }
+                        | crate::agents::AgentEvent::ReceiverAbortApplied { .. }
                 ) {
                     trace_events.push(event);
                 }
@@ -500,6 +524,17 @@ impl Rig {
     /// same alias as A with another identity to B (`destination`), two
     /// lanes of 64 KiB terms. Returns A2.
     fn second_publisher(&mut self, destination: SocketAddr, identity: Identity) -> EndpointId {
+        self.second_publisher_guarded(destination, identity, None)
+    }
+
+    /// [`Rig::second_publisher`], guarded by `guard` and authenticated
+    /// like the first when the rig is (its sealer required).
+    fn second_publisher_guarded(
+        &mut self,
+        destination: SocketAddr,
+        identity: Identity,
+        guard: Option<super::super::data::GuardSpec>,
+    ) -> EndpointId {
         let loopback = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
         let a2 = self
             .endpoints
@@ -527,8 +562,11 @@ impl Rig {
                 alias: alias(),
             })
             .unwrap();
-        let (outbound, log) =
+        let (mut outbound, log) =
             super::super::data::testing::outbound(a2, alias(), destination, term(65_536), 2, true);
+        if guard.is_some() {
+            outbound.require_auth().unwrap();
+        }
         self.second = Some(log);
         self.links
             .sender
@@ -542,7 +580,7 @@ impl Rig {
                     lane_count: 2,
                 },
                 outbound,
-                guard: None,
+                guard,
                 roles: None,
             })
             .unwrap();
@@ -7645,7 +7683,11 @@ fn a_remote_session_abort_closes_the_image_and_is_acknowledged_in_domain_4() {
         "{receiver:?}"
     );
     assert_eq!(rig.agents.sender.role.counters().abort_acks, 2);
-    assert_eq!(rig.agents.sender.role.counters().abort_acks_unmatched, 1);
+    assert_eq!(
+        rig.agents.sender.role.counters().abort_acks_duplicate,
+        1,
+        "counted, never recorded again"
+    );
     // H8 finding 8: the identical datagram from another source is no
     // cache hit, and finds no binding.
     let before = rig.agents.receiver.counters();
@@ -8048,6 +8090,17 @@ fn guarded_abort_rig(
     trusted: bool,
     signs: bool,
 ) -> (Rig, std::sync::Arc<karyos_client::HeapWords>) {
+    let (rig, word, _b) = guarded_abort_rig_tuned(trusted, signs, None);
+    (rig, word)
+}
+
+/// [`guarded_abort_rig`] with `tune` applied to the agents'
+/// configuration; also returns the subscriber's endpoint.
+fn guarded_abort_rig_tuned(
+    trusted: bool,
+    signs: bool,
+    tune: Option<fn(&mut AgentConfig)>,
+) -> (Rig, std::sync::Arc<karyos_client::HeapWords>, EndpointId) {
     use std::sync::Arc;
 
     use crate::agents::roles::publish_auth::{AbortAuthority, PublicationAuth};
@@ -8074,6 +8127,7 @@ fn guarded_abort_rig(
             policy: None,
             frontier: Default::default(),
         }),
+        tune,
         ..Setup::default()
     });
     let (channel, pairwise) = auth_keys(77);
@@ -8108,7 +8162,7 @@ fn guarded_abort_rig(
     }
     rig.agents.sender.role.set_abort_guard(a, alias(), 11);
     let _slot = established(&mut rig);
-    (rig, word)
+    (rig, word, b)
 }
 
 /// Closes the local guard and appends, so the gate applies the close.
@@ -8695,7 +8749,12 @@ fn a_remotely_guarded_publication_sends_nothing_before_recovery() {
     use crate::remote_guard::Phase;
 
     let (mut rig, _b_at, _signer) = remotely_guarded_rig(MemoryMarks::default(), None);
-    let _slot = established(&mut rig);
+    // ADM-14: while pending it registers no SETUP session, so it never
+    // establishes.
+    for _ in 0..300 {
+        rig.round(true);
+    }
+    assert_eq!(rig.agents.sender.role.registered_sessions(), (0, 1));
     assert_eq!(send_one(&mut rig, 200), 0);
     assert_eq!(
         rig.agents.receiver.role.guard_phase(11, rig.now),
@@ -8806,7 +8865,12 @@ fn a_restart_with_the_stored_mark_refuses_an_old_open() {
     let mut marks = MemoryMarks::default();
     marks.0.insert(11, 4);
     let (mut rig, b_at, signer) = remotely_guarded_rig(marks, Some(guard_word(2, true)));
-    let _slot = established(&mut rig);
+    // ADM-14: while pending it registers no SETUP session, so it never
+    // establishes.
+    for _ in 0..300 {
+        rig.round(true);
+    }
+    assert_eq!(rig.agents.sender.role.registered_sessions(), (0, 1));
     rig.until(true, |rig| {
         rig.agents.receiver.role.guard_phase(11, rig.now) == Some(Phase::Latched)
     });
@@ -9579,6 +9643,11 @@ mod invariants;
 /// A valid RSP_SETUP CHALLENGE of the rig's publication from receiver 77
 /// under `boot`, sealed under its pairwise RSP_SETUP proof (domain 6).
 fn valid_challenge(boot: [u64; 2], nonce: [u64; 2]) -> Vec<u8> {
+    valid_challenge_for(identity(), boot, nonce)
+}
+
+/// [`valid_challenge`] naming the incarnation `identity`.
+fn valid_challenge_for(identity: Identity, boot: [u64; 2], nonce: [u64; 2]) -> Vec<u8> {
     use karyos_protocol::network::{ChallengeBlock, Control, RspChallenge};
 
     use crate::wire_auth::{ENVELOPE_LEN, Proof, ProofKind};
@@ -9594,7 +9663,7 @@ fn valid_challenge(boot: [u64; 2], nonce: [u64; 2]) -> Vec<u8> {
     .unwrap();
     let control = Control::Challenge(RspChallenge {
         alias: alias(),
-        identity: identity(),
+        identity,
         challenge: ChallengeBlock {
             receiver_boot_id: boot,
             nonce,
@@ -9728,8 +9797,16 @@ fn an_admission_pending_publication_does_not_establish() {
             .admission_pending()
     );
     let sender = rig.agents.sender.role.counters();
-    assert!(sender.setup_blocked > 0, "no ANNOUNCE went out: {sender:?}");
+    // No session is registered, so no ANNOUNCE is even attempted.
+    assert_eq!(
+        rig.agents.sender.role.session_counters().announces,
+        0,
+        "no ANNOUNCE went out: {sender:?}"
+    );
     assert_eq!(rig.agents.receiver.role.posted_challenges().len(), 0);
+    // ADM-14: no SETUP session incarnation is registered; it is held
+    // deferred until the first persisted OPEN.
+    assert_eq!(rig.agents.sender.role.registered_sessions(), (0, 1));
     let established = rig.agents.sender.role.session_counters().established;
     assert!(
         rig.agents
@@ -9739,7 +9816,9 @@ fn an_admission_pending_publication_does_not_establish() {
             .is_none(),
         "a valid challenge binds nothing"
     );
-    assert_eq!(rig.agents.sender.role.counters().establishment_refused, 1);
+    // It names no registered incarnation: nothing is answered, bound or
+    // registered.
+    assert_eq!(rig.agents.sender.role.registered_sessions(), (0, 1));
     assert_eq!(
         rig.agents.sender.role.session_counters().established,
         established
@@ -10116,3 +10195,804 @@ fn a_key_rotation_keeps_an_encrypted_session_flowing() {
         assert_eq!(after.get(reason), 0, "{reason:?}: {after:?}");
     }
 }
+
+/// The `SenderAbortEnded` reports the rig saw, in full: the incarnation
+/// named, whether interrupted, and the first ACK's ranges.
+fn abort_reports(
+    rig: &Rig,
+) -> Vec<(
+    Identity,
+    bool,
+    Option<karyos_protocol::network::Lanes<karyos_protocol::network::authenticated::AckLane>>,
+)> {
+    rig.trace_events
+        .iter()
+        .filter_map(|event| match event {
+            crate::agents::AgentEvent::SenderAbortEnded {
+                identity,
+                interrupted,
+                lanes,
+                ..
+            } => Some((*identity, *interrupted, *lanes)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A local guard word open at epoch 2, and its gate spec.
+fn open_guard_spec() -> (
+    std::sync::Arc<karyos_client::HeapWords>,
+    super::super::data::GuardSpec,
+) {
+    use std::sync::Arc;
+
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::sync::Ordering;
+
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
+    let spec = super::super::data::GuardSpec {
+        word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+        cell: Arc::new(AppliedEpoch::new()),
+        epoch: 2,
+        empty_since: None,
+        rate: None,
+        reserve: None,
+        policy: None,
+        frontier: Default::default(),
+    };
+    (word, spec)
+}
+
+/// H8 GRD-17, ABT-15, RNG-6 with real guarded publications: the sender
+/// holds one publication, so its abort table holds one abort. Publication
+/// A's guard closes; its signed abort is pending (no receiver trusts the
+/// authority, so no ACK comes) and stays so after A is removed: the table
+/// is exhausted by a real abort. Publication B's guard then closes. B is
+/// terminal at once all the same (`auth.aborted`), with no room taken:
+/// its interruption is recorded on its own record and counted, its end is
+/// reported for retirement naming its incarnation, and it cannot
+/// establish again.
+#[test]
+fn an_exhausted_abort_table_still_makes_the_close_terminal() {
+    use crate::agents::roles::publish_auth::{AbortAuthority, PublicationAuth};
+    use crate::authority::Ed25519Signer;
+    use karyos_sys::log_buffer::AppendOptions;
+
+    fn one_publication(config: &mut AgentConfig) {
+        config.publications = 1;
+    }
+    let (mut rig, word_a, b) = guarded_abort_rig_tuned(false, true, Some(one_publication));
+    rig.agents.sender.role.set_abort_expiry(u64::MAX / 4);
+    assert_eq!(rig.agents.sender.role.abort_capacity(), 1);
+    // A's abort fills the table, and outlives A's removal.
+    close_guard(&mut rig, &word_a);
+    rig.until(true, |rig| rig.agents.sender.role.pending_aborts() == 1);
+    let a = rig.publisher;
+    let registration = identity().registration_id;
+    rig.links
+        .sender
+        .post(|reply| AgentCommand::RemovePublication {
+            reply,
+            endpoint: a,
+            alias: alias(),
+            registration,
+            linger: 0,
+        })
+        .unwrap();
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    rig.links
+        .sender
+        .post(|reply| AgentCommand::RemoveSenderSession {
+            reply,
+            endpoint: a,
+            alias: alias(),
+            registration,
+        })
+        .unwrap();
+    rig.until(true, |rig| rig.agents.sender.role.outbound(0).is_none());
+    assert_eq!(
+        rig.agents.sender.role.pending_aborts(),
+        1,
+        "A's abort stays"
+    );
+    // Publication B, guarded and signing, on its own endpoint.
+    let other = Identity {
+        driver_id: [8, 9],
+        registration_id: 4,
+        incarnation: 1,
+    };
+    let (word_b, spec_b) = open_guard_spec();
+    let destination = rig.endpoints.local_address(b).unwrap();
+    let a2 = rig.second_publisher_guarded(destination, other, Some(spec_b));
+    let (channel, pairwise) = auth_keys(77);
+    rig.agents.receiver.role.authenticate_published(a2, alias());
+    rig.agents.sender.role.authenticate_publication(
+        PublicationAuth::new(a2, alias(), other, 2, &channel, &[&pairwise]).unwrap(),
+    );
+    rig.agents.sender.role.set_abort_authority(
+        a2,
+        alias(),
+        AbortAuthority::new(Ed25519Signer::from_seed(&[9; 32]), 10, 10),
+    );
+    rig.agents.sender.role.set_abort_guard(a2, alias(), 11);
+    rig.until(true, |rig| {
+        rig.agents.sender.role.session_counters().established >= 1
+            && rig.agents.sender.role.outbound(0).is_some()
+    });
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    let before = rig.agents.sender.role.counters();
+    let _ = karyos_sys::guard::close(&word_b.words()[0]).unwrap();
+    let _ = rig.second.as_mut().unwrap().publications[0]
+        .append(&[5; 100], AppendOptions::default())
+        .unwrap();
+    rig.until(true, |rig| {
+        abort_reports(rig).iter().any(|(named, ..)| *named == other)
+    });
+    let sender = rig.agents.sender.role.counters();
+    assert_eq!(
+        (
+            sender.aborts_sent - before.aborts_sent,
+            sender.aborts_unrequested - before.aborts_unrequested,
+            sender.aborts_interrupted - before.aborts_interrupted,
+        ),
+        (0, 1, 1),
+        "no signed abort fit: B is an interruption; {sender:?}"
+    );
+    assert_eq!(
+        rig.agents.sender.role.pending_aborts(),
+        1,
+        "no room was taken"
+    );
+    assert_eq!(
+        rig.agents.sender.role.aborted_identity(a2, alias()),
+        Some(other),
+        "auth.aborted"
+    );
+    let reports: Vec<_> = abort_reports(&rig)
+        .into_iter()
+        .filter(|(named, ..)| *named == other)
+        .collect();
+    assert_eq!(
+        reports,
+        vec![(other, true, None)],
+        "retired once, interrupted"
+    );
+    // A restarted receiver's fresh challenge establishes nothing.
+    let refused = rig.agents.sender.role.counters().establishment_refused;
+    assert!(
+        rig.agents
+            .sender
+            .role
+            .open_sealed_for(a2, &valid_challenge_for(other, [5, 5], [6, 6]))
+            .is_none()
+    );
+    assert_eq!(
+        rig.agents.sender.role.counters().establishment_refused,
+        refused + 1
+    );
+}
+
+/// H8 RNG-6, ABT-12, end to end through the sender agent's duty: for
+/// either terminal outcome (an interruption with no signer, a completion
+/// by the receiver's ACK) the report the full event ring refuses is kept
+/// and posted again each duty, then reaches the conductor once, naming the
+/// exact incarnation (`an_ended_abort_retires_only_its_own_incarnation`
+/// takes it from there to the retirement and the alias's quarantine).
+#[test]
+fn a_refused_retirement_report_is_posted_again_through_the_duty() {
+    for completed in [false, true] {
+        let (mut rig, word) = guarded_abort_rig(completed, completed);
+        rig.events_full = true;
+        close_guard(&mut rig, &word);
+        for _ in 0..400 {
+            rig.round(true);
+            if rig.agents.sender.role.counters().abort_reports_deferred >= 3 {
+                break;
+            }
+        }
+        let sender = rig.agents.sender.role.counters();
+        assert!(
+            sender.abort_reports_deferred >= 3,
+            "{completed}: {sender:?}"
+        );
+        assert_eq!(
+            (sender.aborts_completed, sender.aborts_interrupted),
+            (u64::from(completed), u64::from(!completed)),
+            "{sender:?}"
+        );
+        assert!(
+            abort_reports(&rig).is_empty(),
+            "nothing reached the conductor"
+        );
+        rig.events_full = false;
+        for _ in 0..20 {
+            rig.round(true);
+        }
+        let reports = abort_reports(&rig);
+        assert_eq!(reports.len(), 1, "posted once: {reports:?}");
+        let (named, interrupted, lanes) = reports[0];
+        assert_eq!((named, interrupted), (identity(), !completed));
+        assert_eq!(lanes.is_some(), completed, "the first ACK's ranges");
+    }
+}
+
+/// H8 ABT-10: an ACK completes the abort only with each lane's range in
+/// `[start, high]` (its join at establishment, its submitted high-water
+/// mark), checked at both ends on lanes at different positions; the
+/// first valid one records the ranges and later ones count as duplicates.
+#[test]
+fn an_ack_is_checked_against_each_lanes_start_and_submitted_high() {
+    use karyos_protocol::network::Receiver;
+    use karyos_protocol::network::authenticated::{AbortAck, AckLane};
+
+    let (mut rig, word) = guarded_abort_rig(false, true);
+    for i in 0..8u8 {
+        let _ = rig.log.as_mut().unwrap().publications[0]
+            .append(&[i; 300], karyos_sys::log_buffer::AppendOptions::default());
+    }
+    for _ in 0..50 {
+        rig.round(true);
+    }
+    close_guard(&mut rig, &word);
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    let (epoch, _, _) = rig.agents.sender.role.pending_abort().unwrap();
+    let a = rig.publisher;
+    let outbound = rig.agents.sender.role.outbound(0).unwrap();
+    let highs = [
+        outbound.submitted_high(0).unwrap(),
+        outbound.submitted_high(1).unwrap(),
+    ];
+    assert!(highs[0] > 0 || highs[1] > 0, "data submitted: {highs:?}");
+    // Different starts on the two lanes, each within what was submitted.
+    let starts = [highs[0] / 2, highs[1] / 4];
+    rig.agents.sender.role.set_lane_starts(a, alias(), &starts);
+    let ack = |lanes: [(u64, u64); 2]| AbortAck {
+        alias: alias(),
+        identity: identity(),
+        receiver: Receiver {
+            receiver_boot_id: [1, 1],
+            receiver_id: 77,
+        },
+        guard_epoch: epoch,
+        lanes: karyos_protocol::network::Lanes::new(&lanes.map(|(delivered, unresolved_end)| {
+            AckLane {
+                delivered,
+                unresolved_end,
+            }
+        }))
+        .unwrap(),
+    };
+    let role = &mut rig.agents.sender.role;
+    let mut invalid = 0;
+    for lane in 0..2 {
+        if starts[lane] > 0 {
+            let mut below = [(starts[0], highs[0]), (starts[1], highs[1])];
+            below[lane].0 = starts[lane] - 1;
+            role.abort_acked_for(a, &ack(below));
+            invalid += 1;
+        }
+        let mut above = [(starts[0], highs[0]), (starts[1], highs[1])];
+        above[lane].1 = highs[lane] + 1;
+        role.abort_acked_for(a, &ack(above));
+        invalid += 1;
+    }
+    assert_eq!(role.counters().abort_acks_invalid, invalid);
+    assert_eq!(role.counters().aborts_completed, 0);
+    let exact = [(starts[0], highs[0]), (starts[1], highs[1])];
+    role.abort_acked_for(a, &ack(exact));
+    role.abort_acked_for(a, &ack(exact));
+    let sender = role.counters();
+    assert_eq!(
+        (sender.aborts_completed, sender.abort_acks_duplicate),
+        (1, 1),
+        "{sender:?}"
+    );
+    let mut posted = Vec::new();
+    role.report_aborts::<OsSocket>(|event| {
+        posted.push(event);
+        true
+    });
+    let Some(crate::agents::AgentEvent::SenderAbortEnded { lanes, .. }) = posted.first() else {
+        panic!("{posted:?}");
+    };
+    assert_eq!(*lanes, Some(ack(exact).lanes), "the first ACK's ranges");
+}
+
+/// H8 ABT-11 (design G3): the abort's deadline runs from its request until
+/// its first send, then from the first send.
+#[test]
+fn the_abort_horizon_runs_from_the_first_send() {
+    let (mut rig, word) = guarded_abort_rig(false, true);
+    rig.agents.sender.role.set_abort_expiry(500 * MS);
+    close_guard(&mut rig, &word);
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    let (_, first, deadline) = rig.agents.sender.role.pending_abort().unwrap();
+    let first = first.expect("sent");
+    assert_eq!(deadline, first + 500 * MS);
+}
+
+/// H8 RCV-4: an abort the receiver applies on its guard authority's own
+/// SESSION_ABORT (the publisher sent none) is learned from its valid ACK:
+/// the incarnation is terminal and retired at the sender, so a receiver
+/// restarted since cannot establish it again.
+#[test]
+fn an_authority_abort_at_the_receiver_retires_the_incarnation_at_the_sender() {
+    use karyos_protocol::network::authenticated::GUARD_CLOSED;
+
+    let scope = crate::agents::roles::AbortScope {
+        authority_id: 10,
+        guard_id: 11,
+    };
+    let (mut rig, b, _slot) = abort_rig(Some(scope));
+    let after = inject_abort(&mut rig, b, &signed_abort(10, 11, GUARD_CLOSED));
+    assert_eq!(after.abort_acks_sent, 1, "{after:?}");
+    for _ in 0..200 {
+        rig.round(true);
+        if !abort_ends(&rig).is_empty() {
+            break;
+        }
+    }
+    let sender = rig.agents.sender.role.counters();
+    assert_eq!(sender.aborts_remote, 1, "{sender:?}");
+    assert_eq!(abort_ends(&rig), vec![false]);
+    // The receiver restarted: a fresh boot id challenges again.
+    let a = rig.publisher;
+    assert!(
+        rig.agents
+            .sender
+            .role
+            .open_sealed_for(a, &valid_challenge([8, 8], [9, 9]))
+            .is_none()
+    );
+    assert_eq!(rig.agents.sender.role.counters().establishment_refused, 1);
+}
+
+/// H8 ABT-11, BUD-8 (design G3): under a mass abort the control budget
+/// still serves heartbeats and SETUP first; abort attempts take only what
+/// it left, a due one that does not fit is deferred to a later duty, never
+/// dropped, and the unrelated live session keeps its heartbeats and image.
+#[test]
+fn a_mass_abort_takes_only_what_the_control_budget_left() {
+    let (mut rig, _word) = guarded_abort_rig(true, true);
+    let slot = established(&mut rig);
+    rig.agents.sender.role.set_control_budget(4);
+    rig.agents.sender.role.fill_due_aborts(true);
+    let queued = rig.agents.sender.role.pending_aborts();
+    assert!(queued > 4, "{queued}");
+    let start = rig.agents.sender.role.counters();
+    for _ in 0..300 {
+        let before = rig.agents.sender.role.counters();
+        rig.round(true);
+        let after = rig.agents.sender.role.counters();
+        let attempts = (after.abort_send_failures + after.aborts_sent + after.aborts_resent)
+            - (before.abort_send_failures + before.aborts_sent + before.aborts_resent);
+        let beats = after.path_heartbeats_sent - before.path_heartbeats_sent;
+        assert!(attempts + beats <= 4, "{attempts} + {beats}: {after:?}");
+    }
+    let end = rig.agents.sender.role.counters();
+    assert!(end.aborts_deferred > 0, "{end:?}");
+    assert!(
+        end.abort_send_failures > start.abort_send_failures,
+        "deferred, then attempted: {end:?}"
+    );
+    assert!(
+        end.heartbeats_sent + end.path_heartbeats_sent
+            > start.heartbeats_sent + start.path_heartbeats_sent,
+        "{end:?}"
+    );
+    assert_eq!(
+        rig.agents.sender.role.pending_aborts(),
+        queued,
+        "none dropped"
+    );
+    assert_eq!(
+        rig.agents.receiver.counters().images_closed_aborted,
+        0,
+        "the live session kept going"
+    );
+    let _ = slot;
+}
+
+/// H8 ABT-11 (design G3): an abort that is never submitted still ends,
+/// interrupted, at its submission deadline from the request, which is
+/// not G3's horizon from a first send (there was none).
+#[test]
+fn a_never_submitted_abort_ends_at_its_submission_deadline() {
+    let (mut rig, word) = guarded_abort_rig(false, true);
+    rig.agents.sender.role.set_abort_expiry(200 * MS);
+    // No attempt ever fits: every one is deferred.
+    rig.agents.sender.role.set_control_budget(0);
+    close_guard(&mut rig, &word);
+    let mut requested = None;
+    for _ in 0..400 {
+        rig.round(true);
+        if requested.is_none()
+            && let Some((_, first, deadline)) = rig.agents.sender.role.pending_abort()
+        {
+            assert_eq!(first, None, "never sent");
+            requested = Some((rig.now, deadline));
+        }
+        if !abort_ends(&rig).is_empty() {
+            break;
+        }
+    }
+    let (at, deadline) = requested.expect("requested");
+    assert_eq!(deadline, at + 200 * MS, "from the request");
+    let sender = rig.agents.sender.role.counters();
+    assert_eq!(
+        (sender.aborts_sent, sender.aborts_interrupted),
+        (0, 1),
+        "{sender:?}"
+    );
+    assert!(sender.aborts_deferred > 0, "{sender:?}");
+    assert_eq!(abort_ends(&rig), vec![true]);
+}
+
+/// Design, Session abort, sender step 2, through both agents: a lost DATA
+/// datagram leaves a hole the receiver NAKs, whose repair job waits (the
+/// cycle's repair budget is spent). Once the incarnation is aborting, the
+/// pending job is cancelled unserved, with no outcome and nothing
+/// repaired, the repair datagrams the backend already holds are left to
+/// it (their storage leases end at its release), and the receiver's later
+/// NAKs are not served.
+#[test]
+fn an_abort_cancels_pending_repairs_and_serves_no_later_nak() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let jobs = |rig: &Rig| {
+        *rig.agents
+            .sender
+            .role
+            .outbound(0)
+            .and_then(|outbound| outbound.repair())
+            .unwrap()
+            .parts()
+            .1
+            .counts()
+    };
+    let (mut rig, word) = guarded_abort_rig(false, true);
+    rig.agents.sender.role.set_repair_bytes(0);
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let _ = rig.log.as_mut().unwrap().publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| jobs(rig).created >= 1);
+    let pending = jobs(&rig);
+    assert_eq!(pending.done, 0, "{pending:?}");
+    let repairs = rig.agents.sender.role.counters().repairs;
+    close_guard(&mut rig, &word);
+    // Aborting first, then the budget is back.
+    rig.until(true, |rig| rig.agents.sender.role.pending_aborts() == 1);
+    rig.agents.sender.role.set_repair_bytes(64 * 1024);
+    for _ in 0..50 {
+        rig.round(true);
+    }
+    let after = jobs(&rig);
+    assert!(after.cancelled >= 1, "{after:?}");
+    assert_eq!(after.done, 0, "{after:?}");
+    let sender = rig.agents.sender.role.counters();
+    assert_eq!(sender.repairs_cancelled, after.cancelled, "{sender:?}");
+    assert_eq!(sender.repairs, repairs, "nothing repaired");
+    assert!(sender.naks_after_abort >= 1, "{sender:?}");
+    assert_eq!(rig.agents.sender.role.pending_aborts(), 1, "still aborting");
+    // No job for the later NAKs.
+    let created = jobs(&rig).created;
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    assert_eq!(jobs(&rig).created, created);
+}
+
+/// The `ReceiverAbortApplied` reports the rig saw: reason and lanes.
+fn receiver_abort_reports(
+    rig: &Rig,
+) -> Vec<(
+    Identity,
+    Option<u16>,
+    karyos_protocol::network::Lanes<karyos_protocol::network::authenticated::AckLane>,
+)> {
+    rig.trace_events
+        .iter()
+        .filter_map(|event| match event {
+            crate::agents::AgentEvent::ReceiverAbortApplied {
+                identity,
+                reason,
+                lanes,
+                ..
+            } => Some((*identity, *reason, *lanes)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Design, Session abort, receiver and G4: a valid authenticated abort
+/// whose reason this driver does not know is applied all the same, its
+/// ACK sent, its reason reported unknown and counted apart.
+#[test]
+fn an_abort_with_an_unknown_reason_is_applied_reported_and_counted() {
+    let scope = crate::agents::roles::AbortScope {
+        authority_id: 10,
+        guard_id: 11,
+    };
+    let (mut rig, b, slot) = abort_rig(Some(scope));
+    let after = inject_abort(&mut rig, b, &signed_abort(10, 0, 9));
+    assert_eq!(
+        (after.abort_acks_sent, after.aborts_unknown_reason),
+        (1, 1),
+        "{after:?}"
+    );
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    let reports = receiver_abort_reports(&rig);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!((reports[0].0, reports[0].1), (identity(), None), "unknown");
+    assert_eq!(reports[0].2.as_slice().len(), 2, "both lanes");
+    let _ = slot;
+}
+
+/// Design, Session abort, steps 4 and receiver: the receiver reports, per
+/// lane, its delivered prefix and unresolved range once at the abort, the
+/// values its ACK carries; the sender records the first valid ACK's ranges
+/// (later ones are counted duplicates) and reports them with the
+/// incarnation's end: both sides report the same ranges.
+#[test]
+fn sender_and_receiver_report_the_same_first_ack_ranges() {
+    use karyos_protocol::network::authenticated::GUARD_CLOSED;
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let scope = crate::agents::roles::AbortScope {
+        authority_id: 10,
+        guard_id: 11,
+    };
+    let (mut rig, b, _slot) = abort_rig(Some(scope));
+    for i in 0..6u8 {
+        let _ =
+            rig.log.as_mut().unwrap().publications[0].append(&[i; 200], AppendOptions::default());
+    }
+    for _ in 0..50 {
+        rig.round(true);
+    }
+    let bytes = signed_abort(10, 11, GUARD_CLOSED);
+    let _ = inject_abort(&mut rig, b, &bytes);
+    // An identical abort resends the ACK: a duplicate at the sender.
+    let after = inject_abort(&mut rig, b, &bytes);
+    assert_eq!(after.abort_acks_resent, 1, "{after:?}");
+    for _ in 0..50 {
+        rig.round(true);
+    }
+    let received = receiver_abort_reports(&rig);
+    assert_eq!(received.len(), 1, "once, at the transition: {received:?}");
+    assert_eq!(received[0].1, Some(GUARD_CLOSED));
+    assert!(
+        received[0]
+            .2
+            .as_slice()
+            .iter()
+            .any(|lane| lane.delivered > 0),
+        "{received:?}"
+    );
+    let sent = abort_reports(&rig);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].2, Some(received[0].2), "the first ACK's ranges");
+    let sender = rig.agents.sender.role.counters();
+    assert!(sender.abort_acks_duplicate >= 1, "{sender:?}");
+}
+
+/// An authority public key file of key 10 at `epoch`, for the abort
+/// signer seeded with `seed` (guards 11 and 12, abort-capable).
+fn abort_authority_file(epoch: u32, seed: u8) -> crate::wire_keys::KeyFile {
+    use crate::authority::Ed25519Signer;
+    use std::fmt::Write as _;
+
+    let public = Ed25519Signer::from_seed(&[seed; 32]).verifier().to_bytes();
+    let mut hex = String::new();
+    for byte in public {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    let text = format!(
+        "format=karyos-wire-key-v1\nkey_id=10\nfile_epoch={epoch}\npurpose=authority-public\nprofile_id=4\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-04-30T00:00:00Z\npublic={hex}\nauthority_id=10\nguards=11,12\nabort=true\n"
+    );
+    crate::wire_keys::parse(&format!("10-{epoch}.key"), text.as_bytes()).unwrap()
+}
+
+/// H8 REV-5, end to end at the receiver through its key application: the
+/// abort authority is trusted from its key file, then its epoch 1 is
+/// revoked (only a successor epoch of the same key id, under another
+/// seed, remains). An abort signed under the revoked epoch is refused
+/// before any state changes, with no ACK, no report and the image kept;
+/// the successor's abort then applies.
+#[test]
+fn a_revoked_abort_signer_epoch_applies_no_remote_abort() {
+    use crate::agents::roles::publish_auth::AbortAuthority;
+    use crate::authority::Ed25519Signer;
+    use crate::wire_auth::FixedKeys;
+    use karyos_protocol::network::authenticated::{GUARD_CLOSED, SessionAbort};
+
+    let scope = crate::agents::roles::AbortScope {
+        authority_id: 10,
+        guard_id: 11,
+    };
+    let (mut rig, b, _slot) = abort_rig(Some(scope));
+    let (channel, pairwise) = auth_keys(77);
+    rig.agents.receiver.role.apply_keys(&FixedKeys {
+        files: vec![channel, pairwise, abort_authority_file(1, 9)],
+    });
+    // Epoch 1 (seed 9) is revoked: only the successor verifies key 10.
+    let (channel, pairwise) = auth_keys(77);
+    rig.agents.receiver.role.apply_keys(&FixedKeys {
+        files: vec![channel, pairwise, abort_authority_file(2, 10)],
+    });
+    let before = rig.agents.receiver.counters();
+    let after = inject_abort(&mut rig, b, &signed_abort(10, 11, GUARD_CLOSED));
+    assert_eq!(after.signed_refused, before.signed_refused + 1, "{after:?}");
+    assert_eq!(after.abort_acks_sent, before.abort_acks_sent, "{after:?}");
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    assert!(receiver_abort_reports(&rig).is_empty());
+    assert_eq!(rig.agents.receiver.counters().images_closed_aborted, 0);
+    // The successor's own abort applies: the refusal was the revocation.
+    let mut signer = AbortAuthority::new(Ed25519Signer::from_seed(&[10; 32]), 10, 10);
+    let mut bytes = vec![0u8; 256];
+    let length = signer
+        .sign(
+            &SessionAbort {
+                alias: alias(),
+                identity: identity(),
+                authority_id: 10,
+                guard_id: 11,
+                guard_epoch: 3,
+                reason: GUARD_CLOSED,
+            },
+            &mut bytes,
+        )
+        .unwrap();
+    bytes.truncate(length);
+    let after = inject_abort(&mut rig, b, &bytes);
+    assert_eq!(
+        after.abort_acks_sent,
+        before.abort_acks_sent + 1,
+        "{after:?}"
+    );
+}
+
+/// An authenticated rig whose publication is incarnation `incarnation`,
+/// its receiver trusting authority 10 (guard 11) for remote aborts and
+/// keeping its durable abort record in `state` (H8 RCV-4).
+fn abort_record_rig(state: &MemDir, incarnation: u64) -> (Rig, EndpointId) {
+    use crate::agents::roles::publish_auth::PublicationAuth;
+    use crate::agents::roles::receive_auth::SubscriptionAuth;
+    use crate::authority::Ed25519Signer;
+    use crate::signed_control::Authority;
+
+    let (mut rig, b) = Rig::new(Setup {
+        auth: true,
+        reliable: true,
+        identity: Some(identity_77(0)),
+        incarnation: Some(incarnation),
+        ..Setup::default()
+    });
+    let (channel, pairwise) = auth_keys(77);
+    let a = rig.publisher;
+    let id = Identity {
+        incarnation,
+        ..identity()
+    };
+    rig.agents.receiver.role.authenticate_published(a, alias());
+    rig.agents.receiver.role.authenticate_subscription(
+        SubscriptionAuth::new(b, alias(), &channel, &pairwise, 77).unwrap(),
+    );
+    rig.agents.sender.role.authenticate_publication(
+        PublicationAuth::new(a, alias(), id, 2, &channel, &[&pairwise]).unwrap(),
+    );
+    rig.agents.receiver.role.trust_authorities(
+        vec![Authority::of(
+            10,
+            Ed25519Signer::from_seed(&[9; 32]).verifier(),
+            10,
+            &[11, 12],
+            true,
+        )],
+        rig.now,
+    );
+    rig.agents.receiver.role.permit_abort(
+        b,
+        alias().stream_id,
+        crate::agents::roles::AbortScope {
+            authority_id: 10,
+            guard_id: 11,
+        },
+    );
+    rig.agents.receiver.role.set_abort_record(Box::new(
+        crate::remote_guard::AbortedIncarnations::new(state.clone()),
+    ));
+    (rig, b)
+}
+
+/// H8 RCV-4, across a receiver-only restart with the ACK lost: the
+/// receiver applies its guard authority's in-scope abort and records the
+/// incarnation durably before acknowledging; the ACK never reaches the
+/// sender. Restarted from the same durable state, the receiver refuses
+/// that incarnation's SETUP, so it never establishes again, while the
+/// publication's next incarnation establishes.
+#[test]
+fn an_applied_abort_stays_terminal_across_a_receiver_restart_with_the_ack_lost() {
+    use karyos_protocol::network::authenticated::GUARD_CLOSED;
+
+    let state = MemDir::default();
+    let (mut rig, b) = abort_record_rig(&state, 1);
+    let _slot = established(&mut rig);
+    // The ACK is lost: the sender never takes it.
+    rig.sender_stopped = true;
+    let after = inject_abort(&mut rig, b, &signed_abort(10, 11, GUARD_CLOSED));
+    assert_eq!(
+        (after.abort_acks_sent, after.abort_records_failed),
+        (1, 0),
+        "{after:?}"
+    );
+    assert_eq!(rig.agents.sender.role.counters().aborts_remote, 0);
+    drop(rig);
+    // The receiver restarts from its durable state; the sender, which
+    // never learned of the abort, announces the same incarnation.
+    let (mut rig, _b) = abort_record_rig(&state, 1);
+    for _ in 0..300 {
+        rig.round(true);
+    }
+    assert!(
+        !rig.events
+            .iter()
+            .any(|event| matches!(event, ImageEvent::Installed { .. })),
+        "{:?}",
+        rig.events
+    );
+    let receiver = rig.agents.receiver.counters();
+    assert!(receiver.setup_after_abort >= 1, "{receiver:?}");
+    drop(rig);
+    // The next incarnation establishes.
+    let (mut rig, _b) = abort_record_rig(&state, 2);
+    let _slot = established(&mut rig);
+    assert_eq!(rig.agents.receiver.counters().setup_after_abort, 0);
+}
+
+/// H8 RCV-4, fail closed: the abort record holds at most `MAX_ABORTED`
+/// incarnations; past it every incarnation is terminal, durably, as a full
+/// key state disables the store (KSF-4). An unreadable record is
+/// terminal for every incarnation too.
+#[test]
+fn a_full_or_unreadable_abort_record_fails_closed() {
+    use crate::remote_guard::{AbortRecord, AbortedIncarnations, MAX_ABORTED};
+
+    let state = MemDir::default();
+    let mut record = AbortedIncarnations::new(state.clone());
+    let of = |incarnation| Identity {
+        incarnation,
+        ..identity()
+    };
+    for incarnation in 0..MAX_ABORTED as u64 {
+        record.record(of(incarnation)).unwrap();
+    }
+    assert!(!record.terminal(&of(u64::MAX)));
+    assert!(record.record(of(u64::MAX)).is_err(), "full");
+    assert!(record.terminal(&of(u64::MAX - 1)), "every one, once full");
+    // Durably: a restart reads it full.
+    let restarted = AbortedIncarnations::new(state.clone());
+    assert!(restarted.terminal(&of(u64::MAX - 1)));
+    state.put(crate::remote_guard::ABORTED_FILE, "garbage\n");
+    let unreadable = AbortedIncarnations::new(state);
+    assert!(unreadable.terminal(&of(u64::MAX - 2)));
+}
+/// H8 round 4: insufficient evidence raised and missing properties (karyos#648).
+mod invariants_r4;

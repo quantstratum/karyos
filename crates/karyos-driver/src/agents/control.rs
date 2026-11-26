@@ -473,6 +473,17 @@ pub trait ControlSeal {
     /// Applies the key store's current key set (H8 finding 4): withdrawn
     /// once its key is revoked, expired or no longer verifies.
     fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet);
+    /// Moves a session sealer to in-band `party_epoch` at `seq` (tests);
+    /// others ignore it.
+    #[cfg(test)]
+    fn jump_to(&mut self, party_epoch: u8, seq: u64) {
+        let _ = (party_epoch, seq);
+    }
+    /// A session sealer's in-band epoch (tests); `None` for others.
+    #[cfg(test)]
+    fn party_epoch_now(&self) -> Option<u8> {
+        None
+    }
 }
 
 impl ControlSeal for Sealer {
@@ -497,6 +508,16 @@ impl ControlSeal for Sealer {
 
     fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
         self.follow(keys);
+    }
+
+    #[cfg(test)]
+    fn jump_to(&mut self, party_epoch: u8, seq: u64) {
+        Sealer::jump_to(self, party_epoch, seq);
+    }
+
+    #[cfg(test)]
+    fn party_epoch_now(&self) -> Option<u8> {
+        Some(self.party_epoch())
     }
 }
 
@@ -526,6 +547,21 @@ impl core::fmt::Debug for SharedSealer {
 }
 
 impl SharedSealer {
+    /// Moves the shared session sealer to in-band `party_epoch` at `seq`
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn jump_to(&self, party_epoch: u8, seq: u64) {
+        if let Ok(mut sealer) = self.sealer.lock() {
+            sealer.jump_to(party_epoch, seq);
+        }
+    }
+
+    /// The shared session sealer's in-band epoch (tests).
+    #[cfg(test)]
+    pub(crate) fn party_epoch_now(&self) -> Option<u8> {
+        self.sealer.lock().ok()?.party_epoch_now()
+    }
+
     /// Shares `sealer`.
     #[must_use]
     pub fn new(sealer: Sealer) -> Self {

@@ -644,24 +644,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // ADR-0076 clause 4, ADR-0114 section 11).
         let auth = super::wire::protected(channel.security)?;
         if let Some(auth) = &auth {
-            // The etf route under a protected class is not designed yet:
-            // refused, typed and counted (karyos#648).
-            if channel.etf.is_some() {
-                if let Some(wire) = net.wire_keys_mut() {
+            // Every operation the class does not support is refused,
+            // typed, before anything exists (fail closed; ADR-0035,
+            // ADR-0076).
+            use crate::error::AuthUnsupported;
+            let extra = if !required_destinations.is_empty() {
+                Some(AuthUnsupported::MultiDestination)
+            } else {
+                roles.is_some().then_some(AuthUnsupported::Roles)
+            };
+            if let Some(operation) = super::wire::unsupported(channel, allowlist.is_some(), extra) {
+                if operation == AuthUnsupported::Etf
+                    && let Some(wire) = net.wire_keys_mut()
+                {
                     wire.count_etf_refused();
                 }
                 return Err(DriverError::AuthenticatedRefused {
-                    reason: crate::error::AuthRefusal::Etf,
-                });
-            }
-            let single = matches!(channel.destination, Destination::Unicast(_))
-                && channel.paths.is_empty()
-                && required_destinations.is_empty()
-                && allowlist.is_none()
-                && roles.is_none();
-            if !single {
-                return Err(DriverError::AuthenticatedRefused {
-                    reason: crate::error::AuthRefusal::Ambiguous,
+                    reason: crate::error::AuthRefusal::Unsupported { operation },
                 });
             }
             let wire = net
@@ -670,7 +669,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     reason: crate::error::AuthRefusal::NoKeyStore,
                 })?;
             let checked = match auth {
-                super::wire::Protected::Auth(auth) => wire.publication(auth).map(|_| ()),
+                super::wire::Protected::Auth(auth) => wire
+                    .publication(auth, config.stream.buffer.stream_id)
+                    .map(|_| ()),
                 super::wire::Protected::Enc(enc) => wire.enc_publication(enc).map(|_| ()),
             };
             if let Err(error) = checked {

@@ -201,6 +201,18 @@ impl SendSessions {
         self.counters
     }
 
+    /// How many sessions the table holds.
+    #[must_use]
+    pub fn registered(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// How many more sessions the table can take.
+    #[must_use]
+    pub fn free(&self) -> usize {
+        self.capacity.saturating_sub(self.sessions.len())
+    }
+
     /// Starts announcing `publication`; its first SETUP is due at once.
     ///
     /// # Errors

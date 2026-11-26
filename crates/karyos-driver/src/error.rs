@@ -69,6 +69,35 @@ pub enum TimedNetworkUnsupported {
     EtfDeclarationInvalid,
 }
 
+/// An authenticated operation this build does not support: refused at
+/// admission, never run under a weaker rule (ADR-0035, ADR-0076; karyos#648:
+/// the authenticated class serves one unicast publisher-to-receiver pair).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AuthUnsupported {
+    /// A multicast destination.
+    #[error("multicast")]
+    Multicast,
+    /// A multi-destination channel, or required destinations.
+    #[error("multi-destination")]
+    MultiDestination,
+    /// Dynamic registration (`control-mode=dynamic`, an allowlist or a
+    /// registering subscription).
+    #[error("dynamic registration")]
+    Dynamic,
+    /// Redundant (routed) paths.
+    #[error("redundant paths")]
+    Routed,
+    /// Paired unicast paths.
+    #[error("paired paths")]
+    PairedPaths,
+    /// Receiver roles or tags.
+    #[error("receiver roles")]
+    Roles,
+    /// An `etf` declaration (ADR-0109).
+    #[error("an etf declaration")]
+    Etf,
+}
+
 /// Why an authenticated channel is refused at admission, before anything
 /// is established (karyos#648; ADR-0086 sections 4, 6 and 7, ADR-0118).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -105,10 +134,20 @@ pub enum AuthRefusal {
     /// publication names both a local and a remote guard.
     #[error("no durable guard state")]
     GuardState,
-    /// An `etf` declaration (ADR-0109): the authenticated class over the
-    /// etf route is not designed yet, so it is refused, never run.
-    #[error("an etf declaration on an authenticated channel")]
-    Etf,
+    /// An operation the authenticated class does not support yet.
+    #[error("unsupported on an authenticated channel: {operation}")]
+    Unsupported {
+        /// Which.
+        operation: AuthUnsupported,
+    },
+    /// The channel key file's scope (`channel_id`, `stream_id`) is not the
+    /// channel's, or the key id is bound to another scope already.
+    #[error("the channel key's scope is not the channel's")]
+    ChannelScope,
+    /// The pairwise key file's scope (`receiver_id`, `publisher_id`) is not
+    /// the channel's, or the key id is bound to another scope already.
+    #[error("the pairwise key's scope is not the channel's")]
+    PairwiseScope,
     /// A VM generation change is not released: no authenticated key is
     /// derived until every role redrew its identities (ADR-0086 section 7,
     /// ADR-0114 section 10).

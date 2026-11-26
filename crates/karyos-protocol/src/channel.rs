@@ -280,6 +280,12 @@ pub struct AuthenticatedChannel {
     /// The channel key (`purpose=channel`): SETUP proofs and the session's
     /// DATA.
     pub channel_key_id: u32,
+    /// The channel's operator-assigned identity: the channel key file's
+    /// `channel_id` must name it (wire-key-files.md section 2.2).
+    pub channel_id: u64,
+    /// The publishing driver of the pair: the pairwise key file's
+    /// `publisher_id` must name it.
+    pub publisher_id: u64,
     /// The receiver's pairwise key (`purpose=pairwise`): RSP_SETUP and the
     /// receiver's controls.
     pub pairwise_key_id: u32,

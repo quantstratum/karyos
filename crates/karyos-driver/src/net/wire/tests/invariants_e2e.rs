@@ -61,6 +61,21 @@ fn withdrawn(drivers: &[&mut EmbeddedDriver]) -> bool {
     }
 }
 
+/// Admits a publication of `stream` under the channel key `key_id`, whose
+/// file must name that stream (ADM-2).
+fn admit_key(driver: &mut EmbeddedDriver, key_id: u32, stream: i32) -> Result<(), DriverError> {
+    let security = Security::Authenticated(AuthenticatedChannel {
+        channel_key_id: key_id,
+        ..auth(None)
+    });
+    driver
+        .add_network_publication(
+            aggregate(stream),
+            &udp(Destination::Unicast(SocketAddr::new(LOOPBACK, 9)), security),
+        )
+        .map(|_| ())
+}
+
 /// A new authenticated publication of `stream` on `driver`, refused or not.
 fn admit(driver: &mut EmbeddedDriver, stream: i32) -> Result<(), DriverError> {
     let security = Security::Authenticated(auth(None));
@@ -178,7 +193,7 @@ fn inv_e2e_a_failed_state_commit_disables_every_path_until_one_succeeds() {
         let _ = publisher.do_work().unwrap();
     }
     assert!(publisher.wire_key_counters().unwrap().failures >= 1);
-    assert_eq!(admit(&mut publisher, STREAM + 1), Ok(()));
+    assert_eq!(admit_key(&mut publisher, 4, STREAM + 1), Ok(()));
 }
 
 /// INV-KSF-5 and INV-REV-6 (H8 N1), end to end: after a store outage
@@ -200,6 +215,8 @@ fn inv_e2e_a_recovered_store_does_not_revive_the_withdrawn_session() {
     for dir in [&keys, &sub_keys] {
         *dir.fail_list.lock().unwrap() = false;
     }
+    // A key of a new channel, admitted once the store recovers.
+    keys.put("4-1.key", &channel_key(4, STREAM + 1));
     advance(RELOAD_INTERVAL_S);
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut revived = false;
@@ -212,7 +229,7 @@ fn inv_e2e_a_recovered_store_does_not_revive_the_withdrawn_session() {
     }
     assert!(!revived, "{:?} {:?}", roles(&publisher), roles(&subscriber));
     assert_eq!(
-        admit(&mut publisher, STREAM + 1),
+        admit_key(&mut publisher, 4, STREAM + 1),
         Ok(()),
         "the store recovered"
     );

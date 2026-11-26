@@ -145,6 +145,9 @@ pub struct JobsCounts {
     pub failed: u64,
     /// Jobs ended by an uncertain submission.
     pub unresolved: u64,
+    /// Jobs cancelled unserved by their incarnation's abort, with no
+    /// outcome (guards-and-abort.md, Session abort, sender step 2).
+    pub cancelled: u64,
     /// An increment did not apply (sticky).
     pub overflowed: bool,
 }
@@ -537,6 +540,22 @@ impl Jobs {
         if self.take(job).is_some() {
             self.counts.bump(|c| &mut c.unresolved);
         }
+    }
+
+    /// Cancels every pending job, unserved and with no linger or outcome:
+    /// the incarnation is aborting (guards-and-abort.md, Session abort,
+    /// sender step 2). Returns the jobs cancelled.
+    pub fn cancel_all(&mut self) -> u64 {
+        let mut cancelled = 0u64;
+        for slot in &mut self.slots {
+            if slot.job.take().is_some() {
+                cancelled = cancelled.saturating_add(1);
+            }
+        }
+        for _ in 0..cancelled {
+            self.counts.bump(|c| &mut c.cancelled);
+        }
+        cancelled
     }
 
     fn take(&mut self, job: JobRef) -> Option<JobKey> {

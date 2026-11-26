@@ -54,6 +54,15 @@ pub mod sizing;
 pub mod sm_schedule;
 pub mod spin;
 pub mod timed_gate;
+// The H7 timing harness of `karyos-protocol`, shared rather than copied:
+// that crate keeps it test-only, so it is included here by path.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "the AEAD backend probes serve the encrypted class's H7 tests"
+)]
+#[path = "../../karyos-protocol/src/protection/timing.rs"]
+mod timing;
 mod trace_journals;
 pub mod wire_auth;
 pub mod wire_enc;
@@ -78,7 +87,8 @@ pub use embedded::{
     stream_lane_bytes,
 };
 pub use error::{
-    AuthRefusal, DriverError, EndpointLimit, TimedNetworkUnsupported, WalkerUnavailable,
+    AuthRefusal, AuthUnsupported, DriverError, EndpointLimit, TimedNetworkUnsupported,
+    WalkerUnavailable,
 };
 pub use generations::{GenerationInfo, Reconfiguration};
 pub use guards::{

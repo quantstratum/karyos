@@ -668,6 +668,16 @@ impl RepairPath {
         report
     }
 
+    /// Cancels its pending repair jobs and the step 8 ERRs not sent yet,
+    /// with no outcome: the incarnation is aborting (guards-and-abort.md,
+    /// Session abort, sender step 2). Datagrams already handed to the
+    /// backend are untouched, so their storage leases are kept until the
+    /// backend releases them. Returns the jobs cancelled.
+    pub fn cancel_pending(&mut self) -> u64 {
+        self.replies.clear();
+        self.jobs.cancel_all()
+    }
+
     /// The step 8 ERRs waiting to be sent, in order; `send` gets each.
     pub fn drain_replies(&mut self, mut send: impl FnMut(&NakReply)) {
         self.drain_replies_on(|reply, _| send(reply));

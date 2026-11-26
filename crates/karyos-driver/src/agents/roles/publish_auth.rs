@@ -49,6 +49,20 @@ struct Bound {
     verifier: Verifier,
 }
 
+/// A terminal incarnation's retirement, reported to the conductor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Retirement {
+    /// The exact incarnation: a report delayed across a replacement
+    /// retires nothing else.
+    pub(crate) identity: Identity,
+    /// Whether no valid ACK completed its abort.
+    pub(crate) interrupted: bool,
+    /// The receiver's per-lane delivered and unresolved ranges from the
+    /// first valid ACK, when one came.
+    pub(crate) lanes:
+        Option<karyos_protocol::network::Lanes<karyos_protocol::network::authenticated::AckLane>>,
+}
+
 /// What the publisher does after a verified RSP_SETUP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Establishing {
@@ -81,8 +95,15 @@ pub(crate) struct PublicationAuth {
     /// The guard its aborts name, bound at admission; 0 for none, which
     /// sends no abort on a close.
     pub(crate) abort_guard: u64,
-    /// The incarnation whose abort was requested: once each.
+    /// The incarnation whose abort was requested, or that is terminal
+    /// otherwise: once each; it establishes nothing more.
     pub(crate) aborted: Option<Identity>,
+    /// Its terminal incarnation's retirement, until the conductor's event
+    /// ring takes its report: one per publication, needing no room.
+    pub(crate) retire: Option<Retirement>,
+    /// Each lane's join at the bound establishment: the lowest delivered
+    /// prefix an ACK may report.
+    pub(crate) lane_starts: Option<karyos_protocol::network::Lanes<u64>>,
     /// The monotonic clock in nanoseconds, for the in-band epoch overlap
     /// (H8 finding 7: never the wall clock).
     clock: fn() -> u64,
@@ -256,6 +277,8 @@ impl PublicationAuth {
             abort: None,
             abort_guard: 0,
             aborted: None,
+            retire: None,
+            lane_starts: None,
             clock: super::receive_auth::monotonic_ns,
         })
     }

@@ -1401,6 +1401,30 @@ impl<T: StreamTerms> Outbound<T> {
         self.max_frame
     }
 
+    /// Cancels its pending repairs (NAK service and retransmission), with
+    /// no outcome record, as its incarnation aborts (guards-and-abort.md,
+    /// Session abort, sender step 2). Repairs already handed to the backend
+    /// keep their storage leases until the backend releases them. Returns
+    /// the jobs cancelled.
+    pub fn cancel_repairs(&mut self) -> u64 {
+        let own = self
+            .repair
+            .as_deref_mut()
+            .map_or(0, super::repair::RepairPath::cancel_pending);
+        let fanout = self
+            .fanout
+            .as_deref_mut()
+            .map_or(0, fanout::Fanout::cancel_repairs);
+        own.saturating_add(fanout)
+    }
+
+    /// `lane`'s submitted high-water mark: the highest end handed to the
+    /// backend; `None` for a lane it does not have.
+    #[must_use]
+    pub fn submitted_high(&self, lane: usize) -> Option<u64> {
+        self.tracks.get(lane).map(|track| track.high)
+    }
+
     /// Each lane's join point for an answer now: where its next read
     /// starts.
     #[must_use]

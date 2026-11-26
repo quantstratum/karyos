@@ -171,10 +171,18 @@ fn encrypted_admission_refuses_multicast_and_ambiguous_configurations() {
         group: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 1, 1, 1)), 4000),
         ttl: None,
     };
-    for destination in [destinations, multicast.clone()] {
+    // Several destinations and multicast are unsupported operations,
+    // refused typed by name (fail closed; ADR-0035, ADR-0076).
+    for (destination, operation) in [
+        (
+            destinations,
+            crate::error::AuthUnsupported::MultiDestination,
+        ),
+        (multicast.clone(), crate::error::AuthUnsupported::Multicast),
+    ] {
         assert_eq!(
             publish(&mut publisher, destination, encrypted()),
-            refused(AuthRefusal::Ambiguous)
+            refused(AuthRefusal::Unsupported { operation })
         );
     }
     nothing_created(&publisher);
@@ -186,7 +194,9 @@ fn encrypted_admission_refuses_multicast_and_ambiguous_configurations() {
     );
     assert_eq!(
         subscribe(&mut subscriber, &udp(multicast, encrypted()), RECEIVER),
-        refused(AuthRefusal::Ambiguous)
+        refused(AuthRefusal::Unsupported {
+            operation: crate::error::AuthUnsupported::Multicast,
+        })
     );
     nothing_created(&subscriber);
 }
@@ -208,7 +218,9 @@ fn an_etf_declaration_is_refused_on_an_encrypted_channel() {
         publisher
             .add_network_publication(aggregate(STREAM), &declared(unicast()))
             .unwrap_err(),
-        refused(AuthRefusal::Etf)
+        refused(AuthRefusal::Unsupported {
+            operation: crate::error::AuthUnsupported::Etf,
+        })
     );
     let (mut subscriber, _) = keyed(&borrowed(&enc_files()));
     assert_eq!(
@@ -217,7 +229,9 @@ fn an_etf_declaration_is_refused_on_an_encrypted_channel() {
             &declared(Destination::Unicast(ANY_PORT)),
             RECEIVER
         ),
-        refused(AuthRefusal::Etf)
+        refused(AuthRefusal::Unsupported {
+            operation: crate::error::AuthUnsupported::Etf,
+        })
     );
     for driver in [&publisher, &subscriber] {
         assert_eq!(driver.wire_key_counters().unwrap().etf_refused, 1);

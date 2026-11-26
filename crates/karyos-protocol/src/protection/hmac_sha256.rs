@@ -336,4 +336,6 @@ impl Protection for HmacSha256 {
 }
 
 #[cfg(test)]
+mod h7_tests;
+#[cfg(test)]
 mod tests;

@@ -700,6 +700,22 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         own_port: bool,
     ) -> Result<NetworkSubscription, DriverError> {
         let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
+        // An authenticated channel asks for nothing the class does not
+        // support, refused typed before any other check (fail closed;
+        // ADR-0035, ADR-0076).
+        if super::wire::protected(channel.security)?.is_some()
+            && let Some(operation) =
+                super::wire::unsupported(channel, dynamic || register_at(channel).is_some(), None)
+        {
+            if operation == crate::error::AuthUnsupported::Etf
+                && let Some(wire) = net.wire_keys_mut()
+            {
+                wire.count_etf_refused();
+            }
+            return Err(DriverError::AuthenticatedRefused {
+                reason: crate::error::AuthRefusal::Unsupported { operation },
+            });
+        }
         // Redundant paths need sockets isolated per interface; without
         // that every datagram would count on every path (owner item 12).
         if !channel.paths.is_empty() && !net.paths_isolated() {
@@ -731,20 +747,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let auth = match super::wire::protected(channel.security)? {
             None => None,
             Some(auth) => {
-                // As at the publisher: no etf declaration (karyos#648).
-                if channel.etf.is_some() {
-                    if let Some(wire) = net.wire_keys_mut() {
-                        wire.count_etf_refused();
-                    }
-                    return Err(DriverError::AuthenticatedRefused {
-                        reason: crate::error::AuthRefusal::Etf,
-                    });
-                }
-                let single = matches!(channel.destination, Destination::Unicast(_))
-                    && channel.paths.is_empty()
-                    && !dynamic
-                    && register_at(channel).is_none()
-                    && identity.is_none_or(|held| held.receiver_id.get() == auth.receiver_id());
+                // Its one receiver is the configured one (the unsupported
+                // operations were refused above).
+                let single =
+                    identity.is_none_or(|held| held.receiver_id.get() == auth.receiver_id());
                 let receiver_id = core::num::NonZeroU64::new(auth.receiver_id()).filter(|_| single);
                 let Some(receiver_id) = receiver_id else {
                     return Err(DriverError::AuthenticatedRefused {

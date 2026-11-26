@@ -271,6 +271,24 @@ impl<T: StreamTerms> Outbound<T> {
         matches!(&self.auth, SenderAuth::Sealing(sealer) if sealer.can_seal())
     }
 
+    /// Moves the installed session sealer to in-band `party_epoch` at
+    /// `seq` (tests).
+    #[cfg(test)]
+    pub(crate) fn jump_sealer(&mut self, party_epoch: u8, seq: u64) {
+        if let SenderAuth::Sealing(sealer) = &mut self.auth {
+            sealer.jump_to(party_epoch, seq);
+        }
+    }
+
+    /// The installed session sealer's in-band epoch and key file (tests).
+    #[cfg(test)]
+    pub(crate) fn sealer_keys(&self) -> Option<(u8, (u32, u32))> {
+        match &self.auth {
+            SenderAuth::Sealing(sealer) => Some((sealer.party_epoch(), sealer.key_ref())),
+            _ => None,
+        }
+    }
+
     /// The installed sealer's party (tests).
     #[cfg(test)]
     pub(crate) fn sealer_party(&self) -> Option<crate::wire_auth::Party> {

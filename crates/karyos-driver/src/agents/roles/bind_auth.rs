@@ -71,6 +71,9 @@ pub(crate) enum Binding {
         view: Arc<KeyView>,
         /// Its installation id, which its cleanup names.
         installation: u64,
+        /// The driver's durable abort record, with a subscription that
+        /// admits remote aborts (H8 RCV-4): kept from the first.
+        aborted: Option<Box<dyn crate::remote_guard::AbortRecord + Send>>,
     },
     /// Receiver: the subscription to `stream_id` on `endpoint` installed
     /// as `installation` ended; its keys, abort scope and control peer
@@ -376,9 +379,13 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 authority,
                 view,
                 installation,
+                aborted,
             } => {
                 let (endpoint, stream_id) = (auth.endpoint, auth.stream_id);
                 self.unbind(endpoint, stream_id);
+                if self.abort_record.is_none() {
+                    self.abort_record = aborted;
+                }
                 if let Some(authority) = authority {
                     let now = (self.clock)();
                     let retention = self.liveness_timeout;
@@ -531,6 +538,40 @@ impl<T: StreamTerms> SenderRole<T> {
 
 #[cfg(test)]
 impl<T: StreamTerms> ReceiverRole<T> {
+    /// The local authenticated publication aliases bound (tests).
+    pub(crate) fn published_bound(&self) -> usize {
+        self.published_auth.len()
+    }
+
+    /// A receiver-only restart of this receive side (tests; H8 round 4):
+    /// what a fresh process start loses is lost here, nothing else. Every
+    /// image is retired with its keys (the shared sealers withdrawn for
+    /// every holder), the signed digest cache is emptied, and a fresh
+    /// `receiver_boot_id` is drawn, so earlier challenges match no answer.
+    /// Configuration (subscriptions, their keys, trusted authorities and
+    /// durable guard marks) stays, as a restart reloads it.
+    pub(in crate::agents) fn restart_receive_side(
+        &mut self,
+        sessions: &super::super::chain::SessionEnd<T>,
+        now: u64,
+    ) {
+        while let Some(installed) = self.images.pop() {
+            if let Some(auth) = installed.auth.as_deref() {
+                crate::agents::control::ControlSeal::withdraw(&mut auth.sealer());
+            }
+            self.retire(sessions, installed, false, now);
+        }
+        if let Some(intake) = self.signed.as_deref_mut() {
+            intake.forget(|_| true);
+        }
+        let old = self.sessions.boot_id();
+        let mut boot = [0_u64; 2];
+        while boot == [0, 0] || boot == old {
+            let _ = karyos_sys::random::fill_u64s(&mut boot);
+        }
+        self.sessions.set_boot_id(boot);
+    }
+
     /// The remote guards followed (tests).
     pub(crate) fn followed_guards(&self) -> usize {
         self.remote_guards.len()

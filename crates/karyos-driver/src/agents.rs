@@ -1008,10 +1008,33 @@ pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
         endpoint: EndpointId,
         /// Its alias.
         alias: karyos_protocol::network::Alias,
-        /// Its registration.
-        registration: u64,
+        /// The exact incarnation retired: a conductor entry of another
+        /// incarnation (a replacement) is not touched.
+        identity: karyos_protocol::network::Identity,
         /// Whether no valid ACK arrived before the deadline.
         interrupted: bool,
+        /// The receiver's per-lane delivered and unresolved ranges from
+        /// the first valid ACK, when one came.
+        lanes: Option<
+            karyos_protocol::network::Lanes<karyos_protocol::network::authenticated::AckLane>,
+        >,
+    },
+    /// The receiver applied a valid, authenticated SESSION_ABORT to an
+    /// image: posted once, at the transition (guards-and-abort.md, Session
+    /// abort, receiver).
+    ReceiverAbortApplied {
+        /// The endpoint it arrived on.
+        endpoint: EndpointId,
+        /// The image's alias.
+        alias: karyos_protocol::network::Alias,
+        /// The aborted incarnation.
+        identity: karyos_protocol::network::Identity,
+        /// Its reason; `None` for one this driver does not know (or
+        /// WRITER_ABORTED, never sent), applied all the same.
+        reason: Option<u16>,
+        /// Per lane, the contiguous delivered prefix and unresolved
+        /// range, the values its ACK carries.
+        lanes: karyos_protocol::network::Lanes<karyos_protocol::network::authenticated::AckLane>,
     },
     /// The answer to [`AgentCommand::ChangeDestination`].
     DestinationChanged {
@@ -1718,8 +1741,53 @@ impl<O: SocketOps, T: StreamTerms> NetworkAgents<O, T> {
         )
     }
 
+    pub(crate) fn published_bound(&self) -> usize {
+        self.receiver.role.published_bound()
+    }
+
+    pub(crate) fn registered_sessions(&self) -> (usize, usize) {
+        self.sender.role.registered_sessions()
+    }
+
+    pub(crate) fn auth_image(
+        &self,
+    ) -> Option<(
+        crate::sessions::receive::BindingKey,
+        karyos_protocol::network::Identity,
+        bool,
+    )> {
+        self.receiver.role.auth_image()
+    }
+
+    /// Hands the receiver `bytes` from `key`'s source on its endpoint at
+    /// `now`, as its socket would.
+    pub(crate) fn inject_received(
+        &mut self,
+        key: crate::sessions::receive::BindingKey,
+        bytes: &[u8],
+        now: u64,
+    ) {
+        let receiver = &mut self.receiver;
+        receiver
+            .role
+            .inject_datagram(&receiver.sessions, key.endpoint, key.source, bytes, now);
+    }
+
     pub(crate) fn followed_guards(&self) -> usize {
         self.receiver.role.followed_guards()
+    }
+
+    /// Whether the sender holds a session of `alias` on `endpoint`, and
+    /// whether the receiver still publishes it.
+    pub(crate) fn alias_held(
+        &self,
+        endpoint: EndpointId,
+        alias: karyos_protocol::network::Alias,
+    ) -> (bool, bool) {
+        (
+            self.sender.role.has_session(endpoint, alias),
+            self.receiver.role.publishes(endpoint, alias),
+        )
     }
 }
 
@@ -2136,6 +2204,8 @@ impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
                 .try_post(AgentEvent::ResetRequested { endpoint, standing })
                 .is_ok()
         });
+        // An applied abort's report; a full ring asks again next cycle.
+        role.report_aborts(|event| events.try_post(event).is_ok());
         // Journals a retirement closed reach the conductor with their facts
         // (trace-network.md §4); a full ring keeps them for the next cycle.
         role.post_retired_journals(|event| match events.try_post(event) {
@@ -2308,6 +2378,13 @@ impl<O: SocketOps, T: StreamTerms> AgentLink<O, T> {
     /// flag, not a command.
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
+    }
+
+    /// Posts `event` into the agent's event ring as the agent would
+    /// (tests): returns whether the ring took it.
+    #[cfg(test)]
+    pub(crate) fn post_event(&self, event: AgentEvent<O, T>) -> bool {
+        self.events.try_post(event).is_ok()
     }
 
     /// Takes the agent's oldest event.

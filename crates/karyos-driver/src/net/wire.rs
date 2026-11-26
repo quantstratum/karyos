@@ -127,6 +127,40 @@ fn enc_refused(error: EncKeyError, missing: AuthRefusal) -> DriverError {
     })
 }
 
+/// The authenticated operation `channel` asks for that this build does
+/// not support (fail closed; ADR-0035, ADR-0076): `dynamic` for a
+/// registration (an allowlist, a registering subscription), `extra` for
+/// required destinations or receiver roles. `None` for one unicast pair.
+pub(crate) fn unsupported(
+    channel: &karyos_protocol::channel::UdpConfig,
+    dynamic: bool,
+    extra: Option<crate::error::AuthUnsupported>,
+) -> Option<crate::error::AuthUnsupported> {
+    use crate::error::AuthUnsupported as Op;
+    use karyos_protocol::channel::{ControlMode, Destination};
+
+    match &channel.destination {
+        Destination::Multicast { .. } => return Some(Op::Multicast),
+        Destination::MultiDestination {
+            mode: ControlMode::Dynamic,
+            ..
+        } => return Some(Op::Dynamic),
+        Destination::MultiDestination { .. } => return Some(Op::MultiDestination),
+        Destination::PairedPaths { .. } => return Some(Op::PairedPaths),
+        _ => {}
+    }
+    if dynamic {
+        return Some(Op::Dynamic);
+    }
+    if !channel.paths.is_empty() {
+        return Some(Op::Routed);
+    }
+    if channel.etf.is_some() {
+        return Some(Op::Etf);
+    }
+    extra
+}
+
 fn refused(reason: AuthRefusal) -> DriverError {
     DriverError::AuthenticatedRefused { reason }
 }
@@ -201,6 +235,28 @@ impl KeyView {
             keys,
             fingerprint,
             generation: 0,
+        }
+    }
+
+    /// Drops every file of a bound key id whose scope is not the one it
+    /// was admitted under (ADM-2): its paths then stop, fail closed.
+    fn keep_scopes(&mut self, scopes: &[(u32, Scope)]) {
+        for key in &mut self.keys {
+            let Some((_, scope)) = scopes.iter().find(|(key_id, _)| *key_id == key.key_id) else {
+                continue;
+            };
+            if key
+                .signing
+                .as_ref()
+                .is_some_and(|file| file.scope != *scope)
+            {
+                key.signing = None;
+            }
+            for slot in &mut key.verifying {
+                if slot.as_ref().is_some_and(|file| file.scope != *scope) {
+                    *slot = None;
+                }
+            }
         }
     }
 
@@ -294,6 +350,66 @@ pub struct WireKeyCounters {
     /// Authenticated admissions refused while a VM generation change was
     /// not released.
     pub generation_refused: u64,
+}
+
+/// The durable state directory, shared by the key store and the
+/// receiver's abort record (H8 RCV-4): one handle, one lock.
+pub(crate) struct SharedDir(Arc<std::sync::Mutex<Dir>>);
+
+impl Files for SharedDir {
+    fn names(&self) -> Result<Vec<String>, FileError> {
+        self.0.lock().map_err(|_| FileError::Refused)?.names()
+    }
+
+    fn read(&self, name: &str, buf: &mut [u8]) -> Result<usize, FileError> {
+        self.0
+            .lock()
+            .map_err(|_| FileError::Refused)?
+            .read(name, buf)
+    }
+
+    fn write_atomic(&self, name: &str, bytes: &[u8]) -> Result<(), FileError> {
+        self.0
+            .lock()
+            .map_err(|_| FileError::Refused)?
+            .write_atomic(name, bytes)
+    }
+
+    fn lock(&self) -> Result<(), FileError> {
+        self.0.lock().map_err(|_| FileError::Refused)?.lock()
+    }
+}
+
+/// The receiver's durable abort record on the state directory, shared by
+/// every abort-scoped subscription binding (H8 RCV-4).
+#[derive(Clone)]
+pub(crate) struct SharedAborted(
+    Arc<std::sync::Mutex<crate::remote_guard::AbortedIncarnations<SharedDir>>>,
+);
+
+impl core::fmt::Debug for SharedAborted {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SharedAborted").finish_non_exhaustive()
+    }
+}
+
+impl crate::remote_guard::AbortRecord for SharedAborted {
+    fn terminal(&self, identity: &karyos_protocol::network::Identity) -> bool {
+        // A poisoned lock is unreadable: every identity is terminal.
+        self.0
+            .lock()
+            .map_or(true, |record| record.terminal(identity))
+    }
+
+    fn record(
+        &mut self,
+        identity: karyos_protocol::network::Identity,
+    ) -> Result<(), crate::remote_guard::MarkError> {
+        self.0
+            .lock()
+            .map_err(|_| crate::remote_guard::MarkError::Unreadable)?
+            .record(identity)
+    }
 }
 
 /// The driver's durable guard marks, shared by every follow binding that
@@ -427,6 +543,9 @@ pub(crate) struct SubscriptionKeys {
     pub(crate) view: Arc<KeyView>,
     /// The binding's installation id, which its cleanup names.
     pub(crate) installation: u64,
+    /// The durable abort record, for a subscription that admits remote
+    /// aborts (H8 RCV-4).
+    pub(crate) aborted: Option<SharedAborted>,
 }
 
 /// The driver's wire key store and its schedule.
@@ -474,8 +593,14 @@ pub(crate) struct WireKeys {
     installations: u64,
     /// The installation id of each followed guard's latest follow.
     guard_installs: Vec<(u64, u64)>,
+    /// The scope each channel and pairwise key id was admitted under
+    /// (ADM-2): a file of the key id under another scope is never in a
+    /// view, so no replacement epoch changes the channel or the pair.
+    scopes: Vec<(u32, Scope)>,
     /// The guard authority's committed epochs, until it starts.
     commits: Option<Dir>,
+    /// The receiver's durable abort record, on the state directory.
+    aborted: SharedAborted,
 }
 
 impl core::fmt::Debug for WireKeys {
@@ -521,7 +646,12 @@ impl WireKeys {
         let now = clock();
         let mono: fn() -> u64 = mono_now;
         let at = mono();
-        let (store, report) = KeyStore::start(keys, state, now)?;
+        let state = Arc::new(std::sync::Mutex::new(state));
+        let (store, report) =
+            KeyStore::start(keys, Box::new(SharedDir(Arc::clone(&state))) as Dir, now)?;
+        let aborted = SharedAborted(Arc::new(std::sync::Mutex::new(
+            crate::remote_guard::AbortedIncarnations::new(SharedDir(state)),
+        )));
         let counters = WireKeyCounters {
             events: u64::try_from(report.events.len()).unwrap_or(u64::MAX),
             failures: u64::from(store.is_disabled()),
@@ -555,7 +685,9 @@ impl WireKeys {
                 deferred: Vec::new(),
                 installations: 0,
                 guard_installs: Vec::new(),
+                scopes: Vec::new(),
                 commits: None,
+                aborted,
             },
             report,
         ))
@@ -620,6 +752,7 @@ impl WireKeys {
             }
         }
         let mut view = KeyView::of(&self.store, now);
+        view.keep_scopes(&self.scopes);
         if !self.unposted
             && view.fingerprint == self.view.fingerprint
             && view.summary().eq(self.view.summary())
@@ -691,6 +824,7 @@ impl WireKeys {
     pub(crate) fn publication(
         &self,
         channel: &AuthenticatedChannel,
+        stream_id: i32,
     ) -> Result<PublicationKeys, DriverError> {
         let view = &*self.view;
         if crate::wire_enc::vm_generation::quiesced() {
@@ -704,19 +838,31 @@ impl WireKeys {
             .signing(channel.channel_key_id)
             .filter(|file| file.purpose == Purpose::Channel)
             .ok_or_else(|| refused(AuthRefusal::ChannelKey))?;
-        let pairwise: Vec<KeyFile> = view
+        // The complete scope (wire-key-files.md section 2.2): the
+        // channel's id and the publication's stream, and the pair's
+        // receiver and publisher (ADM-2).
+        let channel_scope = channel_scope(channel, stream_id);
+        if signing.scope != channel_scope
+            || self.bound_elsewhere(channel.channel_key_id, &channel_scope)
+        {
+            return Err(refused(AuthRefusal::ChannelScope));
+        }
+        let pair_scope = pairwise_scope(channel);
+        let files: Vec<&KeyFile> = view
             .verifying(channel.pairwise_key_id)
             .into_iter()
             .flatten()
-            .filter(|file| {
-                file.purpose == Purpose::Pairwise
-                    && matches!(file.scope, Scope::Pairwise { receiver_id, .. } if receiver_id == channel.receiver_id)
-            })
-            .map(duplicate)
+            .filter(|file| file.purpose == Purpose::Pairwise)
             .collect();
-        if pairwise.is_empty() {
+        if files.is_empty() {
             return Err(refused(AuthRefusal::PairwiseKey));
         }
+        if files.iter().any(|file| file.scope != pair_scope)
+            || self.bound_elsewhere(channel.pairwise_key_id, &pair_scope)
+        {
+            return Err(refused(AuthRefusal::PairwiseScope));
+        }
+        let pairwise: Vec<KeyFile> = files.into_iter().map(duplicate).collect();
         // The authority that guards it (ADR-0118 (a)): this driver itself,
         // signing its aborts, or a remote one whose guard it follows
         // through the authority's public key, its marks durable.
@@ -770,7 +916,12 @@ impl WireKeys {
     ) -> Result<PublicationBinding, DriverError> {
         use crate::agents::roles::publish_auth::{AbortAuthority, PublicationAuth};
 
-        let keys = self.publication(channel)?;
+        let keys = self.publication(channel, publication.alias.stream_id)?;
+        self.bind_scope(
+            channel.channel_key_id,
+            channel_scope(channel, publication.alias.stream_id),
+        );
+        self.bind_scope(channel.pairwise_key_id, pairwise_scope(channel));
         let pairwise: Vec<&KeyFile> = keys.pairwise.iter().collect();
         let auth = PublicationAuth::new(
             publication.endpoint,
@@ -1005,6 +1156,21 @@ impl WireKeys {
         })
     }
 
+    /// Whether `key_id` was admitted under a scope other than `scope`.
+    fn bound_elsewhere(&self, key_id: u32, scope: &Scope) -> bool {
+        self.scopes
+            .iter()
+            .any(|(held, bound)| *held == key_id && bound != scope)
+    }
+
+    /// Records that `key_id` was admitted under `scope`: from now on only
+    /// its files of that scope are in a view.
+    fn bind_scope(&mut self, key_id: u32, scope: Scope) {
+        if !self.scopes.iter().any(|(held, _)| *held == key_id) {
+            self.scopes.push((key_id, scope));
+        }
+    }
+
     /// The next installation id.
     pub(crate) fn next_installation(&mut self) -> u64 {
         self.installations = self.installations.saturating_add(1);
@@ -1015,6 +1181,12 @@ impl WireKeys {
     pub(crate) fn defer(&mut self, binding: Box<crate::agents::roles::AuthBinding>) {
         self.counters.bindings_deferred = self.counters.bindings_deferred.saturating_add(1);
         self.deferred.push(binding);
+    }
+
+    /// How many bindings a full ring holds deferred (tests).
+    #[cfg(test)]
+    pub(crate) fn deferred_bindings(&self) -> usize {
+        self.deferred.len()
     }
 
     /// The deferred bindings, oldest first, to post again.
@@ -1115,23 +1287,35 @@ impl WireKeys {
         if self.store.is_disabled() {
             return Err(refused(AuthRefusal::KeyStoreDisabled));
         }
-        let verifying = view
+        let channel_files: Vec<&KeyFile> = view
             .verifying(channel.channel_key_id)
             .into_iter()
             .flatten()
-            .filter(|file| {
-                file.purpose == Purpose::Channel
-                    && matches!(file.scope, Scope::Channel { stream_id: stream, .. } if stream == stream_id)
-            })
+            .filter(|file| file.purpose == Purpose::Channel)
+            .collect();
+        // The complete scope (ADM-2): every file of the key is the
+        // channel's and the stream's.
+        let channel_scope = channel_scope(channel, stream_id);
+        if channel_files.iter().any(|file| file.scope != channel_scope)
+            || self.bound_elsewhere(channel.channel_key_id, &channel_scope)
+        {
+            return Err(refused(AuthRefusal::ChannelScope));
+        }
+        let verifying = channel_files
+            .into_iter()
             .max_by_key(|file| file.file_epoch)
             .ok_or_else(|| refused(AuthRefusal::ChannelKey))?;
         let pairwise = view
             .signing(channel.pairwise_key_id)
-            .filter(|file| {
-                file.purpose == Purpose::Pairwise
-                    && matches!(file.scope, Scope::Pairwise { receiver_id, .. } if receiver_id == channel.receiver_id)
-            })
+            .filter(|file| file.purpose == Purpose::Pairwise)
             .ok_or_else(|| refused(AuthRefusal::PairwiseKey))?;
+        let pair_scope = pairwise_scope(channel);
+        if pairwise.scope != pair_scope
+            || self.bound_elsewhere(channel.pairwise_key_id, &pair_scope)
+        {
+            return Err(refused(AuthRefusal::PairwiseScope));
+        }
+        let aborted = channel.authority.map(|_| self.aborted.clone());
         if let Some(authority) = channel.authority {
             let valid = view
                 .verifying(authority.key_id)
@@ -1150,11 +1334,14 @@ impl WireKeys {
             }
             self.reserve(authority.control)?;
         }
+        self.bind_scope(channel.channel_key_id, channel_scope);
+        self.bind_scope(channel.pairwise_key_id, pair_scope);
         Ok(SubscriptionKeys {
             channel: duplicate(verifying),
             pairwise: duplicate(pairwise),
             view,
             installation: self.next_installation(),
+            aborted,
         })
     }
 
@@ -1183,6 +1370,22 @@ impl WireKeys {
                 self.peers.swap_remove(index);
             }
         }
+    }
+}
+
+/// The scope a channel key file of `channel` on `stream_id` names.
+fn channel_scope(channel: &AuthenticatedChannel, stream_id: i32) -> Scope {
+    Scope::Channel {
+        channel_id: channel.channel_id,
+        stream_id,
+    }
+}
+
+/// The scope the pairwise key file of `channel` names.
+fn pairwise_scope(channel: &AuthenticatedChannel) -> Scope {
+    Scope::Pairwise {
+        receiver_id: channel.receiver_id,
+        publisher_id: channel.publisher_id,
     }
 }
 

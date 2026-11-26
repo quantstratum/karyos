@@ -114,4 +114,6 @@ impl AuthoritySigner for Ed25519Signer {
 }
 
 #[cfg(test)]
+mod h7_tests;
+#[cfg(test)]
 mod tests;

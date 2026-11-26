@@ -495,6 +495,18 @@ impl Sealer {
         Ok(())
     }
 
+    /// Moves the next envelope to in-band `party_epoch` at `seq` (tests:
+    /// the 75% move and the usage limit, which would otherwise need 2^47
+    /// seals, reached on a live session).
+    #[cfg(test)]
+    pub(crate) fn jump_to(&mut self, party_epoch: u8, seq: u64) {
+        if self.withdrawn {
+            return;
+        }
+        self.profile = self.with_seq(party_epoch, seq);
+        self.party_epoch = party_epoch;
+    }
+
     #[cfg(test)]
     fn at_seq(file: &KeyFile, party: Party, alias: Alias, party_epoch: u8, seq: u64) -> Self {
         Self::starting(file, party, alias, party_epoch, seq).unwrap()
@@ -1730,3 +1742,5 @@ impl BootTable {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vectors;

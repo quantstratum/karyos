@@ -31,7 +31,7 @@ use zeroize::Zeroizing;
 use super::Dir;
 use crate::agents::ThreadingMode;
 use crate::embedded::{AggregateConfig, DriverConfig, EmbeddedDriver, StreamConfig};
-use crate::error::{AuthRefusal, DriverError};
+use crate::error::{AuthRefusal, AuthUnsupported, DriverError};
 use crate::membership::ReceiverIdentity;
 use crate::net::NetworkConfig;
 use crate::wire_keys::store::{FileError, Files, KeyStore, RELOAD_INTERVAL_S};
@@ -206,6 +206,8 @@ fn authority(control: SocketAddr) -> ChannelAuthority {
 fn auth(authority: Option<ChannelAuthority>) -> AuthenticatedChannel {
     AuthenticatedChannel {
         channel_key_id: 3,
+        channel_id: 7,
+        publisher_id: 5,
         pairwise_key_id: 9,
         receiver_id: RECEIVER,
         authority,
@@ -365,7 +367,7 @@ fn authenticated_admission_refuses_a_missing_key_typed() {
         paired
             .add_network_publication(aggregate(STREAM), &udp(to.clone(), security))
             .unwrap_err(),
-        refused(AuthRefusal::PairwiseKey)
+        refused(AuthRefusal::PairwiseScope)
     );
     // A guard the authority key does not list.
     let security = Security::Authenticated(auth(Some(ChannelAuthority {
@@ -383,7 +385,7 @@ fn authenticated_admission_refuses_a_missing_key_typed() {
         subscriber
             .add_network_subscription_as(STREAM, &udp(sub.clone(), security), identity(RECEIVER))
             .unwrap_err(),
-        refused(AuthRefusal::ChannelKey)
+        refused(AuthRefusal::ChannelScope)
     );
     // The subscriber's authority must be a public authority key.
     let channel = channel_key(3, STREAM);
@@ -416,12 +418,15 @@ fn authenticated_admission_refuses_ambiguous_configurations() {
         group: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 1, 1, 1)), 4000),
         ttl: None,
     };
-    for destination in [destinations, multicast] {
+    for (destination, operation) in [
+        (destinations, AuthUnsupported::MultiDestination),
+        (multicast, AuthUnsupported::Multicast),
+    ] {
         assert_eq!(
             driver
                 .add_network_publication(aggregate(STREAM), &udp(destination, security))
                 .unwrap_err(),
-            refused(AuthRefusal::Ambiguous)
+            refused(AuthRefusal::Unsupported { operation })
         );
     }
     let (mut subscriber, _) = keyed(&borrowed(&subscriber_files()));
@@ -458,11 +463,11 @@ fn authenticated_admission_refuses_ambiguous_configurations() {
     );
 }
 
-/// Item 1: the signed control budget is reserved at admission; once the
-/// receiver's peer table is full, an authority at a new control endpoint
-/// is refused, typed, and a removal frees its peer.
+/// Item 1 (ADM-5): the signed control budget is reserved at admission;
+/// once the receiver's peer table is full, an authority at a new control
+/// endpoint is refused, typed, and a removal frees its peer for reuse.
 #[test]
-fn a_full_control_budget_refuses_admission() {
+fn a_full_control_budget_refuses_admission_and_a_removal_frees_a_peer() {
     let peers = crate::signed_control::PEER_SLOTS;
     let channels: Vec<(String, String)> = (0..=peers)
         .map(|at| {
@@ -803,6 +808,8 @@ fn authority_files() -> Vec<(&'static str, String)> {
 fn guarded_files() -> Vec<(&'static str, String)> {
     vec![
         ("3-1.key", channel_key(3, STREAM)),
+        // A second channel, of another stream, for a replacement.
+        ("4-1.key", channel_key(4, STREAM + 1)),
         ("9-1.key", PAIRWISE.to_owned()),
         ("10-1.key", PUBLIC.to_owned()),
     ]
@@ -934,6 +941,16 @@ fn a_remote_guard_opens_the_publication_through_its_authority() {
     let ([mut publisher, mut subscriber, mut authority_driver], handle) =
         remotely_guarded(&marks, &commits);
     let registration = handle.registration();
+    // ADM-14: admitted but pending, the sender holds no live SETUP
+    // session incarnation, only a deferred one, until the first persisted
+    // OPEN.
+    let _ = publisher.do_work().unwrap();
+    assert_eq!(roles(&publisher).0.2, 1, "admission-pending");
+    assert!(!marks.files.lock().unwrap().contains_key("guard-11"));
+    assert_eq!(
+        publisher.net.as_ref().unwrap().registered_sessions(),
+        Some((0, 1))
+    );
     let opened = pump(
         &mut [&mut publisher, &mut subscriber, &mut authority_driver],
         |drivers| {
@@ -942,6 +959,11 @@ fn a_remote_guard_opens_the_publication_through_its_authority() {
                 && roles(drivers[0]).0 == (1, 1, 0)
                 && !drivers[1].network_images(STREAM).is_empty()
         },
+    );
+    assert_eq!(
+        publisher.net.as_ref().unwrap().registered_sessions(),
+        Some((1, 0)),
+        "registered at the open"
     );
     assert!(
         opened,
@@ -995,6 +1017,11 @@ fn an_unpersisted_guard_mark_keeps_the_publication_pending_and_alarms() {
     );
     assert_eq!(roles(&publisher).0.2, 1, "still admission-pending");
     assert!(!marks.files.lock().unwrap().contains_key("guard-11"));
+    // ADM-14: no SETUP session incarnation without a persisted OPEN.
+    assert_eq!(
+        publisher.net.as_ref().unwrap().registered_sessions(),
+        Some((0, 1))
+    );
 }
 
 /// Item 3: an authority whose committed state cannot be written signs
@@ -1117,7 +1144,9 @@ fn an_etf_declaration_is_refused_on_an_authenticated_channel() {
         publisher
             .add_network_publication(aggregate(STREAM), &declared(to, security))
             .unwrap_err(),
-        refused(AuthRefusal::Etf)
+        refused(AuthRefusal::Unsupported {
+            operation: AuthUnsupported::Etf
+        })
     );
     let (mut subscriber, _) = keyed(&borrowed(&subscriber_files()));
     assert_eq!(
@@ -1128,13 +1157,43 @@ fn an_etf_declaration_is_refused_on_an_authenticated_channel() {
                 identity(RECEIVER),
             )
             .unwrap_err(),
-        refused(AuthRefusal::Etf)
+        refused(AuthRefusal::Unsupported {
+            operation: AuthUnsupported::Etf
+        })
     );
     for driver in [&publisher, &subscriber] {
         assert_eq!(driver.wire_key_counters().unwrap().etf_refused, 1);
         let net = driver.net.as_ref().unwrap();
         assert_eq!((net.publication_count(), net.subscription_count()), (0, 0));
     }
+    // ADM-4: the refusal does not depend on a key store. Without one it is
+    // the same typed refusal, ahead of `NoKeyStore`; the count lives in the
+    // store's counters, so it is kept only once a store is started.
+    let mut unkeyed = driver_with(64);
+    let to = Destination::Unicast(SocketAddr::new(LOOPBACK, 9));
+    assert_eq!(
+        unkeyed
+            .add_network_publication(aggregate(STREAM), &declared(to, security))
+            .unwrap_err(),
+        refused(AuthRefusal::Unsupported {
+            operation: AuthUnsupported::Etf
+        })
+    );
+    assert_eq!(
+        unkeyed
+            .add_network_subscription_as(
+                STREAM,
+                &declared(Destination::Unicast(ANY_PORT), security),
+                identity(RECEIVER),
+            )
+            .unwrap_err(),
+        refused(AuthRefusal::Unsupported {
+            operation: AuthUnsupported::Etf
+        })
+    );
+    assert_eq!(unkeyed.wire_key_counters(), None);
+    let net = unkeyed.net.as_ref().unwrap();
+    assert_eq!((net.publication_count(), net.subscription_count()), (0, 0));
 }
 
 /// karyos#648, a refused successor: while a VM generation change is not
@@ -1390,10 +1449,13 @@ fn a_deferred_unfollow_never_undoes_a_later_follow() {
     let _ = publisher.do_work().unwrap();
     // A replacement guarded by the same guard, admitted now, posts its
     // follow ahead of the deferred unfollow.
-    let security = Security::Authenticated(auth(Some(ChannelAuthority {
-        follower_id: 66,
-        ..authority(control())
-    })));
+    let security = Security::Authenticated(AuthenticatedChannel {
+        channel_key_id: 4,
+        ..auth(Some(ChannelAuthority {
+            follower_id: 66,
+            ..authority(control())
+        }))
+    });
     let to = subscriber.network_subscription_address(STREAM).unwrap();
     publisher
         .add_network_publication(
@@ -1607,3 +1669,568 @@ fn a_full_durable_state_stops_both_roles() {
         assert!(driver.wire_key_counters().unwrap().failures >= 1);
     }
 }
+
+/// ADM-2 (wire-key-files.md section 2.2): admission checks the complete
+/// scope of each key file against the channel, one field at a time: the
+/// channel key's `channel_id` on both roles and its `stream_id` on both,
+/// the pairwise key's `receiver_id` and `publisher_id` on both. A
+/// mismatch is refused, typed, and nothing is created.
+#[test]
+fn admission_refuses_a_key_of_another_scope_for_each_field() {
+    let to = Destination::Unicast(SocketAddr::new(LOOPBACK, 9));
+    let sub = Destination::Unicast(ANY_PORT);
+    let (mut publisher, _) = keyed(&borrowed(&publisher_files()));
+    let (mut subscriber, _) = keyed(&borrowed(&subscriber_files()));
+    let base = auth(None);
+    let cases = [
+        (
+            "channel_id",
+            AuthenticatedChannel {
+                channel_id: 8,
+                ..base
+            },
+            STREAM,
+            AuthRefusal::ChannelScope,
+        ),
+        ("stream_id", base, STREAM + 1, AuthRefusal::ChannelScope),
+        (
+            "publisher_id",
+            AuthenticatedChannel {
+                publisher_id: 6,
+                ..base
+            },
+            STREAM,
+            AuthRefusal::PairwiseScope,
+        ),
+        (
+            "receiver_id",
+            AuthenticatedChannel {
+                receiver_id: 78,
+                ..base
+            },
+            STREAM,
+            AuthRefusal::PairwiseScope,
+        ),
+    ];
+    for (field, channel, stream, reason) in cases {
+        let security = Security::Authenticated(channel);
+        assert_eq!(
+            publisher
+                .add_network_publication(aggregate(stream), &udp(to.clone(), security))
+                .unwrap_err(),
+            refused(reason),
+            "publisher, {field}"
+        );
+        assert_eq!(
+            subscriber
+                .add_network_subscription_as(
+                    stream,
+                    &udp(sub.clone(), security),
+                    identity(channel.receiver_id),
+                )
+                .unwrap_err(),
+            refused(reason),
+            "subscriber, {field}"
+        );
+    }
+    for driver in [&publisher, &subscriber] {
+        let net = driver.net.as_ref().unwrap();
+        assert_eq!((net.publication_count(), net.subscription_count()), (0, 0));
+    }
+}
+
+/// ADM-2: a replacement epoch of an admitted key under another scope is
+/// never used: once it is the key's newest, the channel's sessions stop
+/// (fail closed) rather than moving to it.
+#[test]
+fn a_replacement_epoch_of_another_scope_is_never_used() {
+    let (mut publisher, pub_keys, mut subscriber, sub_keys) = established();
+    let other = channel_key(3, STREAM + 1)
+        .replacen("file_epoch=1", "file_epoch=2", 1)
+        .replacen("secret=03", "secret=f3", 1);
+    for keys in [&pub_keys, &sub_keys] {
+        keys.put("3-2.key", &other);
+    }
+    advance(RELOAD_INTERVAL_S);
+    super::MONO_SKEW.with(|skew| {
+        skew.set(skew.get() + RELOAD_INTERVAL_S.unsigned_abs() * 1_000_000_000);
+    });
+    let stopped = pump(&mut [&mut publisher, &mut subscriber], |drivers| {
+        roles(drivers[0]).0.1 == 0
+    });
+    assert!(
+        stopped,
+        "it moved to the other scope: {:?}",
+        roles(&publisher)
+    );
+}
+
+/// Capability enablement fails closed (ADR-0035, ADR-0076): every
+/// operation the authenticated class does not support is refused at
+/// admission, typed, on each role that can ask for it, and nothing is
+/// created.
+#[test]
+fn every_unsupported_authenticated_operation_is_refused_typed() {
+    use karyos_protocol::channel::{ControlMode, EtfDeclaration};
+
+    use crate::sessions::register::{AddressRange, RegistrationAllowlist};
+
+    let security = Security::Authenticated(auth(None));
+    let unicast = SocketAddr::new(LOOPBACK, 9);
+    let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 1, 1, 1)), 4000);
+    let control = SocketAddr::new(LOOPBACK, 4001);
+    let multicast = || udp(Destination::Multicast { group, ttl: None }, security);
+    let manual = || {
+        udp(
+            Destination::MultiDestination {
+                destinations: vec![unicast, SocketAddr::new(LOOPBACK, 10)],
+                control: None,
+                mode: ControlMode::Manual,
+            },
+            security,
+        )
+    };
+    let dynamic = || {
+        udp(
+            Destination::MultiDestination {
+                destinations: Vec::new(),
+                control: Some(control),
+                mode: ControlMode::Dynamic,
+            },
+            security,
+        )
+    };
+    let routed = |to| UdpConfig {
+        interface: None,
+        paths: vec![Interface::Address(LOOPBACK), Interface::Address(LOOPBACK)],
+        ..udp(Destination::Unicast(to), security)
+    };
+    let paired = || UdpConfig {
+        interface: None,
+        paths: vec![Interface::Address(LOOPBACK), Interface::Address(LOOPBACK)],
+        ..udp(
+            Destination::PairedPaths {
+                endpoints: vec![unicast, SocketAddr::new(LOOPBACK, 10)],
+            },
+            security,
+        )
+    };
+    let etf = |to| UdpConfig {
+        etf: Some(EtfDeclaration {
+            priority: 3,
+            delta: Duration::from_nanos(100_000),
+        }),
+        ..udp(Destination::Unicast(to), security)
+    };
+    let allowlist = RegistrationAllowlist::new(&[AddressRange::new(
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)),
+        8,
+    )
+    .unwrap()])
+    .unwrap();
+    let roles = crate::membership::PublicationRoles {
+        strategy: karyos_protocol::roles::Strategy::Min,
+        required: Vec::new(),
+        tags: Vec::new(),
+    };
+    let (mut publisher, _) = keyed(&borrowed(&publisher_files()));
+    let publications = [
+        (
+            "multicast",
+            publisher.add_network_publication(aggregate(STREAM), &multicast()),
+            AuthUnsupported::Multicast,
+        ),
+        (
+            "multi-destination",
+            publisher.add_network_publication(aggregate(STREAM), &manual()),
+            AuthUnsupported::MultiDestination,
+        ),
+        (
+            "required destinations",
+            publisher.add_network_publication_with_destinations(
+                aggregate(STREAM),
+                &udp(Destination::Unicast(unicast), security),
+                None,
+                &[unicast],
+            ),
+            AuthUnsupported::MultiDestination,
+        ),
+        (
+            "dynamic registration",
+            publisher.add_dynamic_network_publication(
+                aggregate(STREAM),
+                &dynamic(),
+                allowlist,
+                None,
+            ),
+            AuthUnsupported::Dynamic,
+        ),
+        (
+            "routed",
+            publisher.add_network_publication(aggregate(STREAM), &routed(unicast)),
+            AuthUnsupported::Routed,
+        ),
+        (
+            "paired paths",
+            publisher.add_network_publication(aggregate(STREAM), &paired()),
+            AuthUnsupported::PairedPaths,
+        ),
+        (
+            "etf",
+            publisher.add_network_publication(aggregate(STREAM), &etf(unicast)),
+            AuthUnsupported::Etf,
+        ),
+        (
+            "receiver roles",
+            publisher.add_network_publication_with_roles(
+                aggregate(STREAM),
+                &udp(Destination::Unicast(unicast), security),
+                roles,
+            ),
+            AuthUnsupported::Roles,
+        ),
+    ];
+    for (name, result, operation) in publications {
+        assert_eq!(
+            result.map(drop),
+            Err(refused(AuthRefusal::Unsupported { operation })),
+            "publication, {name}"
+        );
+    }
+    let (mut subscriber, _) = keyed(&borrowed(&subscriber_files()));
+    let subscriptions = [
+        (
+            "multicast",
+            subscriber.add_network_subscription_as(STREAM, &multicast(), identity(RECEIVER)),
+            AuthUnsupported::Multicast,
+        ),
+        (
+            "multi-destination",
+            subscriber.add_network_subscription_as(STREAM, &manual(), identity(RECEIVER)),
+            AuthUnsupported::MultiDestination,
+        ),
+        (
+            "dynamic registration",
+            subscriber.add_dynamic_network_subscription(STREAM, &dynamic(), identity(RECEIVER)),
+            AuthUnsupported::Dynamic,
+        ),
+        (
+            "routed",
+            subscriber.add_network_subscription_as(STREAM, &routed(ANY_PORT), identity(RECEIVER)),
+            AuthUnsupported::Routed,
+        ),
+        (
+            "paired paths",
+            subscriber.add_network_subscription_as(STREAM, &paired(), identity(RECEIVER)),
+            AuthUnsupported::PairedPaths,
+        ),
+        (
+            "etf",
+            subscriber.add_network_subscription_as(STREAM, &etf(ANY_PORT), identity(RECEIVER)),
+            AuthUnsupported::Etf,
+        ),
+    ];
+    for (name, result, operation) in subscriptions {
+        assert_eq!(
+            result.map(drop),
+            Err(refused(AuthRefusal::Unsupported { operation })),
+            "subscription, {name}"
+        );
+    }
+    for driver in [&publisher, &subscriber] {
+        let net = driver.net.as_ref().unwrap();
+        assert_eq!((net.publication_count(), net.subscription_count()), (0, 0));
+    }
+}
+
+/// Leaves exactly `free` slots in `driver`'s receiver command ring.
+fn receiver_slots(driver: &mut EmbeddedDriver, free: usize) {
+    for _ in 0..10 {
+        let _ = driver.do_work().unwrap();
+    }
+    let capacity = driver.net.as_ref().unwrap().fill_receiver_ring();
+    assert!(capacity > free);
+    for _ in 0..10 {
+        let _ = driver.do_work().unwrap();
+    }
+    driver.net.as_ref().unwrap().ping_receiver(capacity - free);
+}
+
+/// H8 R3-5, cross-role rollback: a remotely guarded admission whose
+/// alias binding and follow reach the receiver (its last two free slots)
+/// while its `AddPublication` is refused by the sender's full ring leaves
+/// nothing behind on either role: the alias is unbound, the follow undone
+/// by its own installation (deferred past the full receiver ring, never
+/// lost), and the sender holds no binding.
+#[test]
+fn a_refused_remotely_guarded_admission_leaves_nothing_on_either_role() {
+    let (mut publisher, _) = keyed(&borrowed(&guarded_files()));
+    publisher
+        .start_guard_state(
+            Box::new(Mem::default()) as Dir,
+            Box::new(Mem::default()) as Dir,
+        )
+        .unwrap();
+    // The send endpoint is open first, through a trusted publication of
+    // another stream on the same interface.
+    let silent = std::net::UdpSocket::bind(SocketAddr::new(LOOPBACK, 0)).unwrap();
+    publisher
+        .add_network_publication(
+            aggregate(STREAM + 2),
+            &udp(
+                Destination::Unicast(silent.local_addr().unwrap()),
+                Security::Trusted,
+            ),
+        )
+        .unwrap();
+    assert!(pump(&mut [&mut publisher], |_| true));
+    receiver_slots(&mut publisher, 2);
+    assert!(publisher.net.as_ref().unwrap().fill_sender_ring() > 0);
+    let security = Security::Authenticated(auth(Some(ChannelAuthority {
+        follower_id: 66,
+        ..authority(control())
+    })));
+    assert_eq!(
+        publisher
+            .add_network_publication(
+                aggregate(STREAM),
+                &udp(Destination::Unicast(SocketAddr::new(LOOPBACK, 9)), security),
+            )
+            .map(drop),
+        Err(DriverError::NetworkBusy)
+    );
+    assert_eq!(
+        publisher.net.as_ref().unwrap().fill_receiver_ring(),
+        0,
+        "the alias and the follow took the receiver's two slots"
+    );
+    let counters = publisher.wire_key_counters().unwrap();
+    assert_eq!(
+        (counters.admissions_busy, counters.bindings_deferred),
+        (1, 1)
+    );
+    let clean = pump(&mut [&mut publisher], |drivers| {
+        let net = drivers[0].net.as_ref().unwrap();
+        net.followed_guards() == Some(0) && net.published_bound() == Some(0)
+    });
+    assert!(
+        clean,
+        "left behind: {:?} {:?} {:?}",
+        publisher.net.as_ref().unwrap().followed_guards(),
+        publisher.net.as_ref().unwrap().published_bound(),
+        roles(&publisher)
+    );
+    assert_eq!(roles(&publisher).0.0, 0, "the sender holds no binding");
+    assert_eq!(publisher.net.as_ref().unwrap().publication_count(), 1);
+}
+
+/// ADM-8 (ADR-0118 (a)), through the production path: the subscription's
+/// admitted authority and guard reach its image through the receiver's
+/// own `Binding::Subscription` (no scope hook). A validly signed abort
+/// from another trusted abort-capable authority (20, trusted on this
+/// receiver through a second channel), or from the guarding authority
+/// under another of its guards, is refused before any state changes and
+/// counted; the guarding authority's abort under its guard applies.
+#[test]
+fn the_subscription_hands_its_abort_scope_to_the_image() {
+    use crate::agents::roles::publish_auth::AbortAuthority;
+    use crate::authority::Ed25519Signer;
+    use karyos_protocol::network::authenticated::{GUARD_CLOSED, SessionAbort};
+
+    let public: String = Ed25519Signer::from_seed(&[8; 32])
+        .verifier()
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let other = format!(
+        "format=karyos-wire-key-v1\nkey_id=20\nfile_epoch=1\npurpose=authority-public\nprofile_id=4\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-04-30T00:00:00Z\npublic={public}\nauthority_id=20\nguards=21\nabort=true\n"
+    );
+    let mut files = subscriber_files();
+    files.push(("4-1.key", channel_key(4, STREAM + 1)));
+    files.push(("20-1.key", other));
+    let (mut subscriber, _) = keyed(&borrowed(&files));
+    let guarded = Security::Authenticated(auth(Some(authority(control()))));
+    subscriber
+        .add_network_subscription_as(
+            STREAM,
+            &udp(Destination::Unicast(ANY_PORT), guarded),
+            identity(RECEIVER),
+        )
+        .unwrap();
+    let second = Security::Authenticated(AuthenticatedChannel {
+        channel_key_id: 4,
+        ..auth(Some(ChannelAuthority {
+            key_id: 20,
+            authority_id: 20,
+            guard_id: 21,
+            control: SocketAddr::new(LOOPBACK, 8),
+            follower_id: 0,
+        }))
+    });
+    subscriber
+        .add_network_subscription_as(
+            STREAM + 1,
+            &udp(Destination::Unicast(ANY_PORT), second),
+            identity(RECEIVER),
+        )
+        .unwrap();
+    let to = subscriber.network_subscription_address(STREAM).unwrap();
+    let (mut publisher, _) = keyed(&borrowed(&publisher_files()));
+    publisher
+        .add_network_publication(aggregate(STREAM), &udp(Destination::Unicast(to), guarded))
+        .unwrap();
+    let up = pump(&mut [&mut publisher, &mut subscriber], |drivers| {
+        drivers[1].net.as_ref().unwrap().auth_image().is_some()
+    });
+    assert!(up, "never established: {:?}", roles(&subscriber));
+    let (key, incarnation, _) = subscriber.net.as_ref().unwrap().auth_image().unwrap();
+    let abort = |authority_id: u64, guard_id: u64, reason: u16| {
+        let seed = if authority_id == 10 { 9 } else { 8 };
+        let mut signer = AbortAuthority::new(
+            Ed25519Signer::from_seed(&[seed; 32]),
+            u32::try_from(authority_id).unwrap(),
+            authority_id,
+        );
+        let mut bytes = vec![0u8; 256];
+        let length = signer
+            .sign(
+                &SessionAbort {
+                    alias: key.alias,
+                    identity: incarnation,
+                    authority_id,
+                    guard_id,
+                    guard_epoch: 3,
+                    reason,
+                },
+                &mut bytes,
+            )
+            .unwrap();
+        bytes.truncate(length);
+        bytes
+    };
+    let counters =
+        |driver: &EmbeddedDriver| driver.net.as_ref().unwrap().receiver_counters().unwrap();
+    for (authority_id, guard_id, reason) in [
+        (20, 21, GUARD_CLOSED),
+        (20, 0, 2),
+        (10, 12, GUARD_CLOSED),
+        (10, 12, 2),
+    ] {
+        // The publisher's reserved verify budget refills between aborts.
+        std::thread::sleep(Duration::from_millis(300));
+        // One verify per receiver cycle.
+        let _ = subscriber.do_work().unwrap();
+        let before = counters(&subscriber);
+        subscriber
+            .net
+            .as_mut()
+            .unwrap()
+            .inject_received(key, &abort(authority_id, guard_id, reason));
+        let after = counters(&subscriber);
+        assert_eq!(
+            (after.aborts_out_of_scope, after.abort_acks_sent),
+            (before.aborts_out_of_scope + 1, before.abort_acks_sent),
+            "{authority_id} {guard_id} {reason}: {after:?}"
+        );
+        assert!(
+            !subscriber.net.as_ref().unwrap().auth_image().unwrap().2,
+            "not aborted"
+        );
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = subscriber.do_work().unwrap();
+    let before = counters(&subscriber);
+    subscriber
+        .net
+        .as_mut()
+        .unwrap()
+        .inject_received(key, &abort(10, 11, GUARD_CLOSED));
+    let after = counters(&subscriber);
+    assert_eq!(
+        after.abort_acks_sent,
+        before.abort_acks_sent + 1,
+        "{after:?}"
+    );
+    assert!(subscriber.net.as_ref().unwrap().auth_image().unwrap().2);
+}
+
+/// ADM-6, ADM-13, RNG-1, RNG-5 (cross-role rollback, delivery order
+/// reversed): a remotely guarded admission whose alias and follow reach
+/// the receiver while the sender refuses it leaves cleanups behind (its
+/// alias queued stale, its unfollow deferred past the full receiver
+/// ring). A replacement of the same stream and guard admitted before those
+/// cleanups are delivered posts its alias and follow ahead of them; the
+/// late cleanups, named by alias key and installation id, leave the
+/// replacement bound and its guard followed.
+#[test]
+fn a_late_cleanup_of_a_refused_admission_never_touches_its_replacement() {
+    let (mut publisher, _) = keyed(&borrowed(&guarded_files()));
+    publisher
+        .start_guard_state(
+            Box::new(Mem::default()) as Dir,
+            Box::new(Mem::default()) as Dir,
+        )
+        .unwrap();
+    let silent = std::net::UdpSocket::bind(SocketAddr::new(LOOPBACK, 0)).unwrap();
+    publisher
+        .add_network_publication(
+            aggregate(STREAM + 2),
+            &udp(
+                Destination::Unicast(silent.local_addr().unwrap()),
+                Security::Trusted,
+            ),
+        )
+        .unwrap();
+    assert!(pump(&mut [&mut publisher], |_| true));
+    receiver_slots(&mut publisher, 2);
+    assert!(publisher.net.as_ref().unwrap().fill_sender_ring() > 0);
+    let security = Security::Authenticated(auth(Some(ChannelAuthority {
+        follower_id: 66,
+        ..authority(control())
+    })));
+    let to = Destination::Unicast(SocketAddr::new(LOOPBACK, 9));
+    assert_eq!(
+        publisher
+            .add_network_publication(aggregate(STREAM), &udp(to.clone(), security))
+            .map(drop),
+        Err(DriverError::NetworkBusy)
+    );
+    // One duty: both rings drain; the unfollow, met by the still full
+    // receiver ring at the duty's start, stays deferred.
+    let _ = publisher.do_work().unwrap();
+    assert_eq!(
+        publisher
+            .net
+            .as_ref()
+            .unwrap()
+            .wire_keys()
+            .unwrap()
+            .deferred_bindings(),
+        1,
+        "the cleanup is still held"
+    );
+    // The replacement, admitted now, is delivered ahead of the cleanup.
+    publisher
+        .add_network_publication(aggregate(STREAM), &udp(to, security))
+        .unwrap();
+    for _ in 0..50 {
+        let _ = publisher.do_work().unwrap();
+    }
+    let net = publisher.net.as_ref().unwrap();
+    assert_eq!(net.wire_keys().unwrap().deferred_bindings(), 0, "delivered");
+    assert_eq!(
+        net.followed_guards(),
+        Some(1),
+        "the replacement's follow stays"
+    );
+    assert_eq!(
+        net.published_bound(),
+        Some(1),
+        "the replacement's alias stays"
+    );
+    assert_eq!(roles(&publisher).0.0, 1, "the sender binds the replacement");
+    assert_eq!(net.publication_count(), 2);
+}
+/// H8 round 4: proofs through the authority restart (karyos#648).
+mod invariants_r4;

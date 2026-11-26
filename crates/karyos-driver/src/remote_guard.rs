@@ -23,8 +23,8 @@
 //! [`crate::signed_control::SignedIntake`]; this module is its epoch check
 //! and state change. Nothing here allocates after construction.
 
-use karyos_protocol::network::Receiver;
 use karyos_protocol::network::authenticated::{GuardState, GuardStatus, StatusChallenge};
+use karyos_protocol::network::{Identity, Receiver};
 
 use crate::sessions::NonceSource;
 use crate::wire_keys::store::{FileError, Files};
@@ -241,6 +241,166 @@ impl<F: Files> MarkStore for GuardMarks<F> {
             return Ok(());
         }
         self.write(guard_id, held, true)
+    }
+}
+
+/// The durable record of the publication incarnations whose remote
+/// SESSION_ABORT this receiver applied (H8 RCV-4): one stays terminal
+/// across a receiver-only restart, even when its ACK never reached the
+/// sender, so its SETUP never establishes it again.
+pub trait AbortRecord: core::fmt::Debug {
+    /// Whether `identity` is terminal here. Fail closed: true for every
+    /// identity once the record is full or unreadable.
+    fn terminal(&self, identity: &Identity) -> bool;
+    /// Records `identity` durably before the abort is acknowledged.
+    ///
+    /// # Errors
+    ///
+    /// [`MarkError`] when the record is full or unreadable, or the commit
+    /// failed; the identity is terminal in memory regardless.
+    fn record(&mut self, identity: Identity) -> Result<(), MarkError>;
+}
+
+/// The most incarnations [`AbortedIncarnations`] holds; past it every
+/// identity is terminal (fail closed, as a full key state disables the
+/// store, KSF-4).
+pub const MAX_ABORTED: usize = 256;
+/// The record's file in the driver's durable state directory.
+pub const ABORTED_FILE: &str = "aborted-incarnations";
+const ABORTED_FORMAT: &str = "karyos-aborted-incarnations-v1";
+/// The largest record file: the header, the flag and every line.
+const ABORTED_MAX_LEN: usize = 64 + MAX_ABORTED * 88;
+
+/// [`AbortRecord`] in one file of a [`Files`] directory: a header, a
+/// `full` flag and one `<driver0>-<driver1>-<registration>-<incarnation>`
+/// line per terminal identity, replaced atomically at each record.
+pub struct AbortedIncarnations<F: Files> {
+    files: F,
+    held: Vec<Identity>,
+    /// The capacity was exceeded once: every identity is terminal.
+    full: bool,
+    /// The file could not be read at start: every identity is terminal.
+    unreadable: bool,
+}
+
+impl<F: Files> core::fmt::Debug for AbortedIncarnations<F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AbortedIncarnations")
+            .field("held", &self.held.len())
+            .field("full", &self.full)
+            .field("unreadable", &self.unreadable)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F: Files> AbortedIncarnations<F> {
+    /// The record in `files`, loaded now; allocates only here.
+    pub fn new(files: F) -> Self {
+        let mut record = Self {
+            files,
+            held: Vec::with_capacity(MAX_ABORTED),
+            full: false,
+            unreadable: false,
+        };
+        if record.load().is_err() {
+            record.held.clear();
+            record.unreadable = true;
+        }
+        record
+    }
+
+    fn load(&mut self) -> Result<(), MarkError> {
+        let mut buf = vec![0u8; ABORTED_MAX_LEN + 1];
+        let len = match self.files.read(ABORTED_FILE, &mut buf) {
+            Ok(len) => len,
+            Err(FileError::NotFound) => return Ok(()),
+            Err(FileError::Refused) => return Err(MarkError::Unreadable),
+        };
+        let text = buf
+            .get(..len)
+            .and_then(|bytes| core::str::from_utf8(bytes).ok())
+            .ok_or(MarkError::Unreadable)?;
+        let mut lines = text.split('\n');
+        if lines.next() != Some(ABORTED_FORMAT) {
+            return Err(MarkError::Unreadable);
+        }
+        self.full = match lines.next() {
+            Some("full=0") => false,
+            Some("full=1") => true,
+            _ => return Err(MarkError::Unreadable),
+        };
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.split('-').map(|part| {
+                part.bytes()
+                    .all(|byte| byte.is_ascii_digit())
+                    .then(|| part.parse::<u64>().ok())
+                    .flatten()
+            });
+            let (Some(Some(d0)), Some(Some(d1)), Some(Some(registration)), Some(Some(inc)), None) = (
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+            ) else {
+                return Err(MarkError::Unreadable);
+            };
+            if self.held.len() >= MAX_ABORTED {
+                return Err(MarkError::Unreadable);
+            }
+            self.held.push(Identity {
+                driver_id: [d0, d1],
+                registration_id: registration,
+                incarnation: inc,
+            });
+        }
+        Ok(())
+    }
+
+    fn write(&self) -> Result<(), MarkError> {
+        use core::fmt::Write as _;
+
+        let mut text = String::with_capacity(ABORTED_MAX_LEN);
+        let _ = writeln!(text, "{ABORTED_FORMAT}\nfull={}", u8::from(self.full));
+        for identity in &self.held {
+            let _ = writeln!(
+                text,
+                "{}-{}-{}-{}",
+                identity.driver_id[0],
+                identity.driver_id[1],
+                identity.registration_id,
+                identity.incarnation
+            );
+        }
+        self.files
+            .write_atomic(ABORTED_FILE, text.as_bytes())
+            .map_err(|_| MarkError::Commit)
+    }
+}
+
+impl<F: Files> AbortRecord for AbortedIncarnations<F> {
+    fn terminal(&self, identity: &Identity) -> bool {
+        self.full || self.unreadable || self.held.contains(identity)
+    }
+
+    fn record(&mut self, identity: Identity) -> Result<(), MarkError> {
+        if self.unreadable {
+            return Err(MarkError::Unreadable);
+        }
+        if self.held.contains(&identity) {
+            return Ok(());
+        }
+        if self.held.len() >= MAX_ABORTED {
+            // Fail closed: from here every identity is terminal, durably.
+            self.full = true;
+            self.write()?;
+            return Err(MarkError::Commit);
+        }
+        self.held.push(identity);
+        self.write()
     }
 }
 
