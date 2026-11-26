@@ -221,21 +221,35 @@ impl Entry {
     ///
     /// [`LogError::TooLarge`] for a payload over `u32::MAX` bytes.
     pub fn frame(&self) -> Result<Vec<u8>, LogError> {
-        let length = u32::try_from(self.payload.len())
-            .map_err(|_| LogError::TooLarge { index: self.index })?;
         let mut frame =
             Vec::with_capacity(self.payload.len().checked_add(FRAME_HEADER).unwrap_or(0));
+        self.frame_into(&mut frame)?;
+        Ok(frame)
+    }
+
+    /// [`Entry::frame`] into `frame`, cleared first: a caller that keeps
+    /// `frame` encodes without allocating once it has grown to the
+    /// largest entry (karyos#691).
+    ///
+    /// # Errors
+    ///
+    /// [`LogError::TooLarge`] for a payload over `u32::MAX` bytes, with
+    /// `frame` left empty.
+    pub fn frame_into(&self, frame: &mut Vec<u8>) -> Result<(), LogError> {
+        frame.clear();
+        let length = u32::try_from(self.payload.len())
+            .map_err(|_| LogError::TooLarge { index: self.index })?;
         frame.extend_from_slice(&MAGIC);
         frame.extend_from_slice(&length.to_le_bytes());
         frame.extend_from_slice(&self.index.to_le_bytes());
         frame.extend_from_slice(&self.term.to_le_bytes());
         frame.extend_from_slice(&self.event_time.to_le_bytes());
         let mut crc = Crc32c::new();
-        crc.update(&frame);
+        crc.update(frame);
         crc.update(&self.payload);
         frame.extend_from_slice(&crc.finish().to_le_bytes());
         frame.extend_from_slice(&self.payload);
-        Ok(frame)
+        Ok(())
     }
 
     /// Its encoded size: header and payload; `None` past `u64::MAX`.
@@ -589,6 +603,11 @@ pub struct RaftLog<D: Disk + Clone> {
     epoch: u64,
     /// The bytes of one seal, reused.
     seal_buf: Vec<u8>,
+    /// The frame of the entry being appended, reused (karyos#691).
+    frame_buf: Vec<u8>,
+    /// The hard state's file and its temporary file, built once, so a
+    /// save allocates nothing (karyos#691).
+    hard_state_paths: file::Paths,
     /// The longest a committed tail waits unsealed ([`RaftLog::tick`]).
     seal_interval_ns: u64,
     /// When [`RaftLog::tick`] first saw the current unsealed tail.
@@ -791,6 +810,8 @@ impl<D: Disk + Clone> RaftLog<D> {
             integrity,
             epoch,
             seal_buf: Vec::new(),
+            frame_buf: Vec::new(),
+            hard_state_paths: file::Paths::new(dir, HARD_STATE_FILE),
             seal_interval_ns: DEFAULT_SEAL_INTERVAL_NS,
             tail_since: None,
         })
@@ -1061,6 +1082,8 @@ impl<D: Disk + Clone> RaftLog<D> {
             integrity,
             epoch,
             seal_buf: Vec::new(),
+            frame_buf: Vec::new(),
+            hard_state_paths: file::Paths::new(dir, HARD_STATE_FILE),
             seal_interval_ns: DEFAULT_SEAL_INTERVAL_NS,
             tail_since: None,
         };
@@ -1378,7 +1401,12 @@ impl<D: Disk + Clone> RaftLog<D> {
                 commit: Some(base),
             },
         };
-        match file::replace(&mut self.disk, &self.dir, HARD_STATE_FILE, &state.encode()) {
+        match file::replace_at(
+            &mut self.disk,
+            &self.dir,
+            &self.hard_state_paths,
+            &state.encode(),
+        ) {
             Ok(()) => {
                 self.hard_state = Some(state);
                 Ok(())
@@ -1444,6 +1472,13 @@ impl<D: Disk + Clone> RaftLog<D> {
         result.map_err(LogError::Store)
     }
 
+    /// Reserves the in-memory index for `additional` more entries, so the
+    /// appends that fill it allocate nothing (karyos#691); the index
+    /// otherwise grows by doubling, an allocation now and then.
+    pub fn reserve(&mut self, additional: usize) {
+        self.entries.reserve(additional);
+    }
+
     /// Appends `entries`, each starting at [`RaftLog::next_index`] and not
     /// lowering the term; returns the last index written. Not durable
     /// until [`RaftLog::sync`].
@@ -1466,7 +1501,7 @@ impl<D: Disk + Clone> RaftLog<D> {
             .last()
             .map(|(_, term)| *term)
             .or(self.base_term);
-        let mut frames = Vec::with_capacity(entries.len());
+        // Every entry is checked before anything is written.
         for entry in entries {
             if entry.index != expected {
                 return Err(LogError::NotNext {
@@ -1481,18 +1516,32 @@ impl<D: Disk + Clone> RaftLog<D> {
                     got: entry.term,
                 });
             }
-            frames.push((entry.term, entry.frame()?));
+            if u32::try_from(entry.payload.len()).is_err() {
+                return Err(LogError::TooLarge { index: entry.index });
+            }
             last = Some(entry.term);
             expected = expected
                 .checked_add(1)
                 .ok_or(LogError::TooLarge { index: entry.index })?;
         }
-        for (term, frame) in frames {
+        // Then each is framed into the kept buffer and written: no
+        // allocation per entry once the buffer and the index have grown.
+        let mut frame = std::mem::take(&mut self.frame_buf);
+        for entry in entries {
+            let framed = entry.frame_into(&mut frame);
+            if let Err(error) = framed {
+                self.frame_buf = frame;
+                return Err(error);
+            }
             let position = self.store.written();
             let appended = self.store.append(position, &frame);
-            self.poison_on(appended)?;
-            self.entries.push((position, term));
+            if let Err(error) = self.poison_on(appended) {
+                self.frame_buf = frame;
+                return Err(error);
+            }
+            self.entries.push((position, entry.term));
         }
+        self.frame_buf = frame;
         Ok(self.last_index())
     }
 
@@ -1907,7 +1956,12 @@ impl<D: Disk + Clone> RaftLog<D> {
         if let Some(commit) = state.commit {
             self.check_commit(commit)?;
         }
-        match file::replace(&mut self.disk, &self.dir, HARD_STATE_FILE, &state.encode()) {
+        match file::replace_at(
+            &mut self.disk,
+            &self.dir,
+            &self.hard_state_paths,
+            &state.encode(),
+        ) {
             Ok(()) => {
                 self.hard_state = Some(state);
             }

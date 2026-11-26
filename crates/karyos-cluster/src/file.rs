@@ -7,7 +7,7 @@
 //! lies) is refused by its CRC when it is read.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use karyos_archive::disk::Disk;
 
@@ -24,13 +24,45 @@ pub(crate) fn replace<D: Disk>(
     name: &str,
     bytes: &[u8],
 ) -> io::Result<()> {
-    let target = dir.join(name);
-    let temporary = dir.join(format!("{name}.tmp"));
-    let file = disk.create(&temporary)?;
+    replace_at(disk, dir, &Paths::new(dir, name), bytes)
+}
+
+/// A record's file and its temporary file, built once: a record replaced
+/// often ([`replace_at`]) allocates no paths (karyos#691).
+#[derive(Debug, Clone)]
+pub(crate) struct Paths {
+    target: PathBuf,
+    temporary: PathBuf,
+}
+
+impl Paths {
+    /// The paths of `dir/name` and `dir/name.tmp`.
+    pub(crate) fn new(dir: &Path, name: &str) -> Self {
+        Self {
+            target: dir.join(name),
+            temporary: dir.join(format!("{name}.tmp")),
+        }
+    }
+}
+
+/// [`replace`] through paths built once: the same steps (the temporary
+/// file written and synced, renamed over the record, `dir` synced), with
+/// nothing allocated here.
+///
+/// # Errors
+///
+/// As [`replace`].
+pub(crate) fn replace_at<D: Disk>(
+    disk: &mut D,
+    dir: &Path,
+    paths: &Paths,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let file = disk.create(&paths.temporary)?;
     disk.write_at(&file, 0, bytes)?;
     disk.sync(&file)?;
     drop(file);
-    disk.rename(&temporary, &target)?;
+    disk.rename(&paths.temporary, &paths.target)?;
     disk.sync_dir(dir)
 }
 
