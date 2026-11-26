@@ -104,3 +104,101 @@ fn openraft_replication_path_allocates_and_the_gate_reports_it() {
     let (allocations, frees) = measured.per_entry().unwrap();
     assert!(allocations > 0 && frees > 0, "{measured:?}");
 }
+
+/// C5 version 2's allocation gate in the simulator, for every variant at
+/// one commit (quantstratum-docs: karyos/evaluations/c5-raft-comparison-v2.md,
+/// "One probe, one revision"; version 1's gate counts W1 and W2): each
+/// variant measured with `harness::probe` on W1's allocation case (version
+/// 1's, `W1 n=3 payload=32 clients=32`, batch limit 16) and on W2's
+/// nominal case under the manifest's declared limits, seed 1, one line per
+/// measurement on stdout for the run record. W2's declared limits set each
+/// core's batching, so it runs the evaluated builds, not the batch-16 ones.
+/// The counts are the gate's evidence, scored by the report: this asserts
+/// only that each run passes its case and the probe measured entries.
+/// Ignored by default: the run record runs it at its run commit.
+#[test]
+#[ignore = "C5 v2's allocation measurement; the run record runs it at its commit"]
+fn the_c5_v2_allocation_lines() {
+    use karyos_raft_eval::openraft_core::OpenRaft;
+    use karyos_raft_eval::raft_rs::RaftRs;
+    use karyos_sim::harness::custom::Custom;
+    use karyos_sim::harness::workloads::W2;
+
+    let _serial = serial();
+    let w1 = W1::skeleton().cases().into_iter().nth(1).unwrap();
+    let w2 = W2::manifest()
+        .cases()
+        .unwrap()
+        .into_iter()
+        .find(|case| case.name.ends_with("nominal"))
+        .unwrap();
+    let raft = ("raft 0.7.0", VARIANT.label());
+    let openraft = ("openraft 0.10.0-alpha.37", OPENRAFT_VARIANT.label());
+    let custom = ("custom core (karyos_cluster::consensus)", "not applicable");
+    let runs: [(&str, &str, &Case, AllocationReport); 6] = [
+        (
+            raft.0,
+            raft.1,
+            &w1,
+            measure::<RaftRsBatch16>(&w1, 1).unwrap(),
+        ),
+        (
+            openraft.0,
+            openraft.1,
+            &w1,
+            measure::<OpenRaftBatch16>(&w1, 1).unwrap(),
+        ),
+        (custom.0, custom.1, &w1, measure::<Custom>(&w1, 1).unwrap()),
+        (raft.0, raft.1, &w2, measure::<RaftRs>(&w2, 1).unwrap()),
+        (
+            openraft.0,
+            openraft.1,
+            &w2,
+            measure::<OpenRaft>(&w2, 1).unwrap(),
+        ),
+        (custom.0, custom.1, &w2, measure::<Custom>(&w2, 1).unwrap()),
+    ];
+    for (core, variant, case, measured) in &runs {
+        assert_eq!(
+            workloads::pass(case, &measured.outcome),
+            Ok(None),
+            "{core} {}",
+            case.name
+        );
+        assert!(
+            measured.entries > 0,
+            "{core} {}: nothing measured",
+            case.name
+        );
+        let stages: Vec<String> = measured
+            .stages
+            .iter()
+            .map(|(stage, counts)| {
+                format!(
+                    "\"{}\":[{},{}]",
+                    stage.name(),
+                    counts.allocations,
+                    counts.frees
+                )
+            })
+            .collect();
+        let _ = writeln!(
+            std::io::stdout(),
+            "{{\"evidence\":\"C5 v2 simulator\",\"core\":\"{core}\",\"variant\":\"{variant}\",\
+             \"forms\":\"borrowed: propose_slice, ready_into, entries_into\",\
+             \"case\":\"{}\",\"servers\":{},\"clients\":{},\"operations\":{},\
+             \"payload\":{},\"limits\":{},\"seed\":1,\"warmup\":{WARMUP},\"entries\":{},\
+             \"allocations\":{},\"frees\":{},\"stages\":{{{}}}}}",
+            case.name,
+            case.servers,
+            case.clients,
+            case.operations,
+            case.payload,
+            case.limits.is_some(),
+            measured.entries,
+            measured.counts.allocations,
+            measured.counts.frees,
+            stages.join(","),
+        );
+    }
+}
