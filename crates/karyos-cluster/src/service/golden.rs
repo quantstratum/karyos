@@ -403,7 +403,8 @@ const B1_V2: &str = "05 00 01 00 02 00 14 00 20 00 00 00
 /// (karyos#927): B-1 and B-2 are reproduced byte for byte (as an earlier
 /// build's entries, `exact` false), B-3 to B-12 refused as stated. B-1 v2
 /// is this build's version 2 (karyos#750), and B-7 names version 3, the
-/// first one unknown. Schema 2's vectors above are unchanged.
+/// first one unknown. B-8 names template 5, the first one unknown, as
+/// ADR-0122 reissued it: templates 2 to 4 decode. Schema 2's vectors above are unchanged.
 #[test]
 fn test_schema_5_golden_vectors_b1_to_b12() {
     let earlier = |config| SessionBounds {
@@ -494,9 +495,9 @@ fn test_schema_5_golden_vectors_b1_to_b12() {
         ),
         (
             "B-8",
-            "05 00 02 00 01 00 14 00 20 00 00 00
+            "05 00 05 00 01 00 14 00 20 00 00 00
              40 00 00 00 40 00 00 00 00 20 00 00 00 58 47 f8 0d 00 00 00",
-            unsupported(5, 2, 1),
+            unsupported(5, 5, 1),
         ),
         (
             "B-9",

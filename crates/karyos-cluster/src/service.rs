@@ -77,16 +77,30 @@
 //! before, and a bounds entry that later differs from them stops the
 //! container as above. A `Membership` entry is a configuration entry of
 //! the core's ([`crate::membership`], karyos#711): it delivers nothing.
+//!
+//! **Rolling upgrades** (ADR-0122, karyos#715): templates 3,
+//! [`Activation`], and 4, [`CoordinatedStop`], of schema 5 change the
+//! log's [`ActiveVersion`] at an index ahead of their entry, or stop every
+//! replica at one. The service sees only the active version
+//! ([`Context::active_version`]), never the binary's; a command the active
+//! version cannot run ([`ClusteredService::required_version`]) is refused
+//! at the leader ([`ProposeRefused::VersionInactive`]) and again when it
+//! applies ([`Applied::CoreRefused`]). See [`upgrade`]'s table.
 
 mod compose;
 #[cfg(test)]
 mod golden;
 #[cfg(test)]
 mod tests;
+mod upgrade;
 
 pub use compose::{
     ComposeError, ComposedSnapshot, MAX_SERVICE_PARTS, PART_METADATA, RestoreError, RestoreRefused,
-    SESSIONS_SECTION_VERSION, ServicePart, ServiceSnapshot, SnapshotFull, TIMERS_VERSION,
+    SESSIONS_SECTION_VERSION, SESSIONS_SECTION_VERSION_1, ServicePart, ServiceSnapshot,
+    SnapshotFull, TIMERS_VERSION,
+};
+pub use upgrade::{
+    ACTIVATION, Activation, ActiveVersion, COORDINATED_STOP, CoordinatedStop, CoreRefusal,
 };
 
 use karyos_codec::{CodecError, Decoder, ENVELOPE_LENGTH, Encoder, Template, VAR_HEADER_LENGTH};
@@ -270,6 +284,8 @@ enum Decoded<'a> {
     Service(Envelope<'a>),
     Bounds(SessionBounds),
     Membership,
+    Activation(Activation<'a>),
+    Stop(CoordinatedStop),
     Guard(GuardEntry),
 }
 
@@ -279,6 +295,12 @@ impl<'a> Decoded<'a> {
             CORE_SCHEMA_ID if MembershipEntry::is_one(bytes) => {
                 let _ = MembershipEntry::decode(bytes)?;
                 Ok(Self::Membership)
+            }
+            CORE_SCHEMA_ID if upgrade::is_core_template(bytes, ACTIVATION.template_id) => {
+                Ok(Self::Activation(Activation::decode(bytes)?))
+            }
+            CORE_SCHEMA_ID if upgrade::is_core_template(bytes, COORDINATED_STOP.template_id) => {
+                Ok(Self::Stop(CoordinatedStop::decode(bytes)?))
             }
             CORE_SCHEMA_ID => Ok(Self::Bounds(SessionBounds::decode(bytes)?)),
             GUARD_SCHEMA_ID => Ok(Self::Guard(GuardEntry::decode(bytes)?)),
@@ -522,6 +544,21 @@ pub enum ProposeRefused {
     /// The envelope does not encode (schema 2 refuses it): never proposed.
     #[error(transparent)]
     Codec(#[from] CodecError),
+    /// A command the log's active version cannot run (ADR-0122 decision
+    /// 3): it needs service version `required` (`None`: a command type, or
+    /// a schema 2 version, the active version does not know). Refused even
+    /// while a higher activation is pending; nothing was proposed.
+    #[error("the command needs version {required:?}, the active one is {active:?}")]
+    VersionInactive {
+        /// The service version the command needs.
+        required: Option<u32>,
+        /// The log's active version.
+        active: ActiveVersion,
+    },
+    /// The log carries a coordinated stop (ADR-0122 decision 6): every
+    /// service proposal is refused until the resuming `Activation` applies.
+    #[error("the cluster is stopping for a coordinated restart")]
+    Stopping,
 }
 
 /// The user's state machine (SPEC.md §9). Every method sees only its
@@ -572,6 +609,25 @@ pub trait ClusteredService {
             None => Ok(()),
         }
     }
+
+    /// The service version `command` needs (ADR-0122 decision 3), or
+    /// `None` for a command type the service does not know at any version.
+    /// The container refuses a command needing more than the log's active
+    /// version, at the leader and again when it applies, so it never
+    /// reaches [`ClusteredService::on_command`]. The default: every
+    /// command runs from version 1.
+    fn required_version(&self, command: &[u8]) -> Option<u32> {
+        let _ = command;
+        Some(1)
+    }
+
+    /// The highest service version this binary runs (ADR-0122 decision
+    /// 4). An `Activation` above it applies as pending, and the container
+    /// stops ([`ApplyError::VersionUnsupported`]) at its activation index.
+    /// The default: version 1.
+    fn supported_version(&self) -> u32 {
+        1
+    }
 }
 
 /// The scheduled timers: ids and deadlines, sorted by id, never more
@@ -615,18 +671,32 @@ pub struct Context<'a> {
     index: u64,
     term: u64,
     log_time: u64,
+    active: ActiveVersion,
     timers: &'a mut Timers,
 }
 
 impl<'a> Context<'a> {
     /// For `entry`, whose event time the log time includes.
-    fn of(entry: &Entry, sessions: &SessionTable, timers: &'a mut Timers) -> Self {
+    fn of(
+        entry: &Entry,
+        sessions: &SessionTable,
+        active: ActiveVersion,
+        timers: &'a mut Timers,
+    ) -> Self {
         Self {
             index: entry.index,
             term: entry.term,
             log_time: sessions.log_time().max(entry.event_time),
+            active,
             timers,
         }
+    }
+
+    /// The log's active version at this entry (ADR-0122 decision 4): the
+    /// only version the service is given, never the binary's own.
+    #[must_use]
+    pub fn active_version(&self) -> ActiveVersion {
+        self.active
     }
 
     /// The entry's log index.
@@ -793,6 +863,13 @@ pub enum Applied<'a> {
         /// Its effects: a lapse's first, then its own, then the lease's.
         effects: &'a [GuardEffect],
     },
+    /// An entry the container refused, the same on every replica
+    /// (ADR-0122): an `Activation` or `CoordinatedStop` that breaks a
+    /// rule, a command the active version cannot run (its client gets
+    /// this refusal as its response), or a schema 2 entry past a
+    /// coordinated stop. It changed nothing and reached no service code;
+    /// the log time moved on.
+    CoreRefused(CoreRefusal),
 }
 
 /// An entry the container cannot apply. It stops: no later entry may be
@@ -834,6 +911,27 @@ pub enum ApplyError {
     /// replica's, which proposed the bounds (karyos#1097).
     #[error("the logged session bounds cannot be held: {0}")]
     BoundsUnheld(ConfigError),
+    /// The log activates service version `required`, above the
+    /// `supported` this binary runs (ADR-0122 decision 4): a stop at the
+    /// activation index, never at the `Activation` entry, so a node
+    /// upgraded inside the window keeps running.
+    #[error("the log activates version {required}, this binary runs at most {supported}")]
+    VersionUnsupported {
+        /// The service version activated.
+        required: u32,
+        /// [`ClusteredService::supported_version`].
+        supported: u32,
+    },
+    /// A coordinated stop (ADR-0122 decision 6): the entry is past the
+    /// stop index `at`, and this binary does not run `resume`. The host
+    /// snapshots at `at` and restarts with a binary that does.
+    #[error("stopped at index {at} for a restart at version {resume}")]
+    Stopped {
+        /// The stop index, the last applied.
+        at: u64,
+        /// The version to resume at.
+        resume: u32,
+    },
 }
 
 /// The container: a service, its session table and its timers, applying
@@ -856,6 +954,9 @@ pub struct ServiceContainer<S> {
     /// When this node last proposed a renewal while leading; local, not
     /// replicated.
     renewed_at: Option<u64>,
+    /// The active version, any pending activation and any logged stop
+    /// (ADR-0122): log state.
+    versions: upgrade::Versions,
 }
 
 impl<S: ClusteredService> ServiceContainer<S> {
@@ -880,7 +981,79 @@ impl<S: ClusteredService> ServiceContainer<S> {
             session_budget: config.session_budget,
             guards: GuardTable::new(config.guards),
             renewed_at: None,
+            versions: upgrade::Versions::default(),
         })
+    }
+
+    /// The log's active version (ADR-0122).
+    #[must_use]
+    pub fn active_version(&self) -> ActiveVersion {
+        self.versions.active
+    }
+
+    /// A pending activation: its version and its activation index.
+    #[must_use]
+    pub fn pending_activation(&self) -> Option<(ActiveVersion, u64)> {
+        self.versions
+            .pending
+            .as_ref()
+            .map(|pending| (pending.version, pending.at))
+    }
+
+    /// A logged coordinated stop: its stop index and its resume version.
+    /// The host takes its snapshot once the stop index has applied.
+    #[must_use]
+    pub fn stop(&self) -> Option<(u64, u32)> {
+        self.versions.stop.map(|stop| (stop.at, stop.resume))
+    }
+
+    /// Proposes `activation` through `core` (ADR-0122 decision 1). It is
+    /// checked when it applies, never here.
+    ///
+    /// # Errors
+    ///
+    /// [`ProposeRefused::Codec`] for an entry that does not encode,
+    /// [`ProposeRefused::NotLeader`] when `core` does not lead.
+    pub fn propose_activation<P: Propose>(
+        &self,
+        activation: &Activation<'_>,
+        core: &mut P,
+    ) -> Result<(), ProposeRefused> {
+        core.propose(activation.to_vec()?)?;
+        Ok(())
+    }
+
+    /// Proposes `stop` through `core` (ADR-0122 decision 6): once it
+    /// applies, [`ServiceContainer::propose`] refuses every proposal.
+    ///
+    /// # Errors
+    ///
+    /// [`ProposeRefused::Stopping`] while a stop is logged,
+    /// [`ProposeRefused::Codec`] and [`ProposeRefused::NotLeader`].
+    pub fn propose_stop<P: Propose>(
+        &self,
+        stop: &CoordinatedStop,
+        core: &mut P,
+    ) -> Result<(), ProposeRefused> {
+        if self.versions.stop.is_some() {
+            return Err(ProposeRefused::Stopping);
+        }
+        core.propose(stop.to_vec()?)?;
+        Ok(())
+    }
+
+    /// Whether the active version runs `command`: `Ok`, or the refusal.
+    fn admits(&self, command: &[u8]) -> Result<(), CoreRefusal> {
+        let active = self.versions.active;
+        let required = if VERSION > active.schema {
+            None
+        } else {
+            self.service.required_version(command)
+        };
+        match required {
+            Some(required) if required <= active.service => Ok(()),
+            required => Err(CoreRefusal::VersionInactive { required, active }),
+        }
     }
 
     /// The service.
@@ -1014,13 +1187,24 @@ impl<S: ClusteredService> ServiceContainer<S> {
     /// # Errors
     ///
     /// [`ProposeRefused::BoundsPending`] for a registration held back,
-    /// [`ProposeRefused::NotLeader`] when `core` does not lead, and
-    /// [`ProposeRefused::Codec`] for an envelope schema 2 refuses.
+    /// [`ProposeRefused::NotLeader`] when `core` does not lead,
+    /// [`ProposeRefused::Codec`] for an envelope schema 2 refuses,
+    /// [`ProposeRefused::Stopping`] while the log carries a coordinated
+    /// stop, and [`ProposeRefused::VersionInactive`] for a command the
+    /// active version cannot run (ADR-0122 decision 3).
     pub fn propose<P: Propose>(
         &self,
         envelope: &Envelope<'_>,
         core: &mut P,
     ) -> Result<(), ProposeRefused> {
+        if self.versions.stop.is_some() {
+            return Err(ProposeRefused::Stopping);
+        }
+        if let Envelope::Request { command, .. } = envelope
+            && let Err(CoreRefusal::VersionInactive { required, active }) = self.admits(command)
+        {
+            return Err(ProposeRefused::VersionInactive { required, active });
+        }
         if matches!(envelope, Envelope::Register { .. }) && !self.bounds_logged && core.leads() {
             return Err(ProposeRefused::BoundsPending);
         }
@@ -1065,10 +1249,34 @@ impl<S: ClusteredService> ServiceContainer<S> {
                 last: self.applied,
             });
         }
-        let envelope = if entry.payload.is_empty() {
+        let decoded = if entry.payload.is_empty() {
             None
         } else {
-            match Decoded::of(&entry.payload).map_err(ApplyError::Envelope)? {
+            Some(Decoded::of(&entry.payload).map_err(ApplyError::Envelope)?)
+        };
+        // A coordinated stop: a binary that does not run the resume
+        // version stops past the stop index; one that does refuses every
+        // schema 2 entry there until the resuming `Activation` applies.
+        let past_stop = match self.versions.stop {
+            Some(stop) if entry.index > stop.at => {
+                let supported = self.service.supported_version();
+                if supported < stop.resume {
+                    return Err(ApplyError::Stopped {
+                        at: stop.at,
+                        resume: stop.resume,
+                    });
+                }
+                true
+            }
+            _ => false,
+        };
+        self.activate(entry)?;
+        let envelope = match decoded {
+            None => None,
+            Some(Decoded::Service(_)) if past_stop => {
+                return Ok(self.refused(entry, CoreRefusal::PastStop));
+            }
+            Some(decoded) => match decoded {
                 Decoded::Service(envelope) => Some(envelope),
                 Decoded::Bounds(bounds) => return self.apply_bounds(entry, bounds),
                 Decoded::Membership => {
@@ -1078,13 +1286,31 @@ impl<S: ClusteredService> ServiceContainer<S> {
                     self.sessions.observe(entry.event_time);
                     return Ok(Applied::Nothing);
                 }
+                Decoded::Activation(activation) => {
+                    return Ok(match self.versions.activation(entry.index, &activation) {
+                        Ok(()) => self.refused_or_nothing(entry, None),
+                        Err(refusal) => self.refused(entry, refusal),
+                    });
+                }
+                Decoded::Stop(stop) => {
+                    return Ok(match self.versions.stop(entry.index, stop) {
+                        Ok(()) => self.refused_or_nothing(entry, None),
+                        Err(refusal) => self.refused(entry, refusal),
+                    });
+                }
                 Decoded::Guard(guard) => return self.apply_guard(entry, guard),
-            }
+            },
         };
+        if let Some(Envelope::Request { command, .. }) = envelope
+            && let Err(refusal) = self.admits(command)
+        {
+            return Ok(self.refused(entry, refusal));
+        }
         self.applied = Some(entry.index);
         if matches!(envelope, Some(Envelope::Register { .. })) {
             self.fresh = false;
         }
+        let active = self.versions.active;
         let Self {
             service,
             sessions,
@@ -1103,7 +1329,7 @@ impl<S: ClusteredService> ServiceContainer<S> {
                 Applied::Closed(sessions.close(client, epoch, entry.event_time))
             }
             Envelope::Request { request, command } => {
-                let mut context = Context::of(entry, sessions, timers);
+                let mut context = Context::of(entry, sessions, active, timers);
                 let outcome = sessions.request(request, command, entry.event_time, |reply| {
                     service.on_command(&mut context, request.client, command, reply)
                 });
@@ -1113,7 +1339,7 @@ impl<S: ClusteredService> ServiceContainer<S> {
                 sessions.observe(entry.event_time);
                 if timers.deadline(timer) == Some(deadline) && deadline <= sessions.log_time() {
                     let _ = timers.remove(timer);
-                    service.on_timer(&mut Context::of(entry, sessions, timers), timer);
+                    service.on_timer(&mut Context::of(entry, sessions, active, timers), timer);
                     Applied::Fired { timer }
                 } else {
                     Applied::Nothing
@@ -1121,10 +1347,80 @@ impl<S: ClusteredService> ServiceContainer<S> {
             }
             Envelope::Configuration(configuration) => {
                 sessions.observe(entry.event_time);
-                service.on_configuration(&mut Context::of(entry, sessions, timers), configuration);
+                service.on_configuration(
+                    &mut Context::of(entry, sessions, active, timers),
+                    configuration,
+                );
                 Applied::Configured
             }
         })
+    }
+
+    /// An entry applied as nothing, or as `refusal`: it moves the log
+    /// time on as any entry.
+    fn refused_or_nothing(
+        &mut self,
+        entry: &Entry,
+        refusal: Option<CoreRefusal>,
+    ) -> Applied<'static> {
+        self.applied = Some(entry.index);
+        self.sessions.observe(entry.event_time);
+        refusal.map_or(Applied::Nothing, Applied::CoreRefused)
+    }
+
+    fn refused(&mut self, entry: &Entry, refusal: CoreRefusal) -> Applied<'static> {
+        self.refused_or_nothing(entry, Some(refusal))
+    }
+
+    /// Activates a pending `Activation` whose index `entry` reaches,
+    /// before `entry` applies: the new version, then its configuration to
+    /// the service with `entry`'s [`Context`] (ADR-0122 decision 2).
+    ///
+    /// # Errors
+    ///
+    /// [`ApplyError::VersionUnsupported`] for a version above the
+    /// binary's: nothing changes.
+    fn activate(&mut self, entry: &Entry) -> Result<(), ApplyError> {
+        if !self
+            .versions
+            .pending
+            .as_ref()
+            .is_some_and(|pending| entry.index >= pending.at)
+        {
+            return Ok(());
+        }
+        let supported = self.service.supported_version();
+        let Some(pending) = self
+            .versions
+            .pending
+            .take_if(|pending| pending.version.service <= supported)
+        else {
+            let required = self
+                .versions
+                .pending
+                .as_ref()
+                .map_or(0, |pending| pending.version.service);
+            return Err(ApplyError::VersionUnsupported {
+                required,
+                supported,
+            });
+        };
+        self.versions.active = pending.version;
+        if !pending.configuration.is_empty() {
+            self.versions.configured = true;
+            let active = self.versions.active;
+            let Self {
+                service,
+                sessions,
+                timers,
+                ..
+            } = self;
+            service.on_configuration(
+                &mut Context::of(entry, sessions, active, timers),
+                &pending.configuration,
+            );
+        }
+        Ok(())
     }
 
     /// Applies a `SessionBounds` entry. Only the log's first counts: equal
