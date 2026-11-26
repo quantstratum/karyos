@@ -11610,6 +11610,19 @@ fn a_next_epoch_sender_control_its_handler_would_refuse_marks_nothing() {
         })
     };
     let lane_3 = Lane::try_new(3).unwrap();
+    // The genuine REPLY comes a millisecond after its probe's submission:
+    // a sample (one of no duration is refused, H8-33).
+    rig.now += MS;
+    VIRTUAL_NOW.with(|now| now.set(rig.now));
+    // A NAK_REPLY takes effect only as the exact echo of an outstanding
+    // NAK (H8-34): the genuine one answers this one.
+    let outstanding = rig
+        .agents
+        .receiver
+        .role
+        .awaited_nak(slot, 0, 64, rig.now)
+        .unwrap();
+    assert_eq!(outstanding.range.length, 64);
     let cases = [
         (vec![heartbeat(other)], heartbeat(identity)),
         (
@@ -11773,6 +11786,10 @@ fn a_next_epoch_rttm_reply_its_probes_would_ignore_marks_nothing() {
         .role
         .issued_probe(slot, rig.now, true)
         .unwrap();
+    // Its REPLY a millisecond on: a sample (one of no duration is refused,
+    // H8-33).
+    rig.now += MS;
+    VIRTUAL_NOW.with(|now| now.set(rig.now));
     let receiver = &mut rig.agents.receiver;
     receiver
         .role
@@ -12244,4 +12261,310 @@ fn a_refused_answer_leaves_a_pending_establishment_its_accepted_epochs() {
     let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
     let first: Vec<Vec<u8>> = (0..3u8).map(|i| vec![i; 100]).collect();
     assert_eq!(enc_deliver(&mut rig, &mut subscriber, &first), first);
+}
+
+/// A rig with an established encrypted image that took three messages,
+/// its sender then stopped: the rig, B, the image's slot, the last domain
+/// 1 seal and this receiver's block (the H8 round 9 regressions).
+fn quiet_encrypted_image(
+    idle_rounds: u32,
+) -> (
+    Rig,
+    EndpointId,
+    SlotRef,
+    crate::wire_enc::SealedRecord,
+    karyos_protocol::network::Receiver,
+    karyos_sys::log_buffer::Subscription<std::sync::Arc<LogBuffer>>,
+) {
+    use karyos_protocol::network::{Control, Datagram, classify};
+    use karyos_protocol::protection::aes_gcm_siv::Domain;
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, b) = encrypted_rig();
+    crate::wire_enc::record_seals();
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let first: Vec<Vec<u8>> = (0..3u8).map(|i| vec![i; 100]).collect();
+    assert_eq!(enc_deliver(&mut rig, &mut subscriber, &first), first);
+    for _ in 0..idle_rounds {
+        rig.round(true);
+    }
+    rig.sender_stopped = true;
+    let seals = crate::wire_enc::take_seals();
+    let last = seals
+        .iter()
+        .rfind(|record| {
+            record.context.domain == Domain::Sender
+                && (idle_rounds == 0 || record.frames.len() == 32)
+        })
+        .unwrap()
+        .clone();
+    let receiver = seals
+        .iter()
+        .filter(|record| record.context.domain == Domain::Receiver)
+        .find_map(|record| match classify(&record.frames) {
+            Ok(Datagram::Control(Control::Status(status))) => Some(status.receiver),
+            _ => None,
+        })
+        .unwrap();
+    (rig, b, slot, last, receiver, subscriber)
+}
+
+/// `frames` sealed as `record` was, under its context's next `party_epoch`
+/// at `seq`.
+fn next_epoch(record: &crate::wire_enc::SealedRecord, frames: Vec<u8>, seq: u64) -> Vec<u8> {
+    let mut record = record.clone();
+    record.context.party_epoch += 1;
+    record.seq = seq;
+    record.frames = frames;
+    replayed(&record)
+}
+
+/// `control` encoded as a datagram's inner frames.
+fn control_frames(control: &karyos_protocol::network::Control) -> Vec<u8> {
+    let mut frames = vec![0_u8; 512];
+    let length = control.encode(&mut frames).unwrap();
+    frames.truncate(length);
+    frames
+}
+
+/// H8-33 (ADR-0114 sections 8 and 9): an RTTM REPLY is committed only
+/// once its handler took the outstanding probe, with one clock read. Under
+/// the next `party_epoch`, a REPLY of no duration (the probe submitted at
+/// the clock's very reading) and then, at the probe's timeout, a late one
+/// take nothing, mark nothing and promote nothing; a fresh probe's REPLY
+/// sealed at the same sequence then takes a sample and promotes.
+#[test]
+fn a_next_epoch_rttm_reply_late_or_of_no_duration_marks_nothing() {
+    use karyos_protocol::network::{Control, Rttm, RttmKind};
+    use karyos_protocol::protection::aes_gcm_siv::EncRejection;
+
+    let (mut rig, b, slot, data, receiver, _subscriber) = quiet_encrypted_image(0);
+    let reply = |probe_id| {
+        control_frames(&Control::Rttm(Rttm {
+            alias: alias(),
+            identity: identity(),
+            receiver,
+            probe_id,
+            kind: RttmKind::Reply {
+                service_delay_ns: 0,
+            },
+        }))
+    };
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let refused = |rig: &Rig| {
+        rig.agents
+            .receiver
+            .role
+            .enc_rejections(b, alias().stream_id)
+            .unwrap()
+            .get(EncRejection::InnerRejected)
+    };
+    let epochs = rig.agents.receiver.role.enc_epochs(slot);
+    let samples = rig.agents.receiver.counters().rttm_samples;
+    let before = refused(&rig);
+    let probe_id = rig
+        .agents
+        .receiver
+        .role
+        .issued_probe(slot, rig.now, true)
+        .unwrap();
+    for (late, wait) in [
+        (false, 0),
+        (true, crate::rtt::RttConfig::default().rtt_probe_timeout),
+    ] {
+        rig.now += wait;
+        VIRTUAL_NOW.with(|now| now.set(rig.now));
+        let receiver = &mut rig.agents.receiver;
+        receiver.role.inject_datagram(
+            &receiver.sessions,
+            b,
+            source,
+            &next_epoch(&data, reply(probe_id), 0),
+            rig.now,
+        );
+        assert_eq!(rig.agents.receiver.role.enc_epochs(slot), epochs, "{late}");
+    }
+    assert_eq!(refused(&rig), before + 2);
+    assert_eq!(rig.agents.receiver.counters().rttm_samples, samples);
+    let probe_id = rig
+        .agents
+        .receiver
+        .role
+        .issued_probe(slot, rig.now, true)
+        .unwrap();
+    rig.now += MS;
+    VIRTUAL_NOW.with(|now| now.set(rig.now));
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_datagram(
+        &receiver.sessions,
+        b,
+        source,
+        &next_epoch(&data, reply(probe_id), 0),
+        rig.now,
+    );
+    assert_eq!(
+        rig.agents.receiver.role.enc_epochs(slot),
+        Some((data.context.key_epoch, data.context.party_epoch + 1)),
+        "its sequence was never marked"
+    );
+    assert_eq!(rig.agents.receiver.counters().rttm_samples, samples + 1);
+}
+
+/// H8-34 (ADR-0114 sections 8 and 9): an ERR NAK_REPLY is committed only
+/// as the exact echo of the lane's outstanding NAK, which its handler
+/// takes. Under the next `party_epoch`, a correctly tagged NAK_REPLY with
+/// no NAK outstanding, then one whose range does not echo the outstanding
+/// NAK, marks nothing and promotes nothing; the exact echo sealed at the
+/// same sequence is then taken and promotes, and a further one, the NAK
+/// answered, is refused.
+#[test]
+fn a_next_epoch_nak_reply_echoing_no_outstanding_nak_marks_nothing() {
+    use karyos_protocol::frame::Lane;
+    use karyos_protocol::network::{Control, NakRange, NakReply, NakReplyReason};
+    use karyos_protocol::protection::aes_gcm_siv::EncRejection;
+
+    let (mut rig, b, slot, data, receiver, _subscriber) = quiet_encrypted_image(0);
+    let reply = |start, length| {
+        control_frames(&Control::NakReply(NakReply {
+            alias: alias(),
+            identity: identity(),
+            receiver,
+            range: NakRange {
+                lane: Lane::ZERO,
+                length,
+                start,
+            },
+            reason: NakReplyReason::RangeUnavailable { lowest_retained: 0 },
+        }))
+    };
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let refused = |rig: &Rig| {
+        rig.agents
+            .receiver
+            .role
+            .enc_rejections(b, alias().stream_id)
+            .unwrap()
+            .get(EncRejection::InnerRejected)
+    };
+    let inject = |rig: &mut Rig, bytes: &[u8]| {
+        let receiver = &mut rig.agents.receiver;
+        receiver
+            .role
+            .inject_datagram(&receiver.sessions, b, source, bytes, rig.now);
+    };
+    let epochs = rig.agents.receiver.role.enc_epochs(slot);
+    let before = refused(&rig);
+    inject(&mut rig, &next_epoch(&data, reply(0, 64), 0));
+    assert_eq!(
+        rig.agents.receiver.role.enc_epochs(slot),
+        epochs,
+        "none outstanding"
+    );
+    let nak = rig
+        .agents
+        .receiver
+        .role
+        .awaited_nak(slot, 0, 64, rig.now)
+        .unwrap();
+    inject(&mut rig, &next_epoch(&data, reply(0, 32), 0));
+    assert_eq!(
+        rig.agents.receiver.role.enc_epochs(slot),
+        epochs,
+        "another range"
+    );
+    assert_eq!(refused(&rig), before + 2);
+    inject(
+        &mut rig,
+        &next_epoch(&data, reply(nak.range.start, nak.range.length), 0),
+    );
+    let promoted = Some((data.context.key_epoch, data.context.party_epoch + 1));
+    assert_eq!(
+        rig.agents.receiver.role.enc_epochs(slot),
+        promoted,
+        "the echo opens: its sequence was never marked"
+    );
+    inject(&mut rig, &next_epoch(&data, reply(0, 64), 1));
+    assert_eq!(refused(&rig), before + 3, "answered: no longer outstanding");
+}
+
+/// H8-35 (ADR-0114 sections 8 and 9): a heartbeat is committed only once
+/// its image takes it. Under the next `party_epoch`, correctly tagged
+/// copies of the image's last heartbeat naming a term before the
+/// incarnation's first, a position outside the receive window, and an EOS
+/// bound outside it are each refused by the image's heartbeat handling:
+/// they mark nothing, promote nothing and change no evidence. The
+/// heartbeat itself, sealed at the same sequence, is then taken and
+/// promotes.
+#[test]
+fn a_next_epoch_heartbeat_its_image_refuses_marks_nothing() {
+    use karyos_protocol::protection::aes_gcm_siv::EncRejection;
+
+    let (mut rig, b, slot, heartbeat, _receiver, _subscriber) = quiet_encrypted_image(300);
+    let term_id = u32::from_le_bytes(heartbeat.frames[20..24].try_into().unwrap());
+    let with = |term: u32, eos: bool| {
+        let mut frames = heartbeat.frames.clone();
+        frames[20..24].copy_from_slice(&term.to_le_bytes());
+        if eos {
+            // The EOS flag of the frame header's flags byte.
+            frames[5] |= 0x04;
+        }
+        frames
+    };
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let refused = |rig: &Rig| {
+        rig.agents
+            .receiver
+            .role
+            .enc_rejections(b, alias().stream_id)
+            .unwrap()
+            .get(EncRejection::InnerRejected)
+    };
+    let epochs = rig.agents.receiver.role.enc_epochs(slot);
+    let before = refused(&rig);
+    let counters = rig.agents.receiver.counters();
+    for (case, frames) in [
+        (
+            "before the incarnation",
+            with(term_id.wrapping_sub(1), false),
+        ),
+        ("outside the window", with(term_id.wrapping_add(3), false)),
+        (
+            "an EOS bound outside the window",
+            with(term_id.wrapping_add(3), true),
+        ),
+    ] {
+        let receiver = &mut rig.agents.receiver;
+        receiver.role.inject_datagram(
+            &receiver.sessions,
+            b,
+            source,
+            &next_epoch(&heartbeat, frames, 0),
+            rig.now,
+        );
+        assert_eq!(rig.agents.receiver.role.enc_epochs(slot), epochs, "{case}");
+    }
+    assert_eq!(refused(&rig), before + 3);
+    let after = rig.agents.receiver.counters();
+    assert_eq!(
+        (after.heartbeats, after.heartbeats_stationary),
+        (counters.heartbeats, counters.heartbeats_stationary),
+        "no evidence"
+    );
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_datagram(
+        &receiver.sessions,
+        b,
+        source,
+        &next_epoch(&heartbeat, heartbeat.frames.clone(), 0),
+        rig.now,
+    );
+    assert_eq!(
+        rig.agents.receiver.role.enc_epochs(slot),
+        Some((
+            heartbeat.context.key_epoch,
+            heartbeat.context.party_epoch + 1
+        )),
+        "its sequence was never marked"
+    );
 }

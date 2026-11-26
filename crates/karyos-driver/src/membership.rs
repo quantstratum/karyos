@@ -616,6 +616,17 @@ impl Membership {
         })
     }
 
+    /// Takes `identity`, the publication's fresh incarnation identity after
+    /// a VM generation change (ADR-0114 section 10 step 3): from now on only
+    /// its SMs are judged and accepted, and the previous identity's are
+    /// refused (`Identity`), so no SM of the new incarnation passes
+    /// unjudged (H8-32). The entries stay: a receiver that binds the new
+    /// incarnation finds its own, with its consumption, since the stream
+    /// and its positions go on; one that does not times out as before.
+    pub fn reidentify(&mut self, identity: Identity) {
+        self.identity = identity;
+    }
+
     /// Makes the receivers at `sources` required, as a multi-destination
     /// publication names its required destinations by endpoint (control
     /// path, before the first SM; karyos#630). Their joins gate admission

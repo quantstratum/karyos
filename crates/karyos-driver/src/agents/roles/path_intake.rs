@@ -41,6 +41,7 @@ use karyos_io::sockets::endpoint::MAX_DATAGRAM;
 use karyos_protocol::network::Alias;
 
 use super::EndpointId;
+use super::receive_enc::EncQueued;
 use crate::paths::PathConfig;
 use crate::paths::queues::{PathQueues, Push};
 
@@ -52,6 +53,9 @@ pub(super) struct Queued {
     pub(super) alias: Alias,
     /// The receive poll's time: its arrival time.
     pub(super) now: u64,
+    /// An encrypted datagram's uncommitted open, committed only once the
+    /// drain's handler took it (ADR-0114 sections 8 and 9).
+    pub(super) enc: Option<EncQueued>,
     slot: usize,
     len: usize,
 }
@@ -126,11 +130,24 @@ impl PathIntake {
     }
 
     /// Queues a copy of `bytes` from `endpoint`, polled at `now`.
+    #[cfg(test)]
     pub(super) fn push(
+        &mut self,
+        endpoint: EndpointId,
+        polled: (SocketAddr, Alias, u64),
+        bytes: &[u8],
+    ) -> Queue {
+        self.push_with(endpoint, polled, bytes, None)
+    }
+
+    /// Queues a copy of `bytes` from `endpoint`, polled at `now`, with an
+    /// encrypted datagram's uncommitted open `enc`.
+    pub(super) fn push_with(
         &mut self,
         endpoint: EndpointId,
         (source, alias, now): (SocketAddr, Alias, u64),
         bytes: &[u8],
+        enc: Option<EncQueued>,
     ) -> Queue {
         let queue = match self.queue_of(endpoint) {
             Some(queue) => queue,
@@ -164,6 +181,7 @@ impl PathIntake {
             source,
             alias,
             now,
+            enc,
             slot,
             len,
         };

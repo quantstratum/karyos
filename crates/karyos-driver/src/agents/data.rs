@@ -1365,37 +1365,6 @@ impl<T: StreamTerms> Outbound<T> {
         }
     }
 
-    /// Whether [`Outbound::nak_at`] would queue or answer `nak` from
-    /// `source` (any destination's when `None`, tests only) at `now`,
-    /// with its requester from the membership as the NAK handler reads
-    /// it, changing nothing (H8-24).
-    pub(crate) fn nak_admissible(
-        &self,
-        source: Option<std::net::SocketAddr>,
-        nak: &Nak,
-        now: u64,
-    ) -> bool {
-        let requester = self.membership().map_or(Requester::Unknown, |membership| {
-            membership.requester(nak.receiver, nak.range.lane, now)
-        });
-        if self.fanout.is_some() {
-            return self.nak_from_admissible(source, nak, requester, now);
-        }
-        let lane = usize::from(nak.range.lane.get());
-        let lanes = u8::try_from(self.readers.len()).unwrap_or(u8::MAX);
-        let sent_high = self.tracks.get(lane).map_or(0, |track| track.high);
-        self.repair.as_deref().is_some_and(|repair| {
-            repair.would_take(
-                nak,
-                requester,
-                self.readers.get(lane),
-                sent_high,
-                lanes,
-                now,
-            )
-        })
-    }
-
     /// Whether `nak`, from a bound receiver, on route `route` at `now`, is
     /// a copy of one another route carried within `path_skew_window`: it
     /// is then absorbed, counted, and spends no NAK budget (RP-11).

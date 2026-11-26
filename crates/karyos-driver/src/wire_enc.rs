@@ -26,12 +26,15 @@
 //! - [`vm_generation`]: the VM generation change of section 10, after
 //!   which no key is derived, no datagram sealed and none opened.
 //!
-//! The receive order is section 8's exactly: fixed fields, epochs,
-//! sequence cap and open rate, key age, key selection, replay precheck,
-//! open and pairwise trailer, inner validation, the atomic check and mark,
-//! and only then the commit. A failure before the mark marks no sequence,
-//! commits no key and promotes no epoch. Nothing here allocates after
-//! construction: every slot is inline and every key is derived into one.
+//! The receive order is section 8's: fixed fields, epochs, sequence cap
+//! and open rate, key age, key selection, replay precheck, open and
+//! pairwise trailer, inner validation ([`EncOpener::verify`]); then the
+//! caller's handler decides, and only a datagram it accepted is marked and
+//! its epoch promoted ([`EncOpener::commit`]). A datagram refused anywhere
+//! before the commit, its handler included, marks no sequence, commits no
+//! key and promotes no epoch, by construction. Nothing here allocates
+//! after construction: every slot is inline and every key is derived into
+//! one.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -1575,6 +1578,28 @@ enum Selected {
     Next,
 }
 
+/// A datagram [`EncOpener::verify`] verified and nothing yet committed
+/// (section 8 steps 1 to 7): its inner frames are plaintext at the start
+/// of the output buffer, its sequence is not marked and its epoch not
+/// promoted. Its handler decides; only then [`EncOpener::commit`] marks
+/// and promotes, and only for an accepted datagram. It names the opener
+/// instance that verified it: no other opener commits it, and the mark is
+/// the window's atomic check and mark, so a token committed twice, or two
+/// tokens of one sequence, mark it once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pending {
+    /// Length of the inner frames in the output buffer.
+    pub frames: usize,
+    /// The epoch pair it verified under.
+    pub epochs: (u32, u16),
+    seq: u64,
+    opener: u64,
+}
+
+/// Opener instances, so a [`Pending`] commits only in the opener that
+/// verified it: a binding made again has a new one.
+static OPENERS: AtomicU64 = AtomicU64::new(1);
+
 /// A datagram the opener fully accepted: its inner frames are plaintext
 /// at the start of the output buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1611,6 +1636,8 @@ pub struct EncOpener {
     /// The VM generation it was made in: it opens nothing in a later one
     /// (section 10).
     generation: u64,
+    /// This opener's instance, named by each [`Pending`] it verifies.
+    instance: u64,
 }
 
 impl core::fmt::Debug for EncOpener {
@@ -1664,6 +1691,7 @@ impl EncOpener {
             erase: erase_with,
             withdrawn: false,
             generation: vm_generation::generation(),
+            instance: OPENERS.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -1830,16 +1858,13 @@ impl EncOpener {
         Ok(selected)
     }
 
-    /// Opens `datagram` into `out` in the receive order of section 8.
-    /// `inner` is the caller's per-frame check of step 7 (binding, alias,
-    /// authority); it runs after the matrix of section 9 and before the
-    /// mark. On success the inner frames are `out[..frames]` and only then
-    /// may they take effect; on any refusal `out` is erased, no sequence is
-    /// marked, no key is committed and no epoch moves. Allocates nothing.
+    /// Opens `datagram` and commits it at once, as an accepting handler
+    /// would (tests).
     ///
     /// # Errors
     ///
-    /// The first [`EncRejection`] that applies.
+    /// As [`Self::verify`] and [`Self::commit`].
+    #[cfg(test)]
     pub fn open(
         &mut self,
         datagram: &[u8],
@@ -1848,6 +1873,32 @@ impl EncOpener {
         now_ns: u64,
         inner: impl FnOnce(&[u8]) -> Result<(), EncRejection>,
     ) -> Result<Accepted, EncRejection> {
+        let pending = self.verify(datagram, out, rate, now_ns, inner)?;
+        self.commit(pending, now_ns)
+    }
+
+    /// Verifies `datagram` into `out` in the receive order of section 8,
+    /// steps 1 to 7: fixed fields, epochs, sequence cap, open rate, key
+    /// age, key selection (the next epoch derived into the scratch slot),
+    /// the replay precheck, the tag and pairwise trailer, the matrix of
+    /// section 9 and `inner`, the caller's structural per-frame check
+    /// (binding, alias). On success the inner frames are `out[..frames]`
+    /// and nothing is marked or promoted: the caller hands them to their
+    /// handler and commits the [`Pending`] only if it accepted them. On any
+    /// refusal `out` is erased. Changes only the rate counter and the
+    /// scratch slot. Allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// The first [`EncRejection`] that applies.
+    pub fn verify(
+        &mut self,
+        datagram: &[u8],
+        out: &mut [u8],
+        rate: &mut OpenRate,
+        now_ns: u64,
+        inner: impl FnOnce(&[u8]) -> Result<(), EncRejection>,
+    ) -> Result<Pending, EncRejection> {
         if self.generation != vm_generation::generation() {
             return Err(EncRejection::VmGeneration);
         }
@@ -1883,21 +1934,118 @@ impl EncOpener {
             .and_then(|frames| {
                 check_matrix(header.domain, frames)?;
                 inner(frames)
-            })
-            .and_then(|()| key.mark(opened.seq));
+            });
         if let Err(reason) = checked {
             zeroize::Zeroize::zeroize(out);
             return Err(reason);
         }
-        let promoted = selected == Selected::Next;
-        if promoted {
-            self.promote(now_ns);
-        }
-        Ok(Accepted {
+        Ok(Pending {
             frames: opened.frames,
             epochs: (header.key_epoch, header.party_epoch),
-            promoted,
+            seq: opened.seq,
+            opener: self.instance,
         })
+    }
+
+    /// Whether `pending` would still commit at `now_ns`, changing nothing:
+    /// it is this opener's, which is neither withdrawn nor of an earlier VM
+    /// generation, its epoch pair is still the current one, the previous
+    /// one inside its overlap, or the next one, and its sequence is not
+    /// marked. A datagram whose handler runs later than its verification
+    /// (a path queue's) is checked again here immediately before it, so
+    /// the check, the handler and the commit run as one step.
+    ///
+    /// # Errors
+    ///
+    /// The [`EncRejection`] the commit would give.
+    pub fn check(&self, pending: &Pending, now_ns: u64) -> Result<(), EncRejection> {
+        self.owns(pending)?;
+        match self.committed_slot(pending.epochs, now_ns) {
+            Some(key) => key.window().check(pending.seq).map_err(EncRejection::from),
+            None if self.is_next(pending.epochs.0, pending.epochs.1) => Ok(()),
+            None => Err(EncRejection::Epoch),
+        }
+    }
+
+    /// Section 8 steps 8 and 9 for a datagram its handler accepted: marks
+    /// `pending`'s sequence in the window of the key it verified under, the
+    /// atomic check and mark, and, for the next epoch, commits it as
+    /// current, keeping the old current for the overlap. A refused
+    /// datagram is never committed, so it marks and promotes nothing.
+    /// Allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`EncRejection::VmGeneration`], [`EncRejection::Withdrawn`],
+    /// [`EncRejection::Epoch`] for another opener's token or an epoch no
+    /// longer selected, or the replay refusal of a sequence already marked;
+    /// nothing changes.
+    pub fn commit(&mut self, pending: Pending, now_ns: u64) -> Result<Accepted, EncRejection> {
+        self.owns(&pending)?;
+        let accepted = |promoted| Accepted {
+            frames: pending.frames,
+            epochs: pending.epochs,
+            promoted,
+        };
+        if let Some(key) = self.committed_slot(pending.epochs, now_ns) {
+            key.mark(pending.seq)?;
+            return Ok(accepted(false));
+        }
+        if !self.is_next(pending.epochs.0, pending.epochs.1) {
+            return Err(EncRejection::Epoch);
+        }
+        let mut next = *self.current.key.context();
+        next.key_epoch = pending.epochs.0;
+        next.party_epoch = pending.epochs.1;
+        // The scratch slot holds the verifying key unless another
+        // datagram's verification re-keyed it since: then it is derived
+        // again, under the same inputs, with an empty window.
+        if *self.scratch.context() != next {
+            derive_into(
+                &self.keys,
+                self.pairwise.as_ref(),
+                next,
+                &mut self.scratch,
+                false,
+            )
+            .map_err(|_| EncRejection::Epoch)?;
+        }
+        self.scratch.mark(pending.seq)?;
+        self.promote(now_ns);
+        Ok(accepted(true))
+    }
+
+    /// Whether `pending` is this opener's and it may still commit.
+    fn owns(&self, pending: &Pending) -> Result<(), EncRejection> {
+        if self.generation != vm_generation::generation() {
+            return Err(EncRejection::VmGeneration);
+        }
+        if self.withdrawn {
+            return Err(EncRejection::Withdrawn);
+        }
+        if pending.opener != self.instance {
+            return Err(EncRejection::Epoch);
+        }
+        Ok(())
+    }
+
+    /// The committed key of `epochs` at `now_ns`: the current one, or the
+    /// previous one inside its overlap.
+    fn committed_slot(&self, epochs: (u32, u16), now_ns: u64) -> Option<&AesGcmSiv> {
+        if epochs == self.epochs() {
+            return Some(&self.current.key);
+        }
+        self.previous
+            .as_ref()
+            .filter(|(previous, until)| {
+                epochs
+                    == (
+                        previous.key.context().key_epoch,
+                        previous.key.context().party_epoch,
+                    )
+                    && now_ns < *until
+            })
+            .map(|(slot, _)| &slot.key)
     }
 
     /// Moves the binding to the epoch pair of an accepted

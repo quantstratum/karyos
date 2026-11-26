@@ -251,21 +251,6 @@ impl Admission {
         }
     }
 
-    /// What [`Self::admit`] would answer for `nak` in `ctx` at `now`,
-    /// counting and recording nothing: a domain 4 open decides with it
-    /// before the NAK's sequence is marked (H8-24).
-    #[must_use]
-    pub fn would_admit(&self, nak: &Nak, ctx: &NakContext, now: u64) -> Admitted {
-        match verdict(nak, ctx) {
-            Verdict::Drop(reason) => Admitted::Dropped(reason),
-            Verdict::Reply(reason) => match self.err_slot(nak, now) {
-                Ok(_) => Admitted::Reply(NakReply::answering(nak, reason)),
-                Err(reason) => Admitted::Dropped(reason),
-            },
-            Verdict::Pass(request) => Admitted::Pass(request),
-        }
-    }
-
     /// The ERR for a request the job table later refused at its start
     /// boundary (step 8), under the same linger. A `RANGE_UNAVAILABLE`
     /// names a lowest retained position above the request's start

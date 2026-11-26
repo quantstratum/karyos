@@ -970,6 +970,7 @@ fn the_domain_6_scratch_slot_keeps_no_retired_pairwise_key() {
 fn a_refused_domain_4_control_marks_nothing_and_promotes_nothing() {
     let (mut sender, _): (super::super::SenderRole, super::super::ReceiverRole) =
         super::super::roles(&crate::agents::AgentConfig::default()).unwrap();
+    sender.clock = clock;
     let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     let stranger: SocketAddr = "10.0.0.7:5000".parse().unwrap();
     let term = TermParams {
@@ -1079,6 +1080,7 @@ fn a_next_epoch_nak_or_rttm_from_an_unbound_source_marks_nothing() {
 
     let (mut sender, _): (super::super::SenderRole, super::super::ReceiverRole) =
         super::super::roles(&crate::agents::AgentConfig::default()).unwrap();
+    sender.clock = clock;
     let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     let stranger: SocketAddr = "10.0.0.7:5000".parse().unwrap();
     let term = TermParams {
@@ -1313,6 +1315,7 @@ fn a_next_epoch_sm_without_a_runtime_binding_marks_nothing() {
 
     let (mut sender, _): (super::super::SenderRole, super::super::ReceiverRole) =
         super::super::roles(&crate::agents::AgentConfig::default()).unwrap();
+    sender.clock = clock;
     let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     let term = TermParams {
         term_length: 65_536,
@@ -1402,6 +1405,7 @@ fn a_next_epoch_sm_without_a_runtime_binding_marks_nothing() {
 fn a_next_epoch_sm_with_no_room_for_its_adoption_marks_nothing() {
     let (mut sender, _): (super::super::SenderRole, super::super::ReceiverRole) =
         super::super::roles(&crate::agents::AgentConfig::default()).unwrap();
+    sender.clock = clock;
     let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     let other: SocketAddr = "10.0.0.10:5000".parse().unwrap();
     let term = TermParams {
@@ -1497,6 +1501,7 @@ fn expect_receiver(path: &mut crate::agents::data::Outbound, source: SocketAddr,
 fn a_next_epoch_nak_its_handler_would_drop_marks_nothing() {
     let (mut sender, _): (super::super::SenderRole, super::super::ReceiverRole) =
         super::super::roles(&crate::agents::AgentConfig::default()).unwrap();
+    sender.clock = clock;
     let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     let term = TermParams {
         term_length: 65_536,
@@ -1747,7 +1752,6 @@ fn a_lost_answer_then_a_fresh_challenge_of_the_same_boot_exchanges_data_and_sm()
     assert_eq!(session_salt(&mut sender), Some(salt), "sealed under B");
     // A, retried or replayed, binds nothing again: its key sealed.
     receiver.nonce = a;
-    tick();
     assert!(establish(&mut sender, destination, &receiver.challenge()).is_none());
     assert_eq!(session_salt(&mut sender), Some(salt));
     receiver.nonce = b;
@@ -2016,4 +2020,173 @@ fn a_next_epoch_rttm_request_its_reply_admission_refuses_marks_nothing() {
         "its sequence was never marked"
     );
     assert_eq!(sender.enc.publications[0].bound_epochs(), Some((1, 1)));
+}
+
+/// H8-31 (sections 6b and 7): the receiver installs the ANSWER to
+/// challenge A, and its first SM is delayed; it resynchronises with a
+/// SOLICIT of nonce B. The binding, never confirmed, is neither re-keyed
+/// nor answered: the receiver keeps A's salt (section 6b step 2), and so
+/// does the publisher. The delayed SM then opens under A and confirms the
+/// binding; the next resynchronisation SOLICIT is answered, the salt and
+/// the runtime binding unchanged (H8-36).
+#[test]
+fn a_resync_before_the_first_sm_keeps_both_peers_on_the_installed_salt() {
+    let (mut sender, destination, _log) = answering();
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    let a = receiver.nonce;
+    assert!(
+        establish(&mut sender, destination, &receiver.challenge()).is_some(),
+        "A is answered, and the receiver installs it"
+    );
+    let salt = session_salt(&mut sender);
+    assert_eq!(
+        salt,
+        Some(Salt::Challenge {
+            receiver_boot_id: receiver.receiver.receiver_boot_id,
+            nonce: id128(a),
+        })
+    );
+    // Its first SM, under A's domain 4 keys, is delayed.
+    let (mut sm_sealer, _) = receiver.data_keys();
+    let sm = seal_control(&mut sm_sealer, &receiver.sm());
+    receiver.nonce = [a[0] + 1, a[1] + 1];
+    assert!(
+        establish(&mut sender, destination, &receiver.solicit()).is_none(),
+        "the resynchronisation of an unconfirmed binding is not answered"
+    );
+    assert_eq!(session_salt(&mut sender), salt, "nothing re-keyed");
+    assert_eq!(
+        sender.enc.publications[0]
+            .channel
+            .rejections
+            .get(EncRejection::ResyncRefused),
+        1
+    );
+    assert_eq!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &sm)
+            .map(|(control, _)| control),
+        Some(receiver.sm()),
+        "the delayed SM opens under A"
+    );
+    let held = sender.bindings.clone();
+    assert!(held.iter().all(|binding| binding.last_sm.is_some()));
+    tick();
+    receiver.nonce = [a[0] + 2, a[1] + 2];
+    let Some(Control::SetupAnswer(answer)) =
+        establish(&mut sender, destination, &receiver.solicit())
+    else {
+        panic!("the confirmed binding's resynchronisation is answered")
+    };
+    assert_eq!(answer.challenge.nonce, receiver.nonce);
+    assert_eq!(session_salt(&mut sender), salt, "A's salt stays");
+    assert_eq!(sender.bindings, held, "the runtime binding stays");
+}
+
+/// H8-36 (section 7): challenge A is answered and its ANSWER lost; B
+/// re-keys the binding and B's SM confirms it. Replayed afterwards, A is
+/// refused as superseded (`enc_retired_boot`) and B as a copy of the
+/// confirmed binding's challenge (`enc_duplicate`): neither is answered,
+/// and no key, salt, epoch or runtime binding changes.
+#[test]
+fn a_superseded_or_bound_challenge_replayed_after_confirmation_changes_nothing() {
+    let (mut sender, destination, _log) = answering();
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    let a = receiver.nonce;
+    let challenge_a = receiver.challenge();
+    assert!(
+        establish(&mut sender, destination, &challenge_a).is_some(),
+        "A is answered; the ANSWER is lost"
+    );
+    receiver.nonce = [a[0] + 1, a[1] + 1];
+    tick();
+    let challenge_b = receiver.challenge();
+    assert!(establish(&mut sender, destination, &challenge_b).is_some());
+    let salt = session_salt(&mut sender);
+    let (mut sm_sealer, _) = receiver.data_keys();
+    let sm = seal_control(&mut sm_sealer, &receiver.sm());
+    assert!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &sm)
+            .is_some(),
+        "B's SM confirms it"
+    );
+    let held = sender.bindings.clone();
+    let epochs = sender.enc.publications[0].bound_epochs();
+    for (replay, reason) in [
+        (&challenge_a, EncRejection::RetiredBoot),
+        (&challenge_b, EncRejection::Duplicate),
+    ] {
+        tick();
+        let before = sender.enc.publications[0].channel.rejections.get(reason);
+        assert!(
+            establish(&mut sender, destination, replay).is_none(),
+            "{reason:?}"
+        );
+        let publication = &sender.enc.publications[0];
+        assert_eq!(publication.channel.rejections.get(reason), before + 1);
+        assert_eq!(publication.bound_receiver(), Some(receiver.receiver));
+        assert_eq!(publication.bound_epochs(), epochs);
+        assert_eq!(session_salt(&mut sender), salt, "{reason:?}");
+        assert_eq!(sender.bindings, held, "{reason:?}");
+    }
+}
+
+/// H8-32 (section 10 step 3): no SM is exempt from its publication's
+/// membership, and a VM generation change takes the membership to the
+/// fresh incarnation. An SM of an incarnation other than the membership's,
+/// with a runtime binding of its own, is refused (`Identity`) and moves
+/// nothing. After the redraw, the fresh incarnation's SM beyond
+/// `sent_high` is refused on its credit and the valid one is accepted,
+/// its binding refreshed.
+#[test]
+fn a_redrawn_publications_membership_judges_its_fresh_incarnations_sms() {
+    use crate::wire_enc::vm_generation;
+
+    let (mut sender, destination, receiver) = with_membership();
+    let sm = |identity, consumption| {
+        let mut status = sm_at(&receiver, consumption, 32_768);
+        status.identity = identity;
+        status
+    };
+    let binding = |sender: &super::super::SenderRole, identity| {
+        *sender
+            .bindings
+            .iter()
+            .find(|binding| binding.identity == identity)
+            .unwrap()
+    };
+    let other = Identity {
+        driver_id: [9, 9],
+        ..IDENTITY
+    };
+    let mut answer = plain_answer();
+    answer.identity = other;
+    sender.bind(EndpointId(1), destination, &answer, None, clock());
+    assert!(
+        sender
+            .status(EndpointId(1), destination, &sm(other, 0), clock())
+            .is_none()
+    );
+    assert!(
+        binding(&sender, other).last_sm.is_none(),
+        "judged by its membership, of another incarnation"
+    );
+    let (signal, injector) = vm_generation::InjectedSignal::new();
+    sender.enc.watch(VmGenerationWatch::new(Box::new(signal)));
+    vm_generation::register();
+    sender.on_generation_change(0);
+    injector.change();
+    sender.on_generation_change(vm_generation::POLL_INTERVAL_NS);
+    let fresh = sender.enc_identity(EndpointId(1), ALIAS).unwrap();
+    assert_ne!(fresh, IDENTITY);
+    answer.identity = fresh;
+    sender.bind(EndpointId(1), destination, &answer, None, clock());
+    let _ = sender.status(EndpointId(1), destination, &sm(fresh, 4096), clock());
+    assert!(
+        binding(&sender, fresh).last_sm.is_none(),
+        "beyond `sent_high`"
+    );
+    let _ = sender.status(EndpointId(1), destination, &sm(fresh, 0), clock());
+    assert_eq!(binding(&sender, fresh).last_sm, Some(clock()), "accepted");
 }

@@ -2126,32 +2126,6 @@ impl<T: StreamTerms> Outbound<T> {
         }
     }
 
-    /// Whether [`Self::nak_from`] would queue or answer `nak` from
-    /// `source` (any destination's when `None`, tests only), changing
-    /// nothing (H8-24).
-    pub(super) fn nak_from_admissible(
-        &self,
-        source: Option<SocketAddr>,
-        nak: &karyos_protocol::network::Nak,
-        requester: crate::repair::admission::Requester,
-        now: u64,
-    ) -> bool {
-        let lane = usize::from(nak.range.lane.get());
-        let lanes = u8::try_from(self.readers.len()).unwrap_or(u8::MAX);
-        let reader = self.readers.get(lane);
-        let Some(fanout) = self.fanout.as_deref() else {
-            return false;
-        };
-        fanout.targets.iter().any(|target| {
-            source.is_none_or(|source| target.address == source)
-                && target.removed.is_none()
-                && target.repair.as_deref().is_some_and(|repair| {
-                    let sent_high = target.lanes.get(lane).map_or(0, |track| track.high);
-                    repair.would_take(nak, requester, reader, sent_high, lanes, now)
-                })
-        })
-    }
-
     /// Serves each destination's repairs on `tx` within `budget`, from a
     /// rotating start; returns the heads submitted.
     pub(super) fn serve_fanout_repair<O: SocketOps>(

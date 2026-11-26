@@ -5114,11 +5114,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 sessions,
                 work: 0,
             };
-            intake.data(
-                entry.source,
-                entry.alias,
-                path_intake::PathIntake::bytes(&entry, &slab),
-            );
+            intake.dequeued(&entry, path_intake::PathIntake::bytes(&entry, &slab));
             if let Some(queues) = self.path_intake.as_deref_mut() {
                 queues.release(entry);
             }
@@ -5472,8 +5468,11 @@ impl<T: StreamTerms> Intake<'_, T> {
     /// image it names exactly (identity and this receiver). The path's
     /// last REQUEST report is settled first, so a REPLY that overtakes the
     /// collection still matches; the sample ends at the clock read here,
-    /// at validation.
-    fn rttm_reply(&mut self, source: SocketAddr, rttm: &Rttm) {
+    /// at validation. Returns whether it took the path's outstanding probe,
+    /// with a sample; an unbound, unmatched, unsubmitted, late or
+    /// zero-duration one takes none and changes nothing but counters
+    /// ([`crate::rtt::RttProbes::take_reply`]).
+    fn rttm_reply(&mut self, source: SocketAddr, rttm: &Rttm) -> bool {
         let key = BindingKey {
             endpoint: self.endpoint,
             source,
@@ -5499,23 +5498,24 @@ impl<T: StreamTerms> Intake<'_, T> {
             });
         let Some((index, path)) = found else {
             self.role.count(|c| &mut c.rttm_replies_unbound);
-            return;
+            return false;
         };
         let seen = (self.role.clock)();
         let Some(image) = self.role.images.get_mut(index) else {
-            return;
+            return false;
         };
         if let Some(probe) = image.probes.get_mut(path) {
             collect_probe(&mut image.rtt, probe, true);
         }
-        let outcome = match image.rtt.generation(path) {
-            Some(generation) => image.rtt.reply(path, generation, rttm.probe_id, seen),
-            None => ReplyOutcome::Ignored,
-        };
-        match outcome {
-            ReplyOutcome::Sample(_) => self.role.count(|c| &mut c.rttm_samples),
-            ReplyOutcome::Ignored => self.role.count(|c| &mut c.rttm_replies_ignored),
+        let taken = image
+            .rtt
+            .generation(path)
+            .and_then(|generation| image.rtt.take_reply(path, generation, rttm.probe_id, seen));
+        match taken {
+            Some(ReplyOutcome::Sample(_)) => self.role.count(|c| &mut c.rttm_samples),
+            Some(ReplyOutcome::Ignored) | None => self.role.count(|c| &mut c.rttm_replies_ignored),
         }
+        taken.is_some()
     }
 
     /// A DATA datagram from `source` (§3.2 step 2): only through its
@@ -5523,7 +5523,8 @@ impl<T: StreamTerms> Intake<'_, T> {
     /// active, validated against the image's parameters, each frame
     /// committed by the receive owner. Fresh evidence (a committed frame or
     /// a heartbeat) keeps the image and the path alive. Nothing allocates.
-    fn data(&mut self, source: SocketAddr, alias: Alias, bytes: &[u8]) {
+    /// Returns whether it took effect ([`Self::data_once`]).
+    fn data(&mut self, source: SocketAddr, alias: Alias, bytes: &[u8]) -> bool {
         #[cfg(test)]
         {
             if self.role.rx_offsets.len() < 96
@@ -5547,7 +5548,7 @@ impl<T: StreamTerms> Intake<'_, T> {
                 {
                     held.push((u64::from(at), length));
                 }
-                return;
+                return true;
             }
             if self.role.drop_data.contains(&seen) {
                 if let (Some(dropped), Some((_, at, _))) =
@@ -5556,7 +5557,7 @@ impl<T: StreamTerms> Intake<'_, T> {
                 {
                     held.push((u64::from(at), length));
                 }
-                return;
+                return true;
             }
             // A DATA frame at or past the offset, decoded from its header:
             // word 0 (length, flags, type), then the term offset. A frame
@@ -5588,14 +5589,14 @@ impl<T: StreamTerms> Intake<'_, T> {
                     tail.term = Some(term);
                     tail.end = end.map_or(tail.end, |end| tail.end.max(end));
                     self.role.drop_tail = Some(tail);
-                    return;
+                    return true;
                 }
             }
             if self.role.repeat_data_from.is_some_and(|from| seen >= from) {
-                self.data_once(source, alias, bytes);
+                let _ = self.data_once(source, alias, bytes);
             }
         }
-        self.data_once(source, alias, bytes);
+        self.data_once(source, alias, bytes)
     }
 
     /// Queues a DATA datagram of a multi-path image in its path's queue
@@ -5603,7 +5604,13 @@ impl<T: StreamTerms> Intake<'_, T> {
     /// from an endpoint whose queue holds datagrams is queued too, so its
     /// path's order holds. Returns whether it was taken (queued, or dropped
     /// by a full queue); `false` delivers it now.
-    fn enqueue(&mut self, source: SocketAddr, alias: Alias, bytes: &[u8]) -> bool {
+    fn enqueue(
+        &mut self,
+        source: SocketAddr,
+        alias: Alias,
+        bytes: &[u8],
+        enc: Option<receive_enc::EncQueued>,
+    ) -> bool {
         let key = BindingKey {
             endpoint: self.endpoint,
             source,
@@ -5625,7 +5632,7 @@ impl<T: StreamTerms> Intake<'_, T> {
         if !intake.takes(self.endpoint, multi) {
             return false;
         }
-        match intake.push(self.endpoint, (source, alias, self.now), bytes) {
+        match intake.push_with(self.endpoint, (source, alias, self.now), bytes, enc) {
             path_intake::Queue::Queued => {
                 role.count(|c| &mut c.path_queued);
                 true
@@ -5660,11 +5667,7 @@ impl<T: StreamTerms> Intake<'_, T> {
             .and_then(|intake| intake.pop_from(endpoint))
         {
             self.now = entry.now;
-            self.data(
-                entry.source,
-                entry.alias,
-                path_intake::PathIntake::bytes(&entry, &slab),
-            );
+            self.dequeued(&entry, path_intake::PathIntake::bytes(&entry, &slab));
             if let Some(intake) = self.role.path_intake.as_deref_mut() {
                 intake.release(entry);
             }
@@ -5675,8 +5678,17 @@ impl<T: StreamTerms> Intake<'_, T> {
         }
     }
 
-    /// One DATA datagram's intake ([`Self::data`]).
-    fn data_once(&mut self, source: SocketAddr, alias: Alias, bytes: &[u8]) {
+    /// One DATA datagram's intake ([`Self::data`]): whether it took
+    /// effect. A batch refused whole (no active binding, an aborted image,
+    /// the structural validation of every frame, ADR-0114 section 9) takes
+    /// none; a valid one takes effect when one of its items does: a frame
+    /// the receive owner took (committed, a duplicate or late copy, a
+    /// recorded conflict) or dropped past its lane's terminal bound, a
+    /// fresh or stationary heartbeat. A batch whose every item was refused
+    /// (frames out of the window, stale or rejected heartbeats, a refused
+    /// EOS bound) changed nothing but counters, and is not taken: an
+    /// encrypted one is not committed (sections 8 and 9).
+    fn data_once(&mut self, source: SocketAddr, alias: Alias, bytes: &[u8]) -> bool {
         let key = BindingKey {
             endpoint: self.endpoint,
             source,
@@ -5700,7 +5712,7 @@ impl<T: StreamTerms> Intake<'_, T> {
             // Terminal since its abort: queued or late DATA and heartbeats
             // move nothing, not even liveness.
             role.count(|c| &mut c.data_after_abort);
-            return;
+            return false;
         }
         let Some(image) = found.and_then(|index| role.images.get_mut(index)) else {
             role.count(|c| &mut c.data_unbound);
@@ -5710,11 +5722,11 @@ impl<T: StreamTerms> Intake<'_, T> {
                 self.now, key.endpoint.0
             ));
             self.solicit(key);
-            return;
+            return false;
         };
         let Ok(datagram) = ValidatedDatagram::parse(bytes, &image.params) else {
             role.count(|c| &mut c.data_invalid);
-            return;
+            return false;
         };
         // Per item: committed, dropped, refused, then fresh, stale,
         // stationary and rejected heartbeats, then frames past their lane's
@@ -5722,6 +5734,7 @@ impl<T: StreamTerms> Intake<'_, T> {
         // records: no overflow.
         let mut outcomes = [0u32; 8];
         let mut path_fresh = false;
+        let mut took = false;
         for item in datagram.items() {
             let (outcome, arrival) = match item {
                 // Past the bound EOS named: dropped before the receive
@@ -5854,6 +5867,9 @@ impl<T: StreamTerms> Intake<'_, T> {
                     }
                 }
             };
+            // Refused: a frame the receive owner refused unrecorded, a stale
+            // heartbeat, a rejected one or a refused EOS bound.
+            took |= arrival.is_some() || !matches!(outcome, 2 | 4 | 6);
             if let Some((Some(delivered), arrival)) = arrival {
                 let fresh = image.stats.arrived(delivered, arrival);
                 // A conflicting copy is recorded, never path evidence.
@@ -5896,6 +5912,7 @@ impl<T: StreamTerms> Intake<'_, T> {
                 role.count(field);
             }
         }
+        took
     }
 
     /// Sends `control` toward `source` from the intake's own endpoint if
@@ -6139,8 +6156,9 @@ impl<T: StreamTerms> Intake<'_, T> {
     /// An ERR NAK_REPLY from `source` (phase 6): it reaches the image bound
     /// to its key, whose repair state accepts only an exact echo of an
     /// outstanding NAK. RANGE_UNAVAILABLE goes to the skip policy (seal or
-    /// close, RC-9); a protocol fault (RC-8) closes the image.
-    fn nak_reply(&mut self, source: SocketAddr, reply: &NakReply) {
+    /// close, RC-9); a protocol fault (RC-8) closes the image. Returns
+    /// whether it echoed an outstanding NAK.
+    fn nak_reply(&mut self, source: SocketAddr, reply: &NakReply) -> bool {
         let key = BindingKey {
             endpoint: self.endpoint,
             source,
@@ -6150,7 +6168,7 @@ impl<T: StreamTerms> Intake<'_, T> {
         let role = &mut *self.role;
         let Some(slot) = role.sessions.lookup(&key) else {
             role.count(|c| &mut c.nak_replies_unbound);
-            return;
+            return false;
         };
         let ReceiverRole {
             images,
@@ -6160,14 +6178,15 @@ impl<T: StreamTerms> Intake<'_, T> {
         } = role;
         let Some(image) = images.iter_mut().find(|image| image.slot == slot) else {
             tally(counters, |c| &mut c.nak_replies_unbound);
-            return;
+            return false;
         };
         let lane = reply.range.lane;
         let Some(end) = window_end(&image.owner, lane, image.term_length) else {
             tally(counters, |c| &mut c.nak_replies_unbound);
-            return;
+            return false;
         };
-        match image.loss.reply(reply, end) {
+        let outcome = image.loss.reply(reply, end);
+        match outcome {
             NakOutcome::Unrecoverable {
                 lane,
                 hole,
@@ -6183,6 +6202,7 @@ impl<T: StreamTerms> Intake<'_, T> {
             }
             NakOutcome::Unmatched | NakOutcome::StillDue => {}
         }
+        outcome != NakOutcome::Unmatched
     }
 
     /// Whether `identity` on an authenticated subscription to `stream_id`
@@ -6195,6 +6215,32 @@ impl<T: StreamTerms> Intake<'_, T> {
                 .abort_record
                 .as_deref()
                 .is_some_and(|record| record.terminal(identity))
+    }
+
+    /// A PATH_HB from `source`: it refreshes only its own bound path and
+    /// creates nothing. Returns whether it refreshed one.
+    fn path_heartbeat(&mut self, source: SocketAddr, heartbeat: &PathHeartbeat) -> bool {
+        let (endpoint, now) = (self.endpoint, self.now);
+        let key = BindingKey {
+            endpoint,
+            source,
+            alias: heartbeat.alias,
+        };
+        match self.role.sessions.paths_mut().path_hb(key, now) {
+            Some(_) => {
+                self.role.count(|c| &mut c.path_heartbeats);
+                true
+            }
+            None => {
+                #[cfg(test)]
+                self.role.note(format!(
+                    "{now} path_hb unbound ep{} from {source}",
+                    endpoint.0
+                ));
+                self.role.count(|c| &mut c.path_heartbeats_unbound);
+                false
+            }
+        }
     }
 
     fn control(&mut self, source: SocketAddr, control: Control) {
@@ -6428,23 +6474,7 @@ impl<T: StreamTerms> Intake<'_, T> {
                 }
             }
             Control::PathHeartbeat(heartbeat) => {
-                let key = BindingKey {
-                    endpoint,
-                    source,
-                    alias: heartbeat.alias,
-                };
-                // It refreshes only its own bound path; it creates nothing.
-                match self.role.sessions.paths_mut().path_hb(key, now) {
-                    Some(_) => self.role.count(|c| &mut c.path_heartbeats),
-                    None => {
-                        #[cfg(test)]
-                        self.role.note(format!(
-                            "{now} path_hb unbound ep{} from {source}",
-                            endpoint.0
-                        ));
-                        self.role.count(|c| &mut c.path_heartbeats_unbound);
-                    }
-                }
+                let _ = self.path_heartbeat(source, &heartbeat);
             }
             Control::Challenge(_) | Control::Solicit(_) | Control::Status(_) | Control::Nak(_) => {
                 let alias = match control {
@@ -6480,11 +6510,15 @@ impl<T: StreamTerms> Intake<'_, T> {
                         seen: now,
                     });
                 }
-                RttmKind::Reply { .. } => self.rttm_reply(source, &rttm),
+                RttmKind::Reply { .. } => {
+                    let _ = self.rttm_reply(source, &rttm);
+                }
                 // A kind a later protocol version decodes: not served.
                 _ => self.role.count(|c| &mut c.unhandled),
             },
-            Control::NakReply(reply) => self.nak_reply(source, &reply),
+            Control::NakReply(reply) => {
+                let _ = self.nak_reply(source, &reply);
+            }
             // A REGISTER names only its stream (design 2.5): it goes to the
             // sender for a stream published on this endpoint, which admits
             // it only for a `control-mode=dynamic` publication (design
@@ -6836,8 +6870,35 @@ impl<T: StreamTerms> Intake<'_, T> {
 
     /// A DATA datagram, through its path's queue when it has one.
     fn deliver(&mut self, source: SocketAddr, alias: Alias, bytes: &[u8]) {
-        if !self.enqueue(source, alias, bytes) {
-            self.data(source, alias, bytes);
+        if !self.enqueue(source, alias, bytes, None) {
+            let _ = self.data(source, alias, bytes);
+        }
+    }
+
+    /// A verified encrypted DATA datagram, `queued` its uncommitted open:
+    /// whether it took effect when delivered now, or `None` when its path's
+    /// queue took it, to be checked, handled and committed as it drains
+    /// ([`Self::enc_queued`]), or dropped it.
+    fn deliver_enc(
+        &mut self,
+        source: SocketAddr,
+        alias: Alias,
+        bytes: &[u8],
+        queued: receive_enc::EncQueued,
+    ) -> Option<bool> {
+        if self.enqueue(source, alias, bytes, Some(queued)) {
+            return None;
+        }
+        Some(self.data(source, alias, bytes))
+    }
+
+    /// A datagram its path's queue held, as the queue drains.
+    fn dequeued(&mut self, entry: &path_intake::Queued, bytes: &[u8]) {
+        match entry.enc {
+            Some(queued) => self.enc_queued(entry.source, entry.alias, bytes, queued),
+            None => {
+                let _ = self.data(entry.source, entry.alias, bytes);
+            }
         }
     }
 
@@ -7378,11 +7439,23 @@ impl<T: StreamTerms> SenderRole<T> {
         bytes: &[u8],
     ) -> Option<(Control, Option<Establishing>)> {
         let now = (self.clock)();
-        self.open_sealed(endpoint, None, bytes, now)
+        let (control, establishing, received) = self.open_sealed(endpoint, None, bytes, now)?;
+        match received {
+            // Committed as an accepting handler would; no source to hand
+            // it to one.
+            Some(received) => self
+                .settle_enc(received, true)
+                .then_some((control, establishing)),
+            None => Some((control, establishing)),
+        }
     }
 
     /// Opens a sealed receiver control from `source` as the duty does
     /// (tests).
+    ///
+    /// A receiver control goes to its handler, as the duty hands it, with
+    /// no socket to answer on, and is committed only if it took effect:
+    /// `None` when verification or its handler refused it.
     #[cfg(test)]
     pub(super) fn open_sealed_from(
         &mut self,
@@ -7391,7 +7464,15 @@ impl<T: StreamTerms> SenderRole<T> {
         bytes: &[u8],
     ) -> Option<(Control, Option<Establishing>)> {
         let now = (self.clock)();
-        self.open_sealed(endpoint, Some(source), bytes, now)
+        let (control, establishing, received) =
+            self.open_sealed(endpoint, Some(source), bytes, now)?;
+        let Some(received) = received else {
+            return Some((control, establishing));
+        };
+        let mut halves: [(EndpointId, Half<karyos_io::sockets::OsSocket>); 0] = [];
+        let accepted = self.receiver_control(&mut halves, (endpoint, source), &control, now, now);
+        self.settle_enc(received, accepted)
+            .then_some((control, establishing))
     }
 
     /// Installs the sealer of a verified establishment, as the answer
@@ -9200,7 +9281,11 @@ impl<T: StreamTerms> SenderRole<T> {
         source: Option<SocketAddr>,
         bytes: &[u8],
         now: u64,
-    ) -> Option<(Control, Option<Establishing>)> {
+    ) -> Option<(
+        Control,
+        Option<Establishing>,
+        Option<publish_enc::EncReceived>,
+    )> {
         // Nothing is opened under a stale or unapplied key view (H8 R3-1).
         if !self
             .key_generation
@@ -9249,9 +9334,9 @@ impl<T: StreamTerms> SenderRole<T> {
             .map(|auth| auth.open(bytes, identity, lane_count));
         match opened {
             Some(Ok(publish_auth::Opened::RspSetup(control, establishing))) => {
-                Some((control, Some(establishing)))
+                Some((control, Some(establishing), None))
             }
-            Some(Ok(publish_auth::Opened::Receiver(control))) => Some((control, None)),
+            Some(Ok(publish_auth::Opened::Receiver(control))) => Some((control, None, None)),
             Some(Ok(publish_auth::Opened::AbortAck(ack))) => {
                 self.count(|c| &mut c.abort_acks);
                 #[cfg(test)]
@@ -9622,7 +9707,18 @@ impl<T: StreamTerms> SenderRole<T> {
                     bytes,
                     seen,
                 } => match self.open_sealed(endpoint, Some(source), bytes.get(), now) {
-                    Some((control, establishing)) => (
+                    // An encrypted receiver control, verified and not yet
+                    // committed: its handler decides, and only an accepted
+                    // one is committed (ADR-0114 sections 8 and 9). The
+                    // role is one thread: nothing else opens between the
+                    // verification, the handler and the commit.
+                    Some((control, _, Some(received))) => {
+                        let accepted =
+                            self.receiver_control(halves, (endpoint, source), &control, seen, now);
+                        let _ = self.settle_enc(received, accepted);
+                        continue;
+                    }
+                    Some((control, establishing, None)) => (
                         ControlItem::Incoming {
                             endpoint,
                             source,
@@ -9691,20 +9787,10 @@ impl<T: StreamTerms> SenderRole<T> {
                 ControlItem::Incoming {
                     endpoint,
                     source,
-                    control: Control::Status(status),
-                    ..
+                    control: control @ (Control::Status(_) | Control::Nak(_) | Control::Rttm(_)),
+                    seen,
                 } => {
-                    // A registrant's first SM finding the slots taken is
-                    // answered with one ERR REGISTRATION (design 3.2).
-                    // Its send failure is counted as the REGISTER's ERR is
-                    // (design 11.2, karyos#977).
-                    if let Some((destination, reply)) = self.status(endpoint, source, &status, now)
-                        && !self
-                            .send_reply(halves, endpoint, destination, &reply)
-                            .submitted()
-                    {
-                        self.count(|c| &mut c.registration_replies_unsent);
-                    }
+                    let _ = self.receiver_control(halves, (endpoint, source), &control, seen, now);
                 }
                 ControlItem::Incoming {
                     endpoint,
@@ -9724,26 +9810,6 @@ impl<T: StreamTerms> SenderRole<T> {
                 ControlItem::Incoming {
                     endpoint,
                     source,
-                    control: Control::Nak(nak),
-                    ..
-                } => self.nak(halves, endpoint, source, &nak, now),
-                ControlItem::Incoming {
-                    endpoint,
-                    source,
-                    control: Control::Rttm(request),
-                    seen,
-                } => {
-                    if let Some(reply) = self.rttm_request(endpoint, source, &request, seen, now)
-                        && self
-                            .send_sender_control(halves, endpoint, source, &Control::Rttm(reply))
-                            .submitted()
-                    {
-                        self.count(|c| &mut c.rttm_replied);
-                    }
-                }
-                ControlItem::Incoming {
-                    endpoint,
-                    source,
                     control,
                     ..
                 } => {
@@ -9755,9 +9821,12 @@ impl<T: StreamTerms> SenderRole<T> {
                         self.count(|c| &mut c.auth_bare);
                         continue;
                     }
-                    if let Some((destination, answer)) =
-                        self.answer_for(endpoint, source, now, control)
-                    {
+                    // A confirmed encrypted binding's resynchronisation
+                    // keeps its runtime binding (H8-36): marked by its open,
+                    // read by `bind`, gone after this answer.
+                    let answered = self.answer_for(endpoint, source, now, control);
+                    self.enc.keep_binding = None;
+                    if let Some((destination, answer)) = answered {
                         match (authenticated, establishing) {
                             (Some(index), Some(establishing)) => {
                                 self.establish(endpoint, &answer, establishing);
@@ -10325,7 +10394,16 @@ impl<T: StreamTerms> SenderRole<T> {
             answer.challenge.receiver_boot_id,
             answer.identity,
         );
+        let keep = self.enc.keep_binding
+            == Some((endpoint, answer.alias, answer.challenge.receiver_boot_id));
         if let Some(held) = self.bindings.iter_mut().find(|held| tuple(held) == wanted) {
+            // A confirmed encrypted binding's section 6b resynchronisation
+            // changes no key and no runtime binding: its receiver id,
+            // joins, consumption and liveness stay (ADR-0114 section 6b
+            // step 4, H8-36).
+            if keep {
+                return;
+            }
             // The same receiver again: its consumption never moves back,
             // and the receiver id it had is remembered for the next SM.
             held.former = held.receiver_id.or(held.former);
@@ -10628,6 +10706,53 @@ impl<T: StreamTerms> SenderRole<T> {
         }
     }
 
+    /// A receiver control (SM, NAK, RTTM REQUEST) from `source` on
+    /// `endpoint`, seen at `seen`, handed to its handler at `now`, which
+    /// answers it as it decides; returns whether it took effect. An
+    /// encrypted one is committed only then (ADR-0114 sections 8 and 9):
+    /// the handler's own refusals are the only ones, with no copy run
+    /// before its sequence is marked.
+    fn receiver_control<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        (endpoint, source): (EndpointId, SocketAddr),
+        control: &Control,
+        seen: u64,
+        now: u64,
+    ) -> bool {
+        match control {
+            Control::Status(status) => {
+                // A registrant's first SM finding the slots taken is
+                // answered with one ERR REGISTRATION (design 3.2). Its send
+                // failure is counted as the REGISTER's ERR is (design 11.2,
+                // karyos#977).
+                let (reply, accepted) = self.status_decided(endpoint, source, status, now);
+                if let Some((destination, reply)) = reply
+                    && !self
+                        .send_reply(halves, endpoint, destination, &reply)
+                        .submitted()
+                {
+                    self.count(|c| &mut c.registration_replies_unsent);
+                }
+                accepted
+            }
+            Control::Nak(nak) => self.nak_decided(halves, endpoint, source, nak, now),
+            Control::Rttm(request) => {
+                let Some(reply) = self.rttm_request(endpoint, source, request, seen, now) else {
+                    return false;
+                };
+                if self
+                    .send_sender_control(halves, endpoint, source, &Control::Rttm(reply))
+                    .submitted()
+                {
+                    self.count(|c| &mut c.rttm_replied);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The REPLY to an RTTM `request` from `source`, seen at `seen` (RC-1):
     /// only for a receiver this sender answered on that endpoint, naming the
     /// publication's incarnation and its receiver id, within
@@ -10684,6 +10809,7 @@ impl<T: StreamTerms> SenderRole<T> {
     /// its source, boot id and incarnation. A step 8 ERR needs the id
     /// ([`Self::reply_nak`]), so one for such a binding is not sent and
     /// counts `nak_replies_unbound`.
+    #[cfg(test)]
     fn nak<O: SocketOps>(
         &mut self,
         halves: &mut [(EndpointId, Half<O>)],
@@ -10692,9 +10818,25 @@ impl<T: StreamTerms> SenderRole<T> {
         nak: &Nak,
         now: u64,
     ) {
+        let _ = self.nak_decided(halves, endpoint, source, nak, now);
+    }
+
+    /// [`Self::nak`], with whether the NAK took effect: absorbed as a copy,
+    /// or queued or answered by its repair path. One refused before that
+    /// (an aborting incarnation, no binding, a spent cycle budget, a drop
+    /// by admission or the job table) is `false`; an encrypted one is then
+    /// not committed (ADR-0114 sections 8 and 9).
+    fn nak_decided<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        endpoint: EndpointId,
+        source: SocketAddr,
+        nak: &Nak,
+        now: u64,
+    ) -> bool {
         #[cfg(test)]
         if self.ignore_naks {
-            return;
+            return false;
         }
         // An aborting or terminal incarnation's repair stops: its NAKs are
         // not served (guards-and-abort.md, Session abort, sender step 2);
@@ -10702,7 +10844,7 @@ impl<T: StreamTerms> SenderRole<T> {
         // backend releases them.
         if self.incarnation_aborting(endpoint, nak.alias) {
             self.count(|c| &mut c.naks_after_abort);
-            return;
+            return false;
         }
         // The held receiver's NAK is answered without the held bytes: the
         // parts before and after them, each as its own NAK (karyos#1067).
@@ -10711,7 +10853,7 @@ impl<T: StreamTerms> SenderRole<T> {
             for part in parts.into_iter().flatten() {
                 self.nak(halves, endpoint, source, &part, now);
             }
-            return;
+            return true;
         }
         #[cfg(test)]
         if self.ignore_naks_of.is_some() && self.nak_log.len() < 64 {
@@ -10739,7 +10881,7 @@ impl<T: StreamTerms> SenderRole<T> {
         });
         let (true, Some(index)) = (bound, index) else {
             self.count(|c| &mut c.nak_unbound);
-            return;
+            return false;
         };
         // Absorption keys on the receiver id, so only one the binding has
         // validated takes part: a copy that fails validation never absorbs
@@ -10753,16 +10895,16 @@ impl<T: StreamTerms> SenderRole<T> {
                 && binding.receiver_id == Some(nak.receiver.receiver_id)
         });
         let Some(outbound) = self.publications.get_mut(index) else {
-            return;
+            return false;
         };
         let route = outbound.route_of(endpoint);
         if validated && outbound.absorbs(nak, route, now) {
             self.count(|c| &mut c.nak_copies_absorbed);
-            return;
+            return true;
         }
         if self.naks_this_cycle >= self.repair.naks_per_cycle {
             self.count(|c| &mut c.nak_cycle_budget);
-            return;
+            return false;
         }
         // Counted against the cycle once it reaches admission; below
         // `naks_per_cycle`, a u32, so it cannot overflow.
@@ -10772,7 +10914,7 @@ impl<T: StreamTerms> SenderRole<T> {
             .unwrap_or(self.naks_this_cycle);
         self.count(|c| &mut c.naks);
         let Some(outbound) = self.publications.get_mut(index) else {
-            return;
+            return false;
         };
         let requester = outbound
             .membership_mut()
@@ -10787,6 +10929,7 @@ impl<T: StreamTerms> SenderRole<T> {
         {
             self.count(|c| &mut c.nak_replies);
         }
+        !matches!(intake, NakIntake::Dropped)
     }
 
     /// The cycle's repairs (R7): the publications in turn from a cursor
@@ -10937,7 +11080,9 @@ impl<T: StreamTerms> SenderRole<T> {
     /// accepted only from a receiver this sender answered there, with the
     /// answered identity, the publication's lane count and, after the first,
     /// the same receiver id. The first accepted SM establishes the
-    /// publication: its SETUP stops.
+    /// publication: its SETUP stops. Returns what to answer
+    /// ([`Self::status_decided`]).
+    #[cfg(test)]
     fn status(
         &mut self,
         endpoint: EndpointId,
@@ -10945,6 +11090,21 @@ impl<T: StreamTerms> SenderRole<T> {
         status: &StatusMessage,
         now: u64,
     ) -> Option<(SocketAddr, Control)> {
+        self.status_decided(endpoint, source, status, now).0
+    }
+
+    /// [`Self::status`], with whether the SM took effect: accepted (its
+    /// binding, lanes, session and membership updated) or a registrant's
+    /// refusal that removed its binding. An SM refused with nothing changed
+    /// is `false`; an encrypted one is then not committed (ADR-0114
+    /// sections 8 and 9).
+    fn status_decided(
+        &mut self,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        status: &StatusMessage,
+        now: u64,
+    ) -> (Option<(SocketAddr, Control)>, bool) {
         self.expire_bindings(now);
         let source = normalized(source);
         let publication = self
@@ -10964,7 +11124,7 @@ impl<T: StreamTerms> SenderRole<T> {
             });
         if !tag_ok {
             self.count(|c| &mut c.sm_tag_mismatch);
-            return None;
+            return (None, false);
         }
         // A removed destination's SMs are ignored: it rejoins nothing
         // (karyos#630). A dynamic publication's registrant is no
@@ -10973,11 +11133,13 @@ impl<T: StreamTerms> SenderRole<T> {
         let dynamic = publication.is_some_and(|outbound| outbound.registration().is_some());
         if stranger && !dynamic {
             self.count(|c| &mut c.sm_unbound);
-            return None;
+            return (None, false);
         }
         // The incarnation is part of the binding: an earlier incarnation's
         // row from the same receiver never shadows the current one.
-        let found = self.sm_binding(endpoint, source, status)?;
+        let Some(found) = self.sm_binding(endpoint, source, status) else {
+            return (None, false);
+        };
         // The SM is checked against its binding (an adoption has no
         // receiver id yet) before it sets a source or adopts anything.
         let receiver_id = match found {
@@ -10991,7 +11153,7 @@ impl<T: StreamTerms> SenderRole<T> {
             && receiver_id.is_none_or(|id| id == status.receiver.receiver_id);
         if !matches {
             self.count(|c| &mut c.sm_mismatch);
-            return None;
+            return (None, false);
         }
         // Only the registrant this sender answered, at the source it
         // registered from, with no SM since its last ANSWER: a stranger
@@ -11012,7 +11174,7 @@ impl<T: StreamTerms> SenderRole<T> {
         };
         if stranger && registrant.is_none() {
             self.count(|c| &mut c.sm_unbound);
-            return None;
+            return (None, false);
         }
         // On a dynamic publication a binding learns its SM source only
         // from the source it was answered at, and adopts none: a
@@ -11032,7 +11194,7 @@ impl<T: StreamTerms> SenderRole<T> {
         };
         if dynamic && elsewhere {
             self.count(|c| &mut c.sm_unbound);
-            return None;
+            return (None, false);
         }
         // A dynamic publication's new membership settles what it replaces
         // (design 3.2 step 4); the bindings may move, so it is found again.
@@ -11041,17 +11203,20 @@ impl<T: StreamTerms> SenderRole<T> {
                 if let Some(refusal) =
                     self.settle_registrant(endpoint, source, status, index, stranger, now)
                 {
-                    return refusal;
+                    return (refusal, true);
                 }
-                self.sm_binding(endpoint, source, status)?
+                match self.sm_binding(endpoint, source, status) {
+                    Some(found) => found,
+                    None => return (None, true),
+                }
             }
             None => found,
         };
         // The membership decides before the binding moves (H8-28): an SM it
-        // rejects (credit, window, lifecycle, capacity) refreshes no
-        // liveness, lane state or session; it is counted there. One of
-        // another incarnation (`Identity`, a membership not yet made again
-        // after a redraw) judges nothing, as before.
+        // rejects (credit, window, lifecycle, capacity, another
+        // incarnation) refreshes no liveness, lane state or session; it is
+        // counted there. A redraw takes the membership to the new
+        // incarnation first, so none is exempt (H8-32).
         let key = SmKey {
             endpoint,
             alias: status.alias,
@@ -11064,13 +11229,10 @@ impl<T: StreamTerms> SenderRole<T> {
             .iter_mut()
             .find(|outbound| outbound.serves(endpoint) && outbound.alias() == status.alias)
             .and_then(|outbound| outbound.membership_mut())
-            && matches!(
-                membership.would_accept(&key, status, now),
-                Err(reason) if reason != crate::membership::StatusRejected::Identity
-            )
+            && membership.would_accept(&key, status, now).is_err()
         {
             let _ = membership.status(&key, status, now);
-            return None;
+            return (None, false);
         }
         let index = match found {
             SmBinding::Bound(index) => index,
@@ -11080,9 +11242,14 @@ impl<T: StreamTerms> SenderRole<T> {
                 }
                 index
             }
-            SmBinding::Adopt(parent) => self.adopt(parent, source, now)?,
+            SmBinding::Adopt(parent) => match self.adopt(parent, source, now) {
+                Some(index) => index,
+                None => return (None, false),
+            },
         };
-        let binding = self.bindings.get_mut(index)?;
+        let Some(binding) = self.bindings.get_mut(index) else {
+            return (None, false);
+        };
         // A reset binding whose next SM names another receiver: the former
         // one's membership ends first (ACS 15648).
         let gone = match (binding.receiver_id, binding.former.take()) {
@@ -11134,7 +11301,7 @@ impl<T: StreamTerms> SenderRole<T> {
         {
             let _ = membership.status(&key, status, now);
         }
-        None
+        (None, true)
     }
 
     /// The first valid SM of the registrant answered through the binding at
@@ -11690,6 +11857,18 @@ impl<T: StreamTerms> SenderRole<T> {
     /// one).
     fn adopt(&mut self, parent: usize, source: SocketAddr, now: u64) -> Option<usize> {
         let parent = *self.bindings.get(parent)?;
+        // An eviction that would take the parent itself adopts nothing:
+        // decided before anything is evicted, so a refused SM changes no
+        // binding (ADR-0114 sections 8 and 9).
+        if let Room::Evict(index) = self.room_for(parent.endpoint, parent.alias, None)
+            && self
+                .bindings
+                .get(index)
+                .is_some_and(|evicted| evicted.id == parent.id)
+        {
+            self.count(|c| &mut c.sm_unbound);
+            return None;
+        }
         // An adoption is of a static publication only, and names no
         // registered receiver: the reservation applies as to any other.
         if !self.make_room(parent.endpoint, parent.alias, None, now) {

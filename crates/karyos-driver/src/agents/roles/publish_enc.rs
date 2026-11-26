@@ -33,7 +33,8 @@ use crate::embedded::StreamTerms;
 use crate::wire_enc::vm_generation;
 use crate::wire_enc::{
     ChannelKeys, EncChannel, EncKeyError, EncOpener, EncRejections, EncSealer, PairwiseFiles,
-    RetiredBoots, VmGenerationWatch, header, id128, open_bootstrap_in, publication_of, quiesced,
+    Pending, RetiredBoots, VmGenerationWatch, header, id128, open_bootstrap_in, publication_of,
+    quiesced,
 };
 use crate::wire_keys::KeyFile;
 use karyos_io::sockets::ops::SocketOps;
@@ -74,6 +75,10 @@ pub(crate) struct EncEstablishing {
     /// Whether it is a new binding; the bound one's answer is resent and
     /// neither re-derives a key nor resets a window (section 7).
     pub(crate) bind: bool,
+    /// Whether it is the section 6b resynchronisation of a confirmed
+    /// binding: answered with no key change, its runtime binding keeps its
+    /// receiver id, consumption and liveness (H8-36).
+    pub(crate) resync: bool,
 }
 
 /// A control that verified.
@@ -241,8 +246,9 @@ impl PublicationEnc {
     }
 
     /// Opens `datagram`, an envelope for this publication, into `out`
-    /// before any inner frame is read, and returns its control. The
-    /// reason of a refusal is counted and nothing else changes.
+    /// before any inner frame is read, and returns its control, committed
+    /// at once as an accepting handler would (tests). The reason of a
+    /// refusal is counted and nothing else changes.
     ///
     /// # Errors
     ///
@@ -253,36 +259,24 @@ impl PublicationEnc {
         datagram: &[u8],
         out: &mut [u8; MAX_PLAINTEXT],
     ) -> Result<EncOpened, EncRejection> {
-        self.open_checked(datagram, out, &|_| true)
-    }
-
-    /// Opens as [`Self::open`], with `admit` the publication-specific
-    /// checks of a receiver control (domain 4) that change nothing: they
-    /// run inside the open, before its sequence is marked and before any
-    /// epoch is promoted, so a control they refuse moves no replay or
-    /// epoch state (sections 8 and 9, H8-15).
-    ///
-    /// # Errors
-    ///
-    /// The [`EncRejection`].
-    #[cfg(test)]
-    pub(crate) fn open_checked(
-        &mut self,
-        datagram: &[u8],
-        out: &mut [u8; MAX_PLAINTEXT],
-        admit: &dyn Fn(&Control) -> bool,
-    ) -> Result<EncOpened, EncRejection> {
-        let (opened, staged) = self.open_staged(datagram, out, admit)?;
+        let (opened, staged, pending) = self.open_staged(datagram, out)?;
         if let Some(staged) = staged {
             self.commit(staged)?;
+        }
+        if let Some(pending) = pending {
+            self.commit_receiver(pending)?;
         }
         Ok(opened)
     }
 
-    /// Opens as [`Self::open_checked`], but a new binding is only staged:
-    /// nothing of it is the publication's until [`Self::commit`], which
-    /// the caller runs once the answer and the runtime binding are
-    /// admitted (H8-25).
+    /// Opens `datagram` as [`Self::open`], committing nothing: a new
+    /// binding is only staged, nothing of it the publication's until
+    /// [`Self::commit`], which the caller runs once the answer and the
+    /// runtime binding are admitted (H8-25); a receiver control (domain 4)
+    /// is only verified, its [`Pending`] committed by
+    /// [`Self::commit_receiver`] once its handler accepted it (sections 8
+    /// and 9): a control its handler refuses marks no sequence and
+    /// promotes no epoch.
     ///
     /// # Errors
     ///
@@ -291,11 +285,38 @@ impl PublicationEnc {
         &mut self,
         datagram: &[u8],
         out: &mut [u8; MAX_PLAINTEXT],
-        admit: &dyn Fn(&Control) -> bool,
-    ) -> Result<(EncOpened, Option<Staged>), EncRejection> {
-        let result = self.open_uncounted(datagram, out, admit);
+    ) -> Result<(EncOpened, Option<Staged>, Option<Pending>), EncRejection> {
+        let result = self.open_uncounted(datagram, out);
         if let Err(reason) = &result {
             self.channel.rejections.bump(*reason);
+        }
+        result
+    }
+
+    /// Commits a receiver control its handler accepted (section 8 steps 8
+    /// and 9): its sequence is marked and a next epoch promoted, and the
+    /// binding is confirmed, the receiver holding its keys. A refusal is
+    /// counted and changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// The [`EncRejection`] of [`EncOpener::commit`], or
+    /// [`EncRejection::Party`] with no binding.
+    pub(crate) fn commit_receiver(&mut self, pending: Pending) -> Result<(), EncRejection> {
+        let now = (self.clock)();
+        let result = self
+            .bound
+            .as_mut()
+            .ok_or(EncRejection::Party)
+            .and_then(|bound| {
+                bound.opener.commit(pending, now)?;
+                // Opened under its keys and accepted: the receiver took
+                // this binding's answer.
+                bound.confirmed = true;
+                Ok(())
+            });
+        if let Err(reason) = result {
+            self.channel.rejections.bump(reason);
         }
         result
     }
@@ -325,8 +346,7 @@ impl PublicationEnc {
         &mut self,
         datagram: &[u8],
         out: &mut [u8; MAX_PLAINTEXT],
-        admit: &dyn Fn(&Control) -> bool,
-    ) -> Result<(EncOpened, Option<Staged>), EncRejection> {
+    ) -> Result<(EncOpened, Option<Staged>, Option<Pending>), EncRejection> {
         // Section 10: nothing is opened after a VM generation change.
         if quiesced() {
             return Err(EncRejection::VmGeneration);
@@ -336,10 +356,12 @@ impl PublicationEnc {
             return Err(EncRejection::Binding);
         }
         match head.domain {
-            Domain::RspSetup => self.rsp_setup(datagram, out),
+            Domain::RspSetup => self
+                .rsp_setup(datagram, out)
+                .map(|(opened, staged)| (opened, staged, None)),
             Domain::Receiver => self
-                .receiver(datagram, out, head.receiver, admit)
-                .map(|opened| (opened, None)),
+                .receiver(datagram, out, head.receiver)
+                .map(|(control, pending)| (EncOpened::Receiver(control), None, Some(pending))),
             Domain::Sender | Domain::Setup => Err(EncRejection::Domain),
         }
     }
@@ -395,37 +417,71 @@ impl PublicationEnc {
         let nonce = id128(challenge.nonce);
         let mut superseded = [None; MAX_RECHALLENGES];
         if let Some(bound) = &self.bound {
-            // The bound boot's fresh challenge re-keys its binding only
-            // while the receiver never confirmed it: its answer was lost,
-            // so the receiver, unbound, takes the salt of the nonce it is
-            // answered with (sections 4 and 7). A confirmed binding keeps
-            // its salt (section 6b), and the bound nonce re-derives
-            // nothing; neither is staged.
-            let rekey = bound.receiver == receiver && !bound.confirmed && bound.nonce != nonce;
-            if rekey {
-                // No earlier nonce of this boot binds again: its domain 1
-                // key may have sealed under a sequence restarted at 0.
-                if bound.superseded.contains(&Some(nonce)) {
-                    return Err(EncRejection::RetiredBoot);
-                }
-                superseded = bound.superseded;
-                let free = superseded
-                    .iter_mut()
-                    .find(|held| held.is_none())
-                    .ok_or(EncRejection::RetiredBoot)?;
-                *free = Some(bound.nonce);
-            } else if bound.receiver == receiver {
-                return Ok((
+            let same = bound.receiver == receiver;
+            // No earlier nonce of this boot binds or is answered again,
+            // whatever the binding's state (H8-36): its domain 1 key may
+            // have sealed under a sequence restarted at 0, and a replayed
+            // challenge changes nothing.
+            if same && bound.superseded.contains(&Some(nonce)) {
+                return Err(EncRejection::RetiredBoot);
+            }
+            let answer = |resync| {
+                Ok((
                     EncOpened::RspSetup(
                         control,
                         EncEstablishing {
                             receiver,
                             nonce: bound.nonce,
                             bind: false,
+                            resync,
                         },
                     ),
                     None,
-                ));
+                ))
+            };
+            if same && bound.nonce == nonce {
+                // The bound challenge: before confirmation its answer was
+                // lost and the receiver, still challenging, gets it again,
+                // which re-derives nothing. Once a control opened under the
+                // binding the receiver installed it and never sends that
+                // challenge again: a copy is a replay, refused, and changes
+                // no key, binding or runtime state (H8-36).
+                if bound.confirmed {
+                    return Err(EncRejection::Duplicate);
+                }
+                return answer(false);
+            }
+            if same && bound.confirmed {
+                // A confirmed binding keeps its salt (section 6b step 2):
+                // the resynchronisation answer changes no key.
+                return answer(matches!(control, Control::Solicit(_)));
+            }
+            if same && !matches!(control, Control::Challenge(_)) {
+                // Before confirmation a fresh SOLICIT of the bound boot may
+                // be the section 6b resynchronisation of a receiver that
+                // installed the bound nonce (its first control delayed or
+                // lost): it keeps its salt, so a re-key here would split
+                // the two (H8-31), while answering it unchanged would split
+                // an unbound one, which takes the nonce it is answered
+                // with. Neither is answered; nothing changes. A receiver
+                // that lost its answer is unbound and establishes through
+                // the ANNOUNCE's CHALLENGE below, which an installed one
+                // never sends (it drops its bound identity's ANNOUNCE); an
+                // installed one resynchronises once its first SM confirms
+                // the binding.
+                return Err(EncRejection::ResyncRefused);
+            }
+            if same {
+                // The bound boot's fresh CHALLENGE before confirmation: its
+                // answer was lost, so the receiver, unbound, takes the salt
+                // of the nonce it is answered with (sections 4 and 7). The
+                // binding is re-keyed to it, staged.
+                superseded = bound.superseded;
+                let free = superseded
+                    .iter_mut()
+                    .find(|held| held.is_none())
+                    .ok_or(EncRejection::RetiredBoot)?;
+                *free = Some(bound.nonce);
             } else if bound.receiver.receiver_id != receiver.receiver_id {
                 // One receiver per publication (unicast).
                 return Err(EncRejection::Party);
@@ -445,6 +501,7 @@ impl PublicationEnc {
                     receiver,
                     nonce,
                     bind: true,
+                    resync: false,
                 },
             ),
             Some(Staged(Bound {
@@ -457,13 +514,17 @@ impl PublicationEnc {
         ))
     }
 
+    /// A domain 4 control of the bound receiver, verified and not
+    /// committed: its frame must name this binding (alias, boot id and
+    /// receiver id) and be one of its receiver controls; whether it takes
+    /// effect is its handler's decision, and only then is it committed
+    /// ([`Self::commit_receiver`]).
     fn receiver(
         &mut self,
         datagram: &[u8],
         out: &mut [u8; MAX_PLAINTEXT],
         party: Option<ReceiverIdentity>,
-        admit: &dyn Fn(&Control) -> bool,
-    ) -> Result<EncOpened, EncRejection> {
+    ) -> Result<(Control, Pending), EncRejection> {
         let now = (self.clock)();
         let party = party.ok_or(EncRejection::Party)?;
         if self.retired.contains(&party) {
@@ -475,29 +536,30 @@ impl PublicationEnc {
             return Err(EncRejection::Party);
         };
         let mut found = None;
-        bound
-            .opener
-            .open(datagram, out, &mut self.channel.rate, now, |frames| {
-                found = match classify(frames) {
-                    Ok(Datagram::Control(control))
-                        if receiver_control_alias(&control) == Some(alias)
-                            && !matches!(control, Control::Challenge(_) | Control::Solicit(_))
-                            && control_receiver(&control).is_some_and(|receiver| {
-                                id128(receiver.receiver_boot_id) == party.receiver_boot_id
-                                    && receiver.receiver_id == party.receiver_id
-                            })
-                            && admit(&control) =>
-                    {
-                        Some(control)
-                    }
-                    _ => None,
-                };
-                found.map(|_| ()).ok_or(EncRejection::InnerRejected)
-            })?;
-        // Opened under its keys: the receiver took this binding's answer.
-        bound.confirmed = true;
+        let pending =
+            bound
+                .opener
+                .verify(datagram, out, &mut self.channel.rate, now, |frames| {
+                    found = match classify(frames) {
+                        Ok(Datagram::Control(control))
+                            if receiver_control_alias(&control) == Some(alias)
+                                && !matches!(
+                                    control,
+                                    Control::Challenge(_) | Control::Solicit(_)
+                                )
+                                && control_receiver(&control).is_some_and(|receiver| {
+                                    id128(receiver.receiver_boot_id) == party.receiver_boot_id
+                                        && receiver.receiver_id == party.receiver_id
+                                }) =>
+                        {
+                            Some(control)
+                        }
+                        _ => None,
+                    };
+                    found.map(|_| ()).ok_or(EncRejection::InnerRejected)
+                })?;
         found
-            .map(EncOpened::Receiver)
+            .map(|control| (control, pending))
             .ok_or(EncRejection::InnerRejected)
     }
 
@@ -649,6 +711,21 @@ pub(crate) struct SenderEnc {
     /// Per channel key id, the highest file epoch seen to sign this boot:
     /// a publication made again starts at it (H8-17).
     activation: crate::wire_enc::ActivationFloors,
+    /// The confirmed binding whose section 6b resynchronisation is being
+    /// answered: publication and boot id. Its runtime binding is kept as
+    /// it is, receiver id, consumption and liveness included (H8-36). Set
+    /// by the open of that SOLICIT, taken by its answer.
+    pub(super) keep_binding: Option<(EndpointId, Alias, [u64; 2])>,
+}
+
+/// A receiver control verified under its publication's domain 4 keys and
+/// not yet committed: its handler decides, then
+/// [`SenderRole::settle_enc`] commits it if it accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct EncReceived {
+    endpoint: EndpointId,
+    alias: Alias,
+    pending: Pending,
 }
 
 impl SenderEnc {
@@ -831,6 +908,10 @@ impl<T: StreamTerms> SenderRole<T> {
                 .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
             {
                 outbound.set_repair_identity(identity);
+                // Its membership judges the new incarnation's SMs (H8-32).
+                if let Some(membership) = outbound.membership_mut() {
+                    membership.reidentify(identity);
+                }
             }
         }
     }
@@ -870,6 +951,10 @@ impl<T: StreamTerms> SenderRole<T> {
                 .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
             {
                 outbound.set_repair_identity(identity);
+                // Its membership judges the new incarnation's SMs (H8-32).
+                if let Some(membership) = outbound.membership_mut() {
+                    membership.reidentify(identity);
+                }
             }
         }
         true
@@ -916,23 +1001,30 @@ impl<T: StreamTerms> SenderRole<T> {
     /// one establishment owns it, and nothing of the previous binding's
     /// key survives.
     ///
-    /// `source` is the datagram's source: with the publication's lane
-    /// count, tag and destinations it is checked inside the open, before
-    /// anything is marked (H8-15). `None` (tests only) skips the source.
+    /// A receiver control (SM, NAK, RTTM REQUEST) comes back verified and
+    /// uncommitted, with its [`EncReceived`]: the caller hands it to its
+    /// handler and commits it ([`SenderRole::settle_enc`]) only if the
+    /// handler accepted it, so a control any handler refuses marks no
+    /// sequence and promotes no epoch, with no copy of the handler's
+    /// checks here (sections 8 and 9).
     ///
-    /// Admit, then commit (H8-24, H8-25): a NAK is admitted only if its
-    /// handler would queue or answer it at `now`; a new binding's
-    /// CHALLENGE or SOLICIT only if its ANSWER would go (route, session,
-    /// answer rate) and its runtime binding would be kept. Only then is
-    /// the old boot retired, the domain 4 opener bound and the domain 1
-    /// sealer installed; a refused one changes none of them.
+    /// Admit, then commit (H8-25): a new binding's CHALLENGE or SOLICIT
+    /// is admitted only if its ANSWER would go (route, session, answer
+    /// rate) and its runtime binding would be kept, which reserves its
+    /// capacity before anything is bound. Only then is the old boot
+    /// retired, the domain 4 opener bound and the domain 1 sealer
+    /// installed; a refused one changes none of them. `source` is the
+    /// datagram's source; `None` (tests only) skips that admission.
     pub(super) fn open_enc(
         &mut self,
         endpoint: EndpointId,
         source: Option<SocketAddr>,
         bytes: &[u8],
         now: u64,
-    ) -> Option<(Control, Option<Establishing>)> {
+    ) -> Option<(Control, Option<Establishing>, Option<EncReceived>)> {
+        // Only the RSP_SETUP of this open may mark its runtime binding as
+        // kept (H8-36).
+        self.enc.keep_binding = None;
         let alias = header(bytes).map(|head| Alias {
             session_id: head.session_id,
             stream_id: head.stream_id,
@@ -944,19 +1036,6 @@ impl<T: StreamTerms> SenderRole<T> {
                 return None;
             }
         };
-        // What `adopt` would find for one more binding (H8-15): taken
-        // before the open, which changes no binding.
-        let room = self.room_for(endpoint, alias, None);
-        // The NAK handler's own refusals before admission, read once: an
-        // aborting incarnation and a spent cycle budget (H8-24).
-        let naks = !self.incarnation_aborting(endpoint, alias)
-            && self.naks_this_cycle < self.repair.naks_per_cycle;
-        // The RTTM REQUEST handler's reply rate and source table at `now`,
-        // charging nothing (H8-29).
-        let replies = source.is_none_or(|source| {
-            self.replies
-                .would_admit(crate::sessions::rate::normalized(source), now)
-        });
         let Some(at) =
             self.enc.publications.iter().position(|publication| {
                 publication.endpoint == endpoint && publication.alias == alias
@@ -966,27 +1045,21 @@ impl<T: StreamTerms> SenderRole<T> {
             return None;
         };
         let publication = self.enc.publications.get_mut(at)?;
-        let outbound = self
-            .publications
-            .iter()
-            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
-            .map(|outbound| &**outbound);
-        let (identity, bindings) = (publication.identity, &self.bindings);
-        let admit = |control: &Control| {
-            receiver_control_admissible(
-                outbound,
-                source,
-                identity,
-                bindings,
-                (room, naks, replies, now),
-                endpoint,
-                control,
-            )
-        };
         let mut out = [0_u8; MAX_PLAINTEXT];
-        match publication.open_staged(bytes, &mut out, &admit) {
-            Ok((EncOpened::Receiver(control), _)) => Some((control, None)),
-            Ok((EncOpened::RspSetup(control, establishing), staged)) => {
+        match publication.open_staged(bytes, &mut out) {
+            Ok((EncOpened::Receiver(control), _, pending)) => {
+                let pending = pending?;
+                Some((
+                    control,
+                    None,
+                    Some(EncReceived {
+                        endpoint,
+                        alias,
+                        pending,
+                    }),
+                ))
+            }
+            Ok((EncOpened::RspSetup(control, establishing), staged, _)) => {
                 // Admit the ANSWER and its runtime binding, of a bound
                 // receiver too (H8-25): one with no room is not answered.
                 let answered = source
@@ -1025,10 +1098,40 @@ impl<T: StreamTerms> SenderRole<T> {
                         outbound.set_key_fence(fence);
                     }
                 }
-                Some((control, None))
+                if establishing.resync {
+                    self.enc.keep_binding = Some((
+                        endpoint,
+                        alias,
+                        match control {
+                            Control::Solicit(solicit) => solicit.challenge.receiver_boot_id,
+                            _ => return None,
+                        },
+                    ));
+                }
+                Some((control, None, None))
             }
             Err(_) => None,
         }
+    }
+
+    /// Settles the receiver control `received` once its handler decided:
+    /// committed if it `accepted` it ([`PublicationEnc::commit_receiver`]),
+    /// else counted as refused (`enc_inner_rejected`) with nothing marked
+    /// or promoted. Whether it committed.
+    pub(super) fn settle_enc(&mut self, received: EncReceived, accepted: bool) -> bool {
+        let Some(publication) = self.enc.publications.iter_mut().find(|publication| {
+            publication.endpoint == received.endpoint && publication.alias == received.alias
+        }) else {
+            return false;
+        };
+        if !accepted {
+            publication
+                .channel
+                .rejections
+                .bump(EncRejection::InnerRejected);
+            return false;
+        }
+        publication.commit_receiver(received.pending).is_ok()
     }
 
     /// Whether [`SenderRole::answer_for`] would answer the domain 6
@@ -1174,160 +1277,6 @@ impl<T: StreamTerms> SenderRole<T> {
 }
 
 /// The receiver block a receiver control names.
-/// The checks of a receiver control that depend on its publication and
-/// change nothing, as [`SenderRole::status`] makes them for an SM: the
-/// publication's lane count, the receiver's configured tag and, from
-/// `source`, a destination of the publication (or a dynamic one's
-/// registrant), and the publication's incarnation `identity`. A NAK
-/// or RTTM REQUEST needs, as [`SenderRole::nak`] and the RTTM reply do, a
-/// binding on `endpoint` of its source, boot id, incarnation and receiver
-/// id (any while unconfirmed), and a NAK a repairing publication, `naks`
-/// (its incarnation not aborting, the cycle's NAK budget not spent) and
-/// an outcome of its repair admission and job table at `now` other than
-/// a drop ([`crate::agents::data::Outbound::nak_admissible`], H8-24); an
-/// RTTM REQUEST `replies` (its reply rate and source table admit it,
-/// H8-29) (an RTTM REPLY is refused). An SM needs,
-/// as [`SenderRole::status`] finds it (`sm_binding`), a runtime binding
-/// of its receiver: one of its SM source, else one with none yet, either
-/// naming its receiver id or none, else an ANSWER-created one with room
-/// for an adoption, as `adopt` decides it from `room` (H8-15: an expired
-/// binding leaves the encrypted context bound; a full table, or one whose
-/// eviction takes the parent, adopts nothing), and the publication's
-/// membership to accept it ([`crate::membership::Membership::would_accept`],
-/// H8-28: credit, window and lifecycle). Run inside the domain 4
-/// open, before the sequence is marked or an epoch promoted; a refused
-/// control changes no state. Any other control is refused: none is a
-/// receiver's domain 4 control.
-fn receiver_control_admissible<T: StreamTerms>(
-    outbound: Option<&crate::agents::data::Outbound<T>>,
-    source: Option<SocketAddr>,
-    identity: Identity,
-    bindings: &[super::ReceiverBinding],
-    (room, naks, replies, now): (super::Room, bool, bool, u64),
-    endpoint: EndpointId,
-    control: &Control,
-) -> bool {
-    let Some(outbound) = outbound else {
-        return false;
-    };
-    let bound = |alias: Alias, named: Identity, receiver: Receiver| {
-        named == identity
-            && bindings.iter().any(|binding| {
-                binding.endpoint == endpoint
-                    && binding.alias == alias
-                    && source.is_none_or(|source| {
-                        binding.source() == crate::sessions::rate::normalized(source)
-                    })
-                    && binding.boot_id == receiver.receiver_boot_id
-                    && binding.identity == named
-                    && binding
-                        .receiver_id
-                        .is_none_or(|id| id == receiver.receiver_id)
-            })
-    };
-    let status = match control {
-        Control::Status(status) => status,
-        Control::Nak(nak) => {
-            return naks
-                && outbound.repairs()
-                && bound(nak.alias, nak.identity, nak.receiver)
-                && outbound.nak_admissible(
-                    source.map(crate::sessions::rate::normalized),
-                    nak,
-                    now,
-                );
-        }
-        Control::Rttm(rttm) => {
-            return matches!(rttm.kind, karyos_protocol::network::RttmKind::Request)
-                && replies
-                && bound(rttm.alias, rttm.identity, rttm.receiver);
-        }
-        _ => return false,
-    };
-    if status.identity != identity || !sm_bound(bindings, room, endpoint, source, status) {
-        return false;
-    }
-    let lanes = u8::try_from(outbound.readers().len()).ok() == Some(status.lanes.count());
-    let tag = outbound.membership().is_none_or(|membership| {
-        membership.configured_tag(status.receiver.receiver_id) == status.group_tag
-            && source.is_none_or(|source| {
-                let key = crate::membership::SmKey {
-                    endpoint,
-                    alias: status.alias,
-                    source: crate::sessions::rate::normalized(source),
-                    identity: status.identity,
-                    receiver: status.receiver,
-                };
-                // A membership of another incarnation (`Identity`) does not
-                // judge this one's SM, as `status` lets it through.
-                !matches!(
-                    membership.would_accept(&key, status, now),
-                    Err(reason) if reason != crate::membership::StatusRejected::Identity
-                )
-            })
-    });
-    let eligible = source.is_none_or(|source| {
-        outbound.sends_to(crate::sessions::rate::normalized(source))
-            || outbound.registration().is_some()
-    });
-    lanes && tag && eligible
-}
-
-/// Whether an SM from `source` has a runtime binding to go to, as
-/// `SenderRole::sm_binding` decides, changing nothing; its receiver id
-/// matches, as [`SenderRole::status`] then requires. `None` (tests only)
-/// takes any binding of the receiver. An adoption needs, as
-/// `SenderRole::adopt` does, `room` ([`SenderRole::room_for`] of one more
-/// binding) free, or an eviction that keeps its parent.
-fn sm_bound(
-    bindings: &[super::ReceiverBinding],
-    room: super::Room,
-    endpoint: EndpointId,
-    source: Option<SocketAddr>,
-    status: &karyos_protocol::network::StatusMessage,
-) -> bool {
-    let source = source.map(crate::sessions::rate::normalized);
-    let receiver = |binding: &&super::ReceiverBinding| {
-        binding.endpoint == endpoint
-            && binding.alias == status.alias
-            && binding.boot_id == status.receiver.receiver_boot_id
-            && binding.identity == status.identity
-    };
-    let held = bindings
-        .iter()
-        .filter(receiver)
-        .find(|binding| source.is_none_or(|source| binding.sm_source == Some(source)))
-        .or_else(|| {
-            bindings
-                .iter()
-                .filter(receiver)
-                .find(|binding| binding.sm_source.is_none())
-        });
-    if let Some(binding) = held {
-        return binding
-            .receiver_id
-            .is_none_or(|id| id == status.receiver.receiver_id);
-    }
-    let Some(at) = bindings
-        .iter()
-        .position(|binding| receiver(&binding) && binding.parent.is_none())
-    else {
-        return false;
-    };
-    let fits = match room {
-        super::Room::Free => true,
-        super::Room::Evict(evicted) => evicted != at,
-        super::Room::Reserved | super::Room::Full => false,
-    };
-    fits && bindings.get(at).is_some_and(|parent| {
-        bindings
-            .iter()
-            .filter(|binding| binding.parent.is_some() && binding.parent == Some(parent.id))
-            .count()
-            < super::MAX_ADOPTIONS
-    })
-}
-
 fn control_receiver(control: &Control) -> Option<Receiver> {
     match control {
         Control::Status(status) => Some(status.receiver),

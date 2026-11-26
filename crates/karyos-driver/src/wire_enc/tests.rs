@@ -1830,3 +1830,50 @@ fn a_full_activation_table_binds_nothing_for_an_untracked_key_id() {
         "tracked, with no epoch seen to sign yet"
     );
 }
+
+/// The order of sections 8 and 9 inverted onto the handler: `verify`
+/// marks nothing and promotes nothing, so a datagram its handler refuses
+/// verifies again unchanged; only `commit`, run once the handler accepted
+/// it, marks and promotes. A token commits once, only in the opener that
+/// verified it, and not after a withdrawal.
+#[test]
+fn a_verified_datagram_marks_and_promotes_only_once_committed() {
+    let mut ours = opener();
+    let mut sealer = sender();
+    let mut rate = OpenRate::default();
+    let mut out = [0_u8; MAX_PLAINTEXT];
+    let now = clock();
+    let mut verify = |opener: &mut EncOpener, bytes: &[u8]| {
+        opener.verify(bytes, &mut out, &mut rate, now, |_| Ok(()))
+    };
+    let first = seal(&mut sealer, &frame(DATA));
+    let pending = verify(&mut ours, &first).unwrap();
+    assert_eq!(ours.current_window().highest(), None, "not marked");
+    let copy = verify(&mut ours, &first).unwrap();
+    assert_eq!(copy, pending, "uncommitted, it verifies again");
+    assert_eq!(ours.check(&pending, now), Ok(()));
+    assert_eq!(ours.commit(pending, now).map(|a| a.promoted), Ok(false));
+    assert_eq!(ours.current_window().highest(), Some(0));
+    assert_eq!(ours.commit(copy, now), Err(EncRejection::Duplicate), "once");
+    assert_eq!(ours.check(&copy, now), Err(EncRejection::Duplicate));
+    assert_eq!(verify(&mut ours, &first), Err(EncRejection::Duplicate));
+    // Only the opener that verified a token commits it.
+    let mut theirs = opener();
+    let second = seal(&mut sealer, &frame(DATA));
+    let token = verify(&mut ours, &second).unwrap();
+    assert_eq!(theirs.check(&token, now), Err(EncRejection::Epoch));
+    assert_eq!(theirs.commit(token, now), Err(EncRejection::Epoch));
+    assert_eq!(theirs.current_window().highest(), None);
+    // The next epoch is promoted at the commit, not at the verification.
+    sealer.roll_now();
+    let rolled = seal(&mut sealer, &frame(DATA));
+    let next = verify(&mut ours, &rolled).unwrap();
+    assert_eq!(ours.epochs(), (1, 0), "not promoted");
+    assert_eq!(ours.commit(next, now).map(|a| a.promoted), Ok(true));
+    assert_eq!(ours.epochs(), (1, 1));
+    // Never after a withdrawal.
+    let third = seal(&mut sealer, &frame(DATA));
+    let late = verify(&mut ours, &third).unwrap();
+    ours.withdraw();
+    assert_eq!(ours.commit(late, now), Err(EncRejection::Withdrawn));
+}

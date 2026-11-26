@@ -42,19 +42,15 @@
 
 use std::net::SocketAddr;
 
-use karyos_protocol::frame::Lane;
 use karyos_protocol::network::encrypted::{EncAnswer, EncSetup, decode_setup};
 use karyos_protocol::network::{
-    Alias, ChallengeBlock, Control, Datagram, Identity, Receiver, RspSolicit, RttmKind, TermParams,
-    classify,
+    Alias, ChallengeBlock, Control, Datagram, Identity, RspSolicit, RttmKind, TermParams, classify,
 };
 use karyos_protocol::protection::aes_gcm_siv::{
     AesGcmSiv, Domain, EncRejection, KeyContext, MAX_PLAINTEXT, PublicationIdentity,
     ReceiverIdentity, Salt, classify_outer,
 };
 use karyos_protocol::protection::hmac_sha256::Domain as ControlDomain;
-
-use karyos_sys::receive::ValidatedDatagram;
 
 use super::super::control::{ControlItem, ControlSeal, SealedBytes, SharedSealer};
 use super::{BindingKey, Intake, ReceiverRole, SessionEnd, SlotRef, sender_frame_alias};
@@ -64,8 +60,8 @@ use crate::sessions::NonceSource;
 use crate::wire_enc::vm_generation;
 use crate::wire_enc::{
     ChannelKeys, EncChannel, EncKeyError, EncOpener, EncRejections, EncSealer, PairwiseFiles,
-    VmGenerationWatch, check_resync, header, id128, identity_of, is_envelope, monotonic_ns,
-    open_bootstrap_in, publication_of, quiesced,
+    Pending, VmGenerationWatch, check_resync, header, id128, identity_of, is_envelope,
+    monotonic_ns, open_bootstrap_in, publication_of, quiesced,
 };
 use crate::wire_keys::KeyFile;
 
@@ -807,48 +803,27 @@ impl ReceiverEnc {
     }
 }
 
-/// What a domain 1 datagram of a bound image is checked against inside
-/// its open, read from the image and the session table before it.
-#[derive(Debug, Clone, Copy)]
-struct SenderChecks {
-    /// The bound image's incarnation.
-    identity: Identity,
-    /// This receiver's block for the image.
-    receiver: Receiver,
-    /// The datagram's key is a path row of the image.
-    path: bool,
-    /// The image is active and not aborted.
-    live: bool,
+/// A domain 1 datagram of the image at `slot`, verified and queued in its
+/// path's order before its handler ran: checked again, handed to its
+/// handler and committed when its queue drains
+/// ([`Intake::enc_queued`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct EncQueued {
+    slot: SlotRef,
+    pending: Pending,
 }
 
-/// The checks of a domain 1 sender control its handler makes and that
-/// change nothing (H8-20): PATH_HB its path row and incarnation
-/// (`Intake::control`); ERR NAK_REPLY the image's incarnation, its
-/// receiver block and a lane `lane_open` admits
-/// (`Intake::nak_reply`); RTTM REPLY its path row, incarnation,
-/// receiver block and a probe id `reply_takes` admits: the path's
-/// outstanding probe, submitted (`Intake::rttm_reply`, H8-29). Run inside the open,
-/// before the sequence is marked or an epoch promoted; any other control
-/// is refused.
-fn sender_control_admissible(
-    control: &Control,
-    checks: &SenderChecks,
-    lane_open: impl Fn(Lane) -> bool,
-    reply_takes: impl Fn(u64) -> bool,
-) -> bool {
+/// Whether a domain 1 sender control names the bound image's incarnation
+/// `identity`: a PATH_HB, an ERR NAK_REPLY or an RTTM REPLY. A structural
+/// check of the frame against its binding, as its alias is; what the
+/// control may change is its handler's decision. Any other control is
+/// refused: none is a sender's domain 1 control.
+fn sender_control_names(control: &Control, identity: Identity) -> bool {
     match control {
-        Control::PathHeartbeat(heartbeat) => checks.path && heartbeat.identity == checks.identity,
-        Control::NakReply(reply) => {
-            reply.identity == checks.identity
-                && reply.receiver == checks.receiver
-                && lane_open(reply.range.lane)
-        }
+        Control::PathHeartbeat(heartbeat) => heartbeat.identity == identity,
+        Control::NakReply(reply) => reply.identity == identity,
         Control::Rttm(rttm) => {
-            matches!(rttm.kind, RttmKind::Reply { .. })
-                && checks.path
-                && rttm.identity == checks.identity
-                && rttm.receiver == checks.receiver
-                && reply_takes(rttm.probe_id)
+            matches!(rttm.kind, RttmKind::Reply { .. }) && rttm.identity == identity
         }
         _ => false,
     }
@@ -1009,11 +984,24 @@ impl<T: StreamTerms> Intake<'_, T> {
         }
     }
 
-    /// A domain 1 datagram of a bound encrypted image: opened under its
-    /// committed keys, its inner frames checked as a datagram of that same
-    /// binding, and only then delivered. DATA for no binding records its
+    /// A domain 1 datagram of a bound encrypted image: verified under its
+    /// committed keys, its inner frames checked to be a datagram of that
+    /// same binding, then handed to their handler, and committed (its
+    /// sequence marked, a next epoch promoted) only if the handler took it
+    /// (ADR-0114 sections 8 and 9): whatever any handler refuses marks and
+    /// promotes nothing, with no copy of its checks run before. A DATA
+    /// batch is taken when one of its frames or heartbeats takes effect
+    /// ([`Intake::data`]), after the structural validation of the whole
+    /// batch; one queued in its path's order is checked again, handled and
+    /// committed when its queue drains. DATA for no binding records its
     /// header's publication as the target of the SOLICIT it causes; a
     /// datagram more than one epoch ahead starts a resynchronisation.
+    ///
+    /// The role is one thread, and each datagram's check, handler and
+    /// commit run in one call: no other datagram is verified or committed
+    /// between them, but the queue a control drains first, which is why
+    /// the control is checked again after it. Two copies of one sequence
+    /// therefore never both reach their handler.
     fn enc_data(
         &mut self,
         source: SocketAddr,
@@ -1024,9 +1012,9 @@ impl<T: StreamTerms> Intake<'_, T> {
     ) -> Result<(), EncRejection> {
         let head = header(bytes)?;
         let bound = self.bound_image(source, alias);
-        let Some((slot, params)) = bound
+        let Some((slot, identity, aborted)) = bound
             .and_then(|image| self.role.images.get(image))
-            .map(|image| (image.slot, image.params))
+            .map(|image| (image.slot, image.identity, image.aborted.is_some()))
         else {
             // A header is a selector only: it records nothing, and causes a
             // SOLICIT only toward the publication a verified SETUP named
@@ -1046,64 +1034,10 @@ impl<T: StreamTerms> Intake<'_, T> {
             return Err(EncRejection::Binding);
         };
         let now = self.now;
-        // What the handlers check that changes nothing, read before the
-        // open so that it runs inside it (H8-15, H8-20).
-        let key = BindingKey {
-            endpoint: self.endpoint,
-            source,
-            alias,
-        };
-        let row = self
-            .role
-            .sessions
-            .paths()
-            .lookup(key)
-            .filter(|(at, _)| *at == slot)
-            .map(|(_, row)| row);
-        let path = row.is_some();
-        // A probe's finished send report is settled first, as the REPLY's
-        // handler settles it, so a REPLY is checked against it (H8-29).
-        if let Some(row) = row
-            && let Some(image) = bound.and_then(|index| self.role.images.get_mut(index))
-            && let Some(probe) = image.probes.get_mut(row)
-        {
-            super::collect_probe(&mut image.rtt, probe, false);
-        }
-        let active = self.role.sessions.is_active(slot);
-        let receiver_boot_id = self.role.sessions.boot_id();
-        let installed = bound
-            .and_then(|index| self.role.images.get(index))
-            .ok_or(EncRejection::Binding)?;
-        let checks = SenderChecks {
-            identity: installed.identity,
-            receiver: Receiver {
-                receiver_boot_id,
-                receiver_id: installed.receiver_id,
-            },
-            path,
-            live: active && installed.aborted.is_none(),
-        };
-        let (owner, term_length) = (&*installed.owner, installed.term_length);
-        let lane_open = |lane: Lane| super::window_end(owner, lane, term_length).is_some();
-        // What `RttProbes::reply` takes: the outstanding probe of the path,
-        // submitted, or still sending, which the REPLY settles (H8-29).
-        let rtt = &installed.rtt;
-        let probe = row.and_then(|row| {
-            let probe = installed.probes.get(row)?;
-            Some((row, probe.pending, probe.slot.sending_start()))
-        });
-        let reply_takes = |probe_id: u64| {
-            probe.is_some_and(|(row, pending, sending)| {
-                rtt.generation(row).is_some_and(|generation| {
-                    let sending = pending
-                        .filter(|pending| {
-                            (pending.generation, pending.probe_id) == (generation, probe_id)
-                        })
-                        .and(sending);
-                    rtt.would_take(row, generation, probe_id, sending)
-                })
-            })
-        };
+        // A binding that is no longer live (an inactive or aborted image)
+        // takes no DATA: refused with its batch, so that the generic DATA
+        // path, which would solicit an inactive key, never sees it.
+        let live = self.role.sessions.is_active(slot) && !aborted;
         let enc = &mut self.role.enc;
         let image = enc
             .images
@@ -1117,23 +1051,19 @@ impl<T: StreamTerms> Intake<'_, T> {
             .channel
             .rate;
         let mut data = None;
-        let opened = image.opener.open(bytes, out, rate, now, |frames| {
-            // The whole check of the bound image's data path runs here,
-            // before the mark: a correctly tagged batch it would refuse
-            // (an image no longer active or aborted, lanes, term offsets,
-            // lengths) marks no sequence and promotes no epoch (H8-04). So
-            // does every check a sender control's handler makes (H8-20).
+        let verified = image.opener.verify(bytes, out, rate, now, |frames| {
+            // The frames name this live binding (alias, and a control's
+            // incarnation): no handler state is read. Whether they take
+            // effect is their handler's decision, below.
             data = match classify(frames) {
                 Ok(Datagram::DataBatch(batch) | Datagram::Heartbeat(batch))
-                    if batch.alias() == alias
-                        && checks.live
-                        && ValidatedDatagram::parse(frames, &params).is_ok() =>
+                    if batch.alias() == alias && live =>
                 {
                     Some(true)
                 }
                 Ok(Datagram::Control(control))
                     if sender_frame_alias(&control) == Some(alias)
-                        && sender_control_admissible(&control, &checks, lane_open, reply_takes) =>
+                        && sender_control_names(&control, identity) =>
                 {
                     Some(false)
                 }
@@ -1141,8 +1071,8 @@ impl<T: StreamTerms> Intake<'_, T> {
             };
             data.map(|_| ()).ok_or(EncRejection::InnerRejected)
         });
-        let accepted = match opened {
-            Ok(accepted) => accepted,
+        let pending = match verified {
+            Ok(pending) => pending,
             Err(EncRejection::Epoch)
                 if (head.key_epoch, head.party_epoch) > image.opener.epochs() =>
             {
@@ -1151,16 +1081,91 @@ impl<T: StreamTerms> Intake<'_, T> {
             }
             Err(reason) => return Err(reason),
         };
-        let frames = out.get(..accepted.frames).ok_or(EncRejection::Short)?;
-        match (data, classify(frames)) {
-            (Some(true), _) => self.deliver(source, alias, frames),
+        let frames = out.get(..pending.frames).ok_or(EncRejection::Short)?;
+        let queued = EncQueued { slot, pending };
+        let accepted = match (data, classify(frames)) {
+            (Some(true), _) => match self.deliver_enc(source, alias, frames, queued) {
+                // Queued in its path's order, or dropped by a full queue:
+                // nothing is committed now.
+                None => return Ok(()),
+                Some(accepted) => accepted,
+            },
             (Some(false), Ok(Datagram::Control(control))) => {
                 self.drain_own_queue();
-                self.control(source, control);
+                // The drain hands its queued datagrams to their handlers
+                // and commits them: this one is checked again after it.
+                self.enc_check(queued)?;
+                self.enc_sender_control(source, control)
             }
             _ => return Err(EncRejection::InnerRejected),
+        };
+        if !accepted {
+            return Err(EncRejection::InnerRejected);
         }
-        Ok(())
+        self.enc_commit(queued)
+    }
+
+    /// Whether `queued` would still commit ([`EncOpener::check`]).
+    fn enc_check(&self, queued: EncQueued) -> Result<(), EncRejection> {
+        self.role
+            .enc
+            .images
+            .iter()
+            .find(|image| image.slot == queued.slot)
+            .ok_or(EncRejection::Binding)
+            .and_then(|image| image.opener.check(&queued.pending, self.now))
+    }
+
+    /// Commits `queued`, which its handler took ([`EncOpener::commit`]).
+    fn enc_commit(&mut self, queued: EncQueued) -> Result<(), EncRejection> {
+        let now = self.now;
+        self.role
+            .enc
+            .images
+            .iter_mut()
+            .find(|image| image.slot == queued.slot)
+            .ok_or(EncRejection::Binding)
+            .and_then(|image| image.opener.commit(queued.pending, now))
+            .map(|_| ())
+    }
+
+    /// A queued encrypted DATA datagram of `alias` from `source`, its
+    /// plaintext `bytes`, as its path's queue drains: checked again, then
+    /// handed to [`Intake::data`], and committed only if it took effect.
+    /// A refusal is counted on its subscription.
+    pub(super) fn enc_queued(
+        &mut self,
+        source: SocketAddr,
+        alias: Alias,
+        bytes: &[u8],
+        queued: EncQueued,
+    ) {
+        let index = self.role.enc.subscription(self.endpoint, alias.stream_id);
+        let result = self.enc_check(queued).and_then(|()| {
+            if self.data(source, alias, bytes) {
+                self.enc_commit(queued)
+            } else {
+                Err(EncRejection::InnerRejected)
+            }
+        });
+        if let Err(reason) = result {
+            self.enc_reject(index, reason);
+        }
+    }
+
+    /// A verified domain 1 sender control handed to its handler: whether
+    /// it took effect. A PATH_HB that refreshed its bound path, an ERR
+    /// NAK_REPLY that echoed an outstanding NAK, an RTTM REPLY that took
+    /// its path's outstanding probe.
+    fn enc_sender_control(&mut self, source: SocketAddr, control: Control) -> bool {
+        match control {
+            Control::PathHeartbeat(heartbeat) => self.path_heartbeat(source, &heartbeat),
+            Control::NakReply(reply) => self.nak_reply(source, &reply),
+            Control::Rttm(rttm) if matches!(rttm.kind, RttmKind::Reply { .. }) => {
+                self.rttm_reply(source, &rttm)
+            }
+            _ => false,
+        }
     }
 
     /// Section 6b step 1: starts the one resynchronisation challenge of the
@@ -1630,6 +1635,28 @@ impl<T: StreamTerms> ReceiverRole<T> {
             .iter()
             .find(|image| image.slot == slot)
             .map(|image| image.opener.epochs())
+    }
+
+    /// Makes `length` bytes of lane 0 from `start` the outstanding NAK of
+    /// the image at `slot`: a hole observed at `now`, its NAK submitted
+    /// once its skew deadline passed. Returns that NAK (tests).
+    #[cfg(test)]
+    pub(crate) fn awaited_nak(
+        &mut self,
+        slot: SlotRef,
+        start: u64,
+        length: u32,
+        now: u64,
+    ) -> Option<karyos_protocol::network::Nak> {
+        use karyos_protocol::frame::Lane;
+
+        let image = self.images.iter_mut().find(|image| image.slot == slot)?;
+        let hole = crate::repair::loss::Hole { start, length };
+        let _ = image.loss.observe(Lane::ZERO, Some(hole), now);
+        let at = now.saturating_add(crate::wire_enc::SECOND_NS);
+        let nak = image.loss.due(Lane::ZERO, at)?;
+        image.loss.submitted(&nak, at, &image.rtt);
+        Some(nak)
     }
 
     /// Issues a fresh RTTM probe on the first path of the image at `slot`
