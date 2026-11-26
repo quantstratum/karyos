@@ -3895,13 +3895,19 @@ impl ClientNode {
     /// interval as set so far.
     #[must_use]
     pub fn with_cluster_client(mut self) -> Self {
-        self.failover = Some(Box::new(FailoverClient::new(
+        #[cfg_attr(not(feature = "test-hooks"), allow(unused_mut))]
+        let mut failover = FailoverClient::new(
             self.id,
             self.server,
             self.script.clone(),
             Rc::clone(&self.recorder),
             self.retry_after,
-        )));
+        );
+        #[cfg(feature = "test-hooks")]
+        if self.corrupts_reads {
+            failover.corrupt_reads();
+        }
+        self.failover = Some(Box::new(failover));
         self
     }
 
@@ -3917,6 +3923,9 @@ impl ClientNode {
     #[cfg(feature = "test-hooks")]
     pub fn corrupting_reads(mut self) -> Self {
         self.corrupts_reads = true;
+        if let Some(failover) = self.failover.as_mut() {
+            failover.corrupt_reads();
+        }
         self
     }
 

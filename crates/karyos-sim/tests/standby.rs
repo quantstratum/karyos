@@ -1108,3 +1108,73 @@ fn s5_a_cluster_client_rejects_generation_1_once_it_saw_generation_2() {
     assert_eq!(successes, [1, 2, 2]);
     assert_eq!(check::standby(observations, &STANDBY), Ok(()));
 }
+
+/// A late refusal from the old primary, to the attempt sent there before
+/// the promotion, arrives after the caller's retry on the standby: it is
+/// the old attempt's, so it steers nothing, and the client keeps sending
+/// to the standby (karyos#720 review).
+#[test]
+fn a_late_old_primary_refusal_after_a_retry_on_the_standby_steers_nothing() {
+    const OLD: NodeId = PRIMARY[0];
+    const NEW: NodeId = STANDBY[0];
+    const OPERATOR: NodeId = 99;
+    let recorder: Shared = Rc::new(RefCell::new(Recorder::default()));
+    let script = vec![Op::Append(vec![1])];
+    let mut client = ClientNode::new(10, OLD, script, Rc::clone(&recorder)).with_cluster_client();
+    let mut out: Vec<(NodeId, Wire<Message>)> = Vec::new();
+    client.tick(0, &mut out);
+    client.deliver(OPERATOR, Wire::Redirect { server: NEW }, 1, &mut out);
+    client.tick(2, &mut out);
+    assert!(matches!(out.last(), Some((NEW, Wire::Request(_)))));
+    let before = out.len();
+    client.deliver(OLD, Wire::Refused { sequence: 1 }, 3, &mut out);
+    assert_eq!(out.len(), before, "{:?}", out.last());
+    let failover = client.failover().unwrap().cluster_client();
+    assert_eq!(failover.leader(), Some(u64::from(NEW)));
+    assert!(
+        !recorder
+            .borrow()
+            .observations
+            .iter()
+            .any(|observation| matches!(
+                observation,
+                Observation::ClientEvent {
+                    event: Event::Resend(_),
+                    ..
+                }
+            ))
+    );
+    client.deliver(
+        NEW,
+        Wire::Response {
+            sequence: 1,
+            bytes: Ret::Appended(1).canonical(),
+            index: 1,
+            generation: 2,
+        },
+        4,
+        &mut out,
+    );
+    assert!(client.done());
+}
+
+/// A client corrupting its reads is caught with Cluster clients as without
+/// them: the history is not linearizable (karyos#1038, karyos#720 review).
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_corrupting_cluster_client_is_caught() {
+    for cluster_clients in [false, true] {
+        let mut case = standby::s1();
+        case.faults.corrupt_reads = vec![0];
+        if cluster_clients {
+            case = standby::with_cluster_clients(case);
+        }
+        let outcome = workloads::run::<Reference>(&case, CORPUS[0]).unwrap();
+        assert!(
+            matches!(outcome.safety, Err(Violation::NotLinearizable(_))),
+            "{}: {:?}",
+            case.name,
+            outcome.safety
+        );
+    }
+}

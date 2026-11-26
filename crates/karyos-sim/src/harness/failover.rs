@@ -55,6 +55,12 @@ struct Open {
     /// Refused for now (busy, no leader): the caller retries it after its
     /// retry interval.
     busy: bool,
+    /// Every attempt sent: to whom, its key, and the generation the client
+    /// had seen when it was sent. The wire carries neither key nor a
+    /// refusal's generation, so an answer from a server is the answer to
+    /// the last attempt sent to it, in that attempt's generation: a late
+    /// refusal from the old primary cannot steer a newer attempt.
+    sends: Vec<(NodeId, Key, u64)>,
 }
 
 /// A scripted client whose failover is [`ClusterClient`]'s.
@@ -67,6 +73,10 @@ pub struct FailoverClient {
     retry_after: u64,
     recorder: Shared,
     client: ClusterClient,
+    /// It records each read with a value no one wrote (karyos#1038,
+    /// tests): a faulty client.
+    #[cfg(feature = "test-hooks")]
+    corrupts_reads: bool,
 }
 
 impl FailoverClient {
@@ -101,7 +111,16 @@ impl FailoverClient {
             retry_after,
             recorder,
             client,
+            #[cfg(feature = "test-hooks")]
+            corrupts_reads: false,
         }
+    }
+
+    /// The client recording each read with a value no one wrote: a faulty
+    /// client (karyos#1038, tests).
+    #[cfg(feature = "test-hooks")]
+    pub fn corrupt_reads(&mut self) {
+        self.corrupts_reads = true;
     }
 
     /// Its open request's wire sequence, if one waits for its outcome.
@@ -133,16 +152,21 @@ impl FailoverClient {
         };
         open.key = send.key;
         open.sent = now;
+        open.sends.push((to, send.key, self.client.generation()));
         out.push((to, Wire::Request(open.command.clone())));
     }
 
-    /// The key of the open request's current attempt, if `sequence` (the
-    /// wire's) is the open request's.
-    fn key_of(&self, sequence: u64) -> Option<Key> {
+    /// The key and generation of the last attempt of the open request sent
+    /// to `from`, if `sequence` (the wire's) is the open request's.
+    fn exchange(&self, from: NodeId, sequence: u64) -> Option<(Key, u64)> {
         self.open
             .as_ref()
-            .filter(|open| open.command.sequence == sequence)
-            .map(|open| open.key)
+            .filter(|open| open.command.sequence == sequence)?
+            .sends
+            .iter()
+            .rev()
+            .find(|(to, _, _)| *to == from)
+            .map(|&(_, key, generation)| (key, generation))
     }
 
     /// Acts on `events`; `settled` is the answer, its entry's index and
@@ -177,6 +201,14 @@ impl FailoverClient {
                         });
                         continue;
                     }
+                    #[cfg(feature = "test-hooks")]
+                    let ret = match ret {
+                        Ret::Values(mut values) if self.corrupts_reads => {
+                            values.push(b"never written".to_vec());
+                            Ret::Values(values)
+                        }
+                        other => other,
+                    };
                     let mut recorder = self.recorder.borrow_mut();
                     let _ = recorder.history.ret(self.id, ret);
                     recorder.observations.push(Observation::Success {
@@ -281,6 +313,7 @@ impl FailoverClient {
             sent: now,
             unknown: false,
             busy: false,
+            sends: Vec::new(),
         });
         self.send(send, now, out);
     }
@@ -293,7 +326,6 @@ impl FailoverClient {
         now: u64,
         out: &mut Outbox<Wire<M>>,
     ) {
-        let generation = self.client.generation();
         match message {
             Wire::Response {
                 sequence,
@@ -303,7 +335,18 @@ impl FailoverClient {
             } => {
                 // Bytes that do not decode are no answer: the retry asks
                 // again.
-                let (Some(key), Some(ret)) = (self.key_of(sequence), Ret::decode(&bytes)) else {
+                // An answer names its own generation; any attempt's outcome
+                // is the request's.
+                let key = self
+                    .exchange(from, sequence)
+                    .map(|(key, _)| key)
+                    .or_else(|| {
+                        self.open
+                            .as_ref()
+                            .filter(|open| open.command.sequence == sequence)
+                            .map(|open| open.key)
+                    });
+                let (Some(key), Some(ret)) = (key, Ret::decode(&bytes)) else {
                     return;
                 };
                 let answer = if ret == Ret::Expired {
@@ -321,24 +364,28 @@ impl FailoverClient {
                 );
             }
             Wire::Refused { sequence } => {
-                if let Some(key) = self.key_of(sequence) {
+                if let Some((key, generation)) = self.exchange(from, sequence) {
                     let leader = Some(u64::from(from));
                     self.replied(key, generation, Reply::Redirect { leader }, None, now, out);
                 }
             }
             Wire::Busy { sequence } => {
-                if let Some(key) = self.key_of(sequence) {
+                if let Some((key, generation)) = self.exchange(from, sequence) {
                     let reply = Reply::Outcome(Answer::WindowFull);
                     self.replied(key, generation, reply, None, now, out);
                 }
             }
             Wire::Redirect { server } => {
                 let leader = Some(u64::from(server));
-                match self.open.as_ref().map(|open| open.key) {
-                    Some(key) if self.client.leader() == Some(u64::from(from)) => {
+                let sequence = self.open.as_ref().map(|open| open.command.sequence);
+                // A server's redirect answers the last attempt sent to it;
+                // the operator's is a leader change.
+                match sequence.and_then(|sequence| self.exchange(from, sequence)) {
+                    Some((key, generation)) => {
                         self.replied(key, generation, Reply::Redirect { leader }, None, now, out);
                     }
-                    _ => {
+                    None => {
+                        let generation = self.client.generation();
                         let mut events = Vec::new();
                         self.client
                             .leader_changed(leader, generation, &mut |event| events.push(event));
