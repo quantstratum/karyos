@@ -2241,3 +2241,6 @@ fn a_late_cleanup_of_a_refused_admission_never_touches_its_replacement() {
 }
 /// H8 round 4: proofs through the authority restart (karyos#648).
 mod invariants_r4;
+
+/// H8 round 6: the round 5 review's rows R5-10 and R5-11 end to end (karyos#648).
+mod invariants_r6;
