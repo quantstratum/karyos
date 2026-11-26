@@ -414,6 +414,12 @@ impl Sealer {
         );
     }
 
+    /// Whether it was withdrawn: a tombstone that seals nothing.
+    #[must_use]
+    pub fn is_withdrawn(&self) -> bool {
+        self.withdrawn
+    }
+
     /// The domain this sealer tags in: 1 for a sender, 4 for a receiver.
     #[must_use]
     pub fn domain(&self) -> Domain {
@@ -954,6 +960,8 @@ impl EpochKeys {
 
 impl Slot {
     fn check(&self, datagram: &[u8]) -> Result<Opened, Refusal> {
+        #[cfg(test)]
+        count_crypto_open();
         let opened = self
             .profile
             .open_envelope(datagram)
@@ -1253,6 +1261,27 @@ thread_local! {
 #[cfg(test)]
 fn recording() -> bool {
     SEALED.with(|sealed| sealed.borrow().is_some())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The envelope opens and signature verifications attempted on this
+    /// thread: an upper bound of its MAC and signature work (tests; H8
+    /// BUD-10).
+    static CRYPTO_OPENS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Counts one envelope open or signature verification attempt (tests).
+#[cfg(test)]
+pub(crate) fn count_crypto_open() {
+    CRYPTO_OPENS.with(|opens| opens.set(opens.get().saturating_add(1)));
+}
+
+/// The envelope opens and signature verifications attempted on this
+/// thread so far (tests).
+#[cfg(test)]
+pub(crate) fn crypto_opens() -> u64 {
+    CRYPTO_OPENS.with(core::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -1667,6 +1696,8 @@ impl Proof {
         }
         let mut first = Rejection::Key;
         for (file_epoch, profile) in self.verifying.iter().flatten() {
+            #[cfg(test)]
+            count_crypto_open();
             match profile.open_envelope(datagram) {
                 Ok(opened) => {
                     return Ok(Proved {

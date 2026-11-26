@@ -914,6 +914,10 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     /// The receiver's `alias_quarantine` (ns): how long a reincarnating
     /// publication's alias waits after its old session's removal.
     alias_quarantine: u64,
+    /// Whether the receiver's challenge table is within the authenticated
+    /// profile's ceilings: a protected channel is refused otherwise
+    /// ([`crate::error::AuthRefusal::ChallengeCeiling`]; H8 R5-04).
+    auth_challenge_ceilings: bool,
     /// Publications between incarnations, at most one per tracked
     /// publication (allocated at start).
     reincarnations: Vec<Reincarnation>,
@@ -1071,6 +1075,7 @@ impl<T: StreamTerms> Network<T> {
             },
             publication_linger: config.stream_defaults.publication_linger,
             alias_quarantine: config.agents.sessions.alias_quarantine,
+            auth_challenge_ceilings: config.agents.sessions.within_auth_ceilings(),
             reincarnations: Vec::with_capacity(config.agents.publications),
             stale_overflows: 0,
             clock: karyos_sys::host_clock::host_monotonic_ns,
@@ -1354,6 +1359,19 @@ impl<T: StreamTerms> Network<T> {
             return Err(DriverError::NetworkBusy);
         }
         Ok(())
+    }
+
+    /// Refuses a protected channel on a driver whose challenge table is
+    /// configured above the authenticated profile's ceilings (ADR-0086
+    /// section 6; H8 R5-04), before anything exists.
+    pub(crate) fn check_auth_challenge_ceilings(&self) -> Result<(), DriverError> {
+        if self.auth_challenge_ceilings {
+            Ok(())
+        } else {
+            Err(DriverError::AuthenticatedRefused {
+                reason: crate::error::AuthRefusal::ChallengeCeiling,
+            })
+        }
     }
 
     /// The driver's wire key store, once started, for admission.

@@ -126,7 +126,32 @@ impl SenderAuth {
     }
 }
 
+impl SenderAuth {
+    /// Whether a sealer of either class is installed and not withdrawn.
+    fn live(&self) -> bool {
+        match self {
+            Self::Sealing(sealer) => !sealer.is_withdrawn(),
+            Self::Encrypting(sealer) => !sealer.is_withdrawn(),
+            Self::Off | Self::Pending | Self::EncPending => false,
+        }
+    }
+}
+
 impl<T: StreamTerms> Outbound<T> {
+    /// The provenance a datagram sealed now carries (H8 R5-03).
+    pub(super) fn seal_stamp(&self) -> super::SealStamp {
+        super::SealStamp {
+            vm: crate::wire_enc::vm_generation::generation(),
+            sealer: self.sealer_epoch,
+        }
+    }
+
+    /// Its sealer was withdrawn, retired or replaced: every head sealed
+    /// before is obsolete and never reaches the backend (H8 R5-03).
+    fn obsolete_sealed(&mut self) {
+        self.sealer_epoch = self.sealer_epoch.wrapping_add(1);
+    }
+
     /// Makes the publication authenticated: from now on it sends nothing
     /// until [`Outbound::install_sealer`] gives it the session's key. The
     /// network admission sizes its log for the inner budget, the channel
@@ -189,6 +214,7 @@ impl<T: StreamTerms> Outbound<T> {
         if sealer.domain() != karyos_protocol::protection::hmac_sha256::Domain::Data {
             return Err(AuthUnsupported::SameEstablishment);
         }
+        self.obsolete_sealed();
         self.auth = SenderAuth::Sealing(Box::new(sealer));
         Ok(())
     }
@@ -253,6 +279,7 @@ impl<T: StreamTerms> Outbound<T> {
     /// under its key; only a new establishment, with new key derivation
     /// inputs, replaces it.
     pub(crate) fn follow_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        let live = self.auth.live();
         match &mut self.auth {
             SenderAuth::Sealing(sealer) => sealer.follow(keys),
             // An encrypted publication's domain 1 sealer: withdrawn, its
@@ -263,6 +290,11 @@ impl<T: StreamTerms> Outbound<T> {
             // establishment replaces it.
             SenderAuth::Encrypting(sealer) => sealer.apply_keys(keys),
             SenderAuth::Off | SenderAuth::Pending | SenderAuth::EncPending => {}
+        }
+        // A withdrawal makes what it sealed obsolete; a routine re-key
+        // keeps it, as its file still verifies through the overlap.
+        if live && !self.auth.live() {
+            self.obsolete_sealed();
         }
     }
 
@@ -405,6 +437,7 @@ impl<T: StreamTerms> Outbound<T> {
         if sealer.domain() != EncDomain::Sender {
             return Err(AuthUnsupported::SameEstablishment);
         }
+        self.obsolete_sealed();
         self.auth = SenderAuth::Encrypting(Box::new(sealer));
         Ok(())
     }
@@ -415,6 +448,7 @@ impl<T: StreamTerms> Outbound<T> {
     /// changes for a publication of another class.
     pub(crate) fn retire_enc_sealer(&mut self) {
         if matches!(self.auth, SenderAuth::Encrypting(_)) {
+            self.obsolete_sealed();
             self.auth = SenderAuth::EncPending;
         }
     }
@@ -425,6 +459,7 @@ impl<T: StreamTerms> Outbound<T> {
     /// publication of another class.
     pub(crate) fn retire_auth_sealer(&mut self) {
         if matches!(self.auth, SenderAuth::Sealing(_)) {
+            self.obsolete_sealed();
             self.auth = SenderAuth::Pending;
         }
     }

@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use super::*;
 
+/// H8 round 5 evidence (R5-07 to R5-09) on the helpers of this module.
+mod r6;
+
 /// Durable marks shared across a restart and observable by the test: the
 /// epochs, the latched guards, and whether a persist fails.
 #[derive(Debug, Clone, Default)]

@@ -716,6 +716,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 reason: crate::error::AuthRefusal::Unsupported { operation },
             });
         }
+        if super::wire::protected(channel.security)?.is_some() {
+            net.check_auth_challenge_ceilings()?;
+        }
         // Redundant paths need sockets isolated per interface; without
         // that every datagram would count on every path (owner item 12).
         if !channel.paths.is_empty() && !net.paths_isolated() {

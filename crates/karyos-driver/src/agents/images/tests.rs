@@ -9915,11 +9915,32 @@ fn a_held_fence_submits_no_setup_under_an_admitting_key_view() {
 /// H8 unit-level invariants raised to two-agent proofs (karyos#648).
 mod invariants_e2e;
 
-/// An in-memory key or state directory, shared with the test.
+/// An in-memory key or state directory, shared with the test; writes of
+/// the names in its second field fail (an injected commit failure).
 #[derive(Clone, Default)]
-struct MemDir(std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>);
+struct MemDir(
+    std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
+    std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+);
 
 impl MemDir {
+    /// A new state directory holding the empty abort record, as
+    /// `KeyStore::initialise` creates it.
+    fn initialised() -> Self {
+        let state = Self::default();
+        crate::remote_guard::initialise_aborted(&state).unwrap();
+        state
+    }
+
+    /// Makes writes of `names` fail from now on (empty: none fail).
+    fn fail_writes(&self, names: &[&'static str]) {
+        *self.1.lock().unwrap() = names.to_vec();
+    }
+
+    fn remove(&self, name: &str) {
+        self.0.lock().unwrap().remove(name);
+    }
+
     fn put(&self, name: &str, text: &str) {
         self.0
             .lock()
@@ -9954,6 +9975,9 @@ impl crate::wire_keys::store::Files for MemDir {
         name: &str,
         bytes: &[u8],
     ) -> Result<(), crate::wire_keys::store::FileError> {
+        if self.1.lock().unwrap().contains(&name) {
+            return Err(crate::wire_keys::store::FileError::Refused);
+        }
         self.0
             .lock()
             .unwrap()
@@ -10516,12 +10540,31 @@ fn the_abort_horizon_runs_from_the_first_send() {
     assert_eq!(deadline, first + 500 * MS);
 }
 
-/// H8 RCV-4: an abort the receiver applies on its guard authority's own
-/// SESSION_ABORT (the publisher sent none) is learned from its valid ACK:
-/// the incarnation is terminal and retired at the sender, so a receiver
-/// restarted since cannot establish it again.
+/// Runs the rig until the receiver's ACK of an injected abort reaches
+/// the sender, and asserts it changed nothing there: a valid domain 4 ACK
+/// with no abort of the sender's pending carries no abort authority (H8
+/// R5-01, ADM-8, ABT-10).
+fn assert_unsolicited_ack_changes_nothing(rig: &mut Rig) {
+    for _ in 0..200 {
+        rig.round(true);
+    }
+    let sender = rig.agents.sender.role.counters();
+    assert_eq!(sender.abort_acks_unmatched, 1, "{sender:?}");
+    assert_eq!(sender.aborts_completed, 0, "{sender:?}");
+    assert!(abort_ends(rig).is_empty(), "nothing retired");
+    let a = rig.publisher;
+    assert_eq!(rig.agents.sender.role.aborted_identity(a, alias()), None);
+    assert_eq!(rig.agents.sender.role.pending_aborts(), 0);
+}
+
+/// H8 R5-01, MP-1: a bound receiver's valid pairwise-authenticated
+/// SESSION_ABORT_ACK, here produced by a receiver that applied an abort
+/// the publisher never sent, against an unguarded publication: counted as
+/// unmatched, nothing aborted or retired, and a restarted receiver of the
+/// same, still live incarnation establishes again (terminality at the
+/// receiver is its durable record's, RCV-4).
 #[test]
-fn an_authority_abort_at_the_receiver_retires_the_incarnation_at_the_sender() {
+fn an_unsolicited_ack_never_retires_an_unguarded_publication() {
     use karyos_protocol::network::authenticated::GUARD_CLOSED;
 
     let scope = crate::agents::roles::AbortScope {
@@ -10531,25 +10574,30 @@ fn an_authority_abort_at_the_receiver_retires_the_incarnation_at_the_sender() {
     let (mut rig, b, _slot) = abort_rig(Some(scope));
     let after = inject_abort(&mut rig, b, &signed_abort(10, 11, GUARD_CLOSED));
     assert_eq!(after.abort_acks_sent, 1, "{after:?}");
-    for _ in 0..200 {
-        rig.round(true);
-        if !abort_ends(&rig).is_empty() {
-            break;
-        }
-    }
-    let sender = rig.agents.sender.role.counters();
-    assert_eq!(sender.aborts_remote, 1, "{sender:?}");
-    assert_eq!(abort_ends(&rig), vec![false]);
-    // The receiver restarted: a fresh boot id challenges again.
+    assert_unsolicited_ack_changes_nothing(&mut rig);
     let a = rig.publisher;
     assert!(
         rig.agents
             .sender
             .role
             .open_sealed_for(a, &valid_challenge([8, 8], [9, 9]))
-            .is_none()
+            .is_some(),
+        "the sender still serves the incarnation"
     );
-    assert_eq!(rig.agents.sender.role.counters().establishment_refused, 1);
+}
+
+/// H8 R5-01, MP-1: the same against a publication guarded at the sender
+/// (guard 11 of authority 10, open): the receiver's ACK of an abort the
+/// sender never requested changes nothing, and the guard's own close
+/// still aborts through the sender's pending abort.
+#[test]
+fn an_unsolicited_ack_never_retires_a_guarded_publication() {
+    use karyos_protocol::network::authenticated::GUARD_CLOSED;
+
+    let (mut rig, _word, b) = guarded_abort_rig_tuned(true, true, None);
+    let after = inject_abort(&mut rig, b, &signed_abort(10, 11, GUARD_CLOSED));
+    assert_eq!(after.abort_acks_sent, 1, "{after:?}");
+    assert_unsolicited_ack_changes_nothing(&mut rig);
 }
 
 /// H8 ABT-11, BUD-8 (design G3): under a mass abort the control budget
@@ -10748,11 +10796,9 @@ fn sender_and_receiver_report_the_same_first_ack_ranges() {
     use karyos_protocol::network::authenticated::GUARD_CLOSED;
     use karyos_sys::log_buffer::AppendOptions;
 
-    let scope = crate::agents::roles::AbortScope {
-        authority_id: 10,
-        guard_id: 11,
-    };
-    let (mut rig, b, _slot) = abort_rig(Some(scope));
+    // The sender's own abort, requested by its guard's close: only an ACK
+    // of a pending abort completes one (H8 R5-01).
+    let (mut rig, word, b) = guarded_abort_rig_tuned(true, true, None);
     for i in 0..6u8 {
         let _ =
             rig.log.as_mut().unwrap().publications[0].append(&[i; 200], AppendOptions::default());
@@ -10760,8 +10806,14 @@ fn sender_and_receiver_report_the_same_first_ack_ranges() {
     for _ in 0..50 {
         rig.round(true);
     }
-    let bytes = signed_abort(10, 11, GUARD_CLOSED);
-    let _ = inject_abort(&mut rig, b, &bytes);
+    close_guard(&mut rig, &word);
+    for _ in 0..400 {
+        rig.round(true);
+        if !abort_ends(&rig).is_empty() {
+            break;
+        }
+    }
+    let bytes = rig.agents.sender.role.last_abort_bytes().unwrap();
     // An identical abort resends the ACK: a duplicate at the sender.
     let after = inject_abort(&mut rig, b, &bytes);
     assert_eq!(after.abort_acks_resent, 1, "{after:?}");
@@ -10927,7 +10979,7 @@ fn abort_record_rig(state: &MemDir, incarnation: u64) -> (Rig, EndpointId) {
 fn an_applied_abort_stays_terminal_across_a_receiver_restart_with_the_ack_lost() {
     use karyos_protocol::network::authenticated::GUARD_CLOSED;
 
-    let state = MemDir::default();
+    let state = MemDir::initialised();
     let (mut rig, b) = abort_record_rig(&state, 1);
     let _slot = established(&mut rig);
     // The ACK is lost: the sender never takes it.
@@ -10938,7 +10990,7 @@ fn an_applied_abort_stays_terminal_across_a_receiver_restart_with_the_ack_lost()
         (1, 0),
         "{after:?}"
     );
-    assert_eq!(rig.agents.sender.role.counters().aborts_remote, 0);
+    assert_eq!(rig.agents.sender.role.counters().abort_acks_unmatched, 0);
     drop(rig);
     // The receiver restarts from its durable state; the sender, which
     // never learned of the abort, announces the same incarnation.
@@ -10970,7 +11022,7 @@ fn an_applied_abort_stays_terminal_across_a_receiver_restart_with_the_ack_lost()
 fn a_full_or_unreadable_abort_record_fails_closed() {
     use crate::remote_guard::{AbortRecord, AbortedIncarnations, MAX_ABORTED};
 
-    let state = MemDir::default();
+    let state = MemDir::initialised();
     let mut record = AbortedIncarnations::new(state.clone());
     let of = |incarnation| Identity {
         incarnation,
@@ -10988,6 +11040,125 @@ fn a_full_or_unreadable_abort_record_fails_closed() {
     state.put(crate::remote_guard::ABORTED_FILE, "garbage\n");
     let unreadable = AbortedIncarnations::new(state);
     assert!(unreadable.terminal(&of(u64::MAX - 2)));
+}
+
+/// Drives `rig` until the sender has resent its abort a few times.
+fn resend_rounds(rig: &mut Rig) {
+    for _ in 0..300 {
+        rig.round(true);
+    }
+}
+
+/// H8 R5-02, MP-2, production path: the receiver applies the guard
+/// authority's abort but neither replica of its record commits. The
+/// image is terminal in memory, no ACK leaves and the digest is not
+/// cached; a redelivery while the writes still fail sends nothing; once
+/// a write succeeds the redelivery commits the record and only then is
+/// the ACK sent, after which a redelivery is a cached resend.
+#[test]
+fn an_abort_is_acknowledged_only_after_its_record_commits() {
+    use crate::remote_guard::{ABORTED_FILE, ABORTED_REPLICA};
+    use karyos_protocol::network::authenticated::GUARD_CLOSED;
+
+    let state = MemDir::initialised();
+    let (mut rig, b) = abort_record_rig(&state, 1);
+    let _slot = established(&mut rig);
+    rig.sender_stopped = true;
+    state.fail_writes(&[ABORTED_FILE, ABORTED_REPLICA]);
+    let abort = signed_abort(10, 11, GUARD_CLOSED);
+    let after = inject_abort(&mut rig, b, &abort);
+    assert_eq!(
+        (after.abort_acks_sent, after.abort_records_failed),
+        (0, 1),
+        "{after:?}"
+    );
+    let after = inject_abort(&mut rig, b, &abort);
+    assert_eq!(
+        (
+            after.abort_acks_sent,
+            after.abort_acks_resent,
+            after.abort_records_failed
+        ),
+        (0, 0, 2),
+        "a retry, still failing: {after:?}"
+    );
+    state.fail_writes(&[]);
+    let after = inject_abort(&mut rig, b, &abort);
+    assert_eq!(
+        (after.abort_acks_sent, after.abort_records_failed),
+        (1, 2),
+        "committed, then acknowledged: {after:?}"
+    );
+    let after = inject_abort(&mut rig, b, &abort);
+    assert_eq!((after.abort_acks_sent, after.abort_acks_resent), (1, 1));
+    assert_eq!(
+        after.aborts_refused, 0,
+        "every redelivery retried: {after:?}"
+    );
+    resend_rounds(&mut rig);
+    assert_eq!(rig.agents.receiver.counters().images_closed_aborted, 1);
+}
+
+/// H8 R5-02, MP-2, across a restart from the retained state directory:
+/// the record's own write fails but its replica commits, the ACK is lost
+/// and the receiver restarts. The restarted receiver reads the union of
+/// both files and refuses the still-live incarnation's SETUP. Later the
+/// record is lost outright: a missing record fails closed, every
+/// incarnation terminal, never an empty record.
+#[test]
+fn a_failed_record_write_with_the_ack_lost_stays_terminal_across_a_restart() {
+    use crate::remote_guard::{ABORTED_FILE, AbortRecord, AbortedIncarnations};
+    use karyos_protocol::network::authenticated::GUARD_CLOSED;
+
+    let state = MemDir::initialised();
+    let (mut rig, b) = abort_record_rig(&state, 1);
+    let _slot = established(&mut rig);
+    rig.sender_stopped = true;
+    state.fail_writes(&[ABORTED_FILE]);
+    let after = inject_abort(&mut rig, b, &signed_abort(10, 11, GUARD_CLOSED));
+    assert_eq!(
+        after.abort_acks_sent, 1,
+        "durable in the replica: {after:?}"
+    );
+    drop(rig);
+    state.fail_writes(&[]);
+    let (mut rig, _b) = abort_record_rig(&state, 1);
+    resend_rounds(&mut rig);
+    assert!(
+        !rig.events
+            .iter()
+            .any(|event| matches!(event, ImageEvent::Installed { .. })),
+        "{:?}",
+        rig.events
+    );
+    assert!(rig.agents.receiver.counters().setup_after_abort >= 1);
+    drop(rig);
+    // Lost: the record created with the state directory is gone.
+    state.remove(ABORTED_FILE);
+    let lost = AbortedIncarnations::new(state.clone());
+    let other = Identity {
+        incarnation: 9,
+        ..identity()
+    };
+    assert!(lost.terminal(&other), "a missing record fails closed");
+}
+
+/// H8 R5-02: a repeated record of an identity whose commit failed retries
+/// the commit rather than reporting the in-memory entry as durable.
+#[test]
+fn a_repeated_record_retries_a_failed_commit() {
+    use crate::remote_guard::{ABORTED_FILE, ABORTED_REPLICA, AbortRecord, AbortedIncarnations};
+
+    let state = MemDir::initialised();
+    let mut record = AbortedIncarnations::new(state.clone());
+    state.fail_writes(&[ABORTED_FILE, ABORTED_REPLICA]);
+    assert!(record.record(identity()).is_err());
+    assert!(record.terminal(&identity()), "terminal in memory");
+    assert!(record.record(identity()).is_err(), "not durable yet");
+    assert!(!AbortedIncarnations::new(state.clone()).terminal(&identity()));
+    state.fail_writes(&[]);
+    assert!(record.record(identity()).is_ok());
+    assert!(AbortedIncarnations::new(state).terminal(&identity()));
 }
 /// H8 round 4: insufficient evidence raised and missing properties (karyos#648).
 mod invariants_r4;
@@ -11374,4 +11545,351 @@ fn a_vm_generation_change_erases_a_queued_domain_4_sealer() {
     injector.change();
     rig.until(true, |rig| rig.agents.receiver.role.enc_generation() == 1);
     assert!(queued.is_withdrawn(), "the queued clone is erased");
+}
+
+/// Sets the interleaving hook that runs between a prepared STATUS or ACK's
+/// generation capture and its post for submission (H8 R5-05).
+fn during_preparation(hook: Option<Box<dyn FnMut()>>) {
+    crate::agents::roles::PREPARED_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+/// H8 R5-05 (RLD-3, ABT-8): a key view changes DURING a STATUS's
+/// preparation: after its role captured the applied generation and signed,
+/// before the STATUS is posted for submission. The stamped generation is
+/// then older than the current one and the sender role refuses it at
+/// submission. The control run, with no change, sends it.
+#[test]
+fn a_view_change_during_status_preparation_refuses_its_submission() {
+    use karyos_protocol::network::Receiver;
+    use karyos_protocol::network::authenticated::{AuthControl, StatusChallenge};
+
+    for change in [false, true] {
+        let (mut rig, b_at, _signer) =
+            remotely_guarded_rig(MemoryMarks::default(), Some(guard_word(2, true)));
+        let a_at = rig.endpoints.local_address(rig.publisher).unwrap();
+        let b = (0..64)
+            .map(EndpointId)
+            .find(|id| rig.endpoints.local_address(*id) == Some(b_at))
+            .unwrap();
+        let mut bytes = vec![0u8; 256];
+        let length = AuthControl::Challenge(StatusChallenge {
+            authority_id: 10,
+            guard_id: 11,
+            receiver: Receiver {
+                receiver_boot_id: [1, 2],
+                receiver_id: 66,
+            },
+            nonce: [9, 9],
+        })
+        .encode(&mut bytes)
+        .unwrap();
+        bytes.truncate(length);
+        rig.round(true);
+        let fence = rig.agents.sender.role.key_fence();
+        let captured = fence.current();
+        let fired = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let seen = std::rc::Rc::clone(&fired);
+        during_preparation(Some(Box::new(move || {
+            seen.set(seen.get() + 1);
+            if change {
+                // Another role applied a newer view meanwhile.
+                assert!(fence.observe(&crate::wire_auth::FixedKeys::default()));
+            }
+        })));
+        let (receiver_before, sender_before) = (
+            rig.agents.receiver.counters(),
+            rig.agents.sender.role.counters(),
+        );
+        let receiver = &mut rig.agents.receiver;
+        receiver
+            .role
+            .inject_datagram(&receiver.sessions, b, a_at, &bytes, rig.now);
+        during_preparation(None);
+        let receiver_after = rig.agents.receiver.counters();
+        rig.round(true);
+        let sender_after = rig.agents.sender.role.counters();
+        assert_eq!(fired.get(), 1, "prepared once");
+        assert_eq!(
+            receiver_after.guard_statuses_sent,
+            receiver_before.guard_statuses_sent + 1,
+            "signed and posted"
+        );
+        if change {
+            assert_eq!(rig.agents.sender.role.key_fence().current(), captured + 1);
+            assert_eq!(sender_after.raw_sent, sender_before.raw_sent, "refused");
+            assert!(sender_after.seal_failures > sender_before.seal_failures);
+        } else {
+            assert!(sender_after.raw_sent > sender_before.raw_sent, "sent");
+        }
+    }
+}
+
+/// H8 R5-05 (RLD-3, ABT-8): a key view changes DURING a
+/// SESSION_ABORT_ACK's preparation, after its role captured the applied
+/// generation and sealed it, before its post: the ACK is refused at
+/// submission and never reaches the publisher. The control run delivers.
+#[test]
+fn a_view_change_during_ack_preparation_refuses_its_submission() {
+    use crate::agents::roles::publish_auth::AbortAuthority;
+    use crate::authority::Ed25519Signer;
+    use crate::signed_control::Authority;
+
+    for change in [false, true] {
+        let (mut rig, b, _channel) = authenticated_rig();
+        let signer = Ed25519Signer::from_seed(&[9; 32]);
+        let verifier = signer.verifier();
+        let a = rig.publisher;
+        rig.agents
+            .sender
+            .role
+            .set_abort_authority(a, alias(), AbortAuthority::new(signer, 10, 10));
+        rig.agents
+            .receiver
+            .role
+            .trust_authorities(vec![Authority::of(10, verifier, 10, &[11], true)], rig.now);
+        rig.agents.receiver.role.permit_abort(
+            b,
+            alias().stream_id,
+            crate::agents::roles::AbortScope {
+                authority_id: 10,
+                guard_id: 11,
+            },
+        );
+        let _slot = established(&mut rig);
+        let fence = rig.agents.sender.role.key_fence();
+        let fired = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let seen = std::rc::Rc::clone(&fired);
+        during_preparation(Some(Box::new(move || {
+            seen.set(seen.get() + 1);
+            if change {
+                let _ = fence.observe(&crate::wire_auth::FixedKeys::default());
+            }
+        })));
+        let failures = rig.agents.sender.role.counters().seal_failures;
+        assert!(rig.agents.sender.role.request_abort(
+            a,
+            alias(),
+            karyos_protocol::network::authenticated::GUARD_CLOSED,
+            11,
+            3,
+            rig.now
+        ));
+        for _ in 0..400 {
+            rig.round(true);
+            if rig.agents.receiver.counters().abort_acks_sent >= 1 {
+                break;
+            }
+        }
+        for _ in 0..20 {
+            rig.round(true);
+        }
+        during_preparation(None);
+        assert!(fired.get() >= 1, "prepared");
+        assert!(rig.agents.receiver.counters().abort_acks_sent >= 1);
+        let acks = rig.agents.sender.role.counters().abort_acks;
+        if change {
+            assert_eq!(acks, 0, "never delivered");
+            assert!(rig.agents.sender.role.counters().seal_failures > failures);
+        } else {
+            assert!(acks >= 1, "delivered");
+        }
+    }
+}
+
+/// A key directory whose reads can be stalled: a read made while it is
+/// stalled blocks until it is released (H8 R5-05).
+#[derive(Clone, Default)]
+struct StallDir {
+    files: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
+    /// (stalled, a read is blocked), and its signal.
+    stall: std::sync::Arc<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>,
+}
+
+impl StallDir {
+    fn put(&self, name: &str, text: &str) {
+        self.files
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), text.as_bytes().to_vec());
+    }
+
+    fn set_stalled(&self, stalled: bool) {
+        let (lock, signal) = &*self.stall;
+        lock.lock().unwrap().0 = stalled;
+        signal.notify_all();
+    }
+
+    fn blocked(&self) -> bool {
+        self.stall.0.lock().unwrap().1
+    }
+
+    fn wait(&self) {
+        let (lock, signal) = &*self.stall;
+        let mut state = lock.lock().unwrap();
+        while state.0 {
+            state.1 = true;
+            state = signal.wait(state).unwrap();
+        }
+        state.1 = false;
+    }
+}
+
+impl crate::wire_keys::store::Files for StallDir {
+    fn names(&self) -> Result<Vec<String>, crate::wire_keys::store::FileError> {
+        self.wait();
+        Ok(self.files.lock().unwrap().keys().cloned().collect())
+    }
+
+    fn read(
+        &self,
+        name: &str,
+        buf: &mut [u8],
+    ) -> Result<usize, crate::wire_keys::store::FileError> {
+        use crate::wire_keys::store::FileError;
+        self.wait();
+        let files = self.files.lock().unwrap();
+        let bytes = files.get(name).ok_or(FileError::NotFound)?;
+        if bytes.len() >= buf.len() {
+            return Err(FileError::Refused);
+        }
+        buf[..bytes.len()].copy_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn write_atomic(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), crate::wire_keys::store::FileError> {
+        self.files
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), bytes.to_vec());
+        Ok(())
+    }
+
+    fn lock(&self) -> Result<(), crate::wire_keys::store::FileError> {
+        Ok(())
+    }
+}
+
+/// A genuine envelope of the established publication: a header-only frame
+/// sealed under its session sealer, with a fresh sequence.
+fn genuine_envelope(rig: &mut Rig) -> Vec<u8> {
+    let outbound = rig.agents.sender.role.outbound_mut(0).unwrap();
+    let mut sealer = outbound.lend_sealer().expect("a live, admitted sealer");
+    let mut bytes = vec![0u8; 32 + crate::wire_auth::ENVELOPE_LEN];
+    let length = sealer.seal(&mut bytes, 32).unwrap();
+    outbound.return_sealer(sealer);
+    bytes.truncate(length);
+    bytes
+}
+
+/// H8 R5-05 (RLD-4, REV-2): the conductor's key file read genuinely
+/// blocks (a stalled reload, on its own thread) while the agents go on
+/// running. The last completed reload granted freshness from the start of
+/// its read; within that bound DATA keeps flowing and the receiver opens
+/// envelopes, and once it lapses, with the reload still blocked, nothing
+/// more is handed to the backend and the receiver refuses envelopes at
+/// ingress: the 10 s revocation bound holds without the conductor.
+#[test]
+fn a_blocked_key_read_stops_live_agents_within_the_bound() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::net::wire::{FRESH_NS, WireKeys};
+    use crate::wire_auth::monotonic_ns;
+    use crate::wire_keys::store::KeyStore;
+
+    let (mut rig, b, _channel) = authenticated_rig();
+    let _slot = established(&mut rig);
+    assert!(send_one(&mut rig, 100) >= 1, "established and sending");
+    let fence = rig.agents.sender.role.key_fence();
+
+    let keys = StallDir::default();
+    keys.put("3-1.key", "format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=1\npurpose=channel\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=1111111111111111111111111111111111111111111111111111111111111111\nchannel_id=7\nstream_id=6\n");
+    let state = StallDir::default();
+    KeyStore::<StallDir, StallDir>::initialise(&state, zeroize::Zeroizing::new([7; 32])).unwrap();
+    let (mut wire, _) = WireKeys::start(
+        Box::new(keys.clone()) as crate::net::wire::Dir,
+        Box::new(state) as crate::net::wire::Dir,
+        None,
+    )
+    .unwrap();
+    // The first duty reloads and, both roles holding its view, grants
+    // freshness from its read's start, at the latest `after`.
+    assert!(wire.duty(&fence).is_none(), "the start view, unchanged");
+    let after = monotonic_ns();
+    // Every later read blocks: the conductor runs on, stalled in it.
+    keys.set_stalled(true);
+    let stop = Arc::new(AtomicBool::new(false));
+    let conductor = {
+        let (fence, stop) = (Arc::clone(&fence), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                let _ = wire.duty(&fence);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+    let early = genuine_envelope(&mut rig);
+    let late = genuine_envelope(&mut rig);
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let (mut sent_while_blocked, mut last_send_start) = (false, 0u64);
+    let mut opened_while_blocked = false;
+    let end = after + FRESH_NS + 1_000_000_000;
+    let mut round = 0u64;
+    while monotonic_ns() < end {
+        if round.is_multiple_of(5) {
+            let _ = rig.log.as_mut().unwrap().publications[0]
+                .append(&[3; 100], karyos_sys::log_buffer::AppendOptions::default());
+        }
+        round += 1;
+        let blocked = keys.blocked();
+        let started = monotonic_ns();
+        let sent = rig.agents.sender.role.counters().sent;
+        rig.round(true);
+        if rig.agents.sender.role.counters().sent > sent {
+            last_send_start = started;
+            sent_while_blocked |= blocked;
+        }
+        if blocked && !opened_while_blocked {
+            // Ingress inside the bound with the reload blocked: opened.
+            let rejected = rig.agents.receiver.counters().auth_rejected;
+            let receiver = &mut rig.agents.receiver;
+            receiver
+                .role
+                .inject_datagram(&receiver.sessions, b, source, &early, rig.now);
+            assert_eq!(rig.agents.receiver.counters().auth_rejected, rejected);
+            opened_while_blocked = true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(keys.blocked(), "the reload is still blocked");
+    assert!(
+        opened_while_blocked && sent_while_blocked,
+        "live inside the bound"
+    );
+    // Nothing reached the backend from a cycle that started past the
+    // bound of the last granted read.
+    assert!(
+        last_send_start <= after + FRESH_NS,
+        "sent at {last_send_start}, bound {}",
+        after + FRESH_NS
+    );
+    // Ingress past the bound: a genuine envelope sealed inside it is
+    // refused at the fence.
+    let (rejected, committed) = (
+        rig.agents.receiver.counters().auth_rejected,
+        rig.agents.receiver.counters().data_committed,
+    );
+    let receiver = &mut rig.agents.receiver;
+    receiver
+        .role
+        .inject_datagram(&receiver.sessions, b, source, &late, rig.now);
+    assert_eq!(rig.agents.receiver.counters().auth_rejected, rejected + 1);
+    assert_eq!(rig.agents.receiver.counters().data_committed, committed);
+    stop.store(true, Ordering::Release);
+    keys.set_stalled(false);
+    conductor.join().unwrap();
 }

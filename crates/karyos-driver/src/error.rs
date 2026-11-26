@@ -163,6 +163,11 @@ pub enum AuthRefusal {
     /// accepts (ADR-0086 section 5, ADR-0114 section 11).
     #[error("the channel MTU leaves no inner budget for the envelope")]
     Mtu,
+    /// The driver's challenge table is configured above the authenticated
+    /// profile's hard ceilings: more than 256 pending challenges, or more
+    /// than 8 per source address (ADR-0086 section 6; H8 R5-04).
+    #[error("the challenge table is configured above the profile ceilings")]
+    ChallengeCeiling,
 }
 
 /// Errors returned by the embedded driver.

@@ -1633,6 +1633,7 @@ fn installed_image_with(
         auth: None,
         enc_seal: None,
         aborted: None,
+        abort_uncommitted: false,
         abort_scope: None,
     };
     (image, params)

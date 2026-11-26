@@ -663,6 +663,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     reason: crate::error::AuthRefusal::Unsupported { operation },
                 });
             }
+            net.check_auth_challenge_ceilings()?;
             let wire = net
                 .wire_keys_mut()
                 .ok_or(DriverError::AuthenticatedRefused {

@@ -541,9 +541,6 @@ pub struct SenderCounters {
     pub abort_reports_deferred: u64,
     /// Valid ACKs after the first of an abort: counted, never recorded.
     pub abort_acks_duplicate: u64,
-    /// Incarnations the receiver aborted on its guard authority's own
-    /// SESSION_ABORT, learned from its valid ACK: terminal and retired.
-    pub aborts_remote: u64,
     /// NAKs of an aborting or terminal incarnation: not served.
     pub naks_after_abort: u64,
     /// Pending repair jobs of an aborting or terminal incarnation,
@@ -1752,6 +1749,9 @@ struct Installed<T: StreamTerms = HeapTerms> {
     /// changes nothing, and from it on the image is terminal to DATA,
     /// heartbeats, sender controls and liveness evidence.
     aborted: Option<u64>,
+    /// The applied abort is not yet durably recorded: its ACK is withheld
+    /// and a redelivery of the same abort retries the record (H8 RCV-4).
+    abort_uncommitted: bool,
     /// The remote abort its publication admits, bound at admission; `None`
     /// refuses every remote abort (ADR-0118).
     abort_scope: Option<AbortScope>,
@@ -3029,6 +3029,20 @@ impl<T: StreamTerms> ReceiverRole<T> {
             .map(receive_auth::ImageAuth::sealer)
     }
 
+    /// Replaces the overlap clock of the authenticated image at `slot`
+    /// (tests; H8 ROT-5).
+    #[cfg(test)]
+    pub(crate) fn set_image_auth_clock(&mut self, slot: SlotRef, clock: fn() -> u64) {
+        if let Some(auth) = self
+            .images
+            .iter_mut()
+            .find(|image| image.slot == slot)
+            .and_then(|image| image.auth.as_deref_mut())
+        {
+            auth.set_clock(clock);
+        }
+    }
+
     /// The `key_id` and file epoch the domain 4 sealer of the
     /// authenticated image at `slot` is under (tests).
     #[cfg(test)]
@@ -3539,6 +3553,12 @@ impl<T: StreamTerms> ReceiverRole<T> {
         self.posted_naks.reserve(256);
         self.posted_challenges.reserve(256);
         self.largest_in.reserve(8);
+    }
+
+    /// The signed intake's digest cache entries (tests; H8 BUD-9).
+    #[cfg(test)]
+    pub(super) fn signed_cached(&self) -> usize {
+        self.signed.as_deref().map_or(0, SignedIntake::cached)
     }
 
     /// The largest datagram `endpoint`'s intake has read (tests).
@@ -4179,6 +4199,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             auth,
             enc_seal,
             aborted: None,
+            abort_uncommitted: false,
             abort_scope,
         });
         Ok(link)
@@ -4222,6 +4243,10 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 })
             };
             let (evidence, closing) = (image.evidence, image.closing);
+            // An abort whose record has not committed keeps its image (still
+            // terminal to DATA) so a redelivery can retry the record and
+            // acknowledge; its liveness bounds the wait (H8 RCV-4).
+            let closing = closing.filter(|_| !image.abort_uncommitted);
             // A later path keeps the image after the founding path's
             // subscription went: its control goes on the live paths only,
             // never to the released founding endpoint (#307 review P2-3).
@@ -6760,6 +6785,8 @@ impl<T: StreamTerms> Intake<'_, T> {
             self.role.count(|c| &mut c.guard_challenges_refused);
             return true;
         };
+        #[cfg(test)]
+        prepared_hook();
         if self.forward(ControlItem::Raw {
             endpoint: self.endpoint,
             destination: answer.destination,
@@ -6930,14 +6957,20 @@ impl<T: StreamTerms> Intake<'_, T> {
         match verified.control {
             AuthControl::Abort(abort) => {
                 // The epoch check: only a bound, authenticated image of
-                // that incarnation not yet aborted.
+                // that incarnation not yet aborted, or aborted by this very
+                // abort whose record has not committed yet (a retry).
                 let index = self.bound_image(source, abort.alias).filter(|index| {
                     self.role.images.get(*index).is_some_and(|image| {
                         image.identity == abort.identity
                             && image.auth.is_some()
-                            && image.aborted.is_none()
+                            && (image.aborted.is_none()
+                                || (image.abort_uncommitted
+                                    && image.aborted == Some(abort.guard_epoch)))
                     })
                 });
+                let retry = index
+                    .and_then(|index| self.role.images.get(index))
+                    .is_some_and(|image| image.aborted.is_some());
                 // The scope check, before any state changes: only the
                 // authority admitted with this publication, under its
                 // guard (ADR-0118).
@@ -6952,7 +6985,7 @@ impl<T: StreamTerms> Intake<'_, T> {
                 // What this path's queue already holds was verified before
                 // the abort: it is delivered first and counts in the ACK;
                 // anything after, here or on another path, is dropped.
-                if index.is_some() {
+                if index.is_some() && !retry {
                     self.drain_own_queue();
                 }
                 // An authenticated abort whose reason this driver does not
@@ -6971,14 +7004,31 @@ impl<T: StreamTerms> Intake<'_, T> {
                 };
                 // Terminal durably before the ACK leaves: a receiver
                 // restarted since refuses its SETUP even when the ACK never
-                // reached the sender (H8 RCV-4).
+                // reached the sender (H8 RCV-4). Until the record commits,
+                // the image is terminal in memory, no ACK leaves and the
+                // digest is not cached, so the next delivery retries.
                 let recorded = self
                     .role
                     .abort_record
                     .as_deref_mut()
                     .map(|record| record.record(resend.ack.identity));
-                if matches!(recorded, Some(Err(_))) {
+                let committed = !matches!(recorded, Some(Err(_)));
+                if let Some(image) = index.and_then(|index| self.role.images.get_mut(index)) {
+                    image.abort_uncommitted = !committed;
+                }
+                if !committed {
                     self.role.count(|c| &mut c.abort_records_failed);
+                }
+                if retry {
+                    if committed {
+                        if self.send_abort_ack(resend.clone()) {
+                            self.role.count(|c| &mut c.abort_acks_sent);
+                        }
+                        if let Some(intake) = self.role.signed.as_deref_mut() {
+                            intake.applied(ingress, source, verified.digest, resend, now);
+                        }
+                    }
+                    return;
                 }
                 // Reported once, at the transition, with the values its ACK
                 // carries (design, Session abort, receiver).
@@ -6996,6 +7046,9 @@ impl<T: StreamTerms> Intake<'_, T> {
                 }
                 if !known {
                     self.role.count(|c| &mut c.aborts_unknown_reason);
+                }
+                if !committed {
+                    return;
                 }
                 if self.send_abort_ack(resend.clone()) {
                     self.role.count(|c| &mut c.abort_acks_sent);
@@ -7107,6 +7160,8 @@ impl<T: StreamTerms> Intake<'_, T> {
         let Some(raw) = bytes.get(..sealed).and_then(SealedBytes::copy) else {
             return false;
         };
+        #[cfg(test)]
+        prepared_hook();
         self.forward(ControlItem::Raw {
             endpoint: resend.endpoint,
             destination: resend.destination,
@@ -8926,10 +8981,12 @@ impl<T: StreamTerms> SenderRole<T> {
     /// pending abort: valid with that epoch and lanes within what was
     /// submitted ([`Self::ack_lanes_valid`]); the first valid one records
     /// its per-lane ranges and completes the abort, later ones are counted
-    /// duplicates, never recorded again. With no abort of ours pending, a
-    /// valid ACK of the live incarnation is the receiver applying its
-    /// guard authority's own abort: the incarnation is terminal and
-    /// retired, so a receiver restarted since cannot establish it again
+    /// duplicates, never recorded again. With no abort of ours pending, an
+    /// ACK changes nothing and is counted: a receiver's pairwise key never
+    /// carries abort authority, and SESSION_ABORT_ACK carries no
+    /// authority evidence (guards-and-abort.md, sender step 4; ADR-0118;
+    /// H8 ADM-8, ABT-10). A receiver that applied its guard authority's
+    /// own abort keeps the incarnation terminal through its durable record
     /// (H8 RCV-4).
     fn abort_acked(
         &mut self,
@@ -8942,28 +8999,15 @@ impl<T: StreamTerms> SenderRole<T> {
                 == (endpoint, ack.alias, ack.identity)
         });
         let Some(at) = at else {
-            let index = self.publication_auth_index(endpoint, ack.alias);
-            let terminal = index
+            let terminal = self
+                .publication_auth_index(endpoint, ack.alias)
                 .and_then(|index| self.publication_auth.get(index))
                 .is_some_and(|auth| auth.aborted == Some(ack.identity));
             if terminal {
                 self.count(|c| &mut c.abort_acks_duplicate);
-                return;
-            }
-            let live = self.sessions.identity(endpoint, ack.alias) == Some(ack.identity);
-            if !(live && lanes_valid) {
+            } else {
                 self.count(|c| &mut c.abort_acks_unmatched);
-                return;
             }
-            if let Some(auth) = index.and_then(|index| self.publication_auth.get_mut(index)) {
-                auth.aborted = Some(ack.identity);
-                auth.retire = Some(publish_auth::Retirement {
-                    identity: ack.identity,
-                    interrupted: false,
-                    lanes: Some(ack.lanes),
-                });
-            }
-            self.count(|c| &mut c.aborts_remote);
             return;
         };
         let (epoch, ended) = self.aborts.get(at).map_or((false, true), |pending| {
@@ -11817,3 +11861,22 @@ pub(crate) fn image_skip_config(paths: &PathConfig, reliable: bool) -> SkipConfi
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs between a prepared STATUS or SESSION_ABORT_ACK generation
+    /// capture (and its signing or sealing) and its post for submission:
+    /// a deterministic interleaving point (H8 R5-05, tests).
+    pub(crate) static PREPARED_HOOK: core::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Runs the [`PREPARED_HOOK`], if set (tests).
+#[cfg(test)]
+fn prepared_hook() {
+    PREPARED_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}

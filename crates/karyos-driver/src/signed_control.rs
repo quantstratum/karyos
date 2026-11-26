@@ -668,6 +668,8 @@ impl<R: Clone> SignedIntake<R> {
             stream_id,
             key_id,
         };
+        #[cfg(test)]
+        crate::wire_auth::count_crypto_open();
         let opened = open_signed(datagram, &binding, &authority.verifier).map_err(
             |rejection: Rejection| {
                 let _ = rejection;

@@ -252,12 +252,15 @@ pub trait AbortRecord: core::fmt::Debug {
     /// Whether `identity` is terminal here. Fail closed: true for every
     /// identity once the record is full or unreadable.
     fn terminal(&self, identity: &Identity) -> bool;
-    /// Records `identity` durably before the abort is acknowledged.
+    /// Records `identity` durably before the abort is acknowledged. `Ok`
+    /// only once it is committed: a repeated call after a failed commit
+    /// retries it, never reports the in-memory entry as durable.
     ///
     /// # Errors
     ///
     /// [`MarkError`] when the record is full or unreadable, or the commit
-    /// failed; the identity is terminal in memory regardless.
+    /// failed; the identity is terminal in memory regardless, and the
+    /// abort must not be acknowledged.
     fn record(&mut self, identity: Identity) -> Result<(), MarkError>;
 }
 
@@ -267,16 +270,24 @@ pub trait AbortRecord: core::fmt::Debug {
 pub const MAX_ABORTED: usize = 256;
 /// The record's file in the driver's durable state directory.
 pub const ABORTED_FILE: &str = "aborted-incarnations";
+/// Its replica, written first at each commit: a commit holds once either
+/// file holds it, and a load takes the union of both.
+pub const ABORTED_REPLICA: &str = "aborted-incarnations-replica";
 const ABORTED_FORMAT: &str = "karyos-aborted-incarnations-v1";
 /// The largest record file: the header, the flag and every line.
 const ABORTED_MAX_LEN: usize = 64 + MAX_ABORTED * 88;
 
-/// [`AbortRecord`] in one file of a [`Files`] directory: a header, a
+/// [`AbortRecord`] in two files of a [`Files`] directory, each a header, a
 /// `full` flag and one `<driver0>-<driver1>-<registration>-<incarnation>`
-/// line per terminal identity, replaced atomically at each record.
+/// line per terminal identity, each replaced atomically at each record:
+/// the replica first, then the record. The record is created with the
+/// state directory ([`initialise_aborted`]), so a missing record is a lost
+/// one and fails closed, never an empty one.
 pub struct AbortedIncarnations<F: Files> {
     files: F,
     held: Vec<Identity>,
+    /// A commit of `held` failed: the next record retries it.
+    dirty: bool,
     /// The capacity was exceeded once: every identity is terminal.
     full: bool,
     /// The file could not be read at start: every identity is terminal.
@@ -299,21 +310,28 @@ impl<F: Files> AbortedIncarnations<F> {
         let mut record = Self {
             files,
             held: Vec::with_capacity(MAX_ABORTED),
+            dirty: false,
             full: false,
             unreadable: false,
         };
-        if record.load().is_err() {
+        let loaded = record
+            .load(ABORTED_FILE, false)
+            .and_then(|()| record.load(ABORTED_REPLICA, true));
+        if loaded.is_err() {
             record.held.clear();
             record.unreadable = true;
         }
         record
     }
 
-    fn load(&mut self) -> Result<(), MarkError> {
+    /// Adds what `name` holds. A missing record was lost (it is created
+    /// with the state directory); a missing replica was never written.
+    fn load(&mut self, name: &str, optional: bool) -> Result<(), MarkError> {
         let mut buf = vec![0u8; ABORTED_MAX_LEN + 1];
-        let len = match self.files.read(ABORTED_FILE, &mut buf) {
+        let len = match self.files.read(name, &mut buf) {
             Ok(len) => len,
-            Err(FileError::NotFound) => return Ok(()),
+            Err(FileError::NotFound) if optional => return Ok(()),
+            Err(FileError::NotFound) => return Err(MarkError::Unreadable),
             Err(FileError::Refused) => return Err(MarkError::Unreadable),
         };
         let text = buf
@@ -324,7 +342,7 @@ impl<F: Files> AbortedIncarnations<F> {
         if lines.next() != Some(ABORTED_FORMAT) {
             return Err(MarkError::Unreadable);
         }
-        self.full = match lines.next() {
+        self.full |= match lines.next() {
             Some("full=0") => false,
             Some("full=1") => true,
             _ => return Err(MarkError::Unreadable),
@@ -348,37 +366,65 @@ impl<F: Files> AbortedIncarnations<F> {
             ) else {
                 return Err(MarkError::Unreadable);
             };
-            if self.held.len() >= MAX_ABORTED {
-                return Err(MarkError::Unreadable);
-            }
-            self.held.push(Identity {
+            let identity = Identity {
                 driver_id: [d0, d1],
                 registration_id: registration,
                 incarnation: inc,
-            });
+            };
+            if self.held.contains(&identity) {
+                continue;
+            }
+            if self.held.len() >= MAX_ABORTED {
+                return Err(MarkError::Unreadable);
+            }
+            self.held.push(identity);
         }
         Ok(())
     }
 
-    fn write(&self) -> Result<(), MarkError> {
-        use core::fmt::Write as _;
-
-        let mut text = String::with_capacity(ABORTED_MAX_LEN);
-        let _ = writeln!(text, "{ABORTED_FORMAT}\nfull={}", u8::from(self.full));
-        for identity in &self.held {
-            let _ = writeln!(
-                text,
-                "{}-{}-{}-{}",
-                identity.driver_id[0],
-                identity.driver_id[1],
-                identity.registration_id,
-                identity.incarnation
-            );
+    /// Commits `held` to the replica, then the record: it holds once
+    /// either write does, since a load takes the union. It stays dirty
+    /// until the record itself is written.
+    fn write(&mut self) -> Result<(), MarkError> {
+        let text = encode_aborted(self.full, &self.held);
+        let replica = self.files.write_atomic(ABORTED_REPLICA, text.as_bytes());
+        let record = self.files.write_atomic(ABORTED_FILE, text.as_bytes());
+        self.dirty = record.is_err();
+        if replica.is_err() && record.is_err() {
+            return Err(MarkError::Commit);
         }
-        self.files
-            .write_atomic(ABORTED_FILE, text.as_bytes())
-            .map_err(|_| MarkError::Commit)
+        Ok(())
     }
+}
+
+fn encode_aborted(full: bool, held: &[Identity]) -> String {
+    use core::fmt::Write as _;
+
+    let mut text = String::with_capacity(ABORTED_MAX_LEN);
+    let _ = writeln!(text, "{ABORTED_FORMAT}\nfull={}", u8::from(full));
+    for identity in held {
+        let _ = writeln!(
+            text,
+            "{}-{}-{}-{}",
+            identity.driver_id[0],
+            identity.driver_id[1],
+            identity.registration_id,
+            identity.incarnation
+        );
+    }
+    text
+}
+
+/// Creates the empty abort record in a new state directory, with the key
+/// state (design section 2.6): from then on a missing record is a lost one.
+///
+/// # Errors
+///
+/// [`MarkError::Commit`] when the write fails.
+pub fn initialise_aborted<F: Files + ?Sized>(files: &F) -> Result<(), MarkError> {
+    files
+        .write_atomic(ABORTED_FILE, encode_aborted(false, &[]).as_bytes())
+        .map_err(|_| MarkError::Commit)
 }
 
 impl<F: Files> AbortRecord for AbortedIncarnations<F> {
@@ -391,7 +437,8 @@ impl<F: Files> AbortRecord for AbortedIncarnations<F> {
             return Err(MarkError::Unreadable);
         }
         if self.held.contains(&identity) {
-            return Ok(());
+            // Held in memory is not durable: retry a failed commit.
+            return if self.dirty { self.write() } else { Ok(()) };
         }
         if self.held.len() >= MAX_ABORTED {
             // Fail closed: from here every identity is terminal, durably.

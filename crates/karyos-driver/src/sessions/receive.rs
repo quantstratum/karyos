@@ -130,7 +130,26 @@ impl Default for SessionConfig {
 #[error("invalid session configuration: {0}")]
 pub struct SessionConfigError(pub &'static str);
 
+/// The most pending challenges an authenticated or encrypted channel's
+/// driver may hold, both challenge kinds together (ADR-0086 section 6,
+/// challenge table bounds).
+pub const AUTH_MAX_PENDING_CHALLENGES: usize = 256;
+
+/// The most pending challenges an authenticated or encrypted channel's
+/// driver may hold for one source address (ADR-0086 section 6).
+pub const AUTH_MAX_PENDING_PER_SOURCE: usize = 8;
+
 impl SessionConfig {
+    /// Whether the challenge table stays within the authenticated
+    /// profile's hard ceilings ([`AUTH_MAX_PENDING_CHALLENGES`],
+    /// [`AUTH_MAX_PENDING_PER_SOURCE`]): a protected channel is admitted
+    /// only on a driver whose configuration does (H8 R5-04).
+    #[must_use]
+    pub const fn within_auth_ceilings(&self) -> bool {
+        self.max_pending_challenges <= AUTH_MAX_PENDING_CHALLENGES
+            && self.max_pending_per_source <= AUTH_MAX_PENDING_PER_SOURCE
+    }
+
     fn validate(&self) -> Result<(), SessionConfigError> {
         if self.max_images == 0
             || self.max_pending_challenges == 0
