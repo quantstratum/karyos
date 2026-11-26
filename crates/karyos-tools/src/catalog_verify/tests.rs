@@ -1897,3 +1897,183 @@ fn a_group_gets_time_evidence_from_the_calibration_journal_on_disk() {
     assert!(out.ends_with("time verdict: not_met\n"), "{out}");
     std::fs::remove_dir_all(&archive.root).unwrap();
 }
+
+/// ADR-0119 point 3, Codex review of docs#1071: recording 7 carries a
+/// requirement for clock domain 5; recording 9 carries none, and holds an
+/// unsynchronised entry and a synchronised one of domain 6.
+/// - An unsynchronised clock is `not_met` even with no requirement for its
+///   domain (SPEC.md 8.4 precedence); only what would be met becomes
+///   `no_evidence`.
+/// - `--recording 9` with no flag counts only 9's requirements: none, so no
+///   verdict, though recording 7 carries one.
+#[test]
+fn a_missing_requirement_never_masks_not_met_and_the_filter_comes_first() {
+    use karyos_archive::integrity::time::{Source, SyncState};
+    use karyos_archive::integrity::time_evidence::{Entry, EntryStore, entries_dir};
+    use karyos_trace::stream::{DriverSelf, StreamMessage, TimeRequirement};
+
+    let root = std::env::temp_dir().join(format!("karyos-verify-scope-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let archive = Archive { root };
+    let dir = archive.dir();
+    std::fs::create_dir_all(entries_dir(&dir)).unwrap();
+    std::fs::create_dir_all(archive.anchors()).unwrap();
+    let met = Entry {
+        source: Source::Gnss,
+        sync_state: SyncState::Synchronised,
+        clock: [0, 0, 0, 5, 77],
+        recording: 7,
+        start: 0,
+        end: 0,
+        min_time: 1000,
+        max_time: 2000,
+        granularity: 1,
+        bound_min_ns: 150,
+        bound_max_ns: 160,
+        calibration: [0xAA; 32],
+        utc_reference: [0xBB; 32],
+        tick_fs: 1_000_000,
+    };
+    let mut journal = open_journal(&dir);
+    let mut store_entries = Vec::new();
+    for recording in [7u64, 9] {
+        let mut bytes = trace_frame(&StreamMessage::DriverSelf(DriverSelf {
+            namespace: 1,
+            namespace_inode: 9,
+            clock: [0, 0, 0, 5, 77],
+            granularity: 1000,
+        }));
+        if recording == 7 {
+            bytes.extend(trace_frame(&StreamMessage::Requirement(TimeRequirement {
+                domain: 5,
+                max_divergence_ns: 1000,
+                max_granularity_ns: 1,
+            })));
+        }
+        let length = bytes.len() as u64;
+        let mut store = SegmentStore::create(
+            StdDisk,
+            &dir,
+            recording,
+            Geometry::new(4096, 8192).unwrap(),
+            SyncPolicy::None,
+            0,
+        )
+        .unwrap();
+        store.append(0, &bytes).unwrap();
+        store.sync().unwrap();
+        drop(store);
+        journal.seal_segment(recording, 0, &bytes, false).unwrap();
+        if recording == 7 {
+            store_entries.push(Entry { end: length, ..met });
+        } else {
+            let clock = [0, 0, 0, 6, 77];
+            store_entries.push(Entry {
+                recording,
+                clock,
+                end: 32,
+                sync_state: SyncState::Unsynchronised,
+                ..met
+            });
+            store_entries.push(Entry {
+                recording,
+                clock,
+                start: 32,
+                end: length,
+                ..met
+            });
+        }
+    }
+    drop(journal);
+    let mut store = EntryStore::open(StdDisk, &dir).unwrap();
+    for entry in &store_entries {
+        store.append(entry).unwrap();
+    }
+    drop(store);
+    sign_time_evidence(&archive, &entries_dir(&dir), 1);
+    let (_, out, err) = time_run(&archive, &[]);
+    assert_eq!(err, "", "{out}");
+    assert!(out.contains("time recording 7 [0, "), "{out}");
+    assert!(
+        out.contains("time recording 9 [0, 32) clock 6:77 not_met\n"),
+        "{out}"
+    );
+    assert!(out.contains("time recording 9 [32, "), "{out}");
+    assert!(out.contains(") clock 6:77 no_evidence\n"), "{out}");
+    assert!(out.ends_with("time verdict: not_met\n"), "{out}");
+    // Recording 9 alone carries no requirement: no verdict, though 7 does.
+    let (_, out, err) = time_run(&archive, &["--recording", "9"]);
+    assert_eq!(err, "", "{out}");
+    assert!(!out.contains("time verdict"), "{out}");
+    assert!(!out.contains("time recording 9"), "{out}");
+    let (_, out, _) = time_run(&archive, &["--recording", "7"]);
+    assert!(out.ends_with("time verdict: met\n"), "{out}");
+}
+
+/// Codex review of #1278, P2: a trace recording that carries a requirement
+/// and a loss but has no evidence entry (no declared clock, or production
+/// that failed first) is found from the seals: its sealed range is
+/// uncovered `no_evidence` and its loss reported, never invisible.
+#[test]
+fn a_trace_recording_without_entries_is_found_from_its_seals() {
+    use karyos_archive::integrity::time_evidence::entries_dir;
+    use karyos_trace::stream::{DriverSelf, StreamLoss, StreamMessage, TimeRequirement};
+
+    let root = std::env::temp_dir().join(format!("karyos-verify-unentried-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let archive = Archive { root };
+    let dir = archive.dir();
+    std::fs::create_dir_all(entries_dir(&dir)).unwrap();
+    std::fs::create_dir_all(archive.anchors()).unwrap();
+    let mut bytes = trace_frame(&StreamMessage::DriverSelf(DriverSelf {
+        namespace: 1,
+        namespace_inode: 9,
+        clock: [0; 5],
+        granularity: 0,
+    }));
+    bytes.extend(trace_frame(&StreamMessage::Requirement(TimeRequirement {
+        domain: 5,
+        max_divergence_ns: 1000,
+        max_granularity_ns: 1,
+    })));
+    bytes.extend(trace_frame(&StreamMessage::Loss(StreamLoss {
+        journal: 7,
+        first: 3,
+        last: 4,
+    })));
+    let length = bytes.len() as u64;
+    let mut store = SegmentStore::create(
+        StdDisk,
+        &dir,
+        4,
+        Geometry::new(4096, 8192).unwrap(),
+        SyncPolicy::None,
+        0,
+    )
+    .unwrap();
+    store.append(0, &bytes).unwrap();
+    store.sync().unwrap();
+    drop(store);
+    let mut journal = open_journal(&dir);
+    journal.seal_segment(4, 0, &bytes, false).unwrap();
+    drop(journal);
+    // A signed entries journal that holds no entry.
+    sign_time_evidence(&archive, &entries_dir(&dir), 1);
+    let (_, out, err) = time_run(&archive, &[]);
+    assert_eq!(err, "", "{out}");
+    assert!(
+        out.contains("time requirement of recording 4 clock domain 5: declared 1000:1"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "time recording 4 [0, {length}) uncovered no_evidence"
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("loss journal 7 sequences [3, 4] no_evidence"),
+        "{out}"
+    );
+    assert!(out.contains("time verdict: no_evidence"), "{out}");
+}

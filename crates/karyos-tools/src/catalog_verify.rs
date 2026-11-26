@@ -545,6 +545,15 @@ pub fn time_report(args: &VerifyArgs) -> Result<Option<TimeReport>, VerifyError>
     };
     let mut gaps = coverage(&args.dir, &dir, &entries)?;
     let (mut losses, carried) = trace_reading(&args.dir, &entries)?;
+    // A recording that carries a requirement and has no entry: its sealed
+    // ranges are uncovered, `no_evidence`, never silent.
+    for (recording, start, end) in sealed_ranges(&args.dir, &dir)? {
+        if carried.contains_key(&recording)
+            && entries.iter().all(|entry| entry.recording != recording)
+        {
+            gaps.push((recording, start, end));
+        }
+    }
     // Each entry's requirement: the flag's, or what its recording carries
     // for its clock domain.
     let requirement_of = |entry: &time_evidence::Entry| {
@@ -569,8 +578,10 @@ pub fn time_report(args: &VerifyArgs) -> Result<Option<TimeReport>, VerifyError>
     if let Some(recording) = args.recording {
         recorded.retain(|(subject, _)| *subject == recording);
     }
-    // No requirement declared anywhere: no verdict (a report with none is
-    // refused).
+    // No requirement declared for what is reported: no verdict (a report
+    // with none is refused). The recording filter applies first, so with
+    // --recording B only B's requirements count, never another
+    // recording's (ADR-0119 point 3).
     let Some(declared) = args.time_requirement.or_else(|| {
         recorded.first().map(|(_, recorded)| Requirement {
             max_divergence_ns: recorded.max_divergence_ns,
@@ -603,9 +614,19 @@ pub fn time_report(args: &VerifyArgs) -> Result<Option<TimeReport>, VerifyError>
         // The zero identity is "provenance unknown", never a clock to look
         // up (quantstratum-docs: karyos/design/trace-clocks.md).
         let verdict = match requirement_of(&entry) {
-            Some(requirement) if covered && entry.clock != [0; 5] => entry.verdict(&requirement),
-            // Not verified, of no clock, or with no requirement to judge.
-            _ => Verdict::NoEvidence,
+            _ if !covered || entry.clock == [0; 5] => Verdict::NoEvidence,
+            Some(requirement) => entry.verdict(&requirement),
+            // No requirement for its domain: what fails whatever the
+            // requirement (an unsynchronised clock) stays not_met, ahead
+            // of the missing requirement (SPEC.md 8.4 precedence); only
+            // what would be met is downgraded to no_evidence (ADR-0119).
+            None => match entry.verdict(&Requirement {
+                max_divergence_ns: u64::MAX,
+                max_granularity_ns: u64::MAX,
+            }) {
+                Verdict::Met => Verdict::NoEvidence,
+                other => other,
+            },
         };
         out.push((entry, verdict));
         at = end;
@@ -645,16 +666,23 @@ fn trace_reading(
 ) -> Result<(Vec<RangeLoss>, Carried), VerifyError> {
     use karyos_archive::integrity::time_producer::EventClock;
     use karyos_archive::integrity::trace_evidence::{TraceSession, fold};
-    let subjects: BTreeSet<u64> = entries.iter().map(|entry| entry.recording).collect();
     let mut carried = Carried::new();
-    if subjects.is_empty() {
-        return Ok((Vec::new(), carried));
-    }
     let (records, _) =
         read_records(&mut StdDisk, archive).map_err(|source| VerifyError::TimeEvidence {
             dir: time_evidence::entries_dir(archive),
             source: time_evidence::StoreError::Io(source),
         })?;
+    // Every sealed recording, not only those with entries: a trace
+    // recording whose evidence never started (no declared clock, or a
+    // production that failed before its first entry) still carries its
+    // requirement and its losses.
+    let mut subjects: BTreeSet<u64> = entries.iter().map(|entry| entry.recording).collect();
+    subjects.extend(
+        records
+            .iter()
+            .filter(|record| record.kind.is_range())
+            .map(|record| record.subject),
+    );
     let mut stores = Stores {
         dir: archive.to_path_buf(),
         open: BTreeMap::new(),
@@ -710,6 +738,42 @@ fn trace_reading(
         Some(error) => Err(error),
         None => Ok((losses, carried)),
     }
+}
+
+/// Each recording's sealed ranges, merged, as `(recording, start, end)`.
+///
+/// # Errors
+///
+/// The journal's read error.
+fn sealed_ranges(
+    archive: &std::path::Path,
+    dir: &std::path::Path,
+) -> Result<Vec<(u64, u64, u64)>, VerifyError> {
+    let (records, _) =
+        read_records(&mut StdDisk, archive).map_err(|source| VerifyError::TimeEvidence {
+            dir: dir.to_path_buf(),
+            source: time_evidence::StoreError::Io(source),
+        })?;
+    let mut sealed: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
+    for record in records.iter().filter(|record| record.kind.is_range()) {
+        sealed
+            .entry(record.subject)
+            .or_default()
+            .push((record.start, record.end));
+    }
+    let mut out = Vec::new();
+    for (subject, mut ranges) in sealed {
+        ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (start, end) in ranges {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        out.extend(merged.into_iter().map(|(start, end)| (subject, start, end)));
+    }
+    Ok(out)
 }
 
 /// The time requirements each trace recording carries, by recording and
