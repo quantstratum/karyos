@@ -1,6 +1,6 @@
 ### Changed
 
-- A retention request (`legal-hold`, `hold-release`, `purge`) on an Archive recording that the requester's role does not allow is now journalled, request then outcome refused `not_authorised`, and still answered `{"error":"forbidden"}` and never sent (karyos#719), as a refused purge of the agent's own journal already was: every request of SPEC §13's Audited operations row and its outcome are in the operations journal.
+- A guard close or reopen, and a retention request (`legal-hold`, `hold-release`, `purge`) on an Archive recording, that the requester's role does not allow is now journalled, request then outcome refused `not_authorised`, and still answered `{"error":"forbidden"}` and never sent (karyos#719), as a refused purge of the agent's own journal already was: every request of SPEC §13's Audited operations row and its outcome are in the operations journal.
 
 ### Added
 

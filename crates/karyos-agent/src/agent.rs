@@ -603,6 +603,36 @@ impl Agent {
         )
     }
 
+    /// Journals a guard close (`reopen_at` `None`) or a reopen at epoch
+    /// `reopen_at` of `guard` in the driver in `dir` that `requester`'s
+    /// role does not allow, refused `not_authorised`, and sends nothing
+    /// (karyos#719; [`operations::refuse_unauthorised`]).
+    pub fn guard_refused(
+        &mut self,
+        dir: &Path,
+        guard: u64,
+        reopen_at: Option<u64>,
+        requester: Requester,
+        reason: &[u8],
+    ) {
+        let operation = self.allocate_operation();
+        let command = operations::Command {
+            dir,
+            guard,
+            transition: reopen_at.map_or(
+                operations::Transition::Close,
+                operations::Transition::Reopen,
+            ),
+            instance: None,
+            operation,
+            operator: requester.operator,
+            relay: requester.relay,
+            reason: operations::cut_reason(reason),
+            timeout: self.config.guard_timeout,
+        };
+        operations::refuse_unauthorised(self.journal.as_mut(), &command, host_monotonic_ns());
+    }
+
     /// Journals a retention `operation` on Archive `recording` that
     /// `requester`'s role does not allow, refused `not_authorised`, and
     /// sends nothing (karyos#719; [`crate::retention::refuse_unauthorised`]).
