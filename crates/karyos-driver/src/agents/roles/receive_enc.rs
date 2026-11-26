@@ -73,14 +73,28 @@ use crate::wire_keys::KeyFile;
 pub(crate) const RSP_TARGETS: usize = 8;
 
 /// Domain 6 sealers a receiver role keeps for one `receiver_boot_id`
-/// (H8-01): each bootstrap key, fixed by its key id, receiver id, target
-/// publication, alias and boot id, has one counter for the whole boot,
-/// whatever happens to the subscription that made it, so it is never made
-/// twice. Preallocated at the first encrypted subscription; when it is
-/// full no further target is challenged until the boot id is redrawn
-/// (fail closed). 64 is eight targets for each of eight subscriptions,
-/// the bound one subscription had before.
+/// (H8-01, H8-10, H8-11): each bootstrap key, fixed by the derivation
+/// inputs it is made of (the channel key id, from which the sealer follows
+/// its file epochs, the receiver id, the target publication and the boot
+/// id; `session_id` and `stream_id` are selectors, never HKDF inputs), has
+/// one counter for as long as that key can be derived, whatever happens to
+/// the subscription that made it and on whichever alias, so it is never
+/// made twice. An entry is reclaimed only once it is withdrawn and every
+/// file epoch it sealed under has stopped verifying, and a key id's
+/// reclaimed epochs are never sealed under again in the boot
+/// ([`RSP_FLOORS`]): its nonce history lives exactly as long as its keys.
+/// Preallocated at the first encrypted subscription; while every entry
+/// holds a live key no further target is challenged (fail closed), so 64
+/// is the bound on the targets one receiver boot challenges at once under
+/// keys still alive: eight for each of eight subscriptions.
 pub(crate) const RSP_SEALERS: usize = 64;
+
+/// Channel key ids whose reclaimed domain 6 entries a receiver boot
+/// remembers (H8-11), each with the highest file epoch they sealed under:
+/// no new domain 6 sealer of that key id takes an epoch at or below it.
+/// One per key id, at most one per entry reclaimed; when it is full no
+/// entry of a further key id is reclaimed (fail closed: it stays).
+pub(crate) const RSP_FLOORS: usize = RSP_SEALERS;
 
 /// How long a resynchronisation challenge stays answerable: the default
 /// `setup_challenge_timeout` of the session table, 1 s (SPEC.md section 5
@@ -114,6 +128,10 @@ impl ControlSeal for EncSealer {
 
     fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
         EncSealer::apply_keys(self, keys);
+    }
+
+    fn key_epoch(&self) -> Option<u32> {
+        (!self.is_withdrawn()).then(|| self.context().key_epoch)
     }
 }
 
@@ -206,9 +224,10 @@ impl SubscriptionEnc {
     }
 }
 
-/// One domain 6 sealer of the role's receiver boot (H8-01): everything
-/// its key derives from but the file epoch, which the sealer itself
-/// follows, and the sealer.
+/// One domain 6 sealer of the role's receiver boot (H8-01, H8-10):
+/// everything its key derives from but the file epoch, which the sealer
+/// itself follows, the one alias whose headers it writes, the highest
+/// file epoch it was keyed under, and the sealer.
 #[derive(Debug)]
 struct RspEntry {
     channel_key_id: u32,
@@ -216,6 +235,8 @@ struct RspEntry {
     publication: PublicationIdentity,
     alias: Alias,
     boot: [u8; 16],
+    /// The highest file epoch its key was derived from (H8-11).
+    high_epoch: u32,
     sealer: SharedSealer,
 }
 
@@ -250,9 +271,13 @@ pub(crate) struct ReceiverEnc {
     /// the oldest giving way; an unverified header records nothing
     /// (H8-02).
     verified: Vec<(EndpointId, Alias, PublicationIdentity)>,
-    /// The domain 6 sealers of the current `receiver_boot_id`, kept for
-    /// the whole boot independently of the subscriptions (H8-01).
+    /// The domain 6 sealers of the current `receiver_boot_id`, kept
+    /// independently of the subscriptions for as long as their keys can
+    /// be derived (H8-01, H8-11).
     rsp: Vec<RspEntry>,
+    /// Per channel key id, the highest file epoch a reclaimed domain 6
+    /// entry of this boot sealed under (H8-11).
+    floors: Vec<(u32, u32)>,
     /// Refusals no encrypted subscription owns, by reason:
     /// `enc_unexpected` on a trusted or authenticated stream among them.
     pub(crate) unattributed: EncRejections,
@@ -290,10 +315,11 @@ impl ReceiverEnc {
         boot: [u64; 2],
         now: u64,
     ) -> Result<(), EncRejection> {
-        let current_key_epoch = self
+        // The active binding epoch, the signing one (H8-12).
+        let binding_key_epoch = self
             .subscriptions
             .get(index)
-            .map(|subscription| subscription.keys.current_epoch())
+            .and_then(|subscription| subscription.keys.signing_epoch())
             .ok_or(EncRejection::ResyncRefused)?;
         let image = self
             .images
@@ -316,7 +342,7 @@ impl ReceiverEnc {
         check_resync(
             (&image.identity, &image.term),
             image.opener.epochs(),
-            current_key_epoch,
+            binding_key_epoch,
             answer,
             envelope_key_epoch,
         )?;
@@ -342,18 +368,73 @@ impl ReceiverEnc {
             subscription.pairwise.admit(keys);
             subscription.keys.retain(keys);
             subscription.pairwise.retain(keys);
-            // New sealers take the epoch the key set signs with (H8-06).
+            // New sealers take the epoch the key set signs with, channel
+            // and pairwise (H8-06).
             subscription.keys.follow_signing(keys);
+            subscription.pairwise.follow_signing(keys);
+            // Its domain 5 scratch slot holds a key of an earlier set:
+            // erased in place (H8-05).
+            crate::wire_enc::erase_slot(&mut subscription.bootstrap);
         }
         // Each domain 6 sealer follows its own key only, keeping its
         // sequence; a withdrawn one stays in the table as a tombstone, so
         // its (target, key, boot id) is refused and never rebuilt with a
-        // sequence restarted at 0 (nonce reuse).
+        // sequence restarted at 0 (nonce reuse), until every file epoch it
+        // sealed under has stopped verifying (H8-11).
         for entry in &mut self.rsp {
+            if let Some(epoch) = entry.sealer.key_epoch() {
+                entry.high_epoch = entry.high_epoch.max(epoch);
+            }
             entry.sealer.apply_keys(keys);
+            if let Some(epoch) = entry.sealer.key_epoch() {
+                entry.high_epoch = entry.high_epoch.max(epoch);
+            }
         }
+        self.reclaim(keys);
         for image in &mut self.images {
             image.opener.apply_keys(keys);
+        }
+    }
+
+    /// Reclaims the domain 6 entries whose keys can no longer be derived
+    /// (H8-11): withdrawn, and every file epoch of its key id up to the
+    /// highest it sealed under no longer verifies, in `keys` or in any
+    /// subscription's files. The key id's floor rises to that epoch first,
+    /// so no sealer of this boot is made again at or below it, whatever
+    /// file later verifies: each nonce history is kept exactly as long as
+    /// its key. A live key's entry, or a withdrawn one whose file still
+    /// verifies, stays. Allocates nothing: both tables are preallocated.
+    fn reclaim(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        let mut at = 0;
+        while let Some(entry) = self.rsp.get(at) {
+            let (key_id, high) = (entry.channel_key_id, entry.high_epoch);
+            let derivable = entry.sealer.key_epoch().is_some()
+                || keys
+                    .verifying(key_id)
+                    .into_iter()
+                    .flatten()
+                    .any(|file| file.file_epoch <= high)
+                || self.subscriptions.iter().any(|subscription| {
+                    subscription.channel_key_id == key_id
+                        && subscription
+                            .keys
+                            .oldest_epoch()
+                            .is_some_and(|oldest| oldest <= high)
+                });
+            if derivable {
+                at = at.saturating_add(1);
+                continue;
+            }
+            let room = self.floors.len() < RSP_FLOORS;
+            match self.floors.iter_mut().find(|(held, _)| *held == key_id) {
+                Some((_, floor)) => *floor = (*floor).max(high),
+                None if room => self.floors.push((key_id, high)),
+                None => {
+                    at = at.saturating_add(1);
+                    continue;
+                }
+            }
+            let _ = self.rsp.swap_remove(at);
         }
     }
 
@@ -366,6 +447,10 @@ impl ReceiverEnc {
         if self.rsp.capacity() < RSP_SEALERS {
             self.rsp
                 .reserve_exact(RSP_SEALERS.saturating_sub(self.rsp.len()));
+        }
+        if self.floors.capacity() < RSP_FLOORS {
+            self.floors
+                .reserve_exact(RSP_FLOORS.saturating_sub(self.floors.len()));
         }
         if self.verified.capacity() < RSP_TARGETS {
             self.verified
@@ -389,7 +474,13 @@ impl ReceiverEnc {
     /// to `publication` on `alias` from the boot `boot`: the one the role
     /// made for that key before, whichever subscription made it, or, when
     /// `create` (a target a verified datagram named, H8-02) and the table
-    /// has room, a new one under the signing epoch.
+    /// has room, a new one under the signing epoch, above the key id's
+    /// reclaimed epochs (H8-11).
+    ///
+    /// The key is fixed by its derivation inputs, not by the alias: a
+    /// second alias for a key already made is refused (`None`), never
+    /// given a second sealer whose sequence would restart at 0 under the
+    /// same key (H8-10).
     fn rsp_sealer(
         &mut self,
         index: usize,
@@ -404,17 +495,24 @@ impl ReceiverEnc {
             entry.channel_key_id == channel_key_id
                 && entry.receiver_id == receiver_id
                 && entry.publication == publication
-                && entry.alias == alias
                 && entry.boot == boot
         }) {
-            return Some(entry.sealer.clone());
+            return (entry.alias == alias).then(|| entry.sealer.clone());
         }
         if !create || self.rsp.len() >= RSP_SEALERS {
             return None;
         }
+        let key_epoch = subscription.keys.signing_epoch()?;
+        if self
+            .floors
+            .iter()
+            .any(|(held, floor)| *held == channel_key_id && key_epoch <= *floor)
+        {
+            return None;
+        }
         let context = KeyContext {
             domain: Domain::RspSetup,
-            key_epoch: subscription.keys.signing_epoch()?,
+            key_epoch,
             party_epoch: 0,
             session_id: alias.session_id,
             stream_id: alias.stream_id,
@@ -439,6 +537,7 @@ impl ReceiverEnc {
             publication,
             alias,
             boot,
+            high_epoch: key_epoch,
             sealer: shared.clone(),
         });
         Some(shared)
@@ -477,6 +576,12 @@ impl ReceiverEnc {
                 && image.alias == alias
                 && publication_of(&image.identity) == publication
         })
+    }
+
+    /// The image at `slot` was retired: its domain 1 keys are dropped,
+    /// which erases them (H8-09).
+    pub(crate) fn retire_image(&mut self, slot: SlotRef) {
+        self.images.retain(|image| image.slot != slot);
     }
 
     /// Marks the local publication `alias` on `endpoint` encrypted.
@@ -546,9 +651,10 @@ impl ReceiverEnc {
     }
 
     /// The boot id was redrawn: no withdrawn domain 6 entry can name a key
-    /// of the new boot, so the table is free again.
+    /// of the new boot, so the table and its floors are free again.
     fn redrawn(&mut self) {
         self.rsp.clear();
+        self.floors.clear();
     }
 }
 
@@ -611,6 +717,29 @@ impl<T: StreamTerms> Intake<'_, T> {
             .unwrap_or(EncRejection::BareFrame);
         self.enc_reject(subscription, reason);
         true
+    }
+
+    /// The log MTU of an image of the subscription to `stream_id` whose
+    /// SETUP advertised `mtu`, the whole datagram (ADR-0086 section 5,
+    /// ADR-0114 section 11; H8-13): less the 84-byte envelope on an
+    /// encrypted subscription, the 48-byte one on an authenticated one,
+    /// unchanged on a trusted one. A SETUP's `mtu` is at least the
+    /// 256-byte floor, so neither subtraction underflows; an image whose
+    /// inner budget holds no frame is refused by its geometry check.
+    pub(super) fn image_mtu(&self, stream_id: i32, mtu: u32) -> u32 {
+        let envelope = if self
+            .role
+            .enc
+            .subscription(self.endpoint, stream_id)
+            .is_some()
+        {
+            karyos_protocol::protection::aes_gcm_siv::ENVELOPE_LEN
+        } else if self.subscription_authenticated(stream_id) {
+            crate::wire_auth::ENVELOPE_LEN
+        } else {
+            0
+        };
+        mtu.saturating_sub(u32::try_from(envelope).unwrap_or(u32::MAX))
     }
 
     /// Counts `reason` on the subscription at `index`, or unattributed.

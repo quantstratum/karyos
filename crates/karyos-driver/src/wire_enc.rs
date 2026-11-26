@@ -263,6 +263,9 @@ struct Secret {
     /// The `key_id` of its file, to follow the key store (H8 finding 4).
     key_id: u32,
     epoch: u32,
+    /// The scope its file names (wire-key-files.md 2.2): a successor of
+    /// another scope is never admitted in its place (H8-03).
+    scope: Scope,
     secret: Zeroizing<[u8; KEY_LEN]>,
 }
 
@@ -279,6 +282,7 @@ impl Clone for Secret {
         Self {
             key_id: self.key_id,
             epoch: self.epoch,
+            scope: self.scope.clone(),
             secret: Zeroizing::new(*self.secret),
         }
     }
@@ -291,6 +295,7 @@ fn secret_of(file: &KeyFile, purpose: Purpose) -> Result<Secret, EncKeyError> {
         Material::Secret(secret) => Ok(Secret {
             key_id: file.key_id,
             epoch: file.file_epoch,
+            scope: file.scope.clone(),
             secret: Zeroizing::new(**secret),
         }),
         Material::Public(_) => Err(EncKeyError::Class),
@@ -333,6 +338,21 @@ fn erase_context(context: &KeyContext) -> Result<KeyContext, ContextError> {
 fn erase(key: &mut AesGcmSiv, erase: KeyContext) {
     let erased = key.rekey(&[0; KEY_LEN], erase, &[]);
     debug_assert!(erased.is_ok(), "the erase context was checked");
+}
+
+/// Erases a cached scratch or bootstrap key in place (H8-05): the slot
+/// stays, so the data path still constructs no key, but no derived key
+/// or pairwise HMAC state of a rotated or retired file survives in it.
+/// Every use of such a slot re-keys it first. A slot whose context
+/// cannot give an erase context is dropped, which erases it too.
+pub(crate) fn erase_slot(slot: &mut Option<AesGcmSiv>) {
+    let Some(key) = slot.as_mut() else {
+        return;
+    };
+    match erase_context(key.context()) {
+        Ok(context) => erase(key, context),
+        Err(_) => *slot = None,
+    }
 }
 
 /// The channel key files of an `encrypted` channel: the `IKM` of every
@@ -422,8 +442,22 @@ impl ChannelKeys {
         self.signing = None;
     }
 
-    /// The current `key_epoch`: the highest file epoch held. Only it
-    /// creates or changes a binding (section 7).
+    /// Whether a bootstrap datagram verified under `key_epoch` may create
+    /// or change a binding (section 7, H8-12): the active binding epoch is
+    /// the signing one, so during a successor's early verify allowance its
+    /// predecessor, which every party still sends under, binds, and so
+    /// does the successor already; once the successor signs, the retired
+    /// predecessor binds nothing. With no file signing nothing binds (fail
+    /// closed).
+    #[must_use]
+    pub fn binds(&self, key_epoch: u32) -> bool {
+        self.signing
+            .is_some_and(|signing| key_epoch >= signing && self.ikm(key_epoch).is_some())
+    }
+
+    /// The highest file epoch held, which may only verify yet (a
+    /// successor in its early verify allowance): never the binding
+    /// epoch, which is [`Self::binds`]'s (H8-12).
     #[must_use]
     pub fn current_epoch(&self) -> u32 {
         self.files
@@ -470,15 +504,25 @@ impl ChannelKeys {
     /// Admits every file of its `key_id` the key set names to verify and
     /// it does not hold yet (rotation, ADR-0114 section 6 and ADR-0086
     /// section 7): into a free slot, or in place of a lower epoch. A file
-    /// of the other class, purpose or profile is not admitted. Returns
-    /// whether one was.
+    /// of the other class, purpose or profile, or of another scope than
+    /// the held files' (`channel_id` and `stream_id`, H8-03), is not
+    /// admitted. Returns whether one was.
     pub fn admit(&mut self, keys: &dyn crate::wire_auth::KeySet) -> bool {
         let Some(key_id) = self.key_id() else {
             return false;
         };
+        let Some(scope) = self
+            .files
+            .iter()
+            .flatten()
+            .map(|file| file.scope.clone())
+            .next()
+        else {
+            return false;
+        };
         let mut admitted = false;
         for file in keys.verifying(key_id).into_iter().flatten() {
-            if self.ikm(file.file_epoch).is_some() {
+            if self.ikm(file.file_epoch).is_some() || file.scope != scope {
                 continue;
             }
             let Ok(secret) = secret_of(file, Purpose::Channel) else {
@@ -516,11 +560,13 @@ impl ChannelKeys {
     }
 }
 
-/// One pairwise file: its receiver and epoch.
+/// One pairwise file: its receiver and epoch, and whether it is the one
+/// its receiver's trailers are sealed with (its signing window, H8-06).
 #[derive(Debug, Clone)]
 struct PairwiseFile {
     receiver_id: u64,
     secret: Secret,
+    signs: bool,
 }
 
 /// The pairwise key files of an `encrypted` channel's configuration
@@ -561,10 +607,42 @@ impl PairwiseFiles {
                 *slot = Some(PairwiseFile {
                     receiver_id,
                     secret,
+                    signs: false,
                 });
             }
         }
-        Ok(Self { files: slots })
+        let mut files = Self { files: slots };
+        // Until a key set names the signing files, each receiver's highest
+        // epoch signs: every key set applied, the admission view first,
+        // sets the one it signs with ([`Self::follow_signing`]).
+        for at in 0..PAIRWISE_FILES {
+            let Some((receiver_id, epoch)) = files
+                .files
+                .get(at)
+                .and_then(Option::as_ref)
+                .map(|file| (file.receiver_id, file.secret.epoch))
+            else {
+                continue;
+            };
+            let highest = files.epochs_of(receiver_id)[0] == Some(epoch);
+            if let Some(Some(file)) = files.files.get_mut(at) {
+                file.signs = highest;
+            }
+        }
+        Ok(files)
+    }
+
+    /// Takes the signing file of each held pairwise `key_id` from `keys`
+    /// (its signing window, not its verify window; H8-06): a held file
+    /// signs exactly when the key set signs with it, so a successor in its
+    /// early verify allowance and a predecessor past its signing expiry
+    /// only verify.
+    pub fn follow_signing(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        for file in self.files.iter_mut().flatten() {
+            file.signs = keys.signing(file.secret.key_id).is_some_and(|signing| {
+                signing.file_epoch == file.secret.epoch && signing.scope == file.secret.scope
+            });
+        }
     }
 
     /// Drops, and so erases, every file the key set no longer names to
@@ -597,10 +675,13 @@ impl PairwiseFiles {
                 let Scope::Pairwise { receiver_id, .. } = file.scope else {
                     continue;
                 };
-                let served =
-                    self.files.iter().flatten().any(|held| {
-                        held.receiver_id == receiver_id && held.secret.key_id == key_id
-                    });
+                // The successor must name the held file's whole scope:
+                // `receiver_id` and `publisher_id` (H8-03).
+                let served = self.files.iter().flatten().any(|held| {
+                    held.receiver_id == receiver_id
+                        && held.secret.key_id == key_id
+                        && held.secret.scope == file.scope
+                });
                 let [highest, lowest] = self.epochs_of(receiver_id);
                 if !served || [highest, lowest].contains(&Some(file.file_epoch)) {
                     continue;
@@ -620,6 +701,7 @@ impl PairwiseFiles {
                     *slot = Some(PairwiseFile {
                         receiver_id,
                         secret,
+                        signs: false,
                     });
                     admitted = true;
                 }
@@ -657,16 +739,19 @@ impl PairwiseFiles {
     }
 
     /// The pairwise keys of `receiver` for the target `publication`, the
-    /// highest epoch first (it seals; every one verifies). Allocates
-    /// nothing.
+    /// first the one that seals, every one verifying. For a sealer
+    /// (`seal`) the first is the receiver's signing file (H8-06); for an
+    /// opener the highest epoch comes first. Allocates nothing.
     ///
     /// # Errors
     ///
-    /// [`EncKeyError::Receiver`] when no file names the receiver.
+    /// [`EncKeyError::Receiver`] when no file names the receiver, or, for
+    /// a sealer, none of its files signs.
     pub fn keys(
         &self,
         receiver: &ReceiverIdentity,
         publication: &PublicationIdentity,
+        seal: bool,
     ) -> Result<([Option<PairwiseKey>; 2], usize), EncKeyError> {
         let mut out: [Option<PairwiseKey>; 2] = [None, None];
         let mut count = 0_usize;
@@ -690,6 +775,18 @@ impl PairwiseFiles {
         {
             epochs = [Some(b), Some(a)];
         }
+        if seal {
+            let signing = self
+                .files
+                .iter()
+                .flatten()
+                .find(|file| file.receiver_id == receiver.receiver_id && file.signs)
+                .map(|file| file.secret.epoch)
+                .ok_or(EncKeyError::Receiver)?;
+            if epochs[0] != Some(signing) {
+                epochs = [Some(signing), epochs[0]];
+            }
+        }
         for (slot, epoch) in out.iter_mut().zip(epochs) {
             let Some(epoch) = epoch else { continue };
             let file = self.files.iter().flatten().find(|file| {
@@ -708,11 +805,13 @@ impl PairwiseFiles {
     }
 }
 
-/// The key of `context`, with the pairwise keys of its receiver domain.
+/// The key of `context`, with the pairwise keys of its receiver domain:
+/// for a sealer (`seal`) the signing one first (H8-06).
 fn derive(
     keys: &ChannelKeys,
     pairwise: Option<&PairwiseFiles>,
     context: KeyContext,
+    seal: bool,
 ) -> Result<AesGcmSiv, EncKeyError> {
     if quiesced() {
         return Err(EncKeyError::VmGeneration);
@@ -720,7 +819,7 @@ fn derive(
     let ikm = keys.ikm(context.key_epoch).ok_or(EncKeyError::NoKey)?;
     match (context.domain.is_receiver(), context.receiver, pairwise) {
         (true, Some(receiver), Some(files)) => {
-            let ([first, second], _) = files.keys(&receiver, &context.publication)?;
+            let ([first, second], _) = files.keys(&receiver, &context.publication, seal)?;
             match (first, second) {
                 (Some(a), Some(b)) => Ok(AesGcmSiv::new(ikm, context, &[a, b])?),
                 (Some(a), None) => Ok(AesGcmSiv::new(ikm, context, &[a])?),
@@ -734,11 +833,13 @@ fn derive(
 
 /// Re-keys `slot` in place for `context` (see [`AesGcmSiv::rekey`]):
 /// the data path never constructs a key, so it never sets up a mutex.
+/// For a sealer (`seal`) the signing pairwise key seals (H8-06).
 fn derive_into(
     keys: &ChannelKeys,
     pairwise: Option<&PairwiseFiles>,
     context: KeyContext,
     slot: &mut AesGcmSiv,
+    seal: bool,
 ) -> Result<(), EncKeyError> {
     if quiesced() {
         return Err(EncKeyError::VmGeneration);
@@ -746,7 +847,7 @@ fn derive_into(
     let ikm = keys.ikm(context.key_epoch).ok_or(EncKeyError::NoKey)?;
     match (context.domain.is_receiver(), context.receiver, pairwise) {
         (true, Some(receiver), Some(files)) => {
-            let ([first, second], _) = files.keys(&receiver, &context.publication)?;
+            let ([first, second], _) = files.keys(&receiver, &context.publication, seal)?;
             match (first, second) {
                 (Some(a), Some(b)) => Ok(slot.rekey(ikm, context, &[a, b])?),
                 (Some(a), None) => Ok(slot.rekey(ikm, context, &[a])?),
@@ -759,21 +860,27 @@ fn derive_into(
 }
 
 /// Replaces the pairwise keys of a receiver domain `key` with those
-/// `files` now hold for its receiver and publication, the highest epoch
-/// sealing (H8-05): a pairwise-only rotation, or the removal of a retired
-/// pairwise file, reaches the key without touching its AEAD key, sequence
-/// or replay window. A key of domain 1 or 5 is left as it is.
+/// `files` now hold for its receiver and publication, for a sealer
+/// (`seal`) the signing one sealing (H8-05, H8-06): a pairwise-only
+/// rotation, or the removal of a retired pairwise file, reaches the key
+/// without touching its AEAD key, sequence or replay window. A key of
+/// domain 1 or 5 is left as it is.
 ///
 /// # Errors
 ///
-/// [`EncKeyError::Receiver`] when no file names its receiver any more.
-fn refresh_pairwise(key: &mut AesGcmSiv, files: Option<&PairwiseFiles>) -> Result<(), EncKeyError> {
+/// [`EncKeyError::Receiver`] when no file names its receiver any more, or,
+/// for a sealer, none of them signs.
+fn refresh_pairwise(
+    key: &mut AesGcmSiv,
+    files: Option<&PairwiseFiles>,
+    seal: bool,
+) -> Result<(), EncKeyError> {
     let context = *key.context();
     let Some(receiver) = context.receiver.filter(|_| context.domain.is_receiver()) else {
         return Ok(());
     };
     let files = files.ok_or(EncKeyError::Receiver)?;
-    let ([first, second], _) = files.keys(&receiver, &context.publication)?;
+    let ([first, second], _) = files.keys(&receiver, &context.publication, seal)?;
     match (first, second) {
         (Some(a), Some(b)) => Ok(key.set_pairwise(&[a, b])?),
         (Some(a), None) => Ok(key.set_pairwise(&[a])?),
@@ -1027,7 +1134,7 @@ impl EncSealer {
         context: KeyContext,
         clock: fn() -> u64,
     ) -> Result<Self, EncKeyError> {
-        let key = derive(keys, pairwise, context)?;
+        let key = derive(keys, pairwise, context, true)?;
         Ok(Self {
             keys: keys.clone(),
             pairwise: pairwise.cloned(),
@@ -1081,6 +1188,7 @@ impl EncSealer {
         self.keys.retain(keys);
         if let Some(pairwise) = self.pairwise.as_mut() {
             pairwise.retain(keys);
+            pairwise.follow_signing(keys);
         }
         self.keys.follow_signing(keys);
         // Sending is the signing window's only (H8-06): no file signing, or
@@ -1093,7 +1201,7 @@ impl EncSealer {
             self.withdraw();
             return;
         };
-        if refresh_pairwise(&mut self.key, self.pairwise.as_ref()).is_err() {
+        if refresh_pairwise(&mut self.key, self.pairwise.as_ref(), true).is_err() {
             self.withdraw();
             return;
         }
@@ -1105,7 +1213,15 @@ impl EncSealer {
             let mut next = *self.key.context();
             next.key_epoch = signing;
             next.party_epoch = 0;
-            if derive_into(&self.keys, self.pairwise.as_ref(), next, &mut self.key).is_ok() {
+            if derive_into(
+                &self.keys,
+                self.pairwise.as_ref(),
+                next,
+                &mut self.key,
+                true,
+            )
+            .is_ok()
+            {
                 self.derived_ns = (self.clock)();
             } else {
                 // The key may be half re-keyed: never seal under it.
@@ -1159,7 +1275,13 @@ impl EncSealer {
             .party_epoch
             .checked_add(1)
             .ok_or(EncSendError::EpochsExhausted)?;
-        derive_into(&self.keys, self.pairwise.as_ref(), next, &mut self.key)?;
+        derive_into(
+            &self.keys,
+            self.pairwise.as_ref(),
+            next,
+            &mut self.key,
+            true,
+        )?;
         self.derived_ns = now_ns;
         Ok(())
     }
@@ -1400,12 +1522,12 @@ impl EncOpener {
         if context.domain.is_bootstrap() {
             return Err(EncKeyError::Context(ContextError::Salt));
         }
-        let key = derive(keys, pairwise, context)?;
+        let key = derive(keys, pairwise, context, false)?;
         // Every key this opener will hold is made now, its mutex locked
         // once by the constructor: promotions and scratch derivations only
         // re-key and move them.
-        let scratch = derive(keys, pairwise, context)?;
-        let spare = derive(keys, pairwise, context)?;
+        let scratch = derive(keys, pairwise, context, false)?;
+        let spare = derive(keys, pairwise, context, false)?;
         Ok(Self {
             keys: keys.clone(),
             pairwise: pairwise.cloned(),
@@ -1466,13 +1588,13 @@ impl EncOpener {
             pairwise.retain(keys);
         }
         if self.keys.ikm(self.epochs().0).is_none()
-            || refresh_pairwise(&mut self.current.key, self.pairwise.as_ref()).is_err()
+            || refresh_pairwise(&mut self.current.key, self.pairwise.as_ref(), false).is_err()
         {
             self.withdraw();
             return;
         }
         if let Some((slot, _)) = self.previous.as_mut()
-            && refresh_pairwise(&mut slot.key, self.pairwise.as_ref()).is_err()
+            && refresh_pairwise(&mut slot.key, self.pairwise.as_ref(), false).is_err()
         {
             self.withdraw();
             return;
@@ -1490,9 +1612,28 @@ impl EncOpener {
                 self.spare = Some(slot.key);
             }
         }
+        // The cached copies (H8-05): the scratch slot and the spare hold
+        // keys derived from earlier files, their pairwise HMAC states
+        // included. Both are re-keyed before any use, so each is erased in
+        // place now and no rotated or retired file's schedule survives.
+        erase(&mut self.scratch, self.erase);
+        if let Some(spare) = self.spare.as_mut() {
+            erase(spare, self.erase);
+        }
         // Rotation (section 6): a newly admitted file epoch is the next
         // epoch at `party_epoch` 0; the first datagram fully accepted under
         // it promotes, and the current one stays for the 10 s overlap.
+    }
+
+    /// The pairwise epochs of the scratch slot and the spare (tests).
+    #[cfg(test)]
+    pub(crate) fn cached_pairwise(&self) -> [[Option<u32>; 2]; 2] {
+        [
+            self.scratch.pairwise_epochs(),
+            self.spare
+                .as_ref()
+                .map_or([None, None], AesGcmSiv::pairwise_epochs),
+        ]
     }
 
     /// The current epoch pair.
@@ -1597,8 +1738,14 @@ impl EncOpener {
             let mut next = *self.current.key.context();
             next.key_epoch = header.key_epoch;
             next.party_epoch = header.party_epoch;
-            derive_into(&self.keys, self.pairwise.as_ref(), next, &mut self.scratch)
-                .map_err(|_| EncRejection::Epoch)?;
+            derive_into(
+                &self.keys,
+                self.pairwise.as_ref(),
+                next,
+                &mut self.scratch,
+                false,
+            )
+            .map_err(|_| EncRejection::Epoch)?;
         }
         let key = match selected {
             Selected::Current => Some(&self.current.key),
@@ -1660,8 +1807,14 @@ impl EncOpener {
         let mut next = *self.current.key.context();
         next.key_epoch = key_epoch;
         next.party_epoch = party_epoch;
-        derive_into(&self.keys, self.pairwise.as_ref(), next, &mut self.scratch)
-            .map_err(|_| EncRejection::ResyncRefused)?;
+        derive_into(
+            &self.keys,
+            self.pairwise.as_ref(),
+            next,
+            &mut self.scratch,
+            false,
+        )
+        .map_err(|_| EncRejection::ResyncRefused)?;
         self.promote(now_ns);
         Ok(())
     }
@@ -1705,8 +1858,9 @@ pub struct Bootstrap {
     pub header: Header,
     /// Length of the one inner frame in the output buffer.
     pub frames: usize,
-    /// Whether it verified under the current file epoch: only such a
-    /// datagram may create or change a binding (section 7).
+    /// Whether it verified under an epoch that binds
+    /// ([`ChannelKeys::binds`]): only such a datagram may create or change
+    /// a binding (section 7, H8-12).
     pub current_epoch: bool,
 }
 
@@ -1800,8 +1954,8 @@ pub fn open_bootstrap_in(
         _ => EncRejection::Party,
     };
     match slot {
-        Some(held) => derive_into(keys, pairwise, context, held).map_err(refusal)?,
-        None => *slot = Some(derive(keys, pairwise, context).map_err(refusal)?),
+        Some(held) => derive_into(keys, pairwise, context, held, false).map_err(refusal)?,
+        None => *slot = Some(derive(keys, pairwise, context, false).map_err(refusal)?),
     }
     let key = slot.as_ref().ok_or(EncRejection::Party)?;
     let opened = key.open_into(datagram, out)?;
@@ -1819,7 +1973,7 @@ pub fn open_bootstrap_in(
     Ok(Bootstrap {
         header,
         frames: opened.frames,
-        current_epoch: header.key_epoch == keys.current_epoch(),
+        current_epoch: keys.binds(header.key_epoch),
     })
 }
 
@@ -1888,23 +2042,24 @@ impl RetiredBoots {
 /// # Errors
 ///
 /// [`EncRejection::ResyncRefused`] when the identity or the term
-/// parameters differ from the bound ones, the answer verified only under
-/// an earlier file epoch than the current one, or its epoch pair is lower
-/// than the bound one.
+/// parameters differ from the bound ones, the answer verified under an
+/// epoch below the active binding (signing) epoch `binding_key_epoch` (a
+/// retired predecessor, H8-12), or its epoch pair is lower than the bound
+/// one.
 pub fn check_resync(
     bound: (
         &karyos_protocol::network::Identity,
         &karyos_protocol::network::TermParams,
     ),
     bound_epochs: (u32, u16),
-    current_key_epoch: u32,
+    binding_key_epoch: u32,
     answer: &karyos_protocol::network::encrypted::EncAnswer,
     envelope_key_epoch: u32,
 ) -> Result<(), EncRejection> {
     let (identity, term) = bound;
     if answer.answer.identity != *identity
         || answer.answer.term != *term
-        || envelope_key_epoch != current_key_epoch
+        || envelope_key_epoch < binding_key_epoch
         || answer.key_epoch != envelope_key_epoch
         || (answer.key_epoch, answer.party_epoch) < bound_epochs
     {

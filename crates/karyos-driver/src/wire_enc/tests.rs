@@ -1473,3 +1473,295 @@ fn a_pairwise_only_rotation_reaches_existing_sealers_and_openers() {
         Err(EncRejection::Pairwise)
     );
 }
+
+/// A channel file of `channel_id` and `stream_id` (H8-03).
+fn channel_scoped(epoch: u32, fill: u8, channel_id: u64, stream_id: i32) -> KeyFile {
+    let secret: String = (0..KEY_LEN).map(|_| format!("{fill:02x}")).collect();
+    let text = format!(
+        "format=karyos-wire-key-v1\nkey_id=3\nfile_epoch={epoch}\npurpose=channel\nprofile_id=16\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret={secret}\nchannel_id={channel_id}\nstream_id={stream_id}\n"
+    );
+    parse(&format!("3-{epoch}.key"), text.as_bytes()).unwrap()
+}
+
+/// A pairwise file of `receiver_id` and `publisher_id` (H8-03).
+fn pairwise_scoped(receiver_id: u64, epoch: u32, fill: u8, publisher_id: u64) -> KeyFile {
+    let secret: String = (0..KEY_LEN).map(|_| format!("{fill:02x}")).collect();
+    let text = format!(
+        "format=karyos-wire-key-v1\nkey_id=9\nfile_epoch={epoch}\npurpose=pairwise\nprofile_id=16\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret={secret}\nreceiver_id={receiver_id}\npublisher_id={publisher_id}\n"
+    );
+    parse(&format!("9-{epoch}.key"), text.as_bytes()).unwrap()
+}
+
+/// H8-03 (wire-key-files.md 2.2): a reload whose successor differs from
+/// the held files in one scope field, each field on its own (the channel
+/// key's `channel_id` and `stream_id`, the pairwise key's `receiver_id`
+/// and `publisher_id`), admits nothing into any key collection: the held
+/// keys stay, a sealer keeps its epoch and pairwise trailer, and once the
+/// held file is gone the sealer is withdrawn rather than moved to the
+/// other scope. A successor of the same scope is admitted.
+#[test]
+fn a_successor_of_another_scope_is_never_admitted() {
+    use crate::wire_auth::FixedKeys;
+
+    for (field, channel_id, stream_id) in [("channel_id", 8, 6), ("stream_id", 7, 7)] {
+        let successor = || channel_scoped(2, 0x22, channel_id, stream_id);
+        let mut held = keys();
+        let set = FixedKeys {
+            files: vec![channel_file(1, 0x11), successor()],
+        };
+        assert!(!held.admit(&set), "{field}");
+        assert_eq!(held.current_epoch(), 1, "{field}");
+        let mut sealer = sender();
+        sealer.apply_keys(&set);
+        assert_eq!(sealer.context().key_epoch, 1, "{field}: not moved");
+        let mut gone = sender();
+        gone.apply_keys(&FixedKeys {
+            files: vec![successor()],
+        });
+        assert!(gone.is_withdrawn(), "{field}: never moved to it");
+    }
+    let mut held = keys();
+    assert!(held.admit(&FixedKeys {
+        files: vec![channel_file(1, 0x11), channel_file(2, 0x22)],
+    }));
+    for (field, receiver_id, publisher_id) in [("receiver_id", 67, 5), ("publisher_id", 66, 6)] {
+        let successor = || pairwise_scoped(receiver_id, 2, 0x42, publisher_id);
+        let mut files = pairs(0x21);
+        let set = FixedKeys {
+            files: vec![
+                channel_file(1, 0x11),
+                pairwise_file(66, 1, 0x21),
+                successor(),
+            ],
+        };
+        assert!(!files.admit(&set), "{field}");
+        assert_eq!(files.epochs_of(66), [Some(1), None], "{field}");
+        let mut sealer = EncSealer::new(
+            &keys(),
+            Some(&pairs(0x21)),
+            context(Domain::Receiver),
+            clock,
+        )
+        .unwrap();
+        // The held file signs; the other scope's successor only verifies.
+        sealer.apply_keys(&Signs {
+            signing: vec![channel_file(1, 0x11), pairwise_file(66, 1, 0x21)],
+            verifying: vec![
+                channel_file(1, 0x11),
+                pairwise_file(66, 1, 0x21),
+                successor(),
+            ],
+        });
+        assert_eq!(
+            sealer.key().pairwise_epochs(),
+            [Some(1), None],
+            "{field}: the held trailer key stays"
+        );
+        sealer.apply_keys(&FixedKeys {
+            files: vec![channel_file(1, 0x11), successor()],
+        });
+        assert!(sealer.is_withdrawn(), "{field}: never moved to it");
+    }
+    let mut files = pairs(0x21);
+    assert!(files.admit(&FixedKeys {
+        files: vec![pairwise_file(66, 1, 0x21), pairwise_file(66, 2, 0x42)],
+    }));
+}
+
+/// H8-05: rotation and retirement reach every cached pairwise copy of an
+/// opener. Its scratch slot and its spare hold keys derived at
+/// construction, their pairwise HMAC states included; after a key set
+/// that rotates the pairwise file and drops the retired one, neither holds
+/// any pairwise key, and the opener still promotes and verifies.
+#[test]
+fn rotation_and_retirement_erase_every_cached_pairwise_copy() {
+    use crate::wire_auth::FixedKeys;
+    use karyos_protocol::frame::FrameType;
+
+    let mut opener = EncOpener::new(
+        &keys(),
+        Some(&pairs(0x21)),
+        context(Domain::Receiver),
+        clock(),
+    )
+    .unwrap();
+    assert_eq!(
+        opener.cached_pairwise(),
+        [[Some(1), None], [Some(1), None]],
+        "made with the first file"
+    );
+    opener.apply_keys(&FixedKeys {
+        files: vec![
+            channel_file(1, 0x11),
+            pairwise_file(66, 1, 0x21),
+            pairwise_file(66, 2, 0x42),
+        ],
+    });
+    assert_eq!(opener.cached_pairwise(), [[None, None], [None, None]]);
+    opener.apply_keys(&FixedKeys {
+        files: vec![channel_file(1, 0x11), pairwise_file(66, 2, 0x42)],
+    });
+    assert!(!opener.is_withdrawn());
+    assert_eq!(
+        opener.cached_pairwise(),
+        [[None, None], [None, None]],
+        "the retired file survives in no cached slot"
+    );
+    // It still opens: the next party epoch is derived into the erased
+    // scratch slot and promoted.
+    let rotated = PairwiseFiles::new(&[&pairwise_file(66, 2, 0x42)]).unwrap();
+    let mut next = context(Domain::Receiver);
+    next.party_epoch = 1;
+    let mut sealer = EncSealer::new(&keys(), Some(&rotated), next, clock).unwrap();
+    let mut channel = EncChannel::default();
+    let opened = open(
+        &mut opener,
+        &mut channel,
+        &seal(&mut sealer, &frame(FrameType::Sm.code())),
+    )
+    .unwrap();
+    assert!(opened.promoted);
+}
+
+/// A key set whose signing files, one per key id, are set apart from its
+/// verifying ones (tests of H8-06).
+struct Signs {
+    signing: Vec<KeyFile>,
+    verifying: Vec<KeyFile>,
+}
+
+impl crate::wire_auth::KeySet for Signs {
+    fn signing(&self, key_id: u32) -> Option<&KeyFile> {
+        self.signing.iter().find(|file| file.key_id == key_id)
+    }
+
+    fn verifying(&self, key_id: u32) -> [Option<&KeyFile>; 2] {
+        let mut of: Vec<&KeyFile> = self
+            .verifying
+            .iter()
+            .filter(|file| file.key_id == key_id)
+            .collect();
+        of.sort_by_key(|file| file.file_epoch);
+        let mut files = [None, None];
+        for (slot, file) in files.iter_mut().zip(of) {
+            *slot = Some(file);
+        }
+        files
+    }
+
+    fn current_epoch(&self, key_id: u32) -> Option<u32> {
+        self.verifying
+            .iter()
+            .filter(|file| file.key_id == key_id)
+            .map(|file| file.file_epoch)
+            .max()
+    }
+
+    fn fingerprint(&self) -> u64 {
+        0
+    }
+
+    fn view_generation(&self) -> u64 {
+        0
+    }
+}
+
+/// H8-06 (wire-key-files.md 2.3): a receiver's domain 4 and domain 6
+/// sealers trail under the pairwise file that signs, never the highest
+/// that verifies. A successor inside its early verify allowance is held
+/// but does not trail; once it signs it trails, with the sequence kept;
+/// once no pairwise file signs, although one still verifies, the sealer
+/// is withdrawn. A sealer made while the predecessor signs takes it.
+#[test]
+fn pairwise_trailers_follow_the_pairwise_signing_window() {
+    let p1 = || pairwise_file(66, 1, 0x21);
+    let p2 = || pairwise_file(66, 2, 0x42);
+    let verifying = || vec![channel_file(1, 0x11), p1(), p2()];
+    for domain in [Domain::Receiver, Domain::RspSetup] {
+        let mut sealer =
+            EncSealer::new(&keys(), Some(&pairs(0x21)), context(domain), clock).unwrap();
+        sealer.apply_keys(&Signs {
+            signing: vec![channel_file(1, 0x11), p1()],
+            verifying: verifying(),
+        });
+        assert_eq!(
+            sealer.key().pairwise_epochs()[0],
+            Some(1),
+            "{domain:?}: the successor only verifies yet"
+        );
+        let sm = frame(karyos_protocol::frame::FrameType::Sm.code());
+        let _ = seal(&mut sealer, &sm);
+        // A sealer made from files holding both, the predecessor signing.
+        let mut both = PairwiseFiles::new(&[&p1(), &p2()]).unwrap();
+        both.follow_signing(&Signs {
+            signing: vec![channel_file(1, 0x11), p1()],
+            verifying: verifying(),
+        });
+        let made = EncSealer::new(&keys(), Some(&both), context(domain), clock).unwrap();
+        assert_eq!(made.key().pairwise_epochs()[0], Some(1), "{domain:?}");
+        sealer.apply_keys(&Signs {
+            signing: vec![channel_file(1, 0x11), p2()],
+            verifying: verifying(),
+        });
+        assert_eq!(
+            sealer.key().pairwise_epochs()[0],
+            Some(2),
+            "{domain:?}: it signs now"
+        );
+        assert_eq!(sealer.key().next_seq(), 1, "{domain:?}: the sequence stays");
+        sealer.apply_keys(&Signs {
+            signing: vec![channel_file(1, 0x11)],
+            verifying: verifying(),
+        });
+        assert!(
+            sealer.is_withdrawn(),
+            "{domain:?}: pairwise signing expired while it still verifies"
+        );
+    }
+}
+
+/// H8-13 (ADR-0114 section 11, ADR-0086 section 5): at the 256-byte MTU
+/// floor the largest receiver control, a four-lane SM of 152 bytes, fits
+/// exactly once sealed in domain 4 with its 84-byte envelope and 20-byte
+/// pairwise trailer; under the authenticated 48-byte envelope it takes
+/// 200 bytes.
+#[test]
+fn a_four_lane_sm_fits_the_256_byte_floor_sealed() {
+    use karyos_protocol::network::{Control, LaneStatus, Receiver, StatusMessage};
+
+    let lane = LaneStatus {
+        consumption: 64,
+        window: 64,
+    };
+    let sm = Control::Status(StatusMessage {
+        alias: Alias {
+            session_id: 9,
+            stream_id: 6,
+        },
+        identity: Identity {
+            driver_id: [1, 1],
+            registration_id: 7,
+            incarnation: 1,
+        },
+        receiver: Receiver {
+            receiver_boot_id: [2, 2],
+            receiver_id: 66,
+        },
+        group_tag: 0,
+        lanes: Lanes::new(&[lane; 4]).unwrap(),
+    });
+    let mut bytes = vec![0_u8; MAX_SEALED];
+    let length = sm.encode(&mut bytes).unwrap();
+    assert_eq!(length, 152);
+    let mut sealer = EncSealer::new(
+        &keys(),
+        Some(&pairs(0x21)),
+        context(Domain::Receiver),
+        clock,
+    )
+    .unwrap();
+    let sealed = sealer.seal(&mut bytes, length).unwrap();
+    let floor = usize::try_from(karyos_protocol::network::MIN_MTU).unwrap();
+    assert_eq!(sealed, floor, "152 + 20 + 84");
+    assert_eq!(length + crate::wire_auth::ENVELOPE_LEN, 200);
+}

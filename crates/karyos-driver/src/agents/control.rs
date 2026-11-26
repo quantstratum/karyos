@@ -476,6 +476,12 @@ pub trait ControlSeal {
     /// Applies the key store's current key set (H8 finding 4): withdrawn
     /// once its key is revoked, expired or no longer verifies.
     fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet);
+    /// The file epoch its current key derives from while it can still
+    /// seal; `None` once withdrawn, or for a sealer that does not say
+    /// (H8-11).
+    fn key_epoch(&self) -> Option<u32> {
+        None
+    }
     /// Moves a session sealer to in-band `party_epoch` at `seq` (tests);
     /// others ignore it.
     #[cfg(test)]
@@ -672,6 +678,15 @@ impl ControlSeal for SharedSealer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .apply_keys(keys);
+    }
+
+    /// The shared key's file epoch; `None` once withdrawn for every
+    /// holder, or under a poisoned lock.
+    fn key_epoch(&self) -> Option<u32> {
+        if self.withdrawn.load(core::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        self.sealer.lock().ok()?.key_epoch()
     }
 }
 

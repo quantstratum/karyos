@@ -1087,6 +1087,41 @@ impl WireKeys {
         })
     }
 
+    /// Registers the scopes the encrypted `channel` to `stream_id` was
+    /// admitted under, as the authenticated class does (ADM-2, H8-03):
+    /// from now on a view holds only its channel key's files of that
+    /// `channel_id` and `stream_id` and its pairwise key's of that
+    /// `receiver_id` and `publisher_id`, so no reload hands a successor of
+    /// another scope to any key collection. A key id already bound under
+    /// another scope is refused.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthRefusal::ChannelScope`] or [`AuthRefusal::PairwiseScope`].
+    fn bind_enc_scopes(
+        &mut self,
+        channel: &EncryptedChannel,
+        stream_id: i32,
+    ) -> Result<(), DriverError> {
+        let channel_scope = Scope::Channel {
+            channel_id: channel.channel_id,
+            stream_id,
+        };
+        let pair_scope = Scope::Pairwise {
+            receiver_id: channel.receiver_id,
+            publisher_id: channel.publisher_id,
+        };
+        if self.bound_elsewhere(channel.channel_key_id, &channel_scope) {
+            return Err(refused(AuthRefusal::ChannelScope));
+        }
+        if self.bound_elsewhere(channel.pairwise_key_id, &pair_scope) {
+            return Err(refused(AuthRefusal::PairwiseScope));
+        }
+        self.bind_scope(channel.channel_key_id, channel_scope);
+        self.bind_scope(channel.pairwise_key_id, pair_scope);
+        Ok(())
+    }
+
     /// The publication side of the encrypted `channel` at admission: its
     /// channel files (of `stream_id`, once the publication's stream is
     /// known) and its one receiver's pairwise files.
@@ -1121,6 +1156,7 @@ impl WireKeys {
         .map_err(|error| enc_refused(error, AuthRefusal::ChannelKey))?;
         enc.sign_with(files.signing)
             .map_err(|error| enc_refused(error, AuthRefusal::ChannelKey))?;
+        self.bind_enc_scopes(channel, publication.alias.stream_id)?;
         Ok(PublicationBinding {
             sender: crate::agents::roles::Binding::EncPublication { enc: Box::new(enc) },
             follow: None,
@@ -1140,6 +1176,7 @@ impl WireKeys {
             self.count_generation_refused();
         }
         let files = self.enc_files(channel, Some(stream_id))?;
+        self.bind_enc_scopes(channel, stream_id)?;
         Ok(EncKeys {
             files,
             view: Arc::clone(&self.view),

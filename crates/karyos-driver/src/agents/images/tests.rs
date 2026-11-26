@@ -11896,3 +11896,30 @@ fn a_blocked_key_read_stops_live_agents_within_the_bound() {
 
 /// H8 round 6: the round 5 review's evidence rows R5-06, R5-10, R5-11 (karyos#648).
 mod invariants_r6;
+
+/// H8-09 (ADR-0114 section 10 step 2, H8 finding 4): an ordinary
+/// retirement (the binding idle past `image_liveness_timeout`), with no
+/// VM generation signal ever seen, withdraws the encrypted image's domain
+/// 4 sealer through its shared object, so the clone a queued control
+/// holds is erased with the image, and its domain 1 keys go with it.
+#[test]
+fn an_ordinary_retirement_erases_a_queued_domain_4_sealer() {
+    let (mut rig, _b) = encrypted_rig();
+    let slot = established(&mut rig);
+    let queued = rig.agents.receiver.role.enc_seal(slot).unwrap();
+    assert!(!queued.is_withdrawn());
+    assert_eq!(rig.agents.receiver.role.enc_images(), 1);
+    rig.sender_stopped = true;
+    rig.now += 11_000 * MS;
+    rig.until(true, |rig| {
+        rig.events
+            .iter()
+            .any(|event| matches!(event, ImageEvent::Retiring { .. }))
+    });
+    assert!(queued.is_withdrawn(), "the queued clone is erased");
+    assert_eq!(
+        rig.agents.receiver.role.enc_images(),
+        0,
+        "its domain 1 keys too"
+    );
+}

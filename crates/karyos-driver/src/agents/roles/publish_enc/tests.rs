@@ -843,3 +843,105 @@ fn retired_boot_ids_expire_once_their_file_epoch_stops_verifying() {
     assert!(publication.retired.has_room(), "expired with their epoch");
     assert!(!publication.retired.contains(&receiver(1)));
 }
+
+/// The view of a successor's activation at the publisher: `signing` the
+/// channel epoch that signs, `verifying` the ones that verify.
+fn activation(signing: u32, verifying: &[u32]) -> crate::wire_auth::SplitKeys {
+    let fill = |epoch: u32| if epoch == 1 { 0x11 } else { 0x33 };
+    let mut files: Vec<KeyFile> = verifying
+        .iter()
+        .map(|epoch| channel(*epoch, fill(*epoch)))
+        .collect();
+    files.push(pairwise(0x22));
+    crate::wire_auth::SplitKeys {
+        signing: Some(channel(signing, fill(signing))),
+        verifying: files,
+        current: verifying.iter().copied().max(),
+    }
+}
+
+/// H8-12 (section 7, wire-key-files.md 2.3): with both channel epochs
+/// loaded, an RSP_SETUP under the signing epoch binds before the
+/// successor's activation (the predecessor signs, the successor verifies
+/// early), as does one under the successor; at and after activation the
+/// retired predecessor binds nothing and the successor binds. The answer
+/// to a binding is sealed under, and states, the signing epoch.
+#[test]
+fn an_rsp_setup_binds_through_the_signing_epoch_around_activation() {
+    for (phase, view, binds) in [
+        ("before", activation(1, &[1, 2]), [true, true]),
+        ("at", activation(2, &[1, 2]), [false, true]),
+        ("after", activation(2, &[2]), [false, true]),
+    ] {
+        for (epoch, binds) in [1, 2].into_iter().zip(binds) {
+            let mut publication = PublicationEnc::new(
+                EndpointId(1),
+                ALIAS,
+                IDENTITY,
+                &[&channel(1, 0x11), &channel(2, 0x33)],
+                &[&pairwise(0x22)],
+                clock,
+            )
+            .unwrap();
+            publication.sign_with(1).unwrap();
+            // The views come in order: the predecessor stops verifying
+            // only after the successor signs.
+            if phase == "after" {
+                publication.apply_keys(&activation(2, &[1, 2]));
+            }
+            publication.apply_keys(&view);
+            let both = ChannelKeys::new(&[&channel(1, 0x11), &channel(2, 0x33)]).unwrap();
+            let mut receiver = peer(5, 0x22, epoch, &both);
+            let opened = open(&mut publication, &receiver.challenge());
+            if binds {
+                assert!(
+                    matches!(
+                        opened,
+                        Ok(EncOpened::RspSetup(_, EncEstablishing { bind: true, .. }))
+                    ),
+                    "{phase} activation, epoch {epoch}: {opened:?}"
+                );
+                let signing = if phase == "before" { 1 } else { 2 };
+                let mut bytes = [0_u8; MAX_SEALED];
+                let length = publication
+                    .seal_answer(plain_answer(), None, &mut bytes)
+                    .unwrap();
+                assert_eq!(
+                    crate::wire_enc::header(&bytes[..length]).unwrap().key_epoch,
+                    signing,
+                    "{phase}: the answer goes under the signing epoch"
+                );
+            } else {
+                assert_eq!(opened, Err(EncRejection::Epoch), "{phase}, {epoch}");
+                assert_eq!(publication.bound_receiver(), None);
+            }
+        }
+    }
+}
+
+/// H8-05: the publication's domain 6 scratch slot, which holds the last
+/// RSP_SETUP's key with its receiver's pairwise HMAC states, is erased in
+/// place by a key set that rotates or retires the pairwise file; the next
+/// RSP_SETUP re-keys it and still binds.
+#[test]
+fn the_domain_6_scratch_slot_keeps_no_retired_pairwise_key() {
+    use crate::wire_auth::FixedKeys;
+
+    let mut publication = publication();
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    assert!(open(&mut publication, &receiver.challenge()).is_ok());
+    assert_eq!(
+        publication.bootstrap.as_ref().unwrap().pairwise_epochs(),
+        [Some(1), None]
+    );
+    publication.apply_keys(&FixedKeys {
+        files: vec![channel(1, 0x11), pairwise(0x22)],
+    });
+    assert_eq!(
+        publication.bootstrap.as_ref().unwrap().pairwise_epochs(),
+        [None, None],
+        "erased in place"
+    );
+    let mut again = peer(6, 0x22, 1, &keys());
+    assert!(open(&mut publication, &again.challenge()).is_ok());
+}

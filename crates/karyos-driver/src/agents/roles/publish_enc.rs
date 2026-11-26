@@ -208,6 +208,11 @@ impl PublicationEnc {
         self.keys.retain(keys);
         self.pairwise.retain(keys);
         self.keys.follow_signing(keys);
+        self.pairwise.follow_signing(keys);
+        // Its domain 6 scratch slot holds the last RSP_SETUP's key, the
+        // receiver's pairwise HMAC states with it: erased in place, so no
+        // rotated or retired file's schedule survives (H8-05).
+        crate::wire_enc::erase_slot(&mut self.bootstrap);
         if let Some(oldest) = self.keys.oldest_epoch() {
             self.retired.expire(oldest);
         }

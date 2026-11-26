@@ -1681,7 +1681,17 @@ impl Proof {
         if profile.next_seq() >= TAG_CAP {
             return Err(SealFailure::Exhausted);
         }
-        Ok(Protection::seal(profile, datagram, frames)?)
+        #[cfg(test)]
+        let plaintext = recording().then(|| datagram.get(..frames).map(<[u8]>::to_vec));
+        let sealed = Protection::seal(profile, datagram, frames)?;
+        #[cfg(test)]
+        if let Some(Some(frames)) = plaintext {
+            record(SealedRecord {
+                domain: self.domain(),
+                frames,
+            });
+        }
+        Ok(sealed)
     }
 
     /// Checks a received proof under each verifying file epoch.

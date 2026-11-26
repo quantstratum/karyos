@@ -842,9 +842,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // A protected datagram is its frames plus its class's envelope
         // (ADR-0086 section 5, ADR-0114 section 11): the log keeps the
         // inner budget, the channel MTU less the envelope, so its frames
-        // and fragments fit a datagram of at most the channel MTU, and
-        // SETUP advertises that budget. A channel MTU whose budget no
-        // receiver accepts is refused.
+        // and fragments fit a datagram of at most the channel MTU. SETUP
+        // advertises the channel (wire) MTU, the whole datagram; each side
+        // derives its log budget from it locally (H8-13).
         if let Some(protected) = auth {
             config.stream.buffer.mtu = inner_mtu(protected, config.stream.buffer.mtu)?;
         }
@@ -1276,10 +1276,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 registration_id: handle.registration(),
                 incarnation,
             },
+            // `mtu` is the whole datagram's (ADR-0086 section 5, ADR-0114
+            // section 11), never the protected log's inner budget (H8-13).
             term: TermParams {
                 term_length: config.term_length.get(),
                 initial_term_id: config.initial_term_id.get().cast_signed(),
-                mtu: config.mtu,
+                mtu: wire_mtu,
             },
             lane_count,
         };
@@ -1589,18 +1591,35 @@ fn envelope_mtu(protected: super::wire::Protected) -> Result<u32, DriverError> {
 
 /// The log MTU of a `protected` publication on a channel of `mtu`: the
 /// channel MTU less its class's envelope (ADR-0086 section 5, ADR-0114
-/// section 11).
+/// section 11). The [`MIN_MTU`](karyos_protocol::network::MIN_MTU) floor
+/// applies to `mtu`, the whole datagram SETUP advertises (H8-13); the
+/// inner budget must only hold a DATA frame header and one payload byte
+/// ([`inner_budget_holds_a_frame`]).
 ///
 /// # Errors
 ///
-/// [`crate::error::AuthRefusal::Mtu`] when the budget is below the
-/// smallest MTU a receiver accepts.
+/// [`crate::error::AuthRefusal::Mtu`] when `mtu` is below the floor or its
+/// inner budget holds no frame.
 fn inner_mtu(protected: super::wire::Protected, mtu: u32) -> Result<u32, DriverError> {
+    let refused = DriverError::AuthenticatedRefused {
+        reason: crate::error::AuthRefusal::Mtu,
+    };
+    if mtu < karyos_protocol::network::MIN_MTU {
+        return Err(refused);
+    }
     mtu.checked_sub(envelope_mtu(protected)?)
-        .filter(|inner| *inner >= karyos_protocol::network::MIN_MTU)
-        .ok_or(DriverError::AuthenticatedRefused {
-            reason: crate::error::AuthRefusal::Mtu,
-        })
+        .filter(|inner| inner_budget_holds_a_frame(*inner))
+        .ok_or(refused)
+}
+
+/// The inner budget rule of a protected log (H8-13): `inner` holds a
+/// DATA frame header and one payload byte, `align_down(inner, 32) > 32`,
+/// the condition every log and image of that MTU is built under
+/// ([`karyos_sys::sizing::FragmentPlan::new`]). Above the 256-byte wire
+/// floor it always holds (172 inner bytes for the encrypted class, 208
+/// for the authenticated one).
+pub(crate) fn inner_budget_holds_a_frame(inner: u32) -> bool {
+    karyos_sys::sizing::FragmentPlan::new(inner, karyos_sys::frame::Flags::NONE).is_ok()
 }
 
 /// The datagram MTU of a `protected` publication whose log holds `inner`

@@ -801,8 +801,12 @@ fn an_invalid_tag_setup_flood_allocates_nothing_and_changes_nothing() {
 }
 
 fn challenge_of(identity: Identity) -> Control {
+    challenge_on(identity, ALIAS)
+}
+
+fn challenge_on(identity: Identity, alias: Alias) -> Control {
     Control::Challenge(karyos_protocol::network::RspChallenge {
-        alias: ALIAS,
+        alias,
         identity,
         challenge: ChallengeBlock {
             receiver_boot_id: [7, 8],
@@ -1013,6 +1017,9 @@ enum Step {
     RollD6(u8),
     /// Rotates the channel file: epoch 2 admitted and signing.
     RotateFile,
+    /// Moves both targets to the other alias (H8-10): each announces on
+    /// it, and the CHALLENGEs that follow are on it.
+    Alias,
     /// Replaces the subscription with a new one of the same files.
     Replace,
     /// Removes the subscription, then makes it again.
@@ -1028,6 +1035,7 @@ fn step() -> impl proptest::strategy::Strategy<Value = Step> {
         any::<u8>().prop_map(Step::RollD4),
         (0_u8..2).prop_map(Step::RollD6),
         Just(Step::RotateFile),
+        Just(Step::Alias),
         Just(Step::Replace),
         Just(Step::RemoveRecreate),
     ]
@@ -1042,6 +1050,8 @@ fn run_steps(steps: &[Step]) -> Vec<crate::wire_enc::SealedRecord> {
         other.registration_id = 4;
         other
     }];
+    let aliases = [ALIAS, ALIAS_2];
+    let mut on = 0_usize;
     for identity in identities {
         rig.inject(&announce_under(identity));
     }
@@ -1052,8 +1062,14 @@ fn run_steps(steps: &[Step]) -> Vec<crate::wire_enc::SealedRecord> {
     for step in steps {
         match *step {
             Step::Challenge(target) => {
-                let challenge = challenge_of(identities[usize::from(target)]);
+                let challenge = challenge_on(identities[usize::from(target)], aliases[on]);
                 let _ = rsp_seal_of(&mut rig, &challenge).seal_control(&mut buffer, frames);
+            }
+            Step::Alias => {
+                on = 1 - on;
+                for identity in identities {
+                    rig.inject(&announce_on(identity, aliases[on]));
+                }
             }
             Step::Establish => {
                 let Some(nonce) = rig.role.nonces.nonce() else {
@@ -1087,7 +1103,7 @@ fn run_steps(steps: &[Step]) -> Vec<crate::wire_enc::SealedRecord> {
             }
             Step::Control(_) | Step::RollD4(_) => {}
             Step::RollD6(target) => {
-                let challenge = challenge_of(identities[usize::from(target)]);
+                let challenge = challenge_on(identities[usize::from(target)], aliases[on]);
                 rsp_seal_of(&mut rig, &challenge).roll_for_test();
             }
             Step::RotateFile => {
@@ -1109,7 +1125,7 @@ fn run_steps(steps: &[Step]) -> Vec<crate::wire_enc::SealedRecord> {
                         .unwrap(),
                 );
                 for identity in identities {
-                    rig.inject(&announce_under(identity));
+                    rig.inject(&announce_on(identity, aliases[on]));
                 }
             }
         }
@@ -1117,8 +1133,31 @@ fn run_steps(steps: &[Step]) -> Vec<crate::wire_enc::SealedRecord> {
     crate::wire_enc::take_seals()
 }
 
+/// The derivation inputs of a recorded seal's key (H8-10): its context
+/// with the selectors `session_id` and `stream_id` cleared, which enter
+/// no HKDF input. Every rig file of a key id has one secret per epoch, so
+/// equal inputs mean one derived key.
+fn derivation(context: &KeyContext) -> KeyContext {
+    KeyContext {
+        session_id: 0,
+        stream_id: 0,
+        ..*context
+    }
+}
+
 /// A verified domain 5 ANNOUNCE of `identity`, under its own key.
 fn announce_under(identity: Identity) -> Vec<u8> {
+    announce_on(identity, ALIAS)
+}
+
+/// A second alias of the rig's stream.
+const ALIAS_2: Alias = Alias {
+    session_id: 9,
+    stream_id: 6,
+};
+
+/// A verified domain 5 ANNOUNCE of `identity` on `alias`.
+fn announce_on(identity: Identity, alias: Alias) -> Vec<u8> {
     let keys = ChannelKeys::new(&[&channel(0x11)]).unwrap();
     let mut sealer = EncSealer::new(
         &keys,
@@ -1127,8 +1166,8 @@ fn announce_under(identity: Identity) -> Vec<u8> {
             domain: Domain::Setup,
             key_epoch: 1,
             party_epoch: 0,
-            session_id: ALIAS.session_id,
-            stream_id: ALIAS.stream_id,
+            session_id: alias.session_id,
+            stream_id: alias.stream_id,
             publication: publication_of(&identity),
             receiver: None,
             salt: Salt::Empty,
@@ -1139,6 +1178,7 @@ fn announce_under(identity: Identity) -> Vec<u8> {
     let mut control = announce();
     if let Control::SetupAnnounce(setup) = &mut control {
         setup.identity = identity;
+        setup.alias = alias;
     }
     sealed(&mut sealer, &control)
 }
@@ -1146,11 +1186,13 @@ fn announce_under(identity: Identity) -> Vec<u8> {
 proptest::proptest! {
     #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
 
-    /// H8-01 and ADR-0114 section 6: within one receiver boot, across any
-    /// sequence of subscription replacements, removals and re-creations,
-    /// `party_epoch` rolls, file epoch rotations and seals in domains 4
-    /// and 6, no two seals share a key context and an envelope sequence,
-    /// so no (key, nonce) pair is ever used twice.
+    /// H8-01, H8-10 and ADR-0114 section 6: within one receiver boot,
+    /// across any sequence of subscription replacements, removals and
+    /// re-creations, alias changes, `party_epoch` rolls, file epoch
+    /// rotations and seals in domains 4 and 6, no two seals share the
+    /// derivation inputs of their key (the context less its selectors)
+    /// and an envelope sequence, so no (key, nonce) pair is ever used
+    /// twice.
     #[test]
     fn no_sealer_repeats_a_key_and_nonce_within_a_boot(
         steps in proptest::collection::vec(step(), 1..48)
@@ -1163,11 +1205,269 @@ proptest::proptest! {
         for (at, record) in seals.iter().enumerate() {
             for other in &seals[..at] {
                 proptest::prop_assert!(
-                    !(other.context == record.context && other.seq == record.seq),
+                    !(derivation(&other.context) == derivation(&record.context)
+                        && other.seq == record.seq),
                     "(key, nonce) reused: {:?} seq {}",
                     record.context,
                     record.seq
                 );
+            }
+        }
+    }
+}
+
+/// H8-10 (ADR-0114 sections 4 and 5): `session_id` and `stream_id` are
+/// selectors, never HKDF inputs, so one publication's domain 6 key is the
+/// same on every alias. A channel key holder that announces the identity
+/// on a second alias after the first alias's challenge gets no second
+/// sealer for that key: the second alias's CHALLENGE is refused, never
+/// sealed at sequence 0 again, and the first alias's sequence continues.
+#[test]
+fn a_second_alias_of_one_key_gets_no_second_sequence() {
+    let mut rig = rig();
+    rig.inject(&announce_on(IDENTITY, ALIAS));
+    assert_eq!(
+        sequence_of(&mut rsp_seal_of(&mut rig, &challenge_on(IDENTITY, ALIAS))),
+        0
+    );
+    rig.inject(&announce_on(IDENTITY, ALIAS_2));
+    assert_eq!(rig.rejections().total(), 0, "both announces verified");
+    let mut buffer = [0_u8; 512];
+    let second = challenge_on(IDENTITY, ALIAS_2);
+    let length = second.encode(&mut buffer).unwrap();
+    assert_eq!(
+        rsp_seal_of(&mut rig, &second).seal_control(&mut buffer, length),
+        None,
+        "no second sequence under the same key"
+    );
+    assert_eq!(rig.role.enc.rsp.len(), 1);
+    assert_eq!(
+        sequence_of(&mut rsp_seal_of(&mut rig, &challenge_on(IDENTITY, ALIAS))),
+        1,
+        "the key's one sequence continues"
+    );
+}
+
+/// A publication of the rig's driver, registration `n`.
+fn target(n: u64) -> PublicationIdentity {
+    PublicationIdentity {
+        driver_id: [5; 16],
+        registration_id: 100 + n,
+        incarnation: 1,
+    }
+}
+
+/// A role whose one subscription holds channel epoch 1, with every domain
+/// 6 entry of the table made, one target each, each having sealed once.
+fn full_rsp_table() -> super::super::ReceiverRole {
+    let (_, mut role) = super::super::roles(&AgentConfig::default()).unwrap();
+    role.enc.subscribe(
+        SubscriptionEnc::new(EndpointId(1), 6, &[&channel(0x11)], &[&pairwise()], 66).unwrap(),
+    );
+    for n in 0..u64::try_from(RSP_SEALERS).unwrap() {
+        let mut sealer = role
+            .enc
+            .rsp_sealer(0, target(n), ALIAS, [4; 16], true)
+            .unwrap();
+        assert_eq!(sequence_of(&mut sealer), 0);
+    }
+    let over = u64::try_from(RSP_SEALERS).unwrap();
+    assert!(
+        role.enc
+            .rsp_sealer(0, target(over), ALIAS, [4; 16], true)
+            .is_none(),
+        "full"
+    );
+    role
+}
+
+/// H8-11: once the root file epoch every entry sealed under stops
+/// verifying, its withdrawn entries are reclaimed, so turnover past 64
+/// targets within one boot keeps challenging: 64 more targets, and the
+/// first ones again, get sealers under the successor epoch, sequence 0
+/// under a new key. No sealer is made again under the reclaimed epoch.
+#[test]
+fn rsp_entries_are_reclaimed_once_their_root_stops_verifying() {
+    use crate::wire_auth::FixedKeys;
+
+    let mut role = full_rsp_table();
+    role.enc.apply_keys(&FixedKeys {
+        files: vec![second_epoch(), pairwise()],
+    });
+    assert!(role.enc.rsp.is_empty(), "every expired entry is reclaimed");
+    assert_eq!(role.enc.floors, vec![(3, 1)]);
+    for n in 0..2 * u64::try_from(RSP_SEALERS).unwrap() {
+        let sealer = role.enc.rsp_sealer(0, target(n), ALIAS, [4; 16], true);
+        if n < u64::try_from(RSP_SEALERS).unwrap() {
+            let mut sealer = sealer.unwrap();
+            let mut bytes = vec![0_u8; MAX_SEALED];
+            let length = announce().encode(&mut bytes).unwrap();
+            let sealed = sealer.seal_control(&mut bytes, length).unwrap();
+            let head = crate::wire_enc::header(&bytes[..sealed]).unwrap();
+            assert_eq!((head.key_epoch, head.seq), (2, 0), "a new key");
+        } else {
+            assert!(sealer.is_none(), "bounded at {RSP_SEALERS}");
+        }
+    }
+    // A floor at epoch 1: should epoch 1 verify again, no sealer of key id
+    // 3 is made under it in this boot.
+    role.enc.rsp.clear();
+    role.enc.subscriptions[0].keys = ChannelKeys::new(&[&channel(0x11)]).unwrap();
+    assert!(
+        role.enc
+            .rsp_sealer(0, target(0), ALIAS, [4; 16], true)
+            .is_none()
+    );
+}
+
+/// H8-11: an entry whose key is still live, or which is withdrawn while a
+/// file it sealed under still verifies (a tombstone), is never reclaimed:
+/// the table stays full and refuses a new target (fail closed).
+#[test]
+fn a_still_derivable_rsp_entry_is_never_reclaimed() {
+    use crate::wire_auth::FixedKeys;
+
+    let mut role = full_rsp_table();
+    // Rotation: every sealer moves to epoch 2 and stays live.
+    role.enc.apply_keys(&FixedKeys {
+        files: vec![channel(0x11), second_epoch(), pairwise()],
+    });
+    assert_eq!(role.enc.rsp.len(), RSP_SEALERS);
+    let over = u64::try_from(RSP_SEALERS).unwrap();
+    assert!(
+        role.enc
+            .rsp_sealer(0, target(over), ALIAS, [4; 16], true)
+            .is_none()
+    );
+    // The pairwise file goes: every sealer is withdrawn, but both channel
+    // epochs still verify.
+    role.enc.apply_keys(&FixedKeys {
+        files: vec![channel(0x11), second_epoch()],
+    });
+    assert_eq!(role.enc.rsp.len(), RSP_SEALERS, "tombstones stay");
+    assert!(role.enc.floors.is_empty());
+    // Epoch 1 goes, epoch 2 stays: they sealed under 2, which verifies.
+    role.enc.apply_keys(&FixedKeys {
+        files: vec![second_epoch()],
+    });
+    assert_eq!(role.enc.rsp.len(), RSP_SEALERS);
+}
+
+/// An ANNOUNCE of `IDENTITY` on `ALIAS` sealed in domain 5 under channel
+/// file epoch `epoch` (1 is fill 0x11, 2 is fill 0x55).
+fn announce_at(epoch: u32) -> Vec<u8> {
+    let file = if epoch == 1 {
+        channel(0x11)
+    } else {
+        second_epoch()
+    };
+    let keys = ChannelKeys::new(&[&file]).unwrap();
+    let mut sealer = EncSealer::new(
+        &keys,
+        None,
+        KeyContext {
+            domain: Domain::Setup,
+            key_epoch: epoch,
+            party_epoch: 0,
+            session_id: ALIAS.session_id,
+            stream_id: ALIAS.stream_id,
+            publication: publication_of(&IDENTITY),
+            receiver: None,
+            salt: Salt::Empty,
+        },
+        monotonic_ns,
+    )
+    .unwrap();
+    sealed(&mut sealer, &announce())
+}
+
+/// The view of a successor's activation: `signing` the channel epoch that
+/// signs, `verifying` the ones that verify, with the pairwise file.
+fn view(signing: u32, verifying: &[u32]) -> crate::wire_auth::SplitKeys {
+    let file = |epoch: u32| {
+        if epoch == 1 {
+            channel(0x11)
+        } else {
+            second_epoch()
+        }
+    };
+    let mut files: Vec<KeyFile> = verifying.iter().map(|epoch| file(*epoch)).collect();
+    files.push(pairwise());
+    crate::wire_auth::SplitKeys {
+        signing: Some(file(signing)),
+        verifying: files,
+        current: verifying.iter().copied().max(),
+    }
+}
+
+/// H8-12 (section 7, wire-key-files.md 2.3): the active binding epoch is
+/// the signing one, not the highest that verifies. With both channel
+/// epochs loaded, before the successor's activation (it verifies early,
+/// its predecessor signs) a SETUP under the predecessor, which every party
+/// still sends under, establishes, and so does one under the successor;
+/// at activation (the successor signs) the retired predecessor binds
+/// nothing and the successor establishes; after the predecessor stops
+/// verifying, likewise.
+#[test]
+fn establishment_binds_through_the_signing_epoch_around_activation() {
+    for (phase, view, binds) in [
+        ("before", view(1, &[1, 2]), [true, true]),
+        ("at", view(2, &[1, 2]), [false, true]),
+        ("after", view(2, &[2]), [false, true]),
+    ] {
+        for (epoch, binds) in [1, 2].into_iter().zip(binds) {
+            let (_, mut role): (_, super::super::ReceiverRole) =
+                super::super::roles(&AgentConfig::default()).unwrap();
+            role.enc.subscribe(
+                SubscriptionEnc::new(
+                    EndpointId(1),
+                    6,
+                    &[&channel(0x11), &second_epoch()],
+                    &[&pairwise()],
+                    66,
+                )
+                .unwrap(),
+            );
+            role.enc.apply_keys(&view);
+            let (sessions, _link) = session_rings(std::num::NonZeroUsize::new(4).unwrap());
+            let source: SocketAddr = "10.0.0.2:4000".parse().unwrap();
+            role.inject_datagram(&sessions, EndpointId(1), source, &announce_at(epoch), 1_000);
+            let rejections = role.enc.rejections(EndpointId(1), 6).unwrap();
+            assert_eq!(
+                role.enc.verified.len(),
+                usize::from(binds),
+                "{phase} activation, epoch {epoch}: {rejections:?}"
+            );
+            if binds {
+                assert_eq!(rejections.total(), 0, "{phase}, {epoch}");
+            }
+        }
+    }
+}
+
+/// H8-12 (section 6b): with both epochs loaded, a resynchronisation
+/// answer under the signing epoch (or the successor already) moves the
+/// binding before the successor's activation and at it; one under a
+/// retired predecessor never does. (After the predecessor stops verifying
+/// an image still bound under it is withdrawn, and re-establishes.)
+#[test]
+fn resync_binds_through_the_signing_epoch_around_activation() {
+    for (phase, view, binds) in [
+        ("before", view(1, &[1, 2]), [true, true]),
+        ("at", view(2, &[1, 2]), [false, true]),
+    ] {
+        for (epoch, binds) in [1, 2].into_iter().zip(binds) {
+            let mut role = bound();
+            role.enc.apply_keys(&view);
+            let result = role
+                .enc
+                .resync(0, &enc_answer(epoch, 3, NONCE), epoch, true, BOOT, 1_500);
+            if binds {
+                assert_eq!(result, Ok(()), "{phase} activation, epoch {epoch}");
+                assert_eq!(role.enc.images[0].opener.epochs(), (epoch, 3));
+            } else {
+                assert_eq!(result, Err(EncRejection::ResyncRefused), "{phase}, {epoch}");
+                assert_eq!(role.enc.images[0].opener.epochs(), (1, 0));
             }
         }
     }

@@ -4818,8 +4818,17 @@ impl<T: StreamTerms> ReceiverRole<T> {
             owner,
             retire,
             cells,
+            enc_seal,
             ..
         } = image;
+        // An encrypted image's domain 4 sealer is withdrawn through its
+        // shared object, which erases its key for every holder, a clone in
+        // a queued control included, and its domain 1 keys go with it
+        // (H8-09): nothing of a retired image outlives it.
+        if let Some(mut seal) = enc_seal {
+            ControlSeal::withdraw(&mut seal);
+        }
+        self.enc.retire_image(slot);
         // Its lanes' journals close now, with their facts, for the
         // conductor (trace-network.md §4: they close with the image).
         let counters = &mut self.counters;
@@ -6322,6 +6331,13 @@ impl<T: StreamTerms> Intake<'_, T> {
                     Some((create, retire, chain)),
                 ) = (outcome, reserved)
                 {
+                    // The answer states the whole datagram's MTU: the
+                    // image's log and checks take the inner budget of its
+                    // class (H8-13).
+                    let term = karyos_protocol::network::TermParams {
+                        mtu: self.image_mtu(answer.alias.stream_id, term.mtu),
+                        ..term
+                    };
                     let event = SessionEvent::CreateImage {
                         endpoint,
                         source,

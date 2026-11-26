@@ -357,13 +357,24 @@ fn frame_lengths(frames: &[u8]) -> Vec<usize> {
 }
 
 /// An established encrypted unicast channel through production admission
-/// (`mtu` 1408): each batch of message lengths is offered at once and
-/// delivered; returns the frame lengths of every domain 1 datagram sealed
-/// meanwhile, after checking that none exceeds 1408 bytes on the wire
-/// (1324 inner bytes).
+/// (`mtu` 1408): see [`enc_run`].
 fn enc_mtu_run(batches: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    enc_run(1408, batches)
+}
+
+/// An established encrypted unicast channel through production admission
+/// at channel `mtu`: each batch of message lengths is offered at once and
+/// delivered; returns the frame lengths of every domain 1 datagram sealed
+/// meanwhile, after checking that none exceeds `mtu` bytes on the wire
+/// (`mtu - 84` inner bytes). Every SETUP the publisher sealed states the
+/// whole datagram's `mtu`, and the receiver's image log takes the inner
+/// budget, derived locally (H8-13).
+fn enc_run(mtu: u32, batches: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    use karyos_protocol::network::encrypted::{EncSetup, decode_setup};
     use karyos_protocol::protection::aes_gcm_siv::{Domain, ENVELOPE_LEN};
 
+    let wire = usize::try_from(mtu).unwrap();
+    crate::wire_enc::record_seals();
     let (mut subscriber, _sub_keys) = keyed(&borrowed(&enc_files()));
     subscriber
         .add_network_subscription_as(
@@ -374,11 +385,10 @@ fn enc_mtu_run(batches: &[Vec<usize>]) -> Vec<Vec<usize>> {
         .unwrap();
     let to = subscriber.network_subscription_address(STREAM).unwrap();
     let (mut publisher, _pub_keys) = keyed(&borrowed(&enc_files()));
+    let mut config = aggregate(STREAM);
+    config.stream.buffer.mtu = mtu;
     let handle = publisher
-        .add_network_publication(
-            aggregate(STREAM),
-            &udp(Destination::Unicast(to), encrypted()),
-        )
+        .add_network_publication(config, &udp(Destination::Unicast(to), encrypted()))
         .unwrap();
     let mut image = None;
     assert!(
@@ -388,8 +398,32 @@ fn enc_mtu_run(batches: &[Vec<usize>]) -> Vec<Vec<usize>> {
         }),
         "the encrypted channel never established"
     );
+    let image = image.unwrap();
+    // The SETUPs advertise the whole datagram (ADR-0114 section 11).
+    let setups: Vec<u32> = crate::wire_enc::take_seals()
+        .iter()
+        .filter(|record| record.context.domain == Domain::Setup)
+        .map(|record| match decode_setup(&record.frames).unwrap() {
+            EncSetup::Announce(announce) => announce.term.mtu,
+            EncSetup::Answer(answer) => answer.answer.term.mtu,
+        })
+        .collect();
+    assert!(!setups.is_empty());
+    assert!(
+        setups.iter().all(|advertised| *advertised == mtu),
+        "{setups:?}"
+    );
+    // Each side sizes its log at the inner budget, locally.
+    for (driver, handle) in [(&publisher, &handle), (&subscriber, &image)] {
+        let stream = handle.streams().next().unwrap();
+        assert_eq!(
+            driver.stream_ref(stream).unwrap().config.mtu,
+            mtu - 84,
+            "the log's inner budget"
+        );
+    }
     let mut reader = subscriber
-        .subscribe_aggregate(&image.unwrap(), Role::Required)
+        .subscribe_aggregate(&image, Role::Required)
         .unwrap();
     let mut lane = publisher
         .publication(handle.lane(Lane::ZERO).unwrap())
@@ -405,7 +439,7 @@ fn enc_mtu_run(batches: &[Vec<usize>]) -> Vec<Vec<usize>> {
             .filter(|record| record.context.domain == Domain::Sender)
             .map(|record| {
                 assert!(
-                    record.frames.len() + ENVELOPE_LEN <= 1408,
+                    record.frames.len() + ENVELOPE_LEN <= wire,
                     "a {}-byte datagram",
                     record.frames.len() + ENVELOPE_LEN
                 );
@@ -495,14 +529,14 @@ fn an_encrypted_message_is_fragmented_at_c_1280() {
     );
 }
 
-/// An encrypted publication on a channel whose MTU less the 84-byte
-/// envelope is below the smallest MTU a receiver accepts is refused,
-/// typed, and nothing is created (ADR-0114 section 11).
+/// H8-13 (ADR-0114 section 11): the 256-byte floor applies to the
+/// channel MTU, the whole datagram. 255 is refused, typed, and nothing is
+/// created; 256 and 288 (inner budgets of 172 and 204 bytes) are admitted.
 #[test]
-fn an_encrypted_channel_with_no_inner_budget_is_refused_typed() {
+fn an_encrypted_channel_below_the_mtu_floor_is_refused_typed() {
     let (mut publisher, _keys) = keyed(&borrowed(&enc_files()));
     let mut config = aggregate(STREAM);
-    config.stream.buffer.mtu = 288;
+    config.stream.buffer.mtu = 255;
     assert_eq!(
         publisher
             .add_network_publication(config, &udp(unicast(), encrypted()))
@@ -510,6 +544,33 @@ fn an_encrypted_channel_with_no_inner_budget_is_refused_typed() {
         refused(AuthRefusal::Mtu)
     );
     nothing_created(&publisher);
+    for mtu in [256, 288] {
+        let (mut publisher, _keys) = keyed(&borrowed(&enc_files()));
+        let mut config = aggregate(STREAM);
+        config.stream.buffer.mtu = mtu;
+        assert!(
+            publisher
+                .add_network_publication(config, &udp(unicast(), encrypted()))
+                .is_ok(),
+            "{mtu}"
+        );
+    }
+}
+
+/// H8-13 (ADR-0114 section 11) at the 256-byte floor, end to end through
+/// production admission: the SETUPs advertise 256, both logs take the
+/// 172-byte inner budget (`c` = 128), the channel establishes and every
+/// message is delivered intact in datagrams of at most 256 bytes: one of
+/// 128 bytes whole, one of 300 cut as 128, 128 and 44.
+#[test]
+fn an_encrypted_channel_at_the_mtu_floor_interoperates() {
+    let data = enc_run(256, &[vec![128], vec![300]]);
+    let lengths: Vec<usize> = data
+        .into_iter()
+        .flatten()
+        .filter(|length| *length > 96)
+        .collect();
+    assert_eq!(lengths, vec![32 + 128, 32 + 128, 32 + 128], "{lengths:?}");
 }
 
 /// H8-03 (wire-key-files.md 2.2): admission uses a channel file only for
@@ -567,4 +628,103 @@ fn encrypted_admission_checks_every_scope_field_of_its_files() {
         refused(AuthRefusal::ChannelKey)
     );
     nothing_created(&publisher);
+}
+
+/// H8-03 (wire-key-files.md 2.2, ADM-2): encrypted admission registers
+/// its scopes as the authenticated class does, so a reload whose successor
+/// file differs from the admitted scope in one field, each field on its
+/// own (the channel key's `channel_id` and `stream_id`, the pairwise
+/// key's `receiver_id` and `publisher_id`), never reaches the roles: the
+/// view the agents apply holds no file of it, on the publisher and on the
+/// subscriber. (Its `not_before` is past the predecessor's overlap, so the
+/// store retires the predecessor at once and the channel stops, fail
+/// closed.) A successor of the admitted scope does reach them.
+#[test]
+fn an_encrypted_reload_refuses_a_successor_of_another_scope() {
+    let successor = |channel_id: u64, stream_id: i32| {
+        enc_channel_key(stream_id)
+            .replace("file_epoch=1", "file_epoch=2")
+            .replace("channel_id=7", &format!("channel_id={channel_id}"))
+            .replace(&"33".repeat(32), &"35".repeat(32))
+    };
+    let pair_successor = |receiver_id: u64, publisher_id: u64| {
+        enc_pairwise_key()
+            .replace("file_epoch=1", "file_epoch=2")
+            .replace(
+                &format!("receiver_id={RECEIVER}"),
+                &format!("receiver_id={receiver_id}"),
+            )
+            .replace("publisher_id=5", &format!("publisher_id={publisher_id}"))
+            .replace(&"44".repeat(32), &"46".repeat(32))
+    };
+    let cases = [
+        (
+            "channel_id",
+            ENC_CHANNEL,
+            successor(CHANNEL_ID + 1, STREAM),
+            false,
+        ),
+        (
+            "stream_id",
+            ENC_CHANNEL,
+            successor(CHANNEL_ID, STREAM + 1),
+            false,
+        ),
+        (
+            "receiver_id",
+            ENC_PAIRWISE,
+            pair_successor(RECEIVER + 1, PUBLISHER_ID),
+            false,
+        ),
+        (
+            "publisher_id",
+            ENC_PAIRWISE,
+            pair_successor(RECEIVER, PUBLISHER_ID + 1),
+            false,
+        ),
+        (
+            "same scope",
+            ENC_CHANNEL,
+            successor(CHANNEL_ID, STREAM),
+            true,
+        ),
+        (
+            "same pair",
+            ENC_PAIRWISE,
+            pair_successor(RECEIVER, PUBLISHER_ID),
+            true,
+        ),
+    ];
+    for (field, key_id, text, reaches) in cases {
+        let (mut subscriber, sub_keys) = keyed(&borrowed(&enc_files()));
+        subscriber
+            .add_network_subscription_as(
+                STREAM,
+                &udp(Destination::Unicast(ANY_PORT), encrypted()),
+                identity(RECEIVER),
+            )
+            .unwrap();
+        let (mut publisher, pub_keys) = keyed(&borrowed(&enc_files()));
+        publisher
+            .add_network_publication(aggregate(STREAM), &udp(unicast(), encrypted()))
+            .unwrap();
+        for keys in [&sub_keys, &pub_keys] {
+            keys.put(&format!("{key_id}-2.key"), &text);
+        }
+        advance(RELOAD_INTERVAL_S);
+        for _ in 0..20 {
+            let _ = subscriber.do_work().unwrap();
+            let _ = publisher.do_work().unwrap();
+        }
+        for driver in [&subscriber, &publisher] {
+            let wire = driver.net.as_ref().unwrap().wire_keys().unwrap();
+            let epochs: Vec<u32> = crate::wire_auth::KeySet::verifying(&*wire.view, key_id)
+                .into_iter()
+                .flatten()
+                .map(|file| file.file_epoch)
+                .collect();
+            let want: Vec<u32> = if reaches { vec![2] } else { Vec::new() };
+            assert_eq!(epochs, want, "{field}");
+        }
+    }
 }

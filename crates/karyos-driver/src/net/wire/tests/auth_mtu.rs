@@ -150,26 +150,123 @@ fn an_authenticated_publication_fills_the_mtu_and_never_exceeds_it() {
     );
 }
 
-/// An authenticated publication on a channel whose MTU less the envelope
-/// is below the smallest MTU a receiver accepts is refused, typed, and
-/// nothing is created.
+/// H8-13 (ADR-0086 section 5): the 256-byte floor applies to the channel
+/// MTU, the whole datagram. 255 is refused, typed, and nothing is
+/// created; 256 and 288 (inner budgets of 208 and 240 bytes) are admitted.
 #[test]
-fn an_authenticated_channel_with_no_inner_budget_is_refused_typed() {
+fn an_authenticated_channel_below_the_mtu_floor_is_refused_typed() {
+    let security = Security::Authenticated(auth(None));
+    let to = || udp(Destination::Unicast(SocketAddr::new(LOOPBACK, 9)), security);
     let (mut publisher, _keys) = keyed(&borrowed(&publisher_files()));
     let mut config = aggregate(STREAM);
-    config.stream.buffer.mtu = 288;
-    let security = Security::Authenticated(auth(None));
+    config.stream.buffer.mtu = 255;
     assert_eq!(
         publisher
-            .add_network_publication(
-                config,
-                &udp(Destination::Unicast(SocketAddr::new(LOOPBACK, 9)), security),
-            )
+            .add_network_publication(config, &to())
             .unwrap_err(),
         refused(AuthRefusal::Mtu)
     );
     let net = publisher.net.as_ref().unwrap();
     assert_eq!(net.publication_count(), 0);
+    for mtu in [256, 288] {
+        let (mut publisher, _keys) = keyed(&borrowed(&publisher_files()));
+        let mut config = aggregate(STREAM);
+        config.stream.buffer.mtu = mtu;
+        assert!(
+            publisher.add_network_publication(config, &to()).is_ok(),
+            "{mtu}"
+        );
+    }
+}
+
+/// H8-13 (ADR-0086 section 5) through production admission, at the
+/// default 1408 and at the 256-byte floor: every SETUP the publisher
+/// seals advertises the channel MTU, the whole datagram, never the log's
+/// inner budget; both logs take `mtu - 48`, each derived locally; the
+/// channel establishes and delivers intact in datagrams of at most `mtu`
+/// bytes (at 256, `c` = 160: 300 bytes leave as 160 and 140).
+#[test]
+fn an_authenticated_setup_advertises_the_wire_mtu_and_interoperates() {
+    for (mtu, message) in [(1408_u32, 1312_usize), (256, 300)] {
+        let wire = usize::try_from(mtu).unwrap();
+        crate::wire_auth::record_seals();
+        let security = Security::Authenticated(auth(None));
+        let (mut subscriber, _sub_keys) = keyed(&borrowed(&subscriber_files()));
+        subscriber
+            .add_network_subscription_as(
+                STREAM,
+                &udp(Destination::Unicast(ANY_PORT), security),
+                identity(RECEIVER),
+            )
+            .unwrap();
+        let to = subscriber.network_subscription_address(STREAM).unwrap();
+        let (mut publisher, _pub_keys) = keyed(&borrowed(&publisher_files()));
+        let mut config = aggregate(STREAM);
+        config.stream.buffer.mtu = mtu;
+        let handle = publisher
+            .add_network_publication(config, &udp(Destination::Unicast(to), security))
+            .unwrap();
+        let mut image = None;
+        assert!(
+            pump(&mut [&mut publisher, &mut subscriber], |drivers| {
+                image = drivers[1].network_image(STREAM, 1);
+                image.is_some()
+            }),
+            "{mtu}: never established"
+        );
+        let image = image.unwrap();
+        let setups: Vec<u32> = crate::wire_auth::take_seals()
+            .iter()
+            .filter(|record| record.domain == Domain::SetupProof)
+            .filter_map(
+                |record| match karyos_protocol::network::classify(&record.frames) {
+                    Ok(karyos_protocol::network::Datagram::Control(
+                        karyos_protocol::network::Control::SetupAnnounce(announce),
+                    )) => Some(announce.term.mtu),
+                    Ok(karyos_protocol::network::Datagram::Control(
+                        karyos_protocol::network::Control::SetupAnswer(answer),
+                    )) => Some(answer.term.mtu),
+                    _ => None,
+                },
+            )
+            .collect();
+        assert!(!setups.is_empty(), "{mtu}");
+        assert!(
+            setups.iter().all(|advertised| *advertised == mtu),
+            "{setups:?}"
+        );
+        for (driver, handle) in [(&publisher, &handle), (&subscriber, &image)] {
+            let stream = handle.streams().next().unwrap();
+            assert_eq!(driver.stream_ref(stream).unwrap().config.mtu, mtu - 48);
+        }
+        let mut reader = subscriber
+            .subscribe_aggregate(&image, Role::Required)
+            .unwrap();
+        let mut lane = publisher
+            .publication(handle.lane(Lane::ZERO).unwrap())
+            .unwrap();
+        crate::wire_auth::record_seals();
+        let payload: Vec<u8> = (0..message)
+            .map(|at| u8::try_from(at % 251).unwrap())
+            .collect();
+        assert!(matches!(
+            lane.offer(&payload).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+        let mut delivered = Vec::new();
+        let budget = Budget {
+            work: 256,
+            bytes: 1 << 22,
+        };
+        assert!(pump(&mut [&mut publisher, &mut subscriber], |_| {
+            let _ = reader.poll(|bytes, _, _| delivered.push(bytes.to_vec()), budget);
+            !delivered.is_empty()
+        }));
+        assert_eq!(delivered, vec![payload], "{mtu}");
+        for record in crate::wire_auth::take_seals() {
+            assert!(record.frames.len() + ENVELOPE_LEN <= wire, "{mtu}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
