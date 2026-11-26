@@ -736,6 +736,42 @@ mod w1 {
             case.name,
             ran.probes
         );
+        // The custom core's process path past the warm-up (C5 v3): what its
+        // adapter pools comes back to it, so its core stages allocate and
+        // free nothing, summed over the servers.
+        if core == "custom" {
+            for stage in CUSTOM_ZERO {
+                assert_eq!(
+                    stage_total(&ran.probes, stage),
+                    (0, 0),
+                    "{core} {}: stage {stage}: {:?}",
+                    case.name,
+                    ran.probes
+                );
+            }
+        }
+    }
+
+    /// The custom core's stages that count nothing past the warm-up on a
+    /// process (C5 v3).
+    pub const CUSTOM_ZERO: [&str; 6] = [
+        "propose",
+        "step_leader",
+        "tick",
+        "ready_leader",
+        "advance_leader",
+        "advance_follower",
+    ];
+
+    /// `stage`'s allocations and frees, summed over the servers.
+    pub fn stage_total(probes: &[Probe], stage: &str) -> (u64, u64) {
+        probes
+            .iter()
+            .flat_map(|probe| probe.stages.iter())
+            .filter(|(name, _, _)| name == stage)
+            .fold((0, 0), |(a, f), (_, more_a, more_f)| {
+                (a + more_a, f + more_f)
+            })
     }
 
     /// The index of the W1 case of `servers`, `payload` and `clients`.

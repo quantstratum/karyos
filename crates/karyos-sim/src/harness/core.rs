@@ -529,6 +529,13 @@ pub struct ReadyBuf<M> {
     pub ready: Ready<M>,
     /// Entries [`drive`] is done with, their payload buffers kept.
     spare: Vec<Entry>,
+    /// Messages of this node's own Readys that the node has sent and is
+    /// done with, given back whole ([`ReadyBuf::give_sent`]): what the core
+    /// gave out in a Ready, returned through it, so a core that pools its
+    /// messages' buffers takes them back ([`ReadyBuf::take_sent`]; C5 v3,
+    /// "the harness and the adapters"). The simulator gives none back: its
+    /// network delivers each message to its receiver.
+    sent: Vec<M>,
 }
 
 impl<M> Default for ReadyBuf<M> {
@@ -536,6 +543,7 @@ impl<M> Default for ReadyBuf<M> {
         Self {
             ready: Ready::default(),
             spare: Vec::new(),
+            sent: Vec::new(),
         }
     }
 }
@@ -570,6 +578,25 @@ impl<M> ReadyBuf<M> {
     /// Drops the pool: for a core that never draws from it.
     pub fn release_spare(&mut self) {
         self.spare = Vec::new();
+    }
+
+    /// Room for `count` sent messages given back at once, reserved at
+    /// initialisation so [`ReadyBuf::give_sent`] does not grow it.
+    pub fn reserve_sent(&mut self, count: usize) {
+        self.sent.reserve(count.saturating_sub(self.sent.len()));
+    }
+
+    /// Gives back `message`, one of this node's Readys' messages, once the
+    /// node has sent it (encoded it) and is done with it. Never wire bytes
+    /// or a datagram: only what the core gave out.
+    pub fn give_sent(&mut self, message: M) {
+        self.sent.push(message);
+    }
+
+    /// Moves the messages given back to `into`, for a core that recycles
+    /// their buffers.
+    pub fn take_sent(&mut self, into: &mut Vec<M>) {
+        into.append(&mut self.sent);
     }
 
     /// Empties the Ready, keeping every vector's capacity and returning its
@@ -1174,6 +1201,27 @@ impl Drop for RunSeed {
 pub const fn node_seed(seed: u64, id: u64) -> u64 {
     // The multiplication wraps by design: a spread of the seed's bits.
     id ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03)
+}
+
+#[cfg(test)]
+mod ready_buf_tests {
+    use super::ReadyBuf;
+
+    /// A sent message given back is taken back whole, in order, and the
+    /// Ready's own recycling leaves it alone (C5 v3).
+    #[test]
+    fn sent_messages_come_back_through_the_buffer() {
+        let mut buf: ReadyBuf<u32> = ReadyBuf::default();
+        buf.reserve_sent(4);
+        buf.give_sent(1);
+        buf.give_sent(2);
+        buf.recycle();
+        let mut back = Vec::new();
+        buf.take_sent(&mut back);
+        assert_eq!(back, [1, 2]);
+        buf.take_sent(&mut back);
+        assert_eq!(back, [1, 2]);
+    }
 }
 
 #[cfg(test)]
