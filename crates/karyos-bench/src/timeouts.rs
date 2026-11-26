@@ -245,7 +245,16 @@ pub const LOST_AFTER: Duration = Duration::from_secs(1);
 ///
 /// The socket's errors.
 pub fn echo(bind: SocketAddr, run: Duration) -> io::Result<u64> {
-    let socket = UdpSocket::bind(bind)?;
+    echo_on(UdpSocket::bind(bind)?, run)
+}
+
+/// [`echo`] on `socket`, already bound: a caller that binds first knows
+/// the echo listens before anything is sent to it.
+///
+/// # Errors
+///
+/// The socket's errors.
+pub fn echo_on(socket: UdpSocket, run: Duration) -> io::Result<u64> {
     socket.set_read_timeout(Some(Duration::from_millis(200)))?;
     let mut buf = [0u8; 1500];
     let mut answered = 0u64;
@@ -344,10 +353,14 @@ pub fn rtt_within(
                     }
                 }
                 Ok(_) => {}
+                // No answer by the deadline, or the peer's port refused
+                // the datagram (nothing listening yet, or any more): lost.
                 Err(error)
                     if matches!(
                         error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::ConnectionRefused
                     ) =>
                 {
                     lost += 1;
@@ -426,11 +439,11 @@ mod tests {
 
     #[test]
     fn a_round_trip_probe_measures_against_a_local_echo() {
-        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let address = probe.local_addr().unwrap();
-        drop(probe);
-        let server = std::thread::spawn(move || echo(address, Duration::from_secs(2)));
-        std::thread::sleep(Duration::from_millis(100));
+        // Bound before the probe starts: nothing is sent to a port no one
+        // listens on.
+        let listening = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = listening.local_addr().unwrap();
+        let server = std::thread::spawn(move || echo_on(listening, Duration::from_secs(2)));
         let report = rtt(address, 50, Duration::from_millis(2), 64).unwrap();
         assert_eq!(report.lost, 0, "{report:?}");
         assert_eq!(report.tail.count, 50);
@@ -472,5 +485,28 @@ mod tests {
             "the deadline's cadence: {report:?}"
         );
         assert_eq!(server.join().unwrap(), 4);
+    }
+}
+
+#[cfg(test)]
+mod refused {
+    use super::*;
+
+    /// Datagrams to a port no one listens on are refused by the host:
+    /// lost, never an error that ends the run.
+    #[test]
+    fn a_refused_datagram_is_lost_not_an_error() {
+        let free = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = free.local_addr().unwrap();
+        drop(free);
+        let report = rtt_within(
+            address,
+            3,
+            Duration::from_millis(1),
+            64,
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        assert_eq!((report.lost, report.tail.count), (3, 0), "{report:?}");
     }
 }
