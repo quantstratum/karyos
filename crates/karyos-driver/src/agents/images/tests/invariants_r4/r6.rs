@@ -695,3 +695,152 @@ fn inv_r6_the_previous_in_band_epoch_stops_at_the_end_of_its_overlap() {
         "for good"
     );
 }
+
+/// Whether DATA sealed by `sealer` and injected on B from `source` opens.
+/// It is a copy of the committed offset 0, so an opened probe leaves no
+/// hole the publisher cannot repair (DATA ahead of the publisher's own
+/// position would be NAKed, answered ERR and close the image). It opened
+/// when nothing is refused and the same bytes again are refused as a
+/// replay (its sequence was recorded); it was refused when its first copy
+/// is, and not as a replay.
+fn opens(
+    rig: &mut Rig,
+    b: EndpointId,
+    source: SocketAddr,
+    slot: SlotRef,
+    sealer: &mut crate::wire_auth::Sealer,
+) -> bool {
+    let bytes = sealed(sealer, &stale_frame(9, 0, 32));
+    let inject = |rig: &mut Rig| {
+        let receiver = &mut rig.agents.receiver;
+        receiver
+            .role
+            .inject_datagram(&receiver.sessions, b, source, &bytes, rig.now);
+    };
+    let refused = rig.agents.receiver.counters().auth_rejected;
+    let replayed = replays(rig, slot);
+    inject(rig);
+    if rig.agents.receiver.counters().auth_rejected > refused {
+        assert_eq!(
+            replays(rig, slot),
+            replayed,
+            "refused by its epoch, not as a replay"
+        );
+        return false;
+    }
+    inject(rig);
+    assert_eq!(
+        replays(rig, slot),
+        replayed + 1,
+        "the opened probe was recorded"
+    );
+    true
+}
+
+/// The file epochs of `key_id` the store's view verifies, in order.
+fn verifying(wire: &crate::net::wire::WireKeys, key_id: u32) -> Vec<u32> {
+    use crate::wire_auth::KeySet as _;
+
+    let view = wire.view();
+    let mut epochs: Vec<u32> = view
+        .verifying(key_id)
+        .iter()
+        .flatten()
+        .map(|file| file.file_epoch)
+        .collect();
+    epochs.sort_unstable();
+    epochs
+}
+
+/// INV-ROT-1 and ROT-6 (ADR-0086 section 7; manifest 4.4; WK 2.3), a real
+/// key store across both agents and successive rollovers. With channel
+/// epochs 1 and 2 loaded, DATA sealed under epoch 1 still opens (the
+/// overlap). The store then admits epoch 3: epoch 1 retires at once (two
+/// epochs verify, 2 and 3), the same DATA under epoch 1 is refused, the
+/// publication's DATA sealer is retagged to epoch 3, and DATA and SMs flow
+/// on the same establishment with nothing else refused. Epochs only move
+/// forward: the epoch 1 file rewritten and reloaded is not admitted again,
+/// the current epoch stays 3, no role is retagged back, and epoch 1 never
+/// verifies again.
+#[test]
+fn inv_r6_a_third_file_epoch_retires_the_first_at_once_and_epochs_never_go_back() {
+    use crate::wire_auth::{KeySet as _, Sealer};
+
+    const C1_REWRITTEN: &str = "format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=1\npurpose=channel\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=7777777777777777777777777777777777777777777777777777777777777777\nchannel_id=7\nstream_id=6\n";
+    const C3: &str = "format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=3\npurpose=channel\nprofile_id=1\nnot_before=2026-11-20T00:00:00Z\nnot_after=2027-02-17T00:00:00Z\nsecret=6666666666666666666666666666666666666666666666666666666666666666\nchannel_id=7\nstream_id=6\n";
+
+    let (mut wire, keys_dir) = store_of(&[("3-1.key", C1), ("9-1.key", P1)]);
+    let (mut rig, b, channel) = authenticated_rig();
+    let slot = established(&mut rig);
+    reload_and_apply(&mut rig, &mut wire, 0);
+    assert!(send_one(&mut rig, 200) >= 1);
+    let party = bound_party(&rig).unwrap();
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let state = key_state(&rig);
+    let sender_refused = rig.agents.sender.role.counters().auth_rejected;
+    let reload_s = u64::try_from(crate::wire_keys::store::RELOAD_INTERVAL_S).unwrap();
+    let mut old = Sealer::new(&channel, party, alias()).unwrap();
+    old.jump_to(0, 1 << 20);
+    let sealer = |rig: &Rig| {
+        rig.agents
+            .sender
+            .role
+            .outbound(0)
+            .unwrap()
+            .sealer_keys()
+            .map(|keys| keys.1)
+    };
+    let reload = |rig: &mut Rig, wire: &mut crate::net::wire::WireKeys| {
+        let refused = rig.agents.receiver.counters().auth_rejected;
+        reload_and_apply(rig, wire, reload_s);
+        let sms = rig.agents.receiver.counters().sm_sent;
+        for _ in 0..3 {
+            assert!(send_one(rig, 200) >= 1, "DATA flows after the reload");
+        }
+        assert!(
+            rig.agents.receiver.counters().sm_sent > sms,
+            "SMs flow back"
+        );
+        assert!(rig.agents.receiver.role.has_image(slot), "the image lives");
+        assert_eq!(key_state(rig), state, "the same establishment");
+        assert_eq!(
+            (
+                rig.agents.sender.role.counters().auth_rejected,
+                rig.agents.receiver.counters().auth_rejected,
+            ),
+            (sender_refused, refused),
+            "nothing refused either way"
+        );
+    };
+
+    keys_dir.put("3-2.key", C2);
+    keys_dir.put("9-2.key", P2);
+    reload(&mut rig, &mut wire);
+    assert_eq!(verifying(&wire, 3), [1, 2]);
+    assert_eq!(sealer(&rig), Some((3, 2)));
+    assert!(
+        opens(&mut rig, b, source, slot, &mut old),
+        "epoch 1 in the overlap"
+    );
+
+    keys_dir.put("3-3.key", C3);
+    reload(&mut rig, &mut wire);
+    assert_eq!(wire.view().current_epoch(3), Some(3));
+    assert_eq!(verifying(&wire, 3), [2, 3], "epoch 1 retired at once");
+    assert_eq!(sealer(&rig), Some((3, 3)), "DATA retagged to epoch 3");
+    assert!(
+        !opens(&mut rig, b, source, slot, &mut old),
+        "epoch 1 refused"
+    );
+
+    // ROT-6: the epoch 1 file is rewritten; it is not admitted again.
+    keys_dir.put("3-1.key", C1_REWRITTEN);
+    reload(&mut rig, &mut wire);
+    assert_eq!(wire.view().current_epoch(3), Some(3));
+    assert_eq!(verifying(&wire, 3), [2, 3], "epoch 1 not admitted again");
+    assert_eq!(sealer(&rig), Some((3, 3)), "no role retagged back");
+    assert!(
+        !opens(&mut rig, b, source, slot, &mut old),
+        "epoch 1 never again"
+    );
+}
