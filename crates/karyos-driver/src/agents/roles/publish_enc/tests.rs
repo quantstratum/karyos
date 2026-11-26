@@ -309,7 +309,7 @@ fn the_answer_is_variant_3_and_the_session_opens_at_its_epochs() {
         joins: Lanes::new(&[0]).unwrap(),
     };
     let mut bytes = [0_u8; MAX_SEALED];
-    let length = publication.seal_answer(answer, 0, &mut bytes).unwrap();
+    let length = publication.seal_answer(answer, None, &mut bytes).unwrap();
     let mut out = [0_u8; MAX_PLAINTEXT];
     let mut rate = OpenRate::default();
     let opened = open_bootstrap(
@@ -717,7 +717,11 @@ fn a_receiver_that_missed_a_whole_epoch_catches_up_by_establishment() {
     };
     let mut bytes = [0_u8; MAX_SEALED];
     let length = publication
-        .seal_answer(answer, fresh.context().party_epoch, &mut bytes)
+        .seal_answer(
+            answer,
+            Some((fresh.context().key_epoch, fresh.context().party_epoch)),
+            &mut bytes,
+        )
         .unwrap();
     let opened = open_bootstrap(
         &keys(),
@@ -747,4 +751,95 @@ fn a_receiver_that_missed_a_whole_epoch_catches_up_by_establishment() {
             .is_ok()
     );
     let _ = &mut first;
+}
+
+fn plain_answer() -> SetupAnswer {
+    SetupAnswer {
+        alias: ALIAS,
+        identity: IDENTITY,
+        term: TermParams {
+            term_length: 65_536,
+            initial_term_id: 0,
+            mtu: 1408,
+        },
+        challenge: ChallengeBlock {
+            receiver_boot_id: [5, 5],
+            nonce: [7, 7],
+        },
+        joins: Lanes::new(&[0]).unwrap(),
+    }
+}
+
+/// H8-06: while a successor file epoch only verifies (its predecessor
+/// still signs), the ENC ANSWER is sealed under the signing epoch and its
+/// epoch block states the domain 5 sealer's actual epoch, so body and
+/// envelope agree; a session sealer at another key epoch refuses the
+/// answer instead of sending one that disagrees.
+#[test]
+fn an_enc_answer_states_and_seals_the_signing_epoch() {
+    use crate::wire_auth::SplitKeys;
+
+    let mut publication = publication();
+    publication.apply_keys(&SplitKeys {
+        signing: Some(channel(1, 0x11)),
+        verifying: vec![channel(1, 0x11), channel(2, 0x33), pairwise(0x22)],
+        current: Some(2),
+    });
+    let mut bytes = [0_u8; MAX_SEALED];
+    let length = publication
+        .seal_answer(plain_answer(), Some((1, 4)), &mut bytes)
+        .unwrap();
+    let both = ChannelKeys::new(&[&channel(1, 0x11), &channel(2, 0x33)]).unwrap();
+    let mut out = [0_u8; MAX_PLAINTEXT];
+    let mut rate = OpenRate::default();
+    let opened = open_bootstrap(
+        &both,
+        None,
+        None,
+        &bytes[..length],
+        &mut out,
+        &mut rate,
+        clock(),
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    let Ok(EncSetup::Answer(enc)) = decode_setup(&out[..opened.frames]) else {
+        panic!()
+    };
+    assert_eq!(opened.header.key_epoch, 1, "sealed under the signing epoch");
+    assert_eq!((enc.key_epoch, enc.party_epoch), (1, 4));
+    assert_eq!(
+        publication.seal_answer(plain_answer(), Some((2, 0)), &mut bytes),
+        None,
+        "never an answer whose epochs disagree"
+    );
+}
+
+/// H8-07 (section 7): the retired boot ids of a file epoch are kept while
+/// that epoch verifies, through the overlap, and expire in the key update
+/// path once it stops verifying, so a full table takes new boot ids again.
+#[test]
+fn retired_boot_ids_expire_once_their_file_epoch_stops_verifying() {
+    use crate::wire_auth::FixedKeys;
+    use crate::wire_enc::RETIRED_BOOTS;
+
+    let mut publication = publication();
+    let receiver = |boot: u64| ReceiverIdentity {
+        receiver_boot_id: id128([boot, boot]),
+        receiver_id: 66,
+    };
+    for boot in 1..=u64::try_from(RETIRED_BOOTS).unwrap() {
+        publication.retired.retire(&receiver(boot), 1).unwrap();
+    }
+    assert!(!publication.retired.has_room());
+    publication.apply_keys(&FixedKeys {
+        files: vec![channel(1, 0x11), channel(2, 0x33), pairwise(0x22)],
+    });
+    assert!(!publication.retired.has_room(), "kept through the overlap");
+    assert!(publication.retired.contains(&receiver(1)));
+    publication.apply_keys(&FixedKeys {
+        files: vec![channel(2, 0x33), pairwise(0x22)],
+    });
+    assert!(publication.retired.has_room(), "expired with their epoch");
+    assert!(!publication.retired.contains(&receiver(1)));
 }

@@ -1369,3 +1369,59 @@ fn after_rekey_only_the_new_key_opens() {
     let original = profile(Domain::Sender, 2, true);
     assert_eq!(original.open_into(&fresh, &mut out), Err(EncRejection::Tag));
 }
+
+/// H8-05: a pairwise-only rotation replaces the trailer keys in place. The
+/// next seal continues the AEAD sequence and carries the new sealing
+/// epoch; the replay window keeps what it marked, so an old datagram stays
+/// a duplicate; a datagram trailed under a dropped epoch no longer
+/// verifies. A sender domain key has no pairwise keys to replace.
+#[test]
+fn set_pairwise_keeps_the_sequence_and_the_window() {
+    let rotated: [u8; 32] = [0x5A; 32];
+    let sealer = profile(Domain::Receiver, 0, true);
+    let mut opener = profile(Domain::Receiver, 0, true);
+    let first = sealed(&sealer, &[0x31; 32], 0);
+    let mut out = vec![0_u8; first.len()];
+    let opened = opener.open_into(&first, &mut out).unwrap();
+    opener.mark(opened.seq).unwrap();
+    let mut sealer = sealer;
+    sealer
+        .set_pairwise(&[pairwise(PAIRWISE_EPOCH + 1, &rotated)])
+        .unwrap();
+    assert_eq!(sealer.next_seq(), 1, "the sequence stays");
+    assert_eq!(sealer.pairwise_epochs(), [Some(PAIRWISE_EPOCH + 1), None]);
+    opener
+        .set_pairwise(&[
+            pairwise(PAIRWISE_EPOCH + 1, &rotated),
+            pairwise(PAIRWISE_EPOCH, &PAIRWISE_SECRET),
+        ])
+        .unwrap();
+    let mut datagram = vec![0_u8; 32 + sealer.overhead()];
+    datagram[..32].copy_from_slice(&[0x32; 32]);
+    let total = sealer.seal_next(&mut datagram, 32).unwrap();
+    let opened = opener.open_into(&datagram[..total], &mut out).unwrap();
+    assert_eq!(
+        (opened.seq, opened.pairwise_epoch),
+        (1, Some(PAIRWISE_EPOCH + 1))
+    );
+    opener.mark(opened.seq).unwrap();
+    assert_eq!(
+        opener.mark(0),
+        Err(EncRejection::Duplicate),
+        "the window stays"
+    );
+    opener
+        .set_pairwise(&[pairwise(PAIRWISE_EPOCH + 1, &rotated)])
+        .unwrap();
+    let old = sealed(&profile(Domain::Receiver, 0, true), &[0x33; 32], 7);
+    assert_eq!(
+        opener.open_into(&old, &mut out).map(|_| ()),
+        Err(EncRejection::Pairwise)
+    );
+    let mut data = data();
+    assert_eq!(
+        data.set_pairwise(&[pairwise(1, &rotated)]),
+        Err(ContextError::Pairwise)
+    );
+    assert_eq!(sealer.set_pairwise(&[]), Err(ContextError::Pairwise));
+}

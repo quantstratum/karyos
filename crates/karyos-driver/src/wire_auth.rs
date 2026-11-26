@@ -1258,6 +1258,53 @@ impl KeySet for FixedKeys {
     }
 }
 
+/// A key set whose signing file and lineage epoch are set apart from its
+/// verifying files, as during a successor's early verify allowance or
+/// after the last signing window ended (wire-key-files.md 2.3; tests).
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct SplitKeys {
+    /// The one file that signs, if any.
+    pub(crate) signing: Option<KeyFile>,
+    /// The files that verify.
+    pub(crate) verifying: Vec<KeyFile>,
+    /// The durable lineage's highest epoch.
+    pub(crate) current: Option<u32>,
+}
+
+#[cfg(test)]
+impl KeySet for SplitKeys {
+    fn signing(&self, key_id: u32) -> Option<&KeyFile> {
+        self.signing.as_ref().filter(|file| file.key_id == key_id)
+    }
+
+    fn verifying(&self, key_id: u32) -> [Option<&KeyFile>; MAX_FILE_EPOCHS] {
+        let mut of: Vec<&KeyFile> = self
+            .verifying
+            .iter()
+            .filter(|file| file.key_id == key_id)
+            .collect();
+        of.sort_by_key(|file| file.file_epoch);
+        let mut files = [None, None];
+        for (slot, file) in files.iter_mut().zip(of) {
+            *slot = Some(file);
+        }
+        files
+    }
+
+    fn current_epoch(&self, _: u32) -> Option<u32> {
+        self.current
+    }
+
+    fn fingerprint(&self) -> u64 {
+        0
+    }
+
+    fn view_generation(&self) -> u64 {
+        0
+    }
+}
+
 /// Tags and checks the SETUP proof (domain 5) or RSP_SETUP (domain 6) of
 /// one channel or pair. These domains keep no window: freshness is the
 /// challenge transcript (ADR-0086 sections 6 and 7), and `envelope_seq` is

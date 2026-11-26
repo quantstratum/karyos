@@ -671,7 +671,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 })?;
             let checked = match auth {
                 super::wire::Protected::Auth(auth) => wire.publication(auth).map(|_| ()),
-                super::wire::Protected::Enc(enc) => wire.enc_publication(enc).map(|_| ()),
+                super::wire::Protected::Enc(enc) => wire.enc_publication(enc, None).map(|_| ()),
             };
             if let Err(error) = checked {
                 if error

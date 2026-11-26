@@ -269,6 +269,15 @@ pub struct EncryptedChannel {
     /// The single unicast receiver: the pairwise key's `receiver_id`
     /// (`receiver-id`), nonzero.
     pub receiver_id: u64,
+    /// The channel's operator-assigned identity (`channel-id`), nonzero:
+    /// admission uses a channel file only when its `channel_id` is this one
+    /// (wire-key-files.md section 2.2).
+    pub channel_id: u64,
+    /// The configured identity of the one publishing driver
+    /// (`publisher-id`), nonzero: admission uses a pairwise file only when
+    /// its `publisher_id` is this one, on the publisher (its own) and on
+    /// the receiver (its peer's) alike (wire-key-files.md section 2.2).
+    pub publisher_id: u64,
 }
 
 /// What an authenticated channel binds at publication and subscription
@@ -495,9 +504,11 @@ enum Key {
     ChannelKeyId,
     PairwiseKeyId,
     ReceiverId,
+    ChannelId,
+    PublisherId,
 }
 
-const KEYS: [(&str, Key); 26] = [
+const KEYS: [(&str, Key); 28] = [
     ("endpoint", Key::Endpoint),
     ("group", Key::Group),
     ("interface", Key::Interface),
@@ -524,6 +535,8 @@ const KEYS: [(&str, Key); 26] = [
     ("channel-key", Key::ChannelKeyId),
     ("pairwise-key", Key::PairwiseKeyId),
     ("receiver-id", Key::ReceiverId),
+    ("channel-id", Key::ChannelId),
+    ("publisher-id", Key::PublisherId),
 ];
 
 /// Whether `name` is kebab-case (`CHANNEL-URI.md` section 2): words of
@@ -842,9 +855,15 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
         .transpose()?
         .unwrap_or_default();
     if !matches!(security, Security::Encrypted(_))
-        && let Some(key) = [Key::ChannelKeyId, Key::PairwiseKeyId, Key::ReceiverId]
-            .into_iter()
-            .find(|&key| get(key).is_some())
+        && let Some(key) = [
+            Key::ChannelKeyId,
+            Key::PairwiseKeyId,
+            Key::ReceiverId,
+            Key::ChannelId,
+            Key::PublisherId,
+        ]
+        .into_iter()
+        .find(|&key| get(key).is_some())
     {
         return Err(ChannelError::NotApplicable { key: key.name() });
     }
@@ -902,7 +921,7 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
 /// An `encrypted` channel (ADR-0114 sections 4a, 6 and 11): `mtu` at most
 /// [`MAX_ENCRYPTED_MTU`], refused first whatever else holds; one unicast
 /// `endpoint` (no `group`, `destinations`, `control` or `paths`: v1 binds
-/// one receiver, and multicast stays refused); and its three key settings,
+/// one receiver, and multicast stays refused); and its five key settings,
 /// each required. A nonzero key id is not checked here: the key store
 /// refuses an unknown one at admission.
 fn parse_encrypted<'a>(
@@ -942,6 +961,11 @@ fn parse_encrypted<'a>(
             id(Key::PairwiseKeyId, "an integer from 1 to 4294967295")?,
         )?,
         receiver_id: id(Key::ReceiverId, "an integer from 1 to 18446744073709551615")?,
+        channel_id: id(Key::ChannelId, "an integer from 1 to 18446744073709551615")?,
+        publisher_id: id(
+            Key::PublisherId,
+            "an integer from 1 to 18446744073709551615",
+        )?,
     })
 }
 

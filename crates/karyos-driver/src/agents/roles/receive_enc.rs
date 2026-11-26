@@ -52,6 +52,8 @@ use karyos_protocol::protection::aes_gcm_siv::{
 };
 use karyos_protocol::protection::hmac_sha256::Domain as ControlDomain;
 
+use karyos_sys::receive::ValidatedDatagram;
+
 use super::super::control::{ControlItem, ControlSeal, SealedBytes, SharedSealer};
 use super::{BindingKey, Intake, ReceiverRole, SessionEnd, SlotRef, sender_frame_alias};
 use crate::agents::EndpointId;
@@ -65,11 +67,20 @@ use crate::wire_enc::{
 };
 use crate::wire_keys::KeyFile;
 
-/// Target publications a subscription keeps a domain 6 sealer for. Each
-/// bootstrap key has one counter for its life, so a sealer is never made
-/// twice for one target; when the table is full no further target is
-/// challenged (fail closed).
+/// Entries of the role's bounded SETUP bookkeeping: the ENC ANSWERs being
+/// installed and the (alias, publication) pairs a verified domain 5 SETUP
+/// named; the oldest gives way (H8-02).
 pub(crate) const RSP_TARGETS: usize = 8;
+
+/// Domain 6 sealers a receiver role keeps for one `receiver_boot_id`
+/// (H8-01): each bootstrap key, fixed by its key id, receiver id, target
+/// publication, alias and boot id, has one counter for the whole boot,
+/// whatever happens to the subscription that made it, so it is never made
+/// twice. Preallocated at the first encrypted subscription; when it is
+/// full no further target is challenged until the boot id is redrawn
+/// (fail closed). 64 is eight targets for each of eight subscriptions,
+/// the bound one subscription had before.
+pub(crate) const RSP_SEALERS: usize = 64;
 
 /// How long a resynchronisation challenge stays answerable: the default
 /// `setup_challenge_timeout` of the session table, 1 s (SPEC.md section 5
@@ -94,6 +105,11 @@ impl ControlSeal for EncSealer {
 
     fn withdraw(&mut self) {
         EncSealer::withdraw(self);
+    }
+
+    #[cfg(test)]
+    fn roll_for_test(&mut self) {
+        self.roll_now();
     }
 
     fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
@@ -129,9 +145,9 @@ pub(crate) struct SubscriptionEnc {
     keys: ChannelKeys,
     pairwise: PairwiseFiles,
     receiver_id: u64,
-    /// The domain 6 sealer of each challenged publication, by target and
-    /// boot id.
-    rsp: Vec<(PublicationIdentity, [u8; 16], SharedSealer)>,
+    /// The `key_id` of its channel files: with the receiver id, what makes
+    /// its domain 6 keys its own (H8-01).
+    channel_key_id: u32,
     /// The channel's rate counters and rejections by reason.
     pub(crate) channel: EncChannel,
     /// The scratch slot of its domain 5 opens, made here and re-keyed for
@@ -176,56 +192,31 @@ impl SubscriptionEnc {
             salt: Salt::Empty,
         };
         let bootstrap = EncSealer::new(&keys, None, placeholder, monotonic_ns)?.into_key();
+        let channel_key_id = keys.key_id().ok_or(EncKeyError::Files)?;
         Ok(Self {
             endpoint,
             stream_id,
             keys,
             pairwise,
             receiver_id,
-            rsp: Vec::with_capacity(RSP_TARGETS),
+            channel_key_id,
             channel: EncChannel::default(),
             bootstrap: Some(bootstrap),
         })
     }
+}
 
-    /// The domain 6 sealer of an RSP_SETUP to the publication `publication`
-    /// on `alias` from the boot `boot`: the one made for it before, or a
-    /// new one while the table has room.
-    fn rsp_sealer(
-        &mut self,
-        publication: PublicationIdentity,
-        alias: Alias,
-        boot: [u8; 16],
-    ) -> Option<SharedSealer> {
-        if let Some((_, _, sealer)) = self
-            .rsp
-            .iter()
-            .find(|(held, at, _)| *held == publication && *at == boot)
-        {
-            return Some(sealer.clone());
-        }
-        if self.rsp.len() >= RSP_TARGETS {
-            return None;
-        }
-        let context = KeyContext {
-            domain: Domain::RspSetup,
-            key_epoch: self.keys.current_epoch(),
-            party_epoch: 0,
-            session_id: alias.session_id,
-            stream_id: alias.stream_id,
-            publication,
-            receiver: Some(ReceiverIdentity {
-                receiver_boot_id: boot,
-                receiver_id: self.receiver_id,
-            }),
-            salt: Salt::Empty,
-        };
-        let sealer =
-            EncSealer::new(&self.keys, Some(&self.pairwise), context, monotonic_ns).ok()?;
-        let shared = SharedSealer::of(sealer);
-        self.rsp.push((publication, boot, shared.clone()));
-        Some(shared)
-    }
+/// One domain 6 sealer of the role's receiver boot (H8-01): everything
+/// its key derives from but the file epoch, which the sealer itself
+/// follows, and the sealer.
+#[derive(Debug)]
+struct RspEntry {
+    channel_key_id: u32,
+    receiver_id: u64,
+    publication: PublicationIdentity,
+    alias: Alias,
+    boot: [u8; 16],
+    sealer: SharedSealer,
 }
 
 /// The committed domain 1 keys of one encrypted image.
@@ -253,10 +244,15 @@ pub(crate) struct ReceiverEnc {
     /// The verified ENC ANSWERs whose images are being installed: the
     /// image takes its keys at the stated epochs, or is not installed.
     answers: Vec<(EndpointId, Alias, EncAnswer)>,
-    /// The publication a domain 1 header named for an alias with no
-    /// binding: the target of the SOLICIT that DATA causes. A selector
-    /// only: a wrong one gives a SOLICIT its publication cannot open.
-    targets: Vec<(EndpointId, Alias, PublicationIdentity)>,
+    /// The (alias, publication) pairs a verified domain 5 SETUP named, by
+    /// endpoint: the only targets a new domain 6 sealer is made for, and
+    /// the SOLICIT target of DATA for an alias with no binding. Bounded,
+    /// the oldest giving way; an unverified header records nothing
+    /// (H8-02).
+    verified: Vec<(EndpointId, Alias, PublicationIdentity)>,
+    /// The domain 6 sealers of the current `receiver_boot_id`, kept for
+    /// the whole boot independently of the subscriptions (H8-01).
+    rsp: Vec<RspEntry>,
     /// Refusals no encrypted subscription owns, by reason:
     /// `enc_unexpected` on a trusted or authenticated stream among them.
     pub(crate) unattributed: EncRejections,
@@ -276,9 +272,15 @@ impl ReceiverEnc {
     /// identity and term parameters, and state a pair not lower than the
     /// bound one. Then the binding's domain 1 keys move to that pair.
     ///
+    /// Every condition is checked, and the move prepared, before the
+    /// challenge is consumed; the consumption and the move are committed
+    /// together, so a refused answer leaves the challenge to the
+    /// legitimate one (section 6b, H8-08).
+    ///
     /// # Errors
     ///
-    /// [`EncRejection::ResyncRefused`]; only a consumed challenge changes.
+    /// [`EncRejection::ResyncRefused`]; nothing changes, but an expired
+    /// challenge is dropped.
     fn resync(
         &mut self,
         index: usize,
@@ -307,11 +309,8 @@ impl ReceiverEnc {
         }
         if answer.answer.challenge.receiver_boot_id != boot
             || answer.answer.challenge.nonce != nonce
+            || !current_epoch
         {
-            return Err(EncRejection::ResyncRefused);
-        }
-        image.resync = None;
-        if !current_epoch {
             return Err(EncRejection::ResyncRefused);
         }
         check_resync(
@@ -321,9 +320,13 @@ impl ReceiverEnc {
             answer,
             envelope_key_epoch,
         )?;
+        // The opener moves only on success, and only then is the challenge
+        // consumed.
         image
             .opener
-            .resync(answer.key_epoch, answer.party_epoch, now)
+            .resync(answer.key_epoch, answer.party_epoch, now)?;
+        image.resync = None;
+        Ok(())
     }
 
     /// Applies the key store's current key set (H8 finding 4): each
@@ -333,18 +336,21 @@ impl ReceiverEnc {
     /// epoch is revoked or expired.
     pub(crate) fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
         for subscription in &mut self.subscriptions {
-            subscription.keys.retain(keys);
-            subscription.pairwise.retain(keys);
-            // Rotation: a newly admitted epoch serves the next bindings.
+            // Rotation: a newly admitted epoch serves the next bindings,
+            // admitted before its predecessor goes.
             subscription.keys.admit(keys);
             subscription.pairwise.admit(keys);
-            // Each domain 6 sealer follows its own key only, keeping its
-            // sequence; a withdrawn one stays in the table as a tombstone,
-            // so its (target, key, boot id) is refused and never rebuilt
-            // with a sequence restarted at 0 (nonce reuse).
-            for (_, _, sealer) in &mut subscription.rsp {
-                sealer.apply_keys(keys);
-            }
+            subscription.keys.retain(keys);
+            subscription.pairwise.retain(keys);
+            // New sealers take the epoch the key set signs with (H8-06).
+            subscription.keys.follow_signing(keys);
+        }
+        // Each domain 6 sealer follows its own key only, keeping its
+        // sequence; a withdrawn one stays in the table as a tombstone, so
+        // its (target, key, boot id) is refused and never rebuilt with a
+        // sequence restarted at 0 (nonce reuse).
+        for entry in &mut self.rsp {
+            entry.sealer.apply_keys(keys);
         }
         for image in &mut self.images {
             image.opener.apply_keys(keys);
@@ -355,14 +361,122 @@ impl ReceiverEnc {
     /// key.
     pub(crate) fn subscribe(&mut self, subscription: SubscriptionEnc) {
         self.unsubscribe(subscription.endpoint, subscription.stream_id);
+        // The fixed tables, made once on the control path: the receive
+        // path pushes into them without allocating.
+        if self.rsp.capacity() < RSP_SEALERS {
+            self.rsp
+                .reserve_exact(RSP_SEALERS.saturating_sub(self.rsp.len()));
+        }
+        if self.verified.capacity() < RSP_TARGETS {
+            self.verified
+                .reserve_exact(RSP_TARGETS.saturating_sub(self.verified.len()));
+        }
         self.subscriptions.push(subscription);
     }
 
     /// Drops the encrypted subscription to `stream_id` on `endpoint`, its
-    /// keys erased on drop.
+    /// keys erased on drop. Its domain 6 sealers stay with the role for
+    /// the boot (H8-01): a subscription made again for the same target
+    /// continues their sequences, never restarts them.
     pub(crate) fn unsubscribe(&mut self, endpoint: EndpointId, stream_id: i32) {
         self.subscriptions
             .retain(|sub| (sub.endpoint, sub.stream_id) != (endpoint, stream_id));
+        self.verified
+            .retain(|(held, alias, _)| (*held, alias.stream_id) != (endpoint, stream_id));
+    }
+
+    /// The domain 6 sealer of an RSP_SETUP of the subscription at `index`
+    /// to `publication` on `alias` from the boot `boot`: the one the role
+    /// made for that key before, whichever subscription made it, or, when
+    /// `create` (a target a verified datagram named, H8-02) and the table
+    /// has room, a new one under the signing epoch.
+    fn rsp_sealer(
+        &mut self,
+        index: usize,
+        publication: PublicationIdentity,
+        alias: Alias,
+        boot: [u8; 16],
+        create: bool,
+    ) -> Option<SharedSealer> {
+        let subscription = self.subscriptions.get(index)?;
+        let (channel_key_id, receiver_id) = (subscription.channel_key_id, subscription.receiver_id);
+        if let Some(entry) = self.rsp.iter().find(|entry| {
+            entry.channel_key_id == channel_key_id
+                && entry.receiver_id == receiver_id
+                && entry.publication == publication
+                && entry.alias == alias
+                && entry.boot == boot
+        }) {
+            return Some(entry.sealer.clone());
+        }
+        if !create || self.rsp.len() >= RSP_SEALERS {
+            return None;
+        }
+        let context = KeyContext {
+            domain: Domain::RspSetup,
+            key_epoch: subscription.keys.signing_epoch()?,
+            party_epoch: 0,
+            session_id: alias.session_id,
+            stream_id: alias.stream_id,
+            publication,
+            receiver: Some(ReceiverIdentity {
+                receiver_boot_id: boot,
+                receiver_id,
+            }),
+            salt: Salt::Empty,
+        };
+        let sealer = EncSealer::new(
+            &subscription.keys,
+            Some(&subscription.pairwise),
+            context,
+            monotonic_ns,
+        )
+        .ok()?;
+        let shared = SharedSealer::of(sealer);
+        self.rsp.push(RspEntry {
+            channel_key_id,
+            receiver_id,
+            publication,
+            alias,
+            boot,
+            sealer: shared.clone(),
+        });
+        Some(shared)
+    }
+
+    /// Records that a verified domain 5 SETUP on `endpoint` named
+    /// `publication` for `alias`, in the fixed table whose oldest entry
+    /// gives way (H8-02).
+    fn note_verified(
+        &mut self,
+        endpoint: EndpointId,
+        alias: Alias,
+        publication: PublicationIdentity,
+    ) {
+        self.verified
+            .retain(|(held, at, _)| (*held, *at) != (endpoint, alias));
+        if self.verified.len() >= RSP_TARGETS {
+            self.verified.remove(0);
+        }
+        self.verified.push((endpoint, alias, publication));
+    }
+
+    /// Whether a verified datagram named `publication` for `alias` on
+    /// either endpoint: a verified SETUP, or a bound image.
+    fn is_verified(
+        &self,
+        publication: PublicationIdentity,
+        alias: Alias,
+        first: EndpointId,
+        second: EndpointId,
+    ) -> bool {
+        self.verified.iter().any(|(held, at, named)| {
+            (*held == first || *held == second) && *at == alias && *named == publication
+        }) || self.images.iter().any(|image| {
+            (image.endpoint == first || image.endpoint == second)
+                && image.alias == alias
+                && publication_of(&image.identity) == publication
+        })
     }
 
     /// Marks the local publication `alias` on `endpoint` encrypted.
@@ -413,17 +527,28 @@ impl ReceiverEnc {
 
     /// Section 10 step 2: drops every derived key and sequence, which
     /// erases them: the images' domain 1 openers, the answers not yet
-    /// installed, the targets and every domain 6 sealer and scratch slot.
-    /// The subscriptions and their key files stay, so that their streams
-    /// keep refusing bare frames and re-establish under the fresh identity.
+    /// installed, the verified targets and every scratch slot. Every
+    /// domain 6 sealer is withdrawn through its shared object, so a clone
+    /// in a queued control is erased with it (H8-09); its entry stays as a
+    /// tombstone until the boot id is redrawn ([`Self::redrawn`]). The
+    /// subscriptions and their key files stay, so that their streams keep
+    /// refusing bare frames and re-establish under the fresh identity.
     fn close(&mut self) {
         self.images.clear();
         self.answers.clear();
-        self.targets.clear();
+        self.verified.clear();
+        for entry in &mut self.rsp {
+            ControlSeal::withdraw(&mut entry.sealer);
+        }
         for subscription in &mut self.subscriptions {
-            subscription.rsp.clear();
             subscription.bootstrap = None;
         }
+    }
+
+    /// The boot id was redrawn: no withdrawn domain 6 entry can name a key
+    /// of the new boot, so the table is free again.
+    fn redrawn(&mut self) {
+        self.rsp.clear();
     }
 }
 
@@ -573,15 +698,22 @@ impl<T: StreamTerms> Intake<'_, T> {
         out: &mut [u8; MAX_PLAINTEXT],
     ) -> Result<(), EncRejection> {
         let head = header(bytes)?;
-        let Some(slot) = self
+        let Some((slot, params)) = self
             .bound_image(source, alias)
             .and_then(|image| self.role.images.get(image))
-            .map(|image| image.slot)
+            .map(|image| (image.slot, image.params))
         else {
-            if let Some(publication) = head.publication {
-                self.enc_target(alias, publication);
+            // A header is a selector only: it records nothing, and causes a
+            // SOLICIT only toward the publication a verified SETUP named
+            // for this alias (H8-02).
+            let endpoint = self.endpoint;
+            if head.publication.is_some()
+                && self.role.enc.verified.iter().any(|(held, at, named)| {
+                    (*held, *at) == (endpoint, alias) && Some(*named) == head.publication
+                })
+            {
                 self.solicit(BindingKey {
-                    endpoint: self.endpoint,
+                    endpoint,
                     source,
                     alias,
                 });
@@ -603,9 +735,14 @@ impl<T: StreamTerms> Intake<'_, T> {
             .rate;
         let mut data = None;
         let opened = image.opener.open(bytes, out, rate, now, |frames| {
+            // The whole check of the bound image's data path runs here,
+            // before the mark: a correctly tagged batch it would refuse
+            // (lanes, term offsets, lengths) marks no sequence and
+            // promotes no epoch (H8-04).
             data = match classify(frames) {
                 Ok(Datagram::DataBatch(batch) | Datagram::Heartbeat(batch))
-                    if batch.alias() == alias =>
+                    if batch.alias() == alias
+                        && ValidatedDatagram::parse(frames, &params).is_ok() =>
                 {
                     Some(true)
                 }
@@ -636,18 +773,6 @@ impl<T: StreamTerms> Intake<'_, T> {
             _ => return Err(EncRejection::InnerRejected),
         }
         Ok(())
-    }
-
-    /// Records `publication` as the SOLICIT target of `alias` on this
-    /// endpoint, in a fixed table whose oldest entry gives way.
-    fn enc_target(&mut self, alias: Alias, publication: PublicationIdentity) {
-        let endpoint = self.endpoint;
-        let targets = &mut self.role.enc.targets;
-        targets.retain(|(held, at, _)| (*held, *at) != (endpoint, alias));
-        if targets.len() >= RSP_TARGETS {
-            targets.remove(0);
-        }
-        targets.push((endpoint, alias, publication));
     }
 
     /// Section 6b step 1: starts the one resynchronisation challenge of the
@@ -766,6 +891,15 @@ impl<T: StreamTerms> Intake<'_, T> {
         if !opened.current_epoch {
             return Err(EncRejection::Epoch);
         }
+        // A verified identity: the only kind a domain 6 sealer is made for.
+        let named = match &setup {
+            EncSetup::Announce(announce) => announce.identity,
+            EncSetup::Answer(answer) => answer.answer.identity,
+        };
+        let endpoint = self.endpoint;
+        self.role
+            .enc
+            .note_verified(endpoint, alias, publication_of(&named));
         match setup {
             EncSetup::Announce(announce) => {
                 self.verified_control(source, Control::SetupAnnounce(announce));
@@ -794,10 +928,12 @@ impl<T: StreamTerms> Intake<'_, T> {
     /// The sealer of a CHALLENGE or SOLICIT an encrypted subscription
     /// sends: domain 6 with its pairwise trailer, under the key of its
     /// target publication. A CHALLENGE names its target; a SOLICIT's is the
-    /// bound image's identity, or else the publication the DATA that caused
-    /// it named. With no target, or no room left for a new target's key,
-    /// it is refused and counted (`seal_failures` at the sender), never
-    /// sent bare. `None` for a stream that is not encrypted.
+    /// bound image's identity, or else the publication a verified SETUP
+    /// named for its alias. A new key is made only for a target a verified
+    /// datagram named (H8-02). With no target, or no room left for a new
+    /// target's key, it is refused and counted (`seal_failures` at the
+    /// sender), never sent bare. `None` for a stream that is not
+    /// encrypted.
     pub(super) fn enc_rsp_seal(
         &mut self,
         endpoint: EndpointId,
@@ -818,11 +954,11 @@ impl<T: StreamTerms> Intake<'_, T> {
         let target = named.or_else(|| self.role.enc.solicit_target(alias, self.endpoint, endpoint));
         let boot = id128(self.role.sessions.boot_id());
         let sealer = target.and_then(|target| {
-            self.role
+            let create = self
+                .role
                 .enc
-                .subscriptions
-                .get_mut(index)
-                .and_then(|subscription| subscription.rsp_sealer(target, alias, boot))
+                .is_verified(target, alias, self.endpoint, endpoint);
+            self.role.enc.rsp_sealer(index, target, alias, boot, create)
         });
         Some(sealer.unwrap_or_else(|| SharedSealer::of(Refuse(ControlDomain::RspSetup))))
     }
@@ -830,7 +966,7 @@ impl<T: StreamTerms> Intake<'_, T> {
 
 impl ReceiverEnc {
     /// The target of a SOLICIT on `alias`: the bound image's publication,
-    /// or the one a domain 1 header named on either endpoint.
+    /// or the one a verified SETUP named on either endpoint.
     fn solicit_target(
         &self,
         alias: Alias,
@@ -844,7 +980,7 @@ impl ReceiverEnc {
             })
             .map(|image| publication_of(&image.identity))
             .or_else(|| {
-                self.targets
+                self.verified
                     .iter()
                     .find(|(held, at, _)| *at == alias && (*held == first || *held == second))
                     .map(|(_, _, publication)| *publication)
@@ -888,19 +1024,22 @@ impl<T: StreamTerms> ReceiverRole<T> {
         if current == self.enc.seen {
             return;
         }
-        // Step 2.
+        // Step 2. Each encrypted image's domain 4 sealer is withdrawn
+        // through its shared object first, which erases its key for every
+        // holder, a clone in a queued control included (H8-09).
         while let Some(image) = self.enc.images.pop() {
             if let Some(index) = self.images.iter().position(|held| held.slot == image.slot) {
-                let installed = self.images.swap_remove(index);
+                let mut installed = self.images.swap_remove(index);
+                if let Some(seal) = installed.enc_seal.as_mut() {
+                    ControlSeal::withdraw(seal);
+                }
                 self.retire(sessions, installed, false, now);
             }
         }
         self.enc.close();
-        // A clone of an image's sealer already in a queued control keeps
-        // its key until that control drains; its generation refuses every
-        // seal through it, so nothing it holds is used after the change.
         for image in &mut self.images {
-            if image.enc_seal.is_some() {
+            if let Some(seal) = image.enc_seal.as_mut() {
+                ControlSeal::withdraw(seal);
                 image.enc_seal = Some(SharedSealer::of(Refuse(ControlDomain::ReceiverToPublisher)));
             }
         }
@@ -929,6 +1068,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             }
         }
         self.sessions.set_boot_id(boot);
+        self.enc.redrawn();
         // The authenticated class re-establishes under the fresh
         // `receiver_boot_id`: once the fence releases, the next SETUP of
         // each publication is challenged afresh (a new nonce), and the
@@ -948,6 +1088,16 @@ impl<T: StreamTerms> ReceiverRole<T> {
     #[cfg(test)]
     pub(crate) fn enc_generation(&self) -> u64 {
         self.enc.seen
+    }
+
+    /// The domain 4 sealer of the image at `slot`, as a queued control
+    /// holds it (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_seal(&self, slot: SlotRef) -> Option<SharedSealer> {
+        self.images
+            .iter()
+            .find(|image| image.slot == slot)
+            .and_then(|image| image.enc_seal.clone())
     }
 
     /// The number of encrypted images holding keys (tests).
@@ -1023,7 +1173,11 @@ impl<T: StreamTerms> ReceiverRole<T> {
             Some(&subscription.pairwise),
             KeyContext {
                 domain: Domain::Receiver,
-                key_epoch: subscription.keys.current_epoch(),
+                // Sending takes the signing epoch (H8-06).
+                key_epoch: subscription
+                    .keys
+                    .signing_epoch()
+                    .ok_or(EncRejection::Epoch)?,
                 party_epoch: 0,
                 receiver: Some(ReceiverIdentity {
                     receiver_boot_id: id128(boot),

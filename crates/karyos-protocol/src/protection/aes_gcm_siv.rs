@@ -795,6 +795,42 @@ impl AesGcmSiv {
         Ok(())
     }
 
+    /// Replaces the pairwise keys of a receiver domain key in place (a
+    /// pairwise-only rotation, H8-05): the first seals, every one verifies.
+    /// The AEAD key, its sequence, its byte tally and its replay window
+    /// stay, so no nonce is reused and no replay is readmitted; the old
+    /// pairwise HMAC states are erased by their drop. On a refusal nothing
+    /// changes.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::Pairwise`] for a key of domain 1 or 5, or no key;
+    /// [`ContextError::PairwiseSlots`] for more than [`PAIRWISE_SLOTS`].
+    pub fn set_pairwise(&mut self, pairwise: &[PairwiseKey]) -> Result<(), ContextError> {
+        if pairwise.len() > PAIRWISE_SLOTS {
+            return Err(ContextError::PairwiseSlots);
+        }
+        if !self.context.domain.is_receiver() || pairwise.is_empty() {
+            return Err(ContextError::Pairwise);
+        }
+        let mut slots: [Option<PairwiseKey>; PAIRWISE_SLOTS] = [None, None];
+        for (slot, key) in slots.iter_mut().zip(pairwise) {
+            *slot = Some(key.clone());
+        }
+        self.pairwise = slots;
+        Ok(())
+    }
+
+    /// The file epochs of its pairwise keys, the sealing one first.
+    #[must_use]
+    pub fn pairwise_epochs(&self) -> [Option<u32>; PAIRWISE_SLOTS] {
+        let mut out = [None; PAIRWISE_SLOTS];
+        for (slot, key) in out.iter_mut().zip(&self.pairwise) {
+            *slot = key.as_ref().map(PairwiseKey::epoch);
+        }
+        out
+    }
+
     /// The context of this key.
     #[must_use]
     pub fn context(&self) -> &KeyContext {
