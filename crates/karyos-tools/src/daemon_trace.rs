@@ -82,6 +82,9 @@ pub trait MirrorSource {
     /// Each journal of the table. An entry being written on every attempt
     /// is skipped, and read again at the next cycle.
     fn journals(&mut self, each: &mut dyn FnMut(JournalRead));
+
+    /// The ring sequence after the newest record, if readable.
+    fn end(&mut self) -> Option<u64>;
 }
 
 impl MirrorSource for TraceMirrorReader {
@@ -95,6 +98,10 @@ impl MirrorSource for TraceMirrorReader {
             deliver(record.seq, record.journal, record.sequence, words);
         })
         .overwritten
+    }
+
+    fn end(&mut self) -> Option<u64> {
+        self.bounds().map(|bounds| bounds.next)
     }
 
     fn journals(&mut self, each: &mut dyn FnMut(JournalRead)) {
@@ -156,6 +163,8 @@ pub struct TracePublisher<S, M> {
     /// ring sequence ranges not yet attributed to a journal.
     overwritten: u64,
     unattributed: Vec<(u64, u64)>,
+    /// The overwritten ranges already reported against journal 0.
+    reported: Vec<(u64, u64)>,
     /// Overwritten records already reported against journal 0.
     unknown: u64,
 }
@@ -192,6 +201,7 @@ impl<S: TraceSink, M: MirrorSource> TracePublisher<S, M> {
             counts: PublisherCounts::default(),
             overwritten: 0,
             unattributed: Vec::new(),
+            reported: Vec::new(),
             unknown: 0,
         }
     }
@@ -270,11 +280,26 @@ impl<S: TraceSink, M: MirrorSource> TracePublisher<S, M> {
         );
         if overwritten > 0 {
             self.overwritten = self.overwritten.saturating_add(overwritten);
-            self.unattributed
-                .push((before, before.saturating_add(overwritten - 1)));
+            let range = (before, before.saturating_add(overwritten - 1));
+            // Adjacent overwrites merge; disjoint ones stay apart, so a
+            // range never covers records read between them.
+            match self.unattributed.last_mut() {
+                Some(last) if last.1.checked_add(1) == Some(range.0) => last.1 = range.1,
+                _ => self.unattributed.push(range),
+            }
         }
         let mut table = Vec::new();
         self.mirror.journals(&mut |read| table.push(read));
+        // The generation in force when the records were scanned: a facts
+        // change read in the table now applies after them, so its message
+        // follows them (the facts in force for a record are read after it).
+        let scanned: BTreeMap<u64, u64> = self
+            .journals
+            .iter()
+            .filter(|(_, known)| known.generation > 0)
+            .map(|(journal, known)| (*journal, known.generation))
+            .collect();
+        let mut changes = Vec::new();
         for read in &table {
             let journal = read.journal;
             let facts = read.facts;
@@ -294,13 +319,20 @@ impl<S: TraceSink, M: MirrorSource> TracePublisher<S, M> {
             known.generation = generation;
             known.facts = facts;
             let [kind, time_namespace, provenance] = facts;
-            self.queue.push_back(StreamMessage::Facts(JournalFacts {
+            let message = StreamMessage::Facts(JournalFacts {
                 journal,
                 generation,
                 kind,
                 time_namespace,
                 provenance,
-            }));
+            });
+            // A journal seen for the first time: its facts were set when it
+            // was created, before any of its records; a change follows them.
+            if generation == 1 {
+                self.queue.push_back(message);
+            } else {
+                changes.push(message);
+            }
         }
         for (ring, journal, sequence, words) in records {
             if let Some(known) = self.journals.get_mut(&journal) {
@@ -318,10 +350,11 @@ impl<S: TraceSink, M: MirrorSource> TracePublisher<S, M> {
             }
             let last = self.last.entry(journal).or_insert(sequence);
             *last = (*last).max(sequence);
-            let generation = self
-                .journals
-                .get(&journal)
-                .map_or(0, |known| known.generation);
+            let generation = scanned.get(&journal).copied().unwrap_or_else(|| {
+                self.journals
+                    .get(&journal)
+                    .map_or(0, |known| known.generation)
+            });
             match words {
                 Some(words) if journal != 0 => {
                     self.queue.push_back(StreamMessage::Record(StreamRecord {
@@ -336,6 +369,7 @@ impl<S: TraceSink, M: MirrorSource> TracePublisher<S, M> {
                 _ => self.loss(journal, sequence, sequence),
             }
         }
+        self.queue.extend(changes);
         if self.overwritten > 0 {
             self.attribute(&table);
         }
@@ -348,11 +382,12 @@ impl<S: TraceSink, M: MirrorSource> TracePublisher<S, M> {
     /// after its last one read to the last its horizon allows (the
     /// overwritten records carried their sequences; the entry keeps only
     /// the horizon). A gap before a later record is already a loss of its
-    /// journal. What the journals still in the table do not account for,
-    /// once none of them has a record the cursor has not passed, belonged
-    /// to journals whose entries were recycled before the records were
-    /// read: nothing names their journal any more, so it is a loss of
-    /// journal 0, by ring sequence.
+    /// journal. What the journals known do not account for belonged to
+    /// journals whose entries were recycled before the records were read:
+    /// nothing names their journal any more, so it is a loss of journal 0,
+    /// by ring sequence, one loss per disjoint overwritten range, reported
+    /// as soon as the overwrite is read: a busy journal with records the
+    /// cursor has not passed never holds it back.
     fn attribute(&mut self, table: &[JournalRead]) {
         let cursor = self.cursor;
         let mut pending = false;
@@ -364,7 +399,13 @@ impl<S: TraceSink, M: MirrorSource> TracePublisher<S, M> {
                 Some(last) if last >= cursor => pending = true,
                 Some(last) if known.accounted.is_none_or(|accounted| accounted < last) => {
                     known.accounted = Some(last);
-                    let first = self.last.get(&read.journal).map_or(0, |last| last + 1);
+                    let first = self
+                        .last
+                        .get(&read.journal)
+                        .map_or(0, |last| last.saturating_add(1));
+                    // `attempted <= first` (the range `[first, first]`)
+                    // arises only when a record really was overwritten:
+                    // `accounted < last < cursor` here.
                     let end = read.attempted.saturating_sub(1).max(first);
                     let _ = self.last.insert(read.journal, end);
                     self.loss(read.journal, first, end);
@@ -372,24 +413,71 @@ impl<S: TraceSink, M: MirrorSource> TracePublisher<S, M> {
                 _ => {}
             }
         }
-        if pending {
-            return;
+        // Each known journal's lost records: mirrored, not read, and not
+        // still in the ring ahead of the cursor, counted by reading that
+        // window without consuming it. The rest of what was overwritten
+        // belonged to journals no longer known: exact, whether or not a
+        // busy journal has records the cursor has not passed.
+        let mut unread: BTreeMap<u64, u64> = BTreeMap::new();
+        if let Some(end) = self.mirror.end() {
+            let mut at = self.cursor;
+            let _ = self.mirror.scan(
+                &mut at,
+                end.saturating_sub(self.cursor),
+                &mut |_, journal, _, _| {
+                    let count = unread.entry(journal).or_default();
+                    *count = count.saturating_add(1);
+                },
+            );
         }
-        // Every overwritten record of a journal still known is one it
-        // mirrored and was not read.
         let attributed: u64 = self
             .journals
-            .values()
-            .map(|known| known.mirrored.saturating_sub(known.read))
+            .iter()
+            .map(|(journal, known)| {
+                known
+                    .mirrored
+                    .saturating_sub(known.read)
+                    .saturating_sub(unread.get(journal).copied().unwrap_or(0))
+            })
             .sum();
         let unknown = self.overwritten.saturating_sub(attributed);
         if unknown > self.unknown {
             self.unknown = unknown;
-            let first = self.unattributed.first().map_or(0, |range| range.0);
-            let last = self.unattributed.last().map_or(0, |range| range.1);
-            self.loss(0, first, last);
+            let ranges = match self.unattributed.is_empty() {
+                // Proven later, of ranges already given: the last of them.
+                true => self.reported.last().copied().into_iter().collect(),
+                false => std::mem::take(&mut self.unattributed),
+            };
+            for (first, last) in ranges {
+                self.loss(0, first, last);
+                self.reported.push((first, last));
+            }
+        } else if !pending {
+            // Every overwritten record is accounted to a known journal.
+            self.unattributed.clear();
         }
-        self.unattributed.clear();
+    }
+
+    /// The ring sequence after the mirror's newest record, if readable.
+    pub fn mirror_end(&mut self) -> Option<u64> {
+        self.mirror.end()
+    }
+
+    /// The ring sequence the publisher reads next.
+    #[must_use]
+    pub fn cursor(&self) -> u64 {
+        self.cursor
+    }
+
+    /// Gives up on the ring records from the cursor up to `end` (a stop
+    /// whose deadline passed, ADR-0117): they are a loss of journal 0, by
+    /// ring sequence, never silently dropped; offered once more.
+    pub fn abandon(&mut self, end: u64) {
+        if end > self.cursor {
+            self.loss(0, self.cursor, end - 1);
+            self.cursor = end;
+        }
+        let _ = self.flush();
     }
 
     fn loss(&mut self, journal: u64, first: u64, last: u64) {

@@ -826,13 +826,24 @@ impl DaemonArchive {
         let Some(trace) = self.trace.as_mut() else {
             return;
         };
-        // One more read of the mirror, then the queue emptied.
+        // Everything the mirror holds now, read and published: the cursor
+        // reaches the mirror's end and the queue empties. A read takes at
+        // most its budget, so it takes as many cycles as it needs.
+        let end = trace.mirror_end();
         let _ = trace.publish();
-        while self.trace.as_ref().is_some_and(|trace| trace.queued() > 0)
+        let behind =
+            |trace: &DaemonTrace| trace.queued() > 0 || end.is_some_and(|end| trace.cursor() < end);
+        while self.trace.as_ref().is_some_and(behind)
             && deadline.is_none_or(|deadline| std::time::Instant::now() < deadline)
         {
             let _ = self.cycle();
             std::thread::yield_now();
+        }
+        // Past the deadline what is unread is a loss, said so.
+        if let (Some(trace), Some(end)) = (self.trace.as_mut(), end)
+            && trace.cursor() < end
+        {
+            trace.abandon(end);
         }
         if let Some(trace) = &self.trace {
             let counts = trace.counts();

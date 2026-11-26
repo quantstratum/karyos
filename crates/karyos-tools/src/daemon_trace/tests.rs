@@ -76,6 +76,10 @@ impl MirrorSource for Mirror {
         overwritten
     }
 
+    fn end(&mut self) -> Option<u64> {
+        Some(self.oldest + self.ring.len() as u64)
+    }
+
     fn journals(&mut self, each: &mut dyn FnMut(JournalRead)) {
         for &(journal, facts) in &self.table {
             let (mirrored, last, attempted) = self.stats.get(&journal).copied().unwrap_or_default();
@@ -154,8 +158,10 @@ fn self_facts_and_records_are_published_in_order() {
             record(7, 1, 0),
             record(7, 1, 1),
             record(7, 1, 2),
+            // Scanned before the table showed the change: the generation
+            // in force then, and the new facts after it.
+            record(7, 1, 3),
             facts(7, 2, [2, 2, 2]),
-            record(7, 2, 3),
         ]
     );
     assert_eq!(publisher.counts().published, 7);
@@ -308,4 +314,104 @@ fn only_a_recycled_journals_records_are_a_loss_of_journal_zero() {
         publisher.sink.taken[1..],
         [facts(7, 1, [2, 1, 2]), record(7, 1, 0), loss(0, 0, 1)]
     );
+}
+
+/// Codex review of #1278, P1: a busy journal whose records the cursor has
+/// not passed never holds back a recycled journal's proven loss.
+#[test]
+fn a_busy_journal_never_holds_back_a_recycled_journals_loss() {
+    let mirror = Mirror::new(vec![(7, [2, 1, 2])], &[]);
+    let stream = Stream {
+        open: true,
+        taken: Vec::new(),
+    };
+    let mut publisher = TracePublisher::new(stream, mirror, OWN).with_budget(1);
+    assert!(publisher.publish());
+    // Journal 9 mirrors two records, its entry recycled; journal 7 keeps
+    // the ring busy ahead of a cursor that reads one record a cycle.
+    publisher.mirror.push(9, 0, words(0));
+    publisher.mirror.push(9, 1, words(1));
+    for sequence in 0..4 {
+        publisher.mirror.push(7, sequence, words(sequence));
+    }
+    publisher.mirror.lap(2);
+    assert!(publisher.publish());
+    assert!(
+        publisher.sink.taken.contains(&loss(0, 0, 1)),
+        "{:?}",
+        publisher.sink.taken
+    );
+    // Journal 7's unread records are not losses.
+    assert!(
+        !publisher
+            .sink
+            .taken
+            .iter()
+            .any(|message| matches!(message, StreamMessage::Loss(loss) if loss.journal == 7)),
+        "{:?}",
+        publisher.sink.taken
+    );
+}
+
+/// Codex review of #1278, P2: two disjoint overwrites of recycled
+/// journals are two losses, never one range over the record read between.
+#[test]
+fn disjoint_overwrites_stay_separate_losses() {
+    let mirror = Mirror::new(vec![(7, [2, 1, 2])], &[]);
+    let stream = Stream {
+        open: true,
+        taken: Vec::new(),
+    };
+    let mut publisher = TracePublisher::new(stream, mirror, OWN);
+    assert!(publisher.publish());
+    // Ring 0: journal 9 (recycled), lapped; ring 1: journal 7, read.
+    publisher.mirror.push(9, 0, words(0));
+    publisher.mirror.push(7, 0, words(0));
+    publisher.mirror.lap(1);
+    assert!(publisher.publish());
+    // Ring 2: journal 8 (recycled), lapped; ring 3: journal 7, read.
+    publisher.mirror.push(8, 0, words(0));
+    publisher.mirror.push(7, 1, words(1));
+    publisher.mirror.lap(2);
+    assert!(publisher.publish());
+    let zero: Vec<&StreamMessage> = publisher
+        .sink
+        .taken
+        .iter()
+        .filter(|message| matches!(message, StreamMessage::Loss(loss) if loss.journal == 0))
+        .collect();
+    assert_eq!(zero, [&loss(0, 0, 0), &loss(0, 2, 2)]);
+}
+
+/// Codex review of #1278, P1: a stop reads the mirror to its end over as
+/// many cycles as the budget needs; what a deadline leaves unread is a
+/// loss of journal 0 by ring sequence, never dropped silently.
+#[test]
+fn a_stop_reads_to_the_mirror_end_or_reports_the_rest() {
+    let records: Vec<(u64, u64, Option<[u64; RECORD_WORDS]>)> = (0..5)
+        .map(|sequence| (7, sequence, words(sequence)))
+        .collect();
+    let mirror = Mirror::new(vec![(7, [2, 1, 2])], &records);
+    let stream = Stream {
+        open: true,
+        taken: Vec::new(),
+    };
+    let mut publisher = TracePublisher::new(stream, mirror, OWN).with_budget(2);
+    let end = publisher.mirror_end().unwrap();
+    assert_eq!(end, 5);
+    let mut cycles = 0;
+    while publisher.cursor() < end || publisher.queued() > 0 {
+        let _ = publisher.publish();
+        cycles += 1;
+    }
+    assert_eq!(cycles, 3, "one read takes at most its budget");
+    assert_eq!(publisher.counts().losses, 0);
+    // A deadline that passes with records unread: a loss of the rest.
+    for sequence in 5..8 {
+        publisher.mirror.push(7, sequence, words(sequence));
+    }
+    let end = publisher.mirror_end().unwrap();
+    publisher.abandon(end);
+    assert_eq!(publisher.sink.taken.last(), Some(&loss(0, 5, 7)));
+    assert_eq!(publisher.cursor(), end);
 }
