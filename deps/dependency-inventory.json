@@ -6217,6 +6217,13 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-cluster@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
         }
       ],
       "features": [
