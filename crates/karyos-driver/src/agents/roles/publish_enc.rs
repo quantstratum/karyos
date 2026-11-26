@@ -850,6 +850,9 @@ impl<T: StreamTerms> SenderRole<T> {
                 return None;
             }
         };
+        // What `adopt` would find for one more binding (H8-15): taken
+        // before the open, which changes no binding.
+        let room = self.room_for(endpoint, alias, None);
         let Some(publication) = self
             .enc
             .publications
@@ -866,7 +869,9 @@ impl<T: StreamTerms> SenderRole<T> {
             .map(|outbound| &**outbound);
         let (identity, bindings) = (publication.identity, &self.bindings);
         let admit = |control: &Control| {
-            receiver_control_admissible(outbound, source, identity, bindings, endpoint, control)
+            receiver_control_admissible(
+                outbound, source, identity, bindings, room, endpoint, control,
+            )
         };
         let mut out = [0_u8; MAX_PLAINTEXT];
         match publication.open_checked(bytes, &mut out, &admit) {
@@ -989,8 +994,9 @@ impl<T: StreamTerms> SenderRole<T> {
 /// as [`SenderRole::status`] finds it (`sm_binding`), a runtime binding
 /// of its receiver: one of its SM source, else one with none yet, either
 /// naming its receiver id or none, else an ANSWER-created one with room
-/// for an adoption (H8-15: an expired binding leaves the encrypted context
-/// bound). Run inside the domain 4
+/// for an adoption, as `adopt` decides it from `room` (H8-15: an expired
+/// binding leaves the encrypted context bound; a full table, or one whose
+/// eviction takes the parent, adopts nothing). Run inside the domain 4
 /// open, before the sequence is marked or an epoch promoted; a refused
 /// control changes no state. Any other control is refused: none is a
 /// receiver's domain 4 control.
@@ -999,6 +1005,7 @@ fn receiver_control_admissible<T: StreamTerms>(
     source: Option<SocketAddr>,
     identity: Identity,
     bindings: &[super::ReceiverBinding],
+    room: super::Room,
     endpoint: EndpointId,
     control: &Control,
 ) -> bool {
@@ -1028,7 +1035,7 @@ fn receiver_control_admissible<T: StreamTerms>(
         Control::Rttm(rttm) => return bound(rttm.alias, rttm.identity, rttm.receiver),
         _ => return false,
     };
-    if status.identity != identity || !sm_bound(bindings, endpoint, source, status) {
+    if status.identity != identity || !sm_bound(bindings, room, endpoint, source, status) {
         return false;
     }
     let lanes = u8::try_from(outbound.readers().len()).ok() == Some(status.lanes.count());
@@ -1045,9 +1052,12 @@ fn receiver_control_admissible<T: StreamTerms>(
 /// Whether an SM from `source` has a runtime binding to go to, as
 /// `SenderRole::sm_binding` decides, changing nothing; its receiver id
 /// matches, as [`SenderRole::status`] then requires. `None` (tests only)
-/// takes any binding of the receiver.
+/// takes any binding of the receiver. An adoption needs, as
+/// `SenderRole::adopt` does, `room` ([`SenderRole::room_for`] of one more
+/// binding) free, or an eviction that keeps its parent.
 fn sm_bound(
     bindings: &[super::ReceiverBinding],
+    room: super::Room,
     endpoint: EndpointId,
     source: Option<SocketAddr>,
     status: &karyos_protocol::network::StatusMessage,
@@ -1074,17 +1084,24 @@ fn sm_bound(
             .receiver_id
             .is_none_or(|id| id == status.receiver.receiver_id);
     }
-    bindings
+    let Some(at) = bindings
         .iter()
-        .filter(receiver)
-        .find(|binding| binding.parent.is_none())
-        .is_some_and(|parent| {
-            bindings
-                .iter()
-                .filter(|binding| binding.parent.is_some() && binding.parent == Some(parent.id))
-                .count()
-                < super::MAX_ADOPTIONS
-        })
+        .position(|binding| receiver(&binding) && binding.parent.is_none())
+    else {
+        return false;
+    };
+    let fits = match room {
+        super::Room::Free => true,
+        super::Room::Evict(evicted) => evicted != at,
+        super::Room::Reserved | super::Room::Full => false,
+    };
+    fits && bindings.get(at).is_some_and(|parent| {
+        bindings
+            .iter()
+            .filter(|binding| binding.parent.is_some() && binding.parent == Some(parent.id))
+            .count()
+            < super::MAX_ADOPTIONS
+    })
 }
 
 fn control_receiver(control: &Control) -> Option<Receiver> {

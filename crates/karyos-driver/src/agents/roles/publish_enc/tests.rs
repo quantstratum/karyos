@@ -1380,3 +1380,70 @@ fn a_next_epoch_sm_without_a_runtime_binding_marks_nothing() {
     }
     assert_eq!(sender.enc.publications[0].bound_epochs(), Some((1, 1)));
 }
+
+/// H8-15: a next-epoch SM that would need an adoption is admitted only if
+/// `adopt` would take it. On an ordinary unicast publication whose table
+/// is full, with its parent the only unconfirmed binding (the eviction
+/// would take it) or full of confirmed bindings, the SM from another
+/// source marks nothing and promotes nothing; with room it is accepted.
+#[test]
+fn a_next_epoch_sm_with_no_room_for_its_adoption_marks_nothing() {
+    let (mut sender, _): (super::super::SenderRole, super::super::ReceiverRole) =
+        super::super::roles(&crate::agents::AgentConfig::default()).unwrap();
+    let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let other: SocketAddr = "10.0.0.10:5000".parse().unwrap();
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 0,
+        mtu: 1408,
+    };
+    let (path, _log) =
+        crate::agents::data::testing::outbound(EndpointId(1), ALIAS, destination, term, 1, false);
+    sender.publications.push(path);
+    sender.enc.publish(publication());
+    sender.bind(EndpointId(1), destination, &plain_answer(), None, clock());
+    sender.bindings[0].sm_source = Some(destination);
+    sender.max_bindings = 4;
+    let parent = sender.bindings[0];
+    for id in 1..4 {
+        sender.bindings.push(super::super::ReceiverBinding {
+            id: parent.id + 100 + id,
+            endpoint: EndpointId(2),
+            last_sm: Some(clock()),
+            ..parent
+        });
+    }
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    assert!(open(&mut sender.enc.publications[0], &receiver.challenge()).is_ok());
+    let (mut sealer, _) = receiver.data_keys();
+    sealer.roll_now();
+    let sm = seal_control(&mut sealer, &receiver.sm());
+    for confirmed in [None, Some(clock())] {
+        sender.bindings[0].last_sm = confirmed;
+        assert!(
+            sender.open_sealed_from(EndpointId(1), other, &sm).is_none(),
+            "{confirmed:?}"
+        );
+        assert_eq!(
+            sender.enc.publications[0].bound_epochs(),
+            Some((1, 0)),
+            "nothing promoted"
+        );
+    }
+    assert_eq!(
+        sender.enc.publications[0]
+            .channel
+            .rejections
+            .get(EncRejection::InnerRejected),
+        2
+    );
+    sender.bindings.pop();
+    assert_eq!(
+        sender
+            .open_sealed_from(EndpointId(1), other, &sm)
+            .map(|(control, _)| control),
+        Some(receiver.sm()),
+        "its sequence was never marked"
+    );
+    assert_eq!(sender.enc.publications[0].bound_epochs(), Some((1, 1)));
+}

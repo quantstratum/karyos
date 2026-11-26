@@ -6359,6 +6359,8 @@ impl<T: StreamTerms> Intake<'_, T> {
                         joins,
                         nonce,
                     });
+                    // Only the accepted ENC ANSWER is kept (H8-23).
+                    self.role.enc.accept_answer(endpoint, answer.alias, nonce);
                     // The conductor gone: the driver is stopping.
                     let _ = sessions.events.post(create, event);
                     self.role.count(|c| &mut c.create_image);

@@ -311,6 +311,10 @@ pub(crate) struct ReceiverEnc {
     /// The verified ENC ANSWERs whose images are being installed: the
     /// image takes its keys at the stated epochs, or is not installed.
     answers: Vec<(EndpointId, Alias, EncAnswer)>,
+    /// The verified ENC ANSWER the session handler is deciding: it enters
+    /// `answers` only if the handler accepts it ([`Self::accept_answer`]),
+    /// so a refused one changes no pending establishment (H8-23).
+    deciding: Option<(EndpointId, Alias, EncAnswer)>,
     /// The (alias, publication) pairs a verified domain 5 SETUP named, by
     /// endpoint: the only targets a new domain 6 sealer is made for, and
     /// the SOLICIT target of DATA for an alias with no binding. Bounded,
@@ -734,6 +738,25 @@ impl ReceiverEnc {
         self.watch = Some(watch);
     }
 
+    /// The ENC ANSWER being decided for `alias` on `endpoint`, accepted
+    /// by the session handler with the challenge `nonce`: kept for its
+    /// image's installation, and its publication noted as verified
+    /// (H8-23). Nothing for a plain answer.
+    pub(super) fn accept_answer(&mut self, endpoint: EndpointId, alias: Alias, nonce: [u64; 2]) {
+        let Some(deciding) = self.deciding.take_if(|(at, named, answer)| {
+            (*at, *named) == (endpoint, alias) && answer.answer.challenge.nonce == nonce
+        }) else {
+            return;
+        };
+        self.answers
+            .retain(|(at, named, _)| (*at, *named) != (endpoint, alias));
+        if self.answers.len() >= RSP_TARGETS {
+            self.answers.remove(0);
+        }
+        self.note_verified(endpoint, alias, publication_of(&deciding.2.answer.identity));
+        self.answers.push(deciding);
+    }
+
     /// Section 10 step 2: drops every derived key and sequence, which
     /// erases them: the images' domain 1 openers, the answers not yet
     /// installed, the verified targets and every scratch slot. Every
@@ -745,6 +768,7 @@ impl ReceiverEnc {
     fn close(&mut self) {
         self.images.clear();
         self.answers.clear();
+        self.deciding = None;
         self.verified.clear();
         for entry in &mut self.rsp {
             ControlSeal::withdraw(&mut entry.sealer);
@@ -1203,26 +1227,22 @@ impl<T: StreamTerms> Intake<'_, T> {
             return Err(EncRejection::Epoch);
         }
         // A verified identity: the only kind a domain 6 sealer is made for.
-        let named = match &setup {
-            EncSetup::Announce(announce) => announce.identity,
-            EncSetup::Answer(answer) => answer.answer.identity,
-        };
-        let endpoint = self.endpoint;
-        self.role
-            .enc
-            .note_verified(endpoint, alias, publication_of(&named));
+        // An answer's is noted only once accepted (H8-23).
         match setup {
             EncSetup::Announce(announce) => {
+                let endpoint = self.endpoint;
+                self.role
+                    .enc
+                    .note_verified(endpoint, alias, publication_of(&announce.identity));
                 self.verified_control(source, Control::SetupAnnounce(announce));
             }
             EncSetup::Answer(answer) => {
-                let answers = &mut self.role.enc.answers;
-                answers.retain(|(endpoint, at, _)| (*endpoint, *at) != (self.endpoint, alias));
-                if answers.len() >= RSP_TARGETS {
-                    answers.remove(0);
-                }
-                answers.push((self.endpoint, alias, answer));
+                // Queued controls first: only this answer's outcome may
+                // take it (H8-23).
+                self.drain_own_queue();
+                self.role.enc.deciding = Some((self.endpoint, alias, answer));
                 self.verified_control(source, Control::SetupAnswer(answer.answer));
+                self.role.enc.deciding = None;
             }
         }
         Ok(())
@@ -1466,6 +1486,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             .position(|(endpoint, alias, answer)| {
                 (*endpoint, *alias) == (key.endpoint, key.alias)
                     && answer.answer.identity == identity
+                    && answer.answer.challenge.nonce == nonce
             });
         let Some((_, _, answer)) = at.map(|at| self.enc.answers.remove(at)) else {
             self.enc.unattributed.bump(EncRejection::Binding);

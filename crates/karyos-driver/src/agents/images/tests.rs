@@ -12074,3 +12074,65 @@ fn an_ordinary_retirement_erases_a_queued_domain_4_sealer() {
         "its domain 1 keys too"
     );
 }
+
+/// H8-23 (ADR-0114 sections 7 and 9): an ENC ANSWER the session handler
+/// refuses changes no pending establishment. The accepted answer has
+/// posted its CreateImage and no image is installed yet; an answer for
+/// the same publication that verifies under the current file epoch but
+/// echoes another challenge, with other epochs, is then refused, and the
+/// installation still takes the accepted answer's epochs and delivers.
+#[test]
+fn a_refused_answer_leaves_a_pending_establishment_its_accepted_epochs() {
+    use karyos_protocol::network::encrypted::{EncSetup, decode_setup};
+    use karyos_protocol::protection::aes_gcm_siv::Domain;
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, b) = encrypted_rig();
+    crate::wire_enc::record_seals();
+    for _ in 0..3000 {
+        if rig.agents.receiver.role.counters().create_image == 1 {
+            break;
+        }
+        rig.round(false);
+    }
+    assert_eq!(rig.agents.receiver.role.counters().create_image, 1);
+    assert_eq!(rig.agents.receiver.role.enc_images(), 0, "pending");
+    let seals = crate::wire_enc::take_seals();
+    let (record, accepted) = seals
+        .iter()
+        .filter(|record| record.context.domain == Domain::Setup)
+        .find_map(|record| match decode_setup(&record.frames) {
+            Ok(EncSetup::Answer(answer)) => Some((record.clone(), answer)),
+            _ => None,
+        })
+        .unwrap();
+    let mut stale = accepted;
+    stale.party_epoch = accepted.party_epoch.wrapping_add(5);
+    stale.answer.challenge.nonce[0] ^= 1;
+    let mut forged = record.clone();
+    forged.seq = seals
+        .iter()
+        .filter(|held| held.context == record.context)
+        .map(|held| held.seq)
+        .max()
+        .unwrap()
+        + 1;
+    assert_eq!(
+        stale.encode(&mut forged.frames).unwrap(),
+        forged.frames.len()
+    );
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let receiver = &mut rig.agents.receiver;
+    receiver
+        .role
+        .inject_datagram(&receiver.sessions, b, source, &replayed(&forged), rig.now);
+    let slot = established(&mut rig);
+    assert_eq!(
+        rig.agents.receiver.role.enc_epochs(slot),
+        Some((accepted.key_epoch, accepted.party_epoch)),
+        "the accepted answer's epochs"
+    );
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let first: Vec<Vec<u8>> = (0..3u8).map(|i| vec![i; 100]).collect();
+    assert_eq!(enc_deliver(&mut rig, &mut subscriber, &first), first);
+}
