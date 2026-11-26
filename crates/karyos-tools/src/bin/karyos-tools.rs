@@ -21,6 +21,7 @@ Usage: karyos-tools replay diff ...   (see karyos-tools replay diff --help)
        karyos-tools probe --dir <dir>  (Linux; see karyos-tools probe --help)
        karyos-tools compat <FROM> <TO> (see karyos-tools compat --help)
        karyos-tools calibrate phc ...  (Linux; see karyos-tools calibrate --help)
+       karyos-tools upgrade-evidence ... (see karyos-tools upgrade-evidence --help)
 
 `karyos-tools replay diff` is `karyos-replay diff` by another name.
 ";
@@ -59,6 +60,11 @@ fn main() -> ExitCode {
         (Some(Some("compat")), _) => ExitCode::from(karyos_tools::compat::run(
             sub.into_iter().chain(args),
             &mut std::io::stdout().lock(),
+            &mut std::io::stderr(),
+        )),
+        (Some(Some("upgrade-evidence")), _) => ExitCode::from(karyos_tools::upgrade_evidence::run(
+            sub.into_iter().chain(args),
+            &mut std::io::stdout(),
             &mut std::io::stderr(),
         )),
         (Some(Some("replay")), None | Some(Some("-h" | "--help"))) => {
