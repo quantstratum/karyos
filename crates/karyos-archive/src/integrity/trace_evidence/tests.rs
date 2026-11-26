@@ -298,3 +298,60 @@ fn a_range_folds_into_tiling_events_and_its_losses() {
     assert_eq!(seen, [(0, 96, false), (96, 128, false)]);
     assert_eq!(end, 128);
 }
+
+/// The Archive's canonical fill record (`queue::fill_record`): a 32-byte
+/// Pad header whose frame length is 32 and whose extent is in bytes
+/// 24..32. Mid-range, it is skipped by its extent, joins the event before
+/// it, and the next record is read where it ends.
+#[test]
+fn a_canonical_fill_record_mid_range_is_skipped_by_its_extent() {
+    let mut fill = vec![0u8; 256];
+    let word0 = Word0::new(HEADER_LENGTH as i32, Flags::NONE, FrameType::Pad);
+    fill[..8].copy_from_slice(&word0.pack().to_le_bytes());
+    fill[24..32].copy_from_slice(&256i64.to_le_bytes());
+    let mut bytes = frame(&StreamMessage::DriverSelf(OWN));
+    bytes.extend(frame(&facts(7, 1, 1, HOST)));
+    bytes.extend(frame(&record(7, 1, 5000, 0)));
+    let before = bytes.len() as u64;
+    bytes.extend(&fill);
+    bytes.extend(frame(&record(7, 1, 6000, 0)));
+    let mut session = TraceSession::new();
+    let folded = fold(&mut session, &CLOCK, &bytes, 0);
+    assert_eq!(folded.end, bytes.len() as u64);
+    assert_eq!(folded.events.len(), 2);
+    assert_eq!(folded.events[0].end, before + 256);
+    assert_eq!(folded.events[1].start, before + 256);
+    assert!(folded.events.iter().all(|event| event.in_session));
+    // The log buffer's form, a frame length that is the extent, still is.
+    let mut seen = Vec::new();
+    let end = frames(&pad(96), 0, |start, end, payload| {
+        seen.push((start, end, payload.is_some()));
+    });
+    assert_eq!((seen, end), (vec![(0, 96, false)], 96));
+}
+
+/// A data message that is not a trace stream message is unreadable, out
+/// of session at time 0, never folded into the event before it; only a
+/// frame with no whole message is untimed.
+#[test]
+fn a_data_message_that_does_not_decode_is_unreadable() {
+    let mut session = session_with(&[StreamMessage::DriverSelf(OWN)]);
+    assert_eq!(
+        session.observe(Some(&[1, 2, 3]), &CLOCK),
+        Observation::Unreadable
+    );
+    assert_eq!(session.observe(None, &CLOCK), Observation::Untimed);
+    let mut bytes = frame(&StreamMessage::DriverSelf(OWN));
+    bytes.extend(frame(&facts(7, 1, 1, HOST)));
+    bytes.extend(frame(&record(7, 1, 5000, 0)));
+    let garbage = bytes.len() as u64;
+    bytes.extend(data_frame(&[9u8; 40], true, true));
+    let mut session = TraceSession::new();
+    let folded = fold(&mut session, &CLOCK, &bytes, 0);
+    assert_eq!(folded.events.len(), 2);
+    assert_eq!(folded.events[1].start, garbage);
+    assert_eq!(
+        (folded.events[1].time, folded.events[1].in_session),
+        (0, false)
+    );
+}

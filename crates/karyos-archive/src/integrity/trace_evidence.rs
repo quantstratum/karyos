@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 
-use karyos_sys::frame::{FRAME_ALIGNMENT, FrameType, Word0};
+use karyos_sys::frame::{FRAME_ALIGNMENT, FrameType, HEADER_LENGTH, Word0};
 use karyos_trace::stream::{DriverSelf, JournalFacts, StreamLoss, StreamMessage, TimeRequirement};
 use karyos_trace::{ClockProvenance, decode_record};
 
@@ -51,9 +51,30 @@ pub fn frames(bytes: &[u8], base: u64, mut each: impl FnMut(u64, u64, Option<&[u
         let Ok(word0) = Word0::unpack(u64::from_le_bytes(word)) else {
             break;
         };
-        let Ok(length) = usize::try_from(word0.frame_length()) else {
+        let Ok(mut length) = usize::try_from(word0.frame_length()) else {
             break;
         };
+        // Padding comes in two forms: the log buffer's, whose frame length
+        // is the extent it pads, and the Archive's canonical fill record
+        // (`queue::fill_record`), a 32-byte header whose frame length is 32
+        // and whose extent is in header bytes 24..32. Both are read as the
+        // journal scan reads them.
+        let pad = matches!(
+            FrameType::try_from_code(word0.frame_type_code()),
+            Ok(FrameType::Pad)
+        );
+        if pad && length == HEADER_LENGTH as usize {
+            let extent = offset
+                .checked_add(24)
+                .zip(offset.checked_add(32))
+                .and_then(|(from, to)| bytes.get(from..to))
+                .and_then(|field| <[u8; 8]>::try_from(field).ok())
+                .map(i64::from_le_bytes)
+                .and_then(|extent| usize::try_from(extent).ok());
+            if let Some(extent) = extent.filter(|extent| *extent > length) {
+                length = extent;
+            }
+        }
         let (Some(aligned), true) = (length.checked_next_multiple_of(alignment), length > 0) else {
             break;
         };
@@ -140,8 +161,15 @@ impl TraceSession {
     /// Reads one frame's payload (`None` for a frame that carries no whole
     /// message) against the declared `clock`.
     pub fn observe(&mut self, payload: Option<&[u8]>, clock: &EventClock) -> Observation {
-        let Some(message) = payload.and_then(|bytes| StreamMessage::decode(bytes).ok()) else {
+        // No whole message (padding, a fragment, a heartbeat, a control
+        // frame): untimed. A data message that is not a trace stream
+        // message is unreadable: out of session, never folded into the
+        // event before it.
+        let Some(bytes) = payload else {
             return Observation::Untimed;
+        };
+        let Ok(message) = StreamMessage::decode(bytes) else {
+            return Observation::Unreadable;
         };
         let first = !self.started;
         self.started = true;
