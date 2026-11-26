@@ -22,6 +22,12 @@
 //! change the errata refuse, and a core that reports a stale
 //! configuration; and the two new checks catch their violations in
 //! hand-built records.
+//!
+//! P5-S1's own checks catch their mutants with the custom core underneath
+//! too (karyos#713): `quorum_of_voters` a core that reports its learners
+//! as voters, `configuration_from_log` a core that restarts under its
+//! bootstrap configuration (M8), and `learner_caught_up` a core that
+//! promotes a lagging learner (M5).
 
 #![allow(
     clippy::unwrap_used,
@@ -320,26 +326,42 @@ fn m7_the_errata_refuse_a_change_before_the_new_leader_commits() {
 const STICKY: u8 = 1;
 const NO_ERRATA: u8 = 2;
 const FROZEN: u8 = 3;
+const AS_VOTERS: u8 = 4;
+const NO_LAG: u8 = 5;
+const BOOTSTRAP: u8 = 6;
 
 /// The custom core with rule `KIND` broken:
 ///
 /// - [`STICKY`]: it keeps claiming leadership once it led;
 /// - [`NO_ERRATA`]: it answers a change the errata refuse as taken;
-/// - [`FROZEN`]: it reports the first configuration it had, forever.
+/// - [`FROZEN`]: it reports the first configuration it had, forever;
+/// - [`AS_VOTERS`]: it reports its learners as voters;
+/// - [`NO_LAG`]: it answers a promotion refused as lagging as taken;
+/// - [`BOOTSTRAP`]: restarted over a log that holds a configuration
+///   entry, it reports the bootstrap voters instead.
 #[derive(Debug)]
 struct Mutant<const KIND: u8> {
     inner: Custom,
     led: Cell<bool>,
     first: Option<Configuration>,
+    bootstrap: Configuration,
 }
 
 impl<const KIND: u8> Mutant<KIND> {
-    fn of(inner: Custom) -> Self {
+    fn of(inner: Custom, peers: &[NodeId]) -> Self {
         let first = inner.configuration();
+        let mut voters = peers.to_vec();
+        voters.sort_unstable();
         Self {
             inner,
             led: Cell::new(false),
             first,
+            bootstrap: Configuration {
+                index: None,
+                voters,
+                outgoing: Vec::new(),
+                learners: Vec::new(),
+            },
         }
     }
 }
@@ -348,7 +370,7 @@ impl<const KIND: u8> ConsensusCore for Mutant<KIND> {
     type Message = <Custom as ConsensusCore>::Message;
 
     fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
-        Self::of(Custom::recover(id, peers, log))
+        Self::of(Custom::recover(id, peers, log), peers)
     }
 
     fn recover_with(
@@ -357,7 +379,7 @@ impl<const KIND: u8> ConsensusCore for Mutant<KIND> {
         limits: &Limits,
         log: &mut LogView<'_>,
     ) -> Result<Self, Unsupported> {
-        Custom::recover_with(id, peers, limits, log).map(Self::of)
+        Custom::recover_with(id, peers, limits, log).map(|inner| Self::of(inner, peers))
     }
 
     fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), Refused> {
@@ -405,11 +427,28 @@ impl<const KIND: u8> ConsensusCore for Mutant<KIND> {
         if KIND == FROZEN {
             return self.first.clone();
         }
-        self.inner.configuration()
+        // Recovered under an entry of its log: it claims the bootstrap.
+        if KIND == BOOTSTRAP
+            && self
+                .first
+                .as_ref()
+                .is_some_and(|first| first.index.is_some())
+        {
+            return Some(self.bootstrap.clone());
+        }
+        let mut configuration = self.inner.configuration();
+        if KIND == AS_VOTERS
+            && let Some(configuration) = configuration.as_mut()
+        {
+            let learners = std::mem::take(&mut configuration.learners);
+            configuration.voters.extend(learners);
+            configuration.voters.sort_unstable();
+        }
+        configuration
     }
 
     fn configuration_stamp(&self) -> Option<u64> {
-        if KIND == FROZEN {
+        if KIND == FROZEN || KIND == AS_VOTERS || KIND == BOOTSTRAP {
             return None;
         }
         self.inner.configuration_stamp()
@@ -442,6 +481,9 @@ impl<const KIND: u8> ConsensusCore for Mutant<KIND> {
     ) -> Result<(), ChangeRefused> {
         let answer = self.inner.propose_change(change, log);
         if KIND == NO_ERRATA && answer == Err(ChangeRefused::InProgress) {
+            return Ok(());
+        }
+        if KIND == NO_LAG && matches!(answer, Err(ChangeRefused::Lagging { .. })) {
             return Ok(());
         }
         answer
@@ -487,6 +529,52 @@ fn a_core_reporting_a_stale_configuration_fails_m2() {
             "seed {seed:#x}: {last:?}"
         );
     }
+}
+
+/// P5-S1's cases on the custom core: its schedule after the warm-up in
+/// which a leader is elected (the reference's leader is fixed).
+fn warmed(mut case: Case) -> Case {
+    for (step, _) in &mut case.schedule {
+        *step += membership::SETTLED;
+    }
+    case.steps += membership::SETTLED;
+    case
+}
+
+/// Whether some seed of `case`, run on core `C`, fails with a violation
+/// `caught` names.
+fn caught<C: ConsensusCore>(case: &Case, caught: impl Fn(&Violation) -> bool) -> bool {
+    CORPUS.iter().any(|&seed| {
+        let outcome = workloads::run::<C>(case, seed).unwrap();
+        matches!(
+            workloads::pass(case, &outcome),
+            Err(Failed::Safety(violation)) if caught(&violation)
+        )
+    })
+}
+
+#[test]
+fn quorum_of_voters_catches_learners_reported_as_voters() {
+    assert!(caught::<Mutant<AS_VOTERS>>(
+        &warmed(membership::m1()),
+        |violation| { matches!(violation, Violation::QuorumOfVoters { .. }) }
+    ));
+}
+
+#[test]
+fn configuration_from_log_catches_a_restart_under_the_bootstrap() {
+    assert!(caught::<Mutant<BOOTSTRAP>>(
+        &warmed(membership::m8()),
+        |violation| { matches!(violation, Violation::ConfigurationNotFromLog { .. }) }
+    ));
+}
+
+#[test]
+fn learner_caught_up_catches_a_lagging_promotion() {
+    assert!(caught::<Mutant<NO_LAG>>(
+        &warmed(membership::m5()),
+        |violation| { matches!(violation, Violation::LearnerBehind { .. }) }
+    ));
 }
 
 // Hand-built records: each new check catches its violation.
