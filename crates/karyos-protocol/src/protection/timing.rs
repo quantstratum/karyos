@@ -498,13 +498,17 @@ mod tests {
     #[test]
     #[ignore = "statistical timing test: run on an idle host"]
     fn h7_identical_classes_give_no_signal() {
+        // As the protection tests: each sample's input is copied into one
+        // shared buffer untimed, and only that buffer is read timed.
+        let work = std::cell::RefCell::new(vec![0_u8; 1024]);
         let report = compare(
             "identical classes",
             11,
             samples(),
             |_, _| vec![0x5A_u8; 1024],
-            |_| {},
-            |bytes| {
+            |bytes| work.borrow_mut().copy_from_slice(bytes),
+            |_| {
+                let bytes = work.borrow();
                 let sum = bytes.iter().fold(0_u64, |sum, byte| {
                     sum.wrapping_mul(31).wrapping_add(u64::from(*byte))
                 });
