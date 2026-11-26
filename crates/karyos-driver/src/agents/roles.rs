@@ -1057,6 +1057,11 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// The applied key generation, shared with the sender role (H8
     /// finding 4).
     key_generation: Arc<crate::wire_auth::KeyGeneration>,
+    /// The key generation this role last applied: what it signs or seals
+    /// prepared datagrams under, stamped on them before they are prepared
+    /// (H8 RLD-3): bytes made under keys the other role has since moved
+    /// on from are dropped at submission.
+    keys_applied: u64,
     /// The remote abort each authenticated subscription admits, by
     /// endpoint and stream: copied to each image at admission.
     abort_scopes: Vec<(EndpointId, i32, AbortScope)>,
@@ -2024,6 +2029,11 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     /// prepared datagram made under an older one is dropped unsent (H8
     /// finding 4).
     key_generation: Arc<crate::wire_auth::KeyGeneration>,
+    /// The key generation this role last applied: what it signs or seals
+    /// prepared datagrams under, stamped on them before they are prepared
+    /// (H8 RLD-3): bytes made under keys the other role has since moved
+    /// on from are dropped at submission.
+    keys_applied: u64,
     /// The encrypted publications' keys (ADR-0114).
     enc: publish_enc::SenderEnc,
     /// The incarnations in `Aborting`, sent and resent at each duty.
@@ -2222,6 +2232,7 @@ pub(super) fn roles<T: StreamTerms>(
     Ok((
         SenderRole {
             key_generation: Arc::clone(&key_generation),
+            keys_applied: 0,
             sessions: send,
             locals: Vec::with_capacity(config.max_endpoints),
             from_receiver,
@@ -2297,6 +2308,7 @@ pub(super) fn roles<T: StreamTerms>(
         },
         ReceiverRole {
             key_generation,
+            keys_applied: 0,
             #[cfg(test)]
             drop_data: Vec::new(),
             #[cfg(test)]
@@ -3074,7 +3086,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 endpoint,
                 destination,
                 bytes: raw,
-                generation: self.key_generation.current(),
+                generation: self.keys_applied,
             }) {
                 Ok(()) => self.count(|c| &mut c.guard_challenges),
                 Err(_) => self.count(|c| &mut c.ring_full_raw),
@@ -3145,6 +3157,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
         // A changed set moves the generation: every prepared send made
         // under the previous one is dropped at submission.
         self.key_generation.observe(keys);
+        self.keys_applied = self.key_generation.current();
         for auth in &mut self.subscription_auth {
             auth.apply_keys(keys);
         }
@@ -6529,6 +6542,9 @@ impl<T: StreamTerms> Intake<'_, T> {
             }
             return false;
         }
+        // The generation of the keys it signs under, read before signing
+        // (H8 RLD-3).
+        let generation = self.role.keys_applied;
         let Some(authority) = self.role.guard_authority.as_deref_mut() else {
             return false;
         };
@@ -6551,7 +6567,7 @@ impl<T: StreamTerms> Intake<'_, T> {
             endpoint: self.endpoint,
             destination: answer.destination,
             bytes: raw,
-            generation: self.role.key_generation.current(),
+            generation,
         }) {
             self.role.count(|c| &mut c.guard_statuses_sent);
         }
@@ -6845,6 +6861,9 @@ impl<T: StreamTerms> Intake<'_, T> {
     fn send_abort_ack(&mut self, mut resend: AckResend) -> bool {
         use karyos_protocol::network::authenticated::AuthControl;
 
+        // The generation of the keys it seals under, read before sealing
+        // (H8 RLD-3).
+        let generation = self.role.keys_applied;
         let mut bytes =
             [0u8; karyos_protocol::network::MAX_CONTROL_LENGTH + crate::wire_auth::ENVELOPE_LEN];
         let Some(plain) = bytes.get_mut(..karyos_protocol::network::MAX_CONTROL_LENGTH) else {
@@ -6863,7 +6882,7 @@ impl<T: StreamTerms> Intake<'_, T> {
             endpoint: resend.endpoint,
             destination: resend.destination,
             bytes: raw,
-            generation: self.role.key_generation.current(),
+            generation,
         })
     }
 
@@ -8204,7 +8223,8 @@ impl<T: StreamTerms> SenderRole<T> {
             first: None,
             next_at: now,
             backoff: ABORT_RESEND_INITIAL_NS,
-            generation: self.key_generation.current(),
+            // Captured as signed: under this role's applied keys (RLD-3).
+            generation: self.keys_applied,
             ended: None,
         });
         true
@@ -8269,7 +8289,7 @@ impl<T: StreamTerms> SenderRole<T> {
                 first: None,
                 next_at: now,
                 backoff: ABORT_RESEND_INITIAL_NS,
-                generation: self.key_generation.current(),
+                generation: self.keys_applied,
                 ended: Some(true),
             });
             if let Some(auth) = self.publication_auth.get_mut(at) {
@@ -8344,6 +8364,12 @@ impl<T: StreamTerms> SenderRole<T> {
             // key application drops once withdrawn (H8 finding 4).
             let generation = self.key_generation.current();
             if pending.generation != generation {
+                // Revalidated only against this role's own keys once it has
+                // applied the newest generation; until then it waits (H8
+                // RLD-3).
+                if self.keys_applied != generation {
+                    continue;
+                }
                 let (endpoint, alias) = (pending.endpoint, pending.alias);
                 let signs = self
                     .publication_auth_index(endpoint, alias)
@@ -8574,6 +8600,7 @@ impl<T: StreamTerms> SenderRole<T> {
     /// the same duty.
     pub fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
         self.key_generation.observe(keys);
+        self.keys_applied = self.key_generation.current();
         self.enc.apply_keys(keys);
         for auth in &mut self.publication_auth {
             auth.apply_keys(keys);
@@ -8585,6 +8612,13 @@ impl<T: StreamTerms> SenderRole<T> {
         // Applied: the fence admits the sender again (H8 R3-1).
         self.key_generation
             .applied(crate::wire_auth::Side::Sender, keys.view_generation());
+    }
+
+    /// Records the shared key generation as applied by this role, as if
+    /// it had applied a newer view (tests).
+    #[cfg(test)]
+    pub(super) fn assume_keys_applied(&mut self) {
+        self.keys_applied = self.key_generation.current();
     }
 
     /// The key fence shared by both roles, for the conductor (H8 R3-1).

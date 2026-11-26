@@ -8281,6 +8281,131 @@ fn the_key_fence_stops_rx_and_tx_without_the_rings() {
     assert!(held.is_empty());
 }
 
+/// H8 RLD-3: a STATUS is stamped with the key generation its role had
+/// applied before it signed. When the other role has moved to a newer
+/// key view meanwhile, the STATUS (signed under the older keys) is
+/// dropped at submission, never sent.
+#[test]
+fn a_status_signed_before_a_view_change_is_not_sent() {
+    use karyos_protocol::network::Receiver;
+    use karyos_protocol::network::authenticated::{AuthControl, StatusChallenge};
+
+    let (mut rig, b_at, _signer) =
+        remotely_guarded_rig(MemoryMarks::default(), Some(guard_word(2, true)));
+    let a_at = rig.endpoints.local_address(rig.publisher).unwrap();
+    let b = (0..64)
+        .map(EndpointId)
+        .find(|id| rig.endpoints.local_address(*id) == Some(b_at))
+        .unwrap();
+    // A newer view applied elsewhere (the sender's ring delivered it
+    // first): the shared generation moved, this receiver has not.
+    rig.agents
+        .sender
+        .role
+        .key_fence()
+        .observe(&crate::wire_auth::FixedKeys::default());
+    let mut bytes = vec![0u8; 256];
+    let length = AuthControl::Challenge(StatusChallenge {
+        authority_id: 10,
+        guard_id: 11,
+        receiver: Receiver {
+            receiver_boot_id: [1, 2],
+            receiver_id: 66,
+        },
+        nonce: [9, 9],
+    })
+    .encode(&mut bytes)
+    .unwrap();
+    bytes.truncate(length);
+    rig.round(true);
+    let (receiver_before, sender_before) = (
+        rig.agents.receiver.counters(),
+        rig.agents.sender.role.counters(),
+    );
+    let receiver = &mut rig.agents.receiver;
+    receiver
+        .role
+        .inject_datagram(&receiver.sessions, b, a_at, &bytes, rig.now);
+    rig.round(true);
+    let (receiver_after, sender_after) = (
+        rig.agents.receiver.counters(),
+        rig.agents.sender.role.counters(),
+    );
+    assert_eq!(
+        receiver_after.guard_statuses_sent,
+        receiver_before.guard_statuses_sent + 1,
+        "signed and queued"
+    );
+    assert_eq!(sender_after.raw_sent, sender_before.raw_sent, "never sent");
+    assert!(sender_after.seal_failures > sender_before.seal_failures);
+}
+
+/// H8 RLD-3: a SESSION_ABORT_ACK is stamped with the key generation its
+/// role had applied before it sealed. The sender has moved to a newer
+/// view meanwhile; the ACK sealed under the older keys is dropped at
+/// submission and never reaches the publisher.
+#[test]
+fn an_ack_sealed_before_a_view_change_is_not_sent() {
+    use crate::agents::roles::publish_auth::AbortAuthority;
+    use crate::authority::Ed25519Signer;
+    use crate::signed_control::Authority;
+
+    let (mut rig, b, _channel) = authenticated_rig();
+    let signer = Ed25519Signer::from_seed(&[9; 32]);
+    let verifier = signer.verifier();
+    let a = rig.publisher;
+    rig.agents
+        .sender
+        .role
+        .set_abort_authority(a, alias(), AbortAuthority::new(signer, 10, 10));
+    rig.agents
+        .receiver
+        .role
+        .trust_authorities(vec![Authority::of(10, verifier, 10, &[11], true)], rig.now);
+    rig.agents.receiver.role.permit_abort(
+        b,
+        alias().stream_id,
+        crate::agents::roles::AbortScope {
+            authority_id: 10,
+            guard_id: 11,
+        },
+    );
+    let _slot = established(&mut rig);
+    // The sender applied a newer view; the receiver has not.
+    rig.agents
+        .sender
+        .role
+        .key_fence()
+        .observe(&crate::wire_auth::FixedKeys::default());
+    rig.agents.sender.role.assume_keys_applied();
+    assert!(rig.agents.sender.role.request_abort(
+        a,
+        alias(),
+        karyos_protocol::network::authenticated::GUARD_CLOSED,
+        11,
+        3,
+        rig.now
+    ));
+    for _ in 0..400 {
+        rig.round(true);
+        if rig.agents.receiver.counters().abort_acks_sent >= 1 {
+            break;
+        }
+    }
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    assert!(
+        rig.agents.receiver.counters().abort_acks_sent >= 1,
+        "sealed"
+    );
+    assert_eq!(
+        rig.agents.sender.role.counters().abort_acks,
+        0,
+        "never delivered"
+    );
+}
+
 /// Marks in memory, for a followed guard.
 #[derive(Debug, Default)]
 struct MemoryMarks(std::collections::HashMap<u64, u64>);

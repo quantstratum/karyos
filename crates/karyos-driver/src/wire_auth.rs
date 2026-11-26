@@ -1070,6 +1070,14 @@ impl KeyGeneration {
             .store(until, core::sync::atomic::Ordering::Release);
     }
 
+    /// Whether both roles have applied view `generation`.
+    #[must_use]
+    pub fn applied_by_both(&self, generation: u64) -> bool {
+        self.applied
+            .iter()
+            .all(|applied| applied.load(core::sync::atomic::Ordering::Acquire) >= generation)
+    }
+
     /// `side` applied view `generation`.
     pub fn applied(&self, side: Side, generation: u64) {
         if let Some(applied) = self.applied.get(side as usize) {

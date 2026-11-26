@@ -43,6 +43,8 @@ const STREAM: i32 = 6;
 const RECEIVER: u64 = 77;
 
 thread_local! {
+    /// Whether [`dirs`] fills the durable state to its capacity.
+    static NEAR_FULL: Cell<bool> = const { Cell::new(false) };
     /// The wall clock of this test's drivers, in seconds.
     static WALL: Cell<i64> = const { Cell::new(START) };
 }
@@ -129,6 +131,18 @@ fn dirs(files: &[(&str, &str)]) -> (Mem, Mem) {
         keys.put(name, text);
     }
     KeyStore::<Mem, Mem>::initialise(&state, Zeroizing::new([7; 32])).unwrap();
+    if NEAR_FULL.with(Cell::get) {
+        // Admit `files` once, then fill the durable state to exactly its
+        // capacity: the next admission overflows it (KSF-4).
+        let (store, _) = KeyStore::start(keys.clone(), state.clone(), wall()).unwrap();
+        let used = store.state().entries();
+        let mut full = store.state().clone();
+        drop(store);
+        for epoch in 1..=u32::try_from(crate::wire_keys::state::MAX_ENTRIES - used).unwrap() {
+            full.tombstones.insert((9999, epoch));
+        }
+        state.put(crate::wire_keys::store::STATE, &full.encode().unwrap());
+    }
     (keys, state)
 }
 
@@ -840,12 +854,26 @@ fn remotely_guarded(
     marks: &Mem,
     commits: &Mem,
 ) -> ([EmbeddedDriver; 3], crate::embedded::AggregateHandle) {
+    let (drivers, handle, _) = remotely_guarded_keys(marks, commits);
+    (drivers, handle)
+}
+
+/// [`remotely_guarded`], with the publisher's and the authority's key
+/// directories.
+fn remotely_guarded_keys(
+    marks: &Mem,
+    commits: &Mem,
+) -> (
+    [EmbeddedDriver; 3],
+    crate::embedded::AggregateHandle,
+    (Mem, Mem),
+) {
     let control = SocketAddr::new(LOOPBACK, crate::test_ports::test_port());
     let guard = ChannelAuthority {
         follower_id: 66,
         ..authority(control)
     };
-    let (mut authority_driver, _) = keyed(&borrowed(&authority_files()));
+    let (mut authority_driver, authority_keys) = keyed(&borrowed(&authority_files()));
     authority_driver
         .start_guard_state(
             Box::new(Mem::default()) as Dir,
@@ -862,7 +890,7 @@ fn remotely_guarded(
         )
         .unwrap();
     let to = subscriber.network_subscription_address(STREAM).unwrap();
-    let (mut publisher, _) = keyed(&borrowed(&guarded_files()));
+    let (mut publisher, publisher_keys) = keyed(&borrowed(&guarded_files()));
     publisher
         .start_guard_state(
             Box::new(marks.clone()) as Dir,
@@ -888,7 +916,11 @@ fn remotely_guarded(
             &[control],
         )
         .unwrap();
-    ([publisher, subscriber, authority_driver], handle)
+    (
+        [publisher, subscriber, authority_driver],
+        handle,
+        (publisher_keys, authority_keys),
+    )
 }
 
 /// Item 3, end to end: the publisher follows the authority's guard from
@@ -1385,3 +1417,189 @@ mod invariants;
 
 /// H8 unit-level invariants raised to end-to-end proofs (karyos#648).
 mod invariants_e2e;
+
+/// H8 RLD-4: freshness is granted only once a reload has completed and
+/// both roles have applied its view, and it runs the revocation bound
+/// from the start of that reload's read. A conductor that stalls, or a
+/// view the roles do not apply, stops every authenticated use within the
+/// bound of the file change; applying the view grants it again.
+#[test]
+fn a_stalled_reload_or_unapplied_view_lapses_within_the_bound() {
+    use crate::wire_auth::{KeyGeneration, KeySet, Side};
+
+    let (keys, state) = dirs(&borrowed(&publisher_files()));
+    let (mut wire, _) = super::WireKeys::start(
+        Box::new(keys.clone()) as Dir,
+        Box::new(state) as Dir,
+        Some(wall),
+    )
+    .unwrap();
+    let fence = Arc::new(KeyGeneration::default());
+    assert!(wire.duty(&fence).is_none(), "the start view, unchanged");
+    let granted = super::mono_now();
+    assert!(fence.admits(Side::Sender, granted));
+    assert!(
+        !fence.admits(Side::Sender, granted + super::FRESH_NS),
+        "never past the bound from the read"
+    );
+    // A file revoked now, with the conductor stalled: refused within the
+    // bound of the change, whatever happens next.
+    keys.put("revoked", "3-1\n");
+    let changed = super::mono_now();
+    assert!(!fence.admits(Side::Sender, changed + super::FRESH_NS));
+    assert!(!fence.admits(Side::Receiver, changed + super::FRESH_NS));
+    // The next reload runs and publishes the new view, which no role has
+    // applied (a full ring): both roles stop at once, and no freshness is
+    // granted.
+    super::MONO_SKEW.with(|skew| skew.set(skew.get() + super::REFRESH_NS));
+    let view = wire.duty(&fence).expect("a new view");
+    assert!(!fence.admits(Side::Sender, super::mono_now()));
+    assert!(!fence.admits(Side::Receiver, super::mono_now()));
+    // Both roles apply it: the next duty grants freshness from its read.
+    fence.applied(Side::Sender, view.view_generation());
+    fence.applied(Side::Receiver, view.view_generation());
+    let _ = wire.duty(&fence);
+    let now = super::mono_now();
+    assert!(fence.admits(Side::Sender, now) && fence.admits(Side::Receiver, now));
+    assert!(!fence.admits(Side::Sender, now + super::FRESH_NS));
+}
+
+/// H8 RLD-4: admission reads a fresh view only: past the bound with no
+/// granted reload, an authenticated channel is refused.
+#[test]
+fn admission_refuses_a_stale_view() {
+    let (mut publisher, _) = keyed(&borrowed(&publisher_files()));
+    super::MONO_SKEW.with(|skew| skew.set(skew.get() + super::FRESH_NS));
+    let security = Security::Authenticated(auth(None));
+    assert_eq!(
+        publisher
+            .add_network_publication(
+                aggregate(STREAM),
+                &udp(Destination::Unicast(SocketAddr::new(LOOPBACK, 9)), security),
+            )
+            .unwrap_err(),
+        refused(AuthRefusal::KeyStoreDisabled)
+    );
+}
+
+/// An authority signing file of epoch 2, seed `0a..`, and its public file.
+fn successor_files() -> (String, String) {
+    let public: String = crate::authority::Ed25519Signer::from_seed(&[0x0a; 32])
+        .verifier()
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    (
+        SIGNING
+            .replace("file_epoch=1", "file_epoch=2")
+            .replace(&"09".repeat(32), &"0a".repeat(32)),
+        PUBLIC.replace("file_epoch=1", "file_epoch=2").replace(
+            "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618",
+            &public,
+        ),
+    )
+}
+
+/// H8 REV-5, end to end on the production path: the guard authority's
+/// original signing epoch is revoked while its successor is present. The
+/// authority signs every later STATUS under the successor, never the
+/// withdrawn seed: the follower, which now trusts only the successor,
+/// keeps verifying them, and the publication stays admitted past the
+/// guard's lifetime.
+#[test]
+fn a_revoked_authority_epoch_with_a_successor_keeps_signing_under_the_successor() {
+    let (marks, commits) = (Mem::default(), Mem::default());
+    let (
+        [mut publisher, mut subscriber, mut authority_driver],
+        handle,
+        (publisher_keys, authority_keys),
+    ) = remotely_guarded_keys(&marks, &commits);
+    let registration = handle.registration();
+    let opened = pump(
+        &mut [&mut publisher, &mut subscriber, &mut authority_driver],
+        |drivers| {
+            drivers[0]
+                .net
+                .as_ref()
+                .unwrap()
+                .publication_established(registration)
+        },
+    );
+    assert!(opened);
+    let (signing, public) = successor_files();
+    authority_keys.put("10-2.key", &signing);
+    authority_keys.put("revoked", "10-1\n");
+    publisher_keys.put("10-2.key", &public);
+    publisher_keys.put("revoked", "10-1\n");
+    advance(RELOAD_INTERVAL_S);
+    let refused = |driver: &EmbeddedDriver| {
+        driver
+            .net
+            .as_ref()
+            .unwrap()
+            .receiver_counters()
+            .unwrap()
+            .signed_refused
+    };
+    let sent = |driver: &EmbeddedDriver| {
+        driver
+            .net
+            .as_ref()
+            .unwrap()
+            .receiver_counters()
+            .unwrap()
+            .guard_statuses_sent
+    };
+    let (refused_before, sent_before) = (refused(&publisher), sent(&authority_driver));
+    // Past the guard's 5 s lifetime: only verifying STATUS keeps it open.
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        for driver in [&mut publisher, &mut subscriber, &mut authority_driver] {
+            let _ = driver.do_work().unwrap();
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    assert!(
+        sent(&authority_driver) > sent_before,
+        "statuses were signed"
+    );
+    assert_eq!(refused(&publisher), refused_before, "and all verified");
+    assert!(
+        publisher
+            .net
+            .as_ref()
+            .unwrap()
+            .publication_established(registration),
+        "the guard stayed open"
+    );
+}
+
+/// H8 KSF-4, end to end: a durable state that would exceed its capacity
+/// disables the store, and both roles of both drivers stop every
+/// authenticated path at the next reload.
+#[test]
+fn a_full_durable_state_stops_both_roles() {
+    NEAR_FULL.with(|full| full.set(true));
+    let (mut publisher, pub_keys, mut subscriber, sub_keys) = established();
+    // One more key to admit: its admission would exceed the capacity.
+    for keys in [&pub_keys, &sub_keys] {
+        keys.put("4-1.key", &channel_key(4, STREAM + 1));
+    }
+    advance(RELOAD_INTERVAL_S);
+    let reached = pump(&mut [&mut publisher, &mut subscriber], |drivers| {
+        roles(drivers[0]).0.1 == 0 && {
+            let (_, images, withdrawn) = roles(drivers[1]).1;
+            images == withdrawn
+        }
+    });
+    assert!(
+        reached,
+        "not disabled: {:?} {:?}",
+        roles(&publisher),
+        roles(&subscriber)
+    );
+    for driver in [&publisher, &subscriber] {
+        assert!(driver.wire_key_counters().unwrap().failures >= 1);
+    }
+}

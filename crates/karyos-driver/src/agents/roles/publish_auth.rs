@@ -1122,6 +1122,30 @@ mod tests {
             Ok(Opened::Receiver(_))
         ));
     }
+
+    /// H8 REV-5: the abort signer is pinned to its admitted file epoch.
+    /// With that epoch revoked while a successor of the same key id signs,
+    /// it is dropped (and erased), never kept signing under the withdrawn
+    /// seed.
+    #[test]
+    fn a_pinned_abort_signer_is_dropped_when_its_epoch_is_revoked() {
+        use crate::authority::Ed25519Signer;
+        use crate::wire_auth::FixedKeys;
+
+        let file = pairwise(1, '2');
+        let mut auth = publication(&[&file]);
+        let mut abort = super::AbortAuthority::new(Ed25519Signer::from_seed(&[9; 32]), 10, 10);
+        abort.file_epoch = Some(1);
+        auth.abort = Some(abort);
+        let successor = key(
+            "10-2.key",
+            "format=karyos-wire-key-v1\nkey_id=10\nfile_epoch=2\npurpose=authority-signing\nprofile_id=4\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-04-30T00:00:00Z\nsecret=0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\nauthority_id=10\nguards=11,12\nabort=true\n",
+        );
+        auth.apply_keys(&FixedKeys {
+            files: vec![channel(), pairwise(1, '2'), successor],
+        });
+        assert!(auth.abort.is_none(), "the withdrawn seed signs nothing");
+    }
 }
 
 /// The H8 invariants of the publication key holders (karyos#648).

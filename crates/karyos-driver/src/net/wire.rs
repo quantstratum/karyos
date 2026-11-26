@@ -35,9 +35,17 @@ pub const TICK_S: i64 = 1;
 const SECOND_NS: u64 = 1_000_000_000;
 const TICK_NS: u64 = TICK_S.unsigned_abs() * SECOND_NS;
 const RELOAD_NS: u64 = RELOAD_INTERVAL_S.unsigned_abs() * SECOND_NS;
-/// How long a view stays usable without a reload, on the monotonic clock:
-/// two reload intervals (H8 R3-1). Past it every authenticated path stops.
-pub const FRESH_NS: u64 = 2 * RELOAD_NS;
+/// How often the store re-reads its directories, on the monotonic clock:
+/// half the revocation bound, so that a reload, its validation and both
+/// roles' application fit inside the bound with room to spare.
+const REFRESH_NS: u64 = RELOAD_NS / 2;
+/// How long a view stays usable after the read it came from started, on
+/// the monotonic clock: exactly the manifest's revocation bound,
+/// [`RELOAD_INTERVAL_S`] (H8 RLD-4). A file changed at `T` is in no view
+/// read after `T`, and every view read before `T` stops at the latest at
+/// its read plus this, before `T` plus the bound, however late the
+/// conductor, the reload or the roles run.
+pub const FRESH_NS: u64 = RELOAD_NS;
 
 /// A key or state directory the driver's store reads.
 pub type Dir = Box<dyn Files + Send>;
@@ -341,6 +349,15 @@ pub(crate) struct WireKeys {
     next_tick: u64,
     /// The number of the last view published.
     published: u64,
+    /// When the last completed reload started reading, monotonic.
+    read_at: u64,
+    /// A view awaiting both roles before the freshness it carries is
+    /// granted: its number and the start of the read it came from.
+    pending: Option<(u64, u64)>,
+    /// The freshness deadline granted last, for admission.
+    fresh_until: u64,
+    /// The fence the duty grants on, kept for admission.
+    fence: Option<Arc<crate::wire_auth::KeyGeneration>>,
     view: Arc<KeyView>,
     /// A view the rings refused: posted again at the next tick.
     unposted: bool,
@@ -430,6 +447,11 @@ impl WireKeys {
                 next_reload: at,
                 next_tick: at.saturating_add(TICK_NS),
                 published: 0,
+                read_at: at,
+                // The start view (number 0) is what both roles hold.
+                pending: Some((0, at)),
+                fresh_until: at.saturating_add(FRESH_NS),
+                fence: None,
                 view,
                 unposted: false,
                 peers: Vec::with_capacity(crate::signed_control::PEER_SLOTS),
@@ -466,12 +488,22 @@ impl WireKeys {
     /// again), for both agents at once.
     ///
     /// The cadence runs on the monotonic clock and the wall clock only
-    /// evaluates validity (H8 R3-1). Each reload renews `fence`'s
-    /// freshness deadline to [`FRESH_NS`] from now, and each new view's
-    /// number is required on `fence` before it is posted: a role that has
-    /// not applied it, because a ring was full, or any role once the
-    /// conductor stops reloading, refuses every authenticated use.
-    pub(crate) fn duty(&mut self, fence: &crate::wire_auth::KeyGeneration) -> Option<Arc<KeyView>> {
+    /// evaluates validity (H8 R3-1). Each new view's number is required on
+    /// `fence` before it is posted, so a role that has not applied it (a
+    /// full ring) refuses every authenticated use. Freshness is granted
+    /// only once a reload has completed and both roles have applied the
+    /// view it produced, and runs [`FRESH_NS`] from the start of that
+    /// reload's read (H8 RLD-4): a stalled conductor, reload or role lets
+    /// it lapse, and every authenticated use stops within the revocation
+    /// bound.
+    pub(crate) fn duty(
+        &mut self,
+        fence: &Arc<crate::wire_auth::KeyGeneration>,
+    ) -> Option<Arc<KeyView>> {
+        if self.fence.is_none() {
+            self.fence = Some(Arc::clone(fence));
+        }
+        self.grant(fence);
         let at = (self.mono)();
         if at < self.next_tick && !self.unposted {
             return None;
@@ -479,8 +511,10 @@ impl WireKeys {
         let now = (self.clock)();
         self.next_tick = at.saturating_add(TICK_NS);
         if at >= self.next_reload {
-            self.next_reload = at.saturating_add(RELOAD_NS);
-            fence.renew(at.saturating_add(FRESH_NS));
+            self.next_reload = at.saturating_add(REFRESH_NS);
+            // The read starts now: the freshness it can grant runs from
+            // here, never from when the reload completes.
+            self.read_at = (self.mono)();
             self.counters.reloads = self.counters.reloads.saturating_add(1);
             let report = self.store.reload(now);
             if report.alarm() {
@@ -497,17 +531,54 @@ impl WireKeys {
             && view.fingerprint == self.view.fingerprint
             && view.summary().eq(self.view.summary())
         {
+            // Unchanged: both roles hold it once they applied its number.
+            self.pending = Some((self.view.generation, self.read_at));
+            self.grant(fence);
             return None;
         }
         if self.unposted && view.summary().eq(self.view.summary()) {
             // The same view again, under its number.
+            self.pending = Some((self.view.generation, self.read_at));
             return Some(Arc::clone(&self.view));
         }
         self.published = self.published.saturating_add(1);
         view.generation = self.published;
         fence.require(self.published);
+        self.pending = Some((self.published, self.read_at));
         self.view = Arc::new(view);
         Some(Arc::clone(&self.view))
+    }
+
+    /// Grants the pending view's freshness on `fence` once both roles have
+    /// applied it: [`FRESH_NS`] from the start of its read.
+    fn grant(&mut self, fence: &crate::wire_auth::KeyGeneration) {
+        let Some((generation, read_at)) = self.pending else {
+            return;
+        };
+        if !fence.applied_by_both(generation) {
+            return;
+        }
+        self.pending = None;
+        let until = read_at.saturating_add(FRESH_NS);
+        self.fresh_until = self.fresh_until.max(until);
+        fence.renew(self.fresh_until);
+    }
+
+    /// Whether the view admission reads is fresh: inside the deadline the
+    /// last completed and applied reload granted (H8 RLD-4).
+    fn fresh(&self) -> Result<(), DriverError> {
+        // A view both roles applied since the last duty counts as granted.
+        let granted = match (self.pending, self.fence.as_deref()) {
+            (Some((generation, read_at)), Some(fence)) if fence.applied_by_both(generation) => {
+                self.fresh_until.max(read_at.saturating_add(FRESH_NS))
+            }
+            _ => self.fresh_until,
+        };
+        if (self.mono)() < granted {
+            Ok(())
+        } else {
+            Err(refused(AuthRefusal::KeyStoreDisabled))
+        }
     }
 
     /// Records whether the view the duty returned reached both agents.
@@ -532,6 +603,7 @@ impl WireKeys {
         if crate::wire_enc::vm_generation::quiesced() {
             return Err(refused(AuthRefusal::GenerationChange));
         }
+        self.fresh()?;
         if self.store.is_disabled() {
             return Err(refused(AuthRefusal::KeyStoreDisabled));
         }
@@ -751,6 +823,7 @@ impl WireKeys {
         guards: Vec<crate::guard_authority::AuthorityGuard>,
         now: u64,
     ) -> Result<crate::guard_authority::GuardAuthority, DriverError> {
+        self.fresh()?;
         let file = self
             .view
             .signing(key_id)
@@ -801,6 +874,7 @@ impl WireKeys {
             self.count_generation_refused();
             return Err(refused(AuthRefusal::GenerationChange));
         }
+        self.fresh()?;
         if self.store.is_disabled() {
             return Err(refused(AuthRefusal::KeyStoreDisabled));
         }
