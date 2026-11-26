@@ -993,6 +993,28 @@ fn creation_syncs<C: ConsensusCore>(geometry: Geometry) -> Option<u64> {
     })
 }
 
+/// What a server's test service is prefilled for in `case` (C5 v3), the
+/// same policy for every variant: every client session's id (as [`run`]
+/// numbers them), room for every append of every session, the case's
+/// payload, and each session's answers. `None` past a count's type.
+#[must_use]
+pub fn service_bounds(case: &Case) -> Option<super::node::ServiceBounds> {
+    let first = case
+        .servers
+        .checked_add(case.spares)?
+        .checked_add(case.standby)?;
+    let sessions = case.sessions()?;
+    let clients = (0..sessions)
+        .map(|session| NodeId::try_from(first.checked_add(session)?).ok())
+        .collect::<Option<Vec<_>>>()?;
+    Some(super::node::ServiceBounds {
+        clients,
+        values: sessions.checked_mul(case.operations)?,
+        payload: case.payload,
+        answers: case.operations,
+    })
+}
+
 /// The script of the `index`th client session of `case`: the operations
 /// [`run`] gives that session's client, which a client in a real process
 /// runs too (C5 v2, "Processes"; karyos#691).

@@ -40,7 +40,7 @@
 //! [`ClusterSim`]: crate::cluster::ClusterSim
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -208,6 +208,27 @@ pub struct Command {
 }
 
 impl Command {
+    /// The client, sequence and appended value (`None` for a read) of the
+    /// command in `bytes`, borrowed: [`Command::decode`] without copying
+    /// the value (C5 v3).
+    #[must_use]
+    pub fn parts(bytes: &[u8]) -> Option<(NodeId, u64, Option<&[u8]>)> {
+        let rest = bytes.strip_prefix(&COMMAND_MAGIC)?;
+        let (client, rest) = rest.split_first_chunk::<4>()?;
+        let (sequence, rest) = rest.split_first_chunk::<8>()?;
+        let (tag, value) = rest.split_first()?;
+        let value = match tag {
+            0 => Some(value),
+            1 if value.is_empty() => None,
+            _ => return None,
+        };
+        Some((
+            u32::from_le_bytes(*client),
+            u64::from_le_bytes(*sequence),
+            value,
+        ))
+    }
+
     /// Its bytes in the log: [`COMMAND_MAGIC`], client, sequence, a tag,
     /// then the value.
     #[must_use]
@@ -262,10 +283,102 @@ pub const RETENTION: usize = 10_000;
 /// the floor and not kept was answered and forgotten: [`Ret::Expired`]. One
 /// above it and not kept was never applied, even below one that was (a
 /// window's requests may commit out of order; karyos#905 review).
+///
+/// Kept in sequence order in a ring of its own, so an answer recorded or
+/// evicted allocates nothing once the ring has its room (C5 v3).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Answers {
-    by_sequence: BTreeMap<u64, Ret>,
+    by_sequence: VecDeque<(u64, Answer)>,
     floor: u64,
+}
+
+impl Answers {
+    /// The answer kept for `sequence`.
+    fn get(&self, sequence: u64) -> Option<Answer> {
+        self.by_sequence
+            .binary_search_by_key(&sequence, |(kept, _)| *kept)
+            .ok()
+            .and_then(|at| self.by_sequence.get(at))
+            .map(|(_, answer)| *answer)
+    }
+
+    /// Keeps `answer` for `sequence`, in order; `false` when one is kept
+    /// for it already.
+    fn insert(&mut self, sequence: u64, answer: Answer) -> bool {
+        match self
+            .by_sequence
+            .binary_search_by_key(&sequence, |(kept, _)| *kept)
+        {
+            Ok(_) => false,
+            Err(at) => {
+                self.by_sequence.insert(at, (sequence, answer));
+                true
+            }
+        }
+    }
+}
+
+/// A kept answer: a [`Ret`] without its values, which the append-only
+/// register holds. A read's answer is the register's first `n` values,
+/// as long as the register was when it was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// [`Ret::Appended`].
+    Appended(u64),
+    /// [`Ret::Values`]: the first `n` values.
+    Values(usize),
+    /// [`Ret::Expired`].
+    Expired,
+}
+
+/// Buffers a service keeps for its values (C5 v3): no part of its state,
+/// so two services equal in state are equal whatever their pools hold.
+#[derive(Debug, Clone, Default)]
+struct Pool(Vec<Vec<u8>>);
+
+impl PartialEq for Pool {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Pool {}
+
+/// What [`TestService::prefilled`] sizes a service for: the case's declared
+/// bounds, by one policy for every variant ([`super::workloads::service_bounds`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceBounds {
+    /// Every client that may send a command.
+    pub clients: Vec<NodeId>,
+    /// Values the register may hold: every append of the case.
+    pub values: usize,
+    /// Bytes of each value at most.
+    pub payload: usize,
+    /// Answers kept per client at most (below [`RETENTION`]).
+    pub answers: usize,
+}
+
+impl ServiceBounds {
+    /// The canonical response bytes of the largest answer: a read of the
+    /// full register.
+    #[must_use]
+    pub fn response_bytes(&self) -> usize {
+        self.values
+            .saturating_mul(self.payload.saturating_add(4))
+            .saturating_add(1)
+    }
+}
+
+/// What [`TestService::apply_into`] applied: the command's client and
+/// sequence, and whether its answer came from the deduplication table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Applied {
+    /// The client.
+    pub client: NodeId,
+    /// Its sequence number.
+    pub sequence: u64,
+    /// Answered from the deduplication table: a retry.
+    pub replayed: bool,
 }
 
 /// The deterministic test service: an append-only register, with a
@@ -273,6 +386,8 @@ struct Answers {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestService {
     values: Vec<Vec<u8>>,
+    /// Buffers for values to come ([`TestService::prefilled`]).
+    spare: Pool,
     /// Per client, its retained answers.
     answered: BTreeMap<NodeId, Answers>,
     applied: Option<u64>,
@@ -299,6 +414,7 @@ impl TestService {
     pub fn with_retention(retention: usize) -> Self {
         Self {
             values: Vec::new(),
+            spare: Pool::default(),
             answered: BTreeMap::new(),
             applied: None,
             deduplicated: 0,
@@ -308,41 +424,128 @@ impl TestService {
         }
     }
 
+    /// A service prefilled at initialisation for `bounds` (C5 v3): room for
+    /// every value, a buffer of the payload's size for each, every client's
+    /// table with room for its answers, so that applying an entry within
+    /// the bounds allocates and frees nothing
+    /// ([`TestService::apply_into`]). Its state is a default service's.
+    #[must_use]
+    pub fn prefilled(bounds: &ServiceBounds) -> Self {
+        let mut service = Self::default();
+        service.values.reserve_exact(bounds.values);
+        service.spare = Pool(
+            (0..bounds.values)
+                .map(|_| Vec::with_capacity(bounds.payload))
+                .collect(),
+        );
+        let answers = bounds.answers.min(service.retention).saturating_add(1);
+        for &client in &bounds.clients {
+            let _ = service.answered.insert(
+                client,
+                Answers {
+                    by_sequence: VecDeque::with_capacity(answers),
+                    floor: 0,
+                },
+            );
+        }
+        service
+    }
+
+    /// Applies the committed `entry`: its client, its sequence and its
+    /// answer (see [`TestService::apply`]); `None` for an entry that holds
+    /// no command.
+    fn answer(&mut self, entry: &Entry) -> Option<(NodeId, u64, Answer, bool)> {
+        self.applied = Some(entry.index);
+        self.log_time = self.log_time.max(entry.event_time);
+        let (client, sequence, value) = Command::parts(&entry.payload)?;
+        let answers = self.answered.entry(client).or_default();
+        if let Some(answer) = answers.get(sequence) {
+            if let Some(count) = self.deduplicated.checked_add(1) {
+                self.deduplicated = count;
+            }
+            return Some((client, sequence, answer, true));
+        }
+        if sequence <= answers.floor {
+            if let Some(count) = self.expired.checked_add(1) {
+                self.expired = count;
+            }
+            return Some((client, sequence, Answer::Expired, false));
+        }
+        let answer = match value {
+            Some(value) => {
+                let mut kept = self.spare.0.pop().unwrap_or_default();
+                kept.clear();
+                kept.extend_from_slice(value);
+                self.values.push(kept);
+                Answer::Appended(u64::try_from(self.values.len()).unwrap_or(u64::MAX))
+            }
+            None => Answer::Values(self.values.len()),
+        };
+        let _ = answers.insert(sequence, answer);
+        while answers.by_sequence.len() > self.retention {
+            if let Some((evicted, _)) = answers.by_sequence.pop_front() {
+                answers.floor = answers.floor.max(evicted);
+            }
+        }
+        Some((client, sequence, answer, false))
+    }
+
+    /// `answer` as a [`Ret`].
+    fn ret(&self, answer: Answer) -> Ret {
+        match answer {
+            Answer::Appended(length) => Ret::Appended(length),
+            Answer::Values(length) => {
+                Ret::Values(self.values.get(..length).unwrap_or_default().to_vec())
+            }
+            Answer::Expired => Ret::Expired,
+        }
+    }
+
+    /// `answer`'s canonical response bytes ([`Ret::canonical`]) into `out`,
+    /// cleared first: no allocation once `out` has room for them.
+    fn canonical_into(&self, answer: Answer, out: &mut Vec<u8>) {
+        out.clear();
+        match answer {
+            Answer::Appended(length) => {
+                out.push(0);
+                out.extend_from_slice(&length.to_le_bytes());
+            }
+            Answer::Expired => out.push(2),
+            Answer::Values(length) => {
+                out.push(1);
+                for value in self.values.get(..length).unwrap_or_default() {
+                    let length = u32::try_from(value.len()).unwrap_or(u32::MAX);
+                    out.extend_from_slice(&length.to_le_bytes());
+                    out.extend_from_slice(value);
+                }
+            }
+        }
+    }
+
     /// Applies the committed `entry`; returns the command and its answer:
     /// the kept answer for a retried sequence, [`Ret::Expired`] for one
     /// whose answer is no longer kept. An entry that holds no command (a
     /// core's own entry) answers nothing.
     pub fn apply(&mut self, entry: &Entry) -> Option<(Command, Ret)> {
-        self.applied = Some(entry.index);
-        self.log_time = self.log_time.max(entry.event_time);
+        let (_, _, answer, _) = self.answer(entry)?;
         let command = Command::decode(&entry.payload)?;
-        let answers = self.answered.entry(command.client).or_default();
-        if let Some(ret) = answers.by_sequence.get(&command.sequence) {
-            if let Some(count) = self.deduplicated.checked_add(1) {
-                self.deduplicated = count;
-            }
-            return Some((command, ret.clone()));
-        }
-        if command.sequence <= answers.floor {
-            if let Some(count) = self.expired.checked_add(1) {
-                self.expired = count;
-            }
-            return Some((command, Ret::Expired));
-        }
-        let ret = match &command.op {
-            Op::Append(value) => {
-                self.values.push(value.clone());
-                Ret::Appended(u64::try_from(self.values.len()).unwrap_or(u64::MAX))
-            }
-            Op::Read => Ret::Values(self.values.clone()),
-        };
-        let _ = answers.by_sequence.insert(command.sequence, ret.clone());
-        while answers.by_sequence.len() > self.retention {
-            if let Some((evicted, _)) = answers.by_sequence.pop_first() {
-                answers.floor = answers.floor.max(evicted);
-            }
-        }
-        Some((command, ret))
+        Some((command, self.ret(answer)))
+    }
+
+    /// [`TestService::apply`] with the answer's canonical response bytes
+    /// written into `response`, cleared first (C5 v3): within the bounds a
+    /// [`TestService::prefilled`] service was sized for, and with
+    /// `response` holding [`ServiceBounds::response_bytes`], it allocates
+    /// and frees nothing. `None`, and `response` untouched, for an entry
+    /// that holds no command.
+    pub fn apply_into(&mut self, entry: &Entry, response: &mut Vec<u8>) -> Option<Applied> {
+        let (client, sequence, answer, replayed) = self.answer(entry)?;
+        self.canonical_into(answer, response);
+        Some(Applied {
+            client,
+            sequence,
+            replayed,
+        })
     }
 
     /// Retries it answered [`Ret::Expired`].
@@ -386,9 +589,9 @@ impl TestService {
             bytes.extend_from_slice(&client.to_le_bytes());
             bytes.extend_from_slice(&answers.floor.to_le_bytes());
             count(&mut bytes, answers.by_sequence.len())?;
-            for (sequence, ret) in &answers.by_sequence {
+            for (sequence, answer) in &answers.by_sequence {
                 bytes.extend_from_slice(&sequence.to_le_bytes());
-                let ret = ret.canonical();
+                let ret = self.ret(*answer).canonical();
                 count(&mut bytes, ret.len())?;
                 bytes.extend_from_slice(&ret);
             }
@@ -438,7 +641,7 @@ impl TestService {
             let client = NodeId::from_le_bytes(*take(&mut rest, 4)?.first_chunk::<4>()?);
             let floor = u64_at(&mut rest)?;
             let mut answers = Answers {
-                by_sequence: BTreeMap::new(),
+                by_sequence: VecDeque::new(),
                 floor,
             };
             let kept = u32_at(&mut rest)?;
@@ -448,8 +651,18 @@ impl TestService {
             for _ in 0..kept {
                 let sequence = u64_at(&mut rest)?;
                 let length = u32_at(&mut rest)?;
-                let ret = Ret::decode(take(&mut rest, length)?)?;
-                if sequence <= floor || answers.by_sequence.insert(sequence, ret).is_some() {
+                let answer = match Ret::decode(take(&mut rest, length)?)? {
+                    Ret::Appended(length) => Answer::Appended(length),
+                    Ret::Expired => Answer::Expired,
+                    // A read's answer is a prefix of the register.
+                    Ret::Values(read) => {
+                        if values.get(..read.len()) != Some(read.as_slice()) {
+                            return None;
+                        }
+                        Answer::Values(read.len())
+                    }
+                };
+                if sequence <= floor || !answers.insert(sequence, answer) {
                     return None;
                 }
             }
@@ -467,6 +680,7 @@ impl TestService {
         let log_time = u64_at(&mut rest)?;
         rest.is_empty().then_some(Self {
             values,
+            spare: Pool::default(),
             answered,
             applied,
             deduplicated,
@@ -722,6 +936,66 @@ mod service_snapshot_tests {
 
     /// A service restored from its snapshot section is the same service:
     /// values, deduplication answers, last index and count (karyos#687).
+    /// The prefilled service answers what the default one answers, in the
+    /// same canonical bytes, retries and reads included, and ends in the
+    /// same state (C5 v3).
+    #[test]
+    fn a_prefilled_service_answers_as_the_default_one() {
+        let bounds = ServiceBounds {
+            clients: vec![7, 8],
+            values: 8,
+            payload: 3,
+            answers: 4,
+        };
+        let mut prefilled = TestService::prefilled(&bounds);
+        let mut plain = TestService::default();
+        let command = |client: NodeId, sequence: u64, op: Op| Command {
+            client,
+            sequence,
+            op,
+        };
+        let commands = [
+            command(7, 1, Op::Append(b"abc".to_vec())),
+            command(8, 1, Op::Append(b"de".to_vec())),
+            command(7, 1, Op::Append(b"abc".to_vec())),
+            command(7, 2, Op::Read),
+            command(8, 2, Op::Append(Vec::new())),
+            command(7, 2, Op::Read),
+            command(9, 1, Op::Append(b"f".to_vec())),
+        ];
+        let mut response = Vec::with_capacity(bounds.response_bytes());
+        for (index, command) in (1u64..).zip(&commands) {
+            let entry = Entry {
+                index,
+                term: 1,
+                event_time: index,
+                payload: command.encode(),
+            };
+            let applied = prefilled.apply_into(&entry, &mut response);
+            let (expected, ret) = plain.apply(&entry).unwrap();
+            assert_eq!(
+                applied.map(|applied| (applied.client, applied.sequence)),
+                Some((expected.client, expected.sequence))
+            );
+            assert_eq!(response, ret.canonical(), "{command:?}");
+        }
+        let core = Entry {
+            index: 99,
+            term: 1,
+            event_time: 0,
+            payload: b"not a command".to_vec(),
+        };
+        assert_eq!(prefilled.apply_into(&core, &mut response), None);
+        assert_eq!(plain.apply(&core), None);
+        assert_eq!(prefilled, plain);
+        assert_eq!(prefilled.digest(), plain.digest());
+        assert_eq!(prefilled.deduplicated(), 2);
+        assert_eq!(
+            TestService::decode(&prefilled.encode().unwrap_or_default()),
+            Some(plain)
+        );
+    }
+
     #[test]
     fn a_service_round_trips_through_its_snapshot_section() {
         let service = service();

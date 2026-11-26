@@ -323,6 +323,8 @@ pub enum ProcessError {
     Log(LogError),
     /// The log geometry.
     Geometry,
+    /// The case's service bounds pass a count's type.
+    Bounds,
     /// The deadline passed without the test's stop.
     Deadline,
     /// The case schedules an action a process run does not take.
@@ -341,6 +343,7 @@ impl fmt::Display for ProcessError {
             Self::Io(error) => write!(f, "i/o: {error}"),
             Self::Log(error) => write!(f, "log: {error:?}"),
             Self::Geometry => f.write_str("the log geometry is refused"),
+            Self::Bounds => f.write_str("the case's service bounds do not fit"),
             Self::Deadline => f.write_str("the deadline passed without a stop"),
             Self::Schedule(action) => write!(f, "a process run does not take {action}"),
             Self::NotAPeer => f.write_str("the node is not among its peers"),
@@ -668,6 +671,8 @@ impl Reassembly {
 struct Serving<M> {
     id: NodeId,
     service: TestService,
+    /// The service's answer to the entry it applies, kept (C5 v3).
+    response: Vec<u8>,
     /// Requests it took, by client and sequence: it answers them.
     pending: BTreeSet<(NodeId, u64)>,
     commit: Option<u64>,
@@ -779,6 +784,7 @@ impl<M> Serving<M> {
         let items = RefCell::new(std::mem::take(&mut self.items));
         let Self {
             service,
+            response,
             pending,
             replies,
             ready,
@@ -813,25 +819,25 @@ impl<M> Serving<M> {
                 out.push((to, message));
             },
             &mut |entry, applying| {
-                let deduplicated = service.deduplicated();
                 // The application is the declared path's apply stage once
                 // a probed core is past its warm-up (version 1's
                 // allocation gate counts "application"): the harness's
-                // test service, as the simulator's servers apply it.
-                let answer = probe::application(|| service.apply(entry));
-                let replayed = service.deduplicated() > deduplicated;
-                let response = answer.as_ref().map(|(_, ret)| ret.canonical());
+                // test service, prefilled to the case's bounds and
+                // answering into the node's kept response buffer, so it
+                // allocates nothing (C5 v3).
+                let applied = probe::application(|| service.apply_into(entry, response));
+                let response = applied.is_some().then(|| response.clone());
                 let mut items = items.borrow_mut();
-                if let Some((command, ret)) = answer
-                    && pending.remove(&(command.client, command.sequence))
+                if let (Some(applied), Some(bytes)) = (applied, &response)
+                    && pending.remove(&(applied.client, applied.sequence))
                 {
-                    if replayed {
+                    if applied.replayed {
                         observe(
                             &mut items,
                             Observation::Deduplicated {
                                 node,
-                                client: command.client,
-                                sequence: command.sequence,
+                                client: applied.client,
+                                sequence: applied.sequence,
                             },
                         );
                     }
@@ -839,7 +845,7 @@ impl<M> Serving<M> {
                         &mut items,
                         Observation::Reply {
                             node,
-                            client: command.client,
+                            client: applied.client,
                             index: entry.index,
                             term: entry.term,
                             generation: FIRST_GENERATION,
@@ -847,10 +853,10 @@ impl<M> Serving<M> {
                         },
                     );
                     replies.push((
-                        command.client,
+                        applied.client,
                         Harness::Response {
-                            sequence: command.sequence,
-                            bytes: ret.canonical(),
+                            sequence: applied.sequence,
+                            bytes: bytes.clone(),
                             index: entry.index,
                             generation: FIRST_GENERATION,
                         },
@@ -1109,9 +1115,13 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
             },
         });
     };
+    // The service prefilled to the case's bounds, the same policy for every
+    // variant (C5 v3), and room for its largest answer.
+    let bounds = workloads::service_bounds(&config.case).ok_or(ProcessError::Bounds)?;
     let mut serving: Serving<C::Message> = Serving {
         id: config.id,
-        service: TestService::default(),
+        service: TestService::prefilled(&bounds),
+        response: Vec::with_capacity(bounds.response_bytes()),
         pending: BTreeSet::new(),
         commit: core.committed(),
         configuration: None,

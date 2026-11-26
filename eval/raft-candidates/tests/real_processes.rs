@@ -739,6 +739,15 @@ mod w1 {
         // The custom core's process path past the warm-up (C5 v3): what its
         // adapter pools comes back to it, so its core stages allocate and
         // free nothing, summed over the servers.
+        // The shared test service, prefilled to the case's bounds,
+        // allocates nothing past the warm-up whatever the core (C5 v3).
+        assert_eq!(
+            stage_total(&ran.probes, "apply"),
+            (0, 0),
+            "{core} {}: the service's application: {:?}",
+            case.name,
+            ran.probes
+        );
         if core == "custom" {
             for stage in CUSTOM_ZERO {
                 assert_eq!(
