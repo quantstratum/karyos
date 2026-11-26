@@ -1283,7 +1283,7 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
         reply_bytes: ReplyBytes::prefilled(&bounds),
         framed: Vec::with_capacity(bounds.response_bytes().saturating_add(FRAME_HEADER)),
         ready: ReadyBuf::default(),
-        command: Vec::new(),
+        command: Vec::with_capacity(command_room(&bounds)),
         now: 0,
         stopped: false,
         limits: config.case.limits,
@@ -1445,10 +1445,29 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
         leads: !serving.stopped && core.leads(),
         up: !serving.stopped,
     };
+    // The decoder's last message, freed as a decoding is (C5 v3 coverage).
+    drop_decoder::<C>(decoder);
     Ok(Served {
         items: serving.items,
         state,
     })
+}
+
+/// Bytes of the largest command a client of the case proposes: its magic,
+/// client, sequence and tag, and a value of the case's payload; the node
+/// encodes each request into a buffer prefilled to it (C5 v3).
+#[must_use]
+pub fn command_room(bounds: &ServiceBounds) -> usize {
+    karyos_sim::harness::node::COMMAND_MAGIC
+        .len()
+        .saturating_add(std::mem::size_of::<NodeId>() + 8 + 1)
+        .saturating_add(bounds.payload)
+}
+
+/// Drops `decoder`, the node's decode slot, counted as the encoding: what
+/// it still holds is a decoded message's (C5 v3 coverage).
+pub fn drop_decoder<C: Wire>(decoder: C::Decoder) {
+    probe::encoding(|| drop(decoder));
 }
 
 #[cfg(test)]

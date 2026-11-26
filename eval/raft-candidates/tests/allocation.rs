@@ -447,3 +447,66 @@ fn the_reply_queue_takes_its_bound_without_allocating() {
     .unwrap();
     assert_eq!(counts, SetCounts::default());
 }
+
+/// Docs#1080 (C5 v3): a request encoded into the node's command buffer,
+/// prefilled from the case's bounds, allocates nothing at the case's
+/// largest payload.
+#[test]
+fn a_request_encodes_into_the_prefilled_command_buffer() {
+    use karyos_sim::harness::node::{Command, Op, ServiceBounds};
+    let _serial = serial();
+    let bounds = ServiceBounds {
+        clients: vec![1, 2],
+        values: 4,
+        payload: 256,
+        answers: 1,
+    };
+    let command = Command {
+        client: u32::MAX,
+        sequence: u64::MAX,
+        op: Op::Append(vec![7; 256]),
+    };
+    let mut buffer = Vec::with_capacity(process::command_room(&bounds));
+    let ((), counts) = window(|| {
+        let _enrolled = enroll();
+        command.encode_into(&mut buffer);
+    })
+    .unwrap();
+    assert_eq!(counts, SetCounts::default());
+    assert_eq!(buffer, command.encode());
+}
+
+/// Docs#1080 (C5 v3 coverage): the decoder's last message, dropped as the
+/// node stops, is counted as the encoding.
+#[test]
+fn the_decoders_last_message_is_counted_as_the_encoding() {
+    use karyos_raft_eval::process::Wire;
+    use karyos_raft_eval::raft_rs::to_raft;
+    let _serial = serial();
+    let mut message = raft::eraftpb::Message::default();
+    message.set_msg_type(raft::eraftpb::MessageType::MsgAppend);
+    message.entries = (1..=4)
+        .map(|index| {
+            to_raft(&karyos_cluster::Entry {
+                index,
+                term: 1,
+                event_time: 0,
+                payload: vec![7; 64],
+            })
+        })
+        .collect();
+    let bytes = protobuf::Message::write_to_bytes(&message).unwrap();
+    let mut decoder = <RaftRsBatch16 as Wire>::decoder();
+    assert!(<RaftRsBatch16 as Wire>::decode_lent(&mut decoder, &bytes).is_some());
+    let mut kept = Some(decoder);
+    let measured = past_warmup(|| {
+        if let Some(decoder) = kept.take() {
+            process::drop_decoder::<RaftRsBatch16>(decoder);
+        }
+    });
+    assert!(
+        staged(&measured, Stage::Encoding).frees >= 1,
+        "{:?}",
+        measured.stages
+    );
+}
