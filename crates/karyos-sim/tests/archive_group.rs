@@ -1173,7 +1173,7 @@ fn a_replayed_group_reaches_no_network_output() {
             karyos_client::ClaimOutcome::NotConnected => {}
             other => panic!("the probe claim: {other:?}"),
         }
-        assert!(Instant::now() < deadline, "A's output never connected");
+        stall.check("A's output never connected");
     }
     let port = DriverPort(std::sync::Arc::clone(&real));
     let mut gateway = Gateway::new(port, clock, sender, Capture::Strict, 1, 4096, 4).unwrap();
