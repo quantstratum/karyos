@@ -567,6 +567,14 @@ impl<M> ReadyBuf<M> {
         into.append(&mut self.spare);
     }
 
+    /// Room in the pool for `count` entries, so that recycling a Ready of
+    /// up to `count` entries does not grow it (C5 v3 coverage: the
+    /// recycling counts in a probed core's Ready stage). A core reserves it
+    /// to its bounds; past that, reserving again allocates nothing.
+    pub fn reserve_spare(&mut self, count: usize) {
+        self.spare.reserve(count.saturating_sub(self.spare.len()));
+    }
+
     /// Drops the pool: for a core that never draws from it.
     pub fn release_spare(&mut self) {
         self.spare = Vec::new();
