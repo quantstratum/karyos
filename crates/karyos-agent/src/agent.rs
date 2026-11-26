@@ -603,6 +603,28 @@ impl Agent {
         )
     }
 
+    /// Journals a retention `operation` on Archive `recording` that
+    /// `requester`'s role does not allow, refused `not_authorised`, and
+    /// sends nothing (karyos#719; [`crate::retention::refuse_unauthorised`]).
+    pub fn retention_refused(
+        &mut self,
+        operation: crate::retention::Operation,
+        recording: u64,
+        requester: Requester,
+        reason: &[u8],
+    ) {
+        let id = self.allocate_operation();
+        let command = crate::retention::Command {
+            operation,
+            recording,
+            id,
+            operator: requester.operator,
+            relay: requester.relay,
+            reason,
+        };
+        crate::retention::refuse_unauthorised(self.journal.as_mut(), &command, host_monotonic_ns());
+    }
+
     /// Makes a retention `operation` on the agent's own operations journal
     /// for `requester` with `reason` (ADR-0113): the reserved recording
     /// name `journal`. `authorised` is false for a purge the requester's

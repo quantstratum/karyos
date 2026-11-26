@@ -931,6 +931,9 @@ impl Server {
                         agent.retention(operation, recording, requester, reason.as_bytes());
                     (json::retention_answer(&answer), Served::Operated)
                 } else {
+                    // Journalled, refused `not_authorised`, and never sent
+                    // (karyos#719).
+                    agent.retention_refused(operation, recording, requester, reason.as_bytes());
                     forbidden()
                 }
             }
