@@ -836,6 +836,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .network
             .and_then(|network| network.stream_defaults.initial_term_id);
         let mut config = config;
+        // A protected datagram is its frames plus its class's envelope
+        // (ADR-0086 section 5, ADR-0114 section 11): the log keeps the
+        // inner budget, the channel MTU less the envelope, so its frames
+        // and fragments fit a datagram of at most the channel MTU, and
+        // SETUP advertises that budget. A channel MTU whose budget no
+        // receiver accepts is refused.
+        if let Some(protected) = auth {
+            config.stream.buffer.mtu = inner_mtu(protected, config.stream.buffer.mtu)?;
+        }
         config.stream.buffer.initial_term_id = self.draw_initial_term_id(forced)?;
         let handle = self.add_aggregate_drawn(config)?;
         if let Some(options) = timed
@@ -1249,6 +1258,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .map(|(spec, id)| (*id, Arc::clone(&spec.frontier)));
         let (config, alias) = term.ok_or(DriverError::InvalidConfig)?;
         let lane_count = u8::try_from(readers.len()).map_err(|_| DriverError::InvalidConfig)?;
+        // The datagram MTU: a protected log holds the inner budget, so its
+        // datagrams add the envelope back (ADR-0086 section 5, ADR-0114
+        // section 11).
+        let wire_mtu = match auth {
+            Some(protected) => wire_mtu(protected, config.mtu)?,
+            None => config.mtu,
+        };
         let publication = |endpoint| Publication {
             endpoint,
             alias,
@@ -1344,7 +1360,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .map(|address| address.is_ipv4());
         let max_destinations = net.max_destinations();
         let outbound = if held.len() > 1 {
-            Outbound::new_routed(&held, alias, readers, &quanta, config.mtu, reliable)
+            Outbound::new_routed(&held, alias, readers, &quanta, wire_mtu, reliable)
         } else {
             Outbound::new(
                 endpoint,
@@ -1352,7 +1368,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 destination,
                 readers,
                 &quanta,
-                config.mtu,
+                wire_mtu,
                 reliable,
             )
             .and_then(|mut outbound| {
@@ -1562,3 +1578,32 @@ fn etf_queue(channel: &UdpConfig) -> Option<karyos_io::backend::EtfQueue> {
 
 #[cfg(test)]
 mod tests;
+
+/// The envelope length of `protected` as an MTU quantity.
+fn envelope_mtu(protected: super::wire::Protected) -> Result<u32, DriverError> {
+    u32::try_from(protected.envelope_len()).map_err(|_| DriverError::InvalidConfig)
+}
+
+/// The log MTU of a `protected` publication on a channel of `mtu`: the
+/// channel MTU less its class's envelope (ADR-0086 section 5, ADR-0114
+/// section 11).
+///
+/// # Errors
+///
+/// [`crate::error::AuthRefusal::Mtu`] when the budget is below the
+/// smallest MTU a receiver accepts.
+fn inner_mtu(protected: super::wire::Protected, mtu: u32) -> Result<u32, DriverError> {
+    mtu.checked_sub(envelope_mtu(protected)?)
+        .filter(|inner| *inner >= karyos_protocol::network::MIN_MTU)
+        .ok_or(DriverError::AuthenticatedRefused {
+            reason: crate::error::AuthRefusal::Mtu,
+        })
+}
+
+/// The datagram MTU of a `protected` publication whose log holds `inner`
+/// bytes: the inverse of [`inner_mtu`].
+fn wire_mtu(protected: super::wire::Protected, inner: u32) -> Result<u32, DriverError> {
+    inner
+        .checked_add(envelope_mtu(protected)?)
+        .ok_or(DriverError::InvalidConfig)
+}

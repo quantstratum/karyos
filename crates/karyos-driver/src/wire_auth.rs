@@ -470,7 +470,17 @@ impl Sealer {
         if seq >= TAG_CAP {
             return Err(SealFailure::Exhausted);
         }
-        Ok(Protection::seal(&self.profile, datagram, frames)?)
+        #[cfg(test)]
+        let plaintext = recording().then(|| datagram.get(..frames).map(<[u8]>::to_vec));
+        let sealed = Protection::seal(&self.profile, datagram, frames)?;
+        #[cfg(test)]
+        if let Some(Some(frames)) = plaintext {
+            record(SealedRecord {
+                domain: self.domain(),
+                frames,
+            });
+        }
+        Ok(sealed)
     }
 
     fn with_seq(&self, party_epoch: u8, seq: u64) -> HmacSha256 {
@@ -1223,6 +1233,48 @@ impl<K: crate::wire_keys::store::Files, S: crate::wire_keys::store::Files> KeySe
     fn view_generation(&self) -> u64 {
         0
     }
+}
+
+/// One datagram a sealer sealed: its domain and its plaintext frames
+/// (tests).
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct SealedRecord {
+    pub(crate) domain: Domain,
+    pub(crate) frames: Vec<u8>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SEALED: core::cell::RefCell<Option<Vec<SealedRecord>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn recording() -> bool {
+    SEALED.with(|sealed| sealed.borrow().is_some())
+}
+
+#[cfg(test)]
+fn record(record: SealedRecord) {
+    SEALED.with(|sealed| {
+        if let Some(sealed) = sealed.borrow_mut().as_mut() {
+            sealed.push(record);
+        }
+    });
+}
+
+/// Starts recording every seal on this thread (tests).
+#[cfg(test)]
+pub(crate) fn record_seals() {
+    SEALED.with(|sealed| *sealed.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stops recording and returns what was sealed since [`record_seals`]
+/// (tests).
+#[cfg(test)]
+pub(crate) fn take_seals() -> Vec<SealedRecord> {
+    SEALED.with(|sealed| sealed.borrow_mut().take().unwrap_or_default())
 }
 
 /// A fixed key set (tests): `files` as loaded, the highest epoch of a

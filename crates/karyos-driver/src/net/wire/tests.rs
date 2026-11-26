@@ -1484,6 +1484,9 @@ mod invariants_e2e;
 /// (ADR-0114).
 mod encrypted;
 
+/// The inner budget of authenticated publications (ADR-0086 section 5).
+mod auth_mtu;
+
 /// H8 RLD-4: freshness is granted only once a reload has completed and
 /// both roles have applied its view, and it runs the revocation bound
 /// from the start of that reload's read. A conductor that stalls, or a

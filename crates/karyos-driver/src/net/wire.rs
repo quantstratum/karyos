@@ -90,6 +90,16 @@ impl Protected {
         }
     }
 
+    /// The bytes its envelope adds to every datagram: 48 for the
+    /// authenticated class (ADR-0086 section 5), 84 for the encrypted
+    /// class (ADR-0114 section 11).
+    pub(crate) fn envelope_len(self) -> usize {
+        match self {
+            Self::Auth(_) => crate::wire_auth::ENVELOPE_LEN,
+            Self::Enc(_) => karyos_protocol::protection::aes_gcm_siv::ENVELOPE_LEN,
+        }
+    }
+
     /// Its single unicast receiver.
     pub(crate) fn receiver_id(self) -> u64 {
         match self {

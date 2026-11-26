@@ -334,3 +334,173 @@ fn an_encrypted_unicast_channel_delivers_and_a_trusted_subscriber_gets_nothing()
             .publication_established(handle.registration())
     );
 }
+
+/// The frame lengths of one sealed datagram's plaintext, each frame at a
+/// 32-byte boundary.
+fn frame_lengths(frames: &[u8]) -> Vec<usize> {
+    let mut lengths = Vec::new();
+    let mut at = 0;
+    while at + 4 <= frames.len() {
+        let length = i32::from_le_bytes(frames[at..at + 4].try_into().unwrap());
+        let length = usize::try_from(length).unwrap();
+        lengths.push(length);
+        at += length.max(32).next_multiple_of(32);
+    }
+    lengths
+}
+
+/// An established encrypted unicast channel through production admission
+/// (`mtu` 1408): each batch of message lengths is offered at once and
+/// delivered; returns the frame lengths of every domain 1 datagram sealed
+/// meanwhile, after checking that none exceeds 1408 bytes on the wire
+/// (1324 inner bytes).
+fn enc_mtu_run(batches: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    use karyos_protocol::protection::aes_gcm_siv::{Domain, ENVELOPE_LEN};
+
+    let (mut subscriber, _sub_keys) = keyed(&borrowed(&enc_files()));
+    subscriber
+        .add_network_subscription_as(
+            STREAM,
+            &udp(Destination::Unicast(ANY_PORT), encrypted()),
+            identity(RECEIVER),
+        )
+        .unwrap();
+    let to = subscriber.network_subscription_address(STREAM).unwrap();
+    let (mut publisher, _pub_keys) = keyed(&borrowed(&enc_files()));
+    let handle = publisher
+        .add_network_publication(
+            aggregate(STREAM),
+            &udp(Destination::Unicast(to), encrypted()),
+        )
+        .unwrap();
+    let mut image = None;
+    assert!(
+        pump(&mut [&mut publisher, &mut subscriber], |drivers| {
+            image = drivers[1].network_image(STREAM, 1);
+            image.is_some()
+        }),
+        "the encrypted channel never established"
+    );
+    let mut reader = subscriber
+        .subscribe_aggregate(&image.unwrap(), Role::Required)
+        .unwrap();
+    let mut lane = publisher
+        .publication(handle.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let budget = Budget {
+        work: 256,
+        bytes: 1 << 22,
+    };
+    crate::wire_enc::record_seals();
+    let sealed = || -> Vec<Vec<usize>> {
+        crate::wire_enc::take_seals()
+            .iter()
+            .filter(|record| record.context.domain == Domain::Sender)
+            .map(|record| {
+                assert!(
+                    record.frames.len() + ENVELOPE_LEN <= 1408,
+                    "a {}-byte datagram",
+                    record.frames.len() + ENVELOPE_LEN
+                );
+                frame_lengths(&record.frames)
+            })
+            .collect()
+    };
+    let mut delivered: Vec<Vec<u8>> = Vec::new();
+    let mut offered: Vec<Vec<u8>> = Vec::new();
+    for messages in batches {
+        for (index, length) in messages.iter().enumerate() {
+            let payload: Vec<u8> = (0..*length)
+                .map(|at| u8::try_from((at * 31 + index) % 251).unwrap())
+                .collect();
+            offered.push(payload.clone());
+            assert!(matches!(
+                lane.offer(&payload).unwrap(),
+                OfferOutcome::Accepted { .. }
+            ));
+        }
+        let want = delivered.len() + messages.len();
+        let done = pump(&mut [&mut publisher, &mut subscriber], |_| {
+            let _ = reader.poll(|bytes, _, _| delivered.push(bytes.to_vec()), budget);
+            delivered.len() == want
+        });
+        if !done {
+            let data: Vec<Vec<usize>> = sealed()
+                .into_iter()
+                .filter(|lengths| lengths.iter().any(|length| *length > 96))
+                .collect();
+            panic!(
+                "{} of {want} delivered; DATA sealed: {data:?}",
+                delivered.len()
+            );
+        }
+    }
+    assert!(delivered == offered, "a message was not delivered intact");
+    sealed()
+}
+
+/// Gate H11 (manifest section 7; ADR-0114 section 11; ADR-0035
+/// Validation), through production admission at `mtu` 1408 (`E` = 84,
+/// inner budget 1324, `c` = 1280): a 1280-byte message leaves as one full
+/// DATA frame of 1312 bytes, a 1396-byte datagram (W4); 40 messages of 32
+/// bytes offered at once leave in datagrams of at most floor(1324 / 64) =
+/// 20 frames of 64 bytes, and one holds exactly 20 (W5). Every message is
+/// delivered, and no sealed datagram exceeds 1408 bytes on the wire.
+#[test]
+fn an_encrypted_publication_fills_the_mtu_and_never_exceeds_it() {
+    let data = enc_mtu_run(&[vec![1280], vec![32; 40]]);
+    assert!(
+        data.iter().flatten().any(|length| *length == 32 + 1280),
+        "W4: {data:?}"
+    );
+    let batched = data
+        .iter()
+        .filter(|lengths| !lengths.is_empty() && lengths.iter().all(|length| *length == 64))
+        .map(Vec::len)
+        .max();
+    assert_eq!(batched, Some(20), "W5: {data:?}");
+}
+
+/// Gate H11 (ADR-0114 section 11): through production admission at
+/// `mtu` 1408 the encrypted log keeps the inner budget of 1324 bytes, so
+/// a message that needs fragments is cut at `c` = 1280: 3000 bytes leave
+/// as 1280, 1280 and 440, and a single message of 1293 bytes, one over
+/// the largest unfragmented payload of 1292, as 1280 and 13. Each
+/// fragment is one datagram of at most 1408 bytes, and both messages are
+/// delivered intact.
+#[test]
+fn an_encrypted_message_is_fragmented_at_c_1280() {
+    let data = enc_mtu_run(&[vec![3000], vec![1293]]);
+    let fragments: Vec<usize> = data.into_iter().flatten().collect();
+    let data: Vec<usize> = fragments
+        .iter()
+        .copied()
+        .filter(|length| *length > 96)
+        .collect();
+    assert_eq!(data, vec![32 + 1280, 32 + 1280, 32 + 440, 32 + 1280]);
+    assert_eq!(
+        fragments
+            .iter()
+            .filter(|length| **length == 32 + 13)
+            .count(),
+        1,
+        "the 13-byte last fragment: {fragments:?}"
+    );
+}
+
+/// An encrypted publication on a channel whose MTU less the 84-byte
+/// envelope is below the smallest MTU a receiver accepts is refused,
+/// typed, and nothing is created (ADR-0114 section 11).
+#[test]
+fn an_encrypted_channel_with_no_inner_budget_is_refused_typed() {
+    let (mut publisher, _keys) = keyed(&borrowed(&enc_files()));
+    let mut config = aggregate(STREAM);
+    config.stream.buffer.mtu = 288;
+    assert_eq!(
+        publisher
+            .add_network_publication(config, &udp(unicast(), encrypted()))
+            .unwrap_err(),
+        refused(AuthRefusal::Mtu)
+    );
+    nothing_created(&publisher);
+}

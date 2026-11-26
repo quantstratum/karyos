@@ -11,8 +11,9 @@
 //! included, takes a fresh envelope sequence of one key. Until the
 //! establishment installs the session's sealer it sends nothing, and a
 //! sealer that can seal no more stops it: fail closed. The log's frames
-//! keep the inner budget; the datagram adds [`ENVELOPE_LEN`] bytes, which
-//! the channel's MTU accounts for when the log is sized (section 5).
+//! keep the inner budget; the datagram adds [`ENVELOPE_LEN`] bytes. The
+//! network admission sizes the log at the channel MTU less the envelope
+//! and gives the sender the channel MTU back (section 5).
 //!
 //! Unicast single-path only: a multi-destination or routed publication
 //! refuses authentication (ADR-0086 open point 6; ADR-0076 clause 4 is
@@ -127,10 +128,11 @@ impl SenderAuth {
 
 impl<T: StreamTerms> Outbound<T> {
     /// Makes the publication authenticated: from now on it sends nothing
-    /// until [`Outbound::install_sealer`] gives it the session's key. Its
-    /// log must be sized for the inner budget, the channel MTU less
-    /// [`ENVELOPE_LEN`]: a frame larger than that is a read error, never
-    /// a datagram over the MTU.
+    /// until [`Outbound::install_sealer`] gives it the session's key. The
+    /// network admission sizes its log for the inner budget, the channel
+    /// MTU less [`ENVELOPE_LEN`], and gives it the channel MTU: a frame
+    /// larger than the budget is a read error, never a datagram over the
+    /// MTU.
     ///
     /// # Errors
     ///
