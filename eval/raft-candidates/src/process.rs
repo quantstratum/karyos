@@ -377,7 +377,20 @@ pub fn ticks_since(start: Instant) -> u64 {
 /// of its window over one connection.
 #[must_use]
 pub fn frame<M>(client: NodeId, message: &Harness<M>) -> Option<Vec<u8>> {
-    let mut body = client.to_le_bytes().to_vec();
+    let mut framed = Vec::new();
+    frame_into(client, message, &mut framed).then_some(framed)
+}
+
+/// [`frame`] into `out`, cleared first: a server keeps `out`, prefilled
+/// for its largest answer, so framing a reply within the case's bounds
+/// allocates nothing (C5 v3). `false`, `out` unspecified, for a message
+/// [`frame`] refuses.
+pub fn frame_into<M>(client: NodeId, message: &Harness<M>, out: &mut Vec<u8>) -> bool {
+    out.clear();
+    // The body's length, set once the body is written.
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&client.to_le_bytes());
+    let body = out;
     match message {
         Harness::Request(command) => {
             body.push(1);
@@ -407,12 +420,23 @@ pub fn frame<M>(client: NodeId, message: &Harness<M>) -> Option<Vec<u8>> {
             body.push(5);
             body.extend_from_slice(&server.to_le_bytes());
         }
-        _ => return None,
+        _ => return false,
     }
-    let mut framed = u32::try_from(body.len()).ok()?.to_le_bytes().to_vec();
-    framed.extend_from_slice(&body);
-    Some(framed)
+    let Ok(length) = u32::try_from(body.len().saturating_sub(4)) else {
+        return false;
+    };
+    if let Some(prefix) = body.get_mut(..4) {
+        prefix.copy_from_slice(&length.to_le_bytes());
+    }
+    true
 }
+
+/// A reply frame's header: its length, the session, the kind, the
+/// sequence, the index and the generation.
+const FRAME_HEADER: usize = 4 + 8 + 1 + 8 + 8 + 8;
+
+/// Bytes a connection queues between two flushes without growing.
+const OUTPUT_ROOM: usize = 1 << 16;
 
 /// A client frame's session and message.
 pub type Framed<M> = (NodeId, Harness<M>);
@@ -495,7 +519,8 @@ impl Connection {
         Ok(Self {
             stream,
             input: Vec::new(),
-            output: Vec::new(),
+            // Room for its queued frames between two flushes (C5 v3).
+            output: Vec::with_capacity(OUTPUT_ROOM),
             closed: false,
         })
     }
@@ -678,6 +703,9 @@ struct Serving<M> {
     /// are copied into one inside the application window and it comes
     /// back once the reply is framed, so answering allocates nothing.
     reply_bytes: ReplyBytes,
+    /// The frame a reply is written into before it is queued, kept and
+    /// prefilled for the largest answer and its header (C5 v3).
+    framed: Vec<u8>,
     ready: ReadyBuf<M>,
     command: Vec<u8>,
     /// Its clock, in ticks.
@@ -715,9 +743,13 @@ impl ReplyBytes {
 
     /// A copy of `bytes` in a pooled buffer: the smallest one it fits.
     fn copy(&mut self, bytes: &[u8]) -> Vec<u8> {
-        let fits = (0..self.0.len())
-            .filter(|&at| self.0[at].capacity() >= bytes.len())
-            .min_by_key(|&at| self.0[at].capacity());
+        let fits = self
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, buffer)| buffer.capacity() >= bytes.len())
+            .min_by_key(|(_, buffer)| buffer.capacity())
+            .map(|(at, _)| at);
         let mut buffer = match fits {
             Some(at) => self.0.swap_remove(at),
             None => self.0.pop().unwrap_or_default(),
@@ -1179,6 +1211,7 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
         items: Vec::new(),
         replies: Vec::new(),
         reply_bytes: ReplyBytes::prefilled(&bounds),
+        framed: Vec::with_capacity(bounds.response_bytes().saturating_add(FRAME_HEADER)),
         ready: ReadyBuf::default(),
         command: Vec::new(),
         now: 0,
@@ -1309,18 +1342,28 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
                 None => probe::encoding(|| drop(message)),
             }
         }
-        for (client, message) in serving.replies.drain(..) {
-            if let (Some(connection), Some(framed)) = (
-                clients.get(&client).and_then(|at| connections.get_mut(*at)),
-                frame(client, &message),
-            ) {
-                connection.queue(&framed);
+        // Framing and queueing a reply is the application's, counted with
+        // it, into the server's kept frame and the connection's prefilled
+        // queue; the reply's buffer goes back to the pool in the same
+        // window (C5 v3).
+        let (replies, framed, reply_bytes) = (
+            &mut serving.replies,
+            &mut serving.framed,
+            &mut serving.reply_bytes,
+        );
+        probe::application(|| {
+            for (client, message) in replies.drain(..) {
+                if let Some(connection) =
+                    clients.get(&client).and_then(|at| connections.get_mut(*at))
+                    && frame_into(client, &message, framed)
+                {
+                    connection.queue(framed);
+                }
+                if let Harness::Response { bytes, .. } = message {
+                    reply_bytes.give_back(bytes);
+                }
             }
-            // The reply's buffer back to the pool, in the window it left.
-            if let Harness::Response { bytes, .. } = message {
-                probe::application(|| serving.reply_bytes.give_back(bytes));
-            }
-        }
+        });
         for connection in &mut connections {
             connection.flush();
         }
