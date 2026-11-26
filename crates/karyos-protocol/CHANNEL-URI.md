@@ -103,7 +103,10 @@ compile without its own case.
 | `guard` | ipc, udp | 1 to 64 bytes of `A-Z a-z 0-9 . _ -` |
 | `trace` | ipc, udp | `off`, `all` or `sampled:` `decimal`, at least 1 |
 | `fc` | udp | `min`, `max` or `tagged:` `decimal` (a `u64`, 0 included) |
-| `security` | udp | `trusted`; `authenticated` and `encrypted` are `SecurityUnsupported` |
+| `security` | udp | `trusted` or `encrypted`; `authenticated` is `SecurityUnsupported`. `encrypted` (ADR-0114) takes one unicast `endpoint` only (no `group`, `destinations`, `control` or `paths`), `mtu` at most 1408, and requires `channel-key`, `pairwise-key` and `receiver-id` |
+| `channel-key` | udp | `decimal`, 1 to 4294967295: the `key_id` of the `profile_id` 16 `channel` file; only with `security=encrypted` |
+| `pairwise-key` | udp | `decimal`, 1 to 4294967295: the `key_id` of the receiver's `profile_id` 16 `pairwise` file; only with `security=encrypted` |
+| `receiver-id` | udp | `decimal`, 1 to 18446744073709551615: the receiver the pairwise file names; only with `security=encrypted` |
 | `destinations` | udp | 1 to 64 `socket-address` elements separated by `;`, none multicast, none repeated |
 | `control` | udp | `socket-address`; not multicast |
 | `control-mode` | udp | `manual` or `dynamic` |

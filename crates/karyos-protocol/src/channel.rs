@@ -22,9 +22,12 @@
 //! this crate's manifest. [`parse_duration`] is the duration grammar new
 //! keys use.
 //!
-//! Phase 2 implements the `trusted` protection class only: `authenticated`
-//! and `encrypted` are refused with [`ChannelError::SecurityUnsupported`]
-//! until the security profile is accepted.
+//! The `trusted` and `encrypted` protection classes parse; `authenticated`
+//! is refused with [`ChannelError::SecurityUnsupported`] until its
+//! capability gate passes. An `encrypted` channel (ADR-0114) names its
+//! channel key, its receiver's pairwise key and that receiver, serves one
+//! unicast receiver and takes `mtu` at most 1408; multicast and every
+//! multi-receiver form are refused at parse.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -230,8 +233,8 @@ pub enum FlowControl {
     Tagged(u64),
 }
 
-/// A channel's protection class (SPEC.md §5). Only [`Security::Trusted`]
-/// parses in Phase 2.
+/// A channel's protection class (SPEC.md §5). [`Security::Trusted`] and
+/// [`Security::Encrypted`] parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Security {
@@ -244,6 +247,28 @@ pub enum Security {
     /// is still refused at parse until its capability gate passes.
     #[cfg(feature = "test-hooks")]
     Authenticated(AuthenticatedChannel),
+    /// The encrypted class (ADR-0114, AES-256-GCM-SIV, `profile_id` 16)
+    /// with the key ids and the single unicast receiver it binds at
+    /// admission.
+    Encrypted(EncryptedChannel),
+}
+
+/// What an encrypted channel binds at publication and subscription
+/// admission (ADR-0114 section 4a): the key ids each side must find valid
+/// in its driver's key store, both `profile_id` 16, and the one unicast
+/// receiver the channel serves. No `key_id` travels on the wire; these
+/// select the files by configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncryptedChannel {
+    /// The channel key (`purpose=channel`, `profile_id` 16): the `IKM` of
+    /// every derivation of ADR-0114 section 4 (`channel-key`).
+    pub channel_key_id: u32,
+    /// The receiver's pairwise key (`purpose=pairwise`, `profile_id` 16):
+    /// the trailer of every domain 4 and 6 datagram (`pairwise-key`).
+    pub pairwise_key_id: u32,
+    /// The single unicast receiver: the pairwise key's `receiver_id`
+    /// (`receiver-id`), nonzero.
+    pub receiver_id: u64,
 }
 
 /// What an authenticated channel binds at publication and subscription
@@ -467,9 +492,12 @@ enum Key {
     PathSkew,
     EtfPriority,
     EtfDelta,
+    ChannelKeyId,
+    PairwiseKeyId,
+    ReceiverId,
 }
 
-const KEYS: [(&str, Key); 23] = [
+const KEYS: [(&str, Key); 26] = [
     ("endpoint", Key::Endpoint),
     ("group", Key::Group),
     ("interface", Key::Interface),
@@ -493,6 +521,9 @@ const KEYS: [(&str, Key); 23] = [
     ("path-skew", Key::PathSkew),
     ("etf-priority", Key::EtfPriority),
     ("etf-delta", Key::EtfDelta),
+    ("channel-key", Key::ChannelKeyId),
+    ("pairwise-key", Key::PairwiseKeyId),
+    ("receiver-id", Key::ReceiverId),
 ];
 
 /// Whether `name` is kebab-case (`CHANNEL-URI.md` section 2): words of
@@ -802,17 +833,7 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
             "authenticated" => Err(ChannelError::SecurityUnsupported {
                 class: "authenticated",
             }),
-            // ADR-0114 sections 6 and 11: an `encrypted` channel takes
-            // `mtu` at most 1408, the size its usage budgets assume; a
-            // larger one is refused at parse whatever else holds. The
-            // class itself stays refused until its capability gate passes
-            // (ADR-0076), as `authenticated` is.
-            "encrypted" => match get(Key::Mtu).map(parse_mtu).transpose()? {
-                Some(mtu) if mtu > MAX_ENCRYPTED_MTU => {
-                    Err(invalid(Key::Mtu, "above 1408 on an `encrypted` channel"))
-                }
-                _ => Err(ChannelError::SecurityUnsupported { class: "encrypted" }),
-            },
+            "encrypted" => parse_encrypted(get, &destination, &paths).map(Security::Encrypted),
             _ => Err(invalid(
                 Key::Security,
                 "`trusted`, `authenticated` or `encrypted`",
@@ -820,6 +841,13 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
         })
         .transpose()?
         .unwrap_or_default();
+    if !matches!(security, Security::Encrypted(_))
+        && let Some(key) = [Key::ChannelKeyId, Key::PairwiseKeyId, Key::ReceiverId]
+            .into_iter()
+            .find(|&key| get(key).is_some())
+    {
+        return Err(ChannelError::NotApplicable { key: key.name() });
+    }
     // `require-abort-ack` (owner decision item 8) is defined with the
     // authenticated capability. Until that capability is supported a
     // request requiring it is refused, typed, and never downgraded to a
@@ -868,6 +896,52 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
         linger,
         path_skew,
         etf,
+    })
+}
+
+/// An `encrypted` channel (ADR-0114 sections 4a, 6 and 11): `mtu` at most
+/// [`MAX_ENCRYPTED_MTU`], refused first whatever else holds; one unicast
+/// `endpoint` (no `group`, `destinations`, `control` or `paths`: v1 binds
+/// one receiver, and multicast stays refused); and its three key settings,
+/// each required. A nonzero key id is not checked here: the key store
+/// refuses an unknown one at admission.
+fn parse_encrypted<'a>(
+    get: &impl Fn(Key) -> Option<&'a str>,
+    destination: &Destination,
+    paths: &[Interface],
+) -> Result<EncryptedChannel, ChannelError> {
+    if get(Key::Mtu)
+        .map(parse_mtu)
+        .transpose()?
+        .is_some_and(|mtu| mtu > MAX_ENCRYPTED_MTU)
+    {
+        return Err(invalid(Key::Mtu, "above 1408 on an `encrypted` channel"));
+    }
+    if !matches!(destination, Destination::Unicast(_)) || !paths.is_empty() {
+        return Err(invalid(
+            Key::Security,
+            "`encrypted` on a channel other than one unicast `endpoint`",
+        ));
+    }
+    let id = |key: Key, what: &'static str| -> Result<u64, ChannelError> {
+        let value = get(key).ok_or(invalid(key, "required on an `encrypted` channel"))?;
+        decimal::<u64>(value)
+            .filter(|&id| id != 0)
+            .ok_or(invalid(key, what))
+    };
+    let narrow = |key: Key, id: u64| {
+        u32::try_from(id).map_err(|_| invalid(key, "an integer from 1 to 4294967295"))
+    };
+    Ok(EncryptedChannel {
+        channel_key_id: narrow(
+            Key::ChannelKeyId,
+            id(Key::ChannelKeyId, "an integer from 1 to 4294967295")?,
+        )?,
+        pairwise_key_id: narrow(
+            Key::PairwiseKeyId,
+            id(Key::PairwiseKeyId, "an integer from 1 to 4294967295")?,
+        )?,
+        receiver_id: id(Key::ReceiverId, "an integer from 1 to 18446744073709551615")?,
     })
 }
 
