@@ -1805,8 +1805,11 @@ impl<D: Disk + Clone> RaftLog<D> {
     /// Seals the log's bytes up to the end of the stored commit's entry,
     /// from where the current subject's seals end (karyos#990): never a
     /// byte Raft may still truncate. Committed bytes are durable, so they
-    /// read back as written. Unless `all`, only whole [`SEAL_CHUNK`]s are
-    /// sealed, and a shorter tail waits (karyos#1050).
+    /// read back as written. Each chunk ends on a frame boundary
+    /// ([`RaftLog::chunk_end`], ADR-0120 decision 3), so a seal never ends
+    /// inside a frame and a replicated range is whole frames. Unless
+    /// `all`, a chunk is sealed only once at least [`SEAL_CHUNK`] bytes
+    /// wait, and a shorter tail waits (karyos#1050).
     fn seal_committed(&mut self, all: bool) -> Result<(), LogError> {
         let Some((commit, end)) = self.committed_end() else {
             return Ok(());
@@ -1822,10 +1825,10 @@ impl<D: Disk + Clone> RaftLog<D> {
             start = self.store.start();
         }
         while start < end {
-            let chunk_end = end.min(start.saturating_add(SEAL_CHUNK));
-            if !all && chunk_end.saturating_sub(start) < SEAL_CHUNK {
+            if !all && end.saturating_sub(start) < SEAL_CHUNK {
                 break;
             }
+            let chunk_end = self.chunk_end(start, end);
             let length = usize::try_from(chunk_end.saturating_sub(start))
                 .map_err(|_| LogError::TooLarge { index: commit })?;
             self.seal_buf.resize(length, 0);
@@ -1835,6 +1838,35 @@ impl<D: Disk + Clone> RaftLog<D> {
             start = chunk_end;
         }
         Ok(())
+    }
+
+    /// Where the seal chunk from `start` ends, on a frame boundary, at most
+    /// `end` (ADR-0120 decision 3): `end` itself when it is within
+    /// [`SEAL_CHUNK`], else the last frame start that fits the chunk, or,
+    /// when the frame at `start` alone is longer than a chunk, that
+    /// frame's end. `end` is a frame's end (the stored commit's), and a
+    /// frame start is the start of an entry's frame, so the chunk is
+    /// always whole frames once `start` is a frame start, as every seal
+    /// written since this rule is.
+    fn chunk_end(&self, start: u64, end: u64) -> u64 {
+        let limit = start.saturating_add(SEAL_CHUNK);
+        if end <= limit {
+            return end;
+        }
+        // The frame starts strictly after `start`, in order.
+        let after = self
+            .entries
+            .partition_point(|&(position, _)| position <= start);
+        let fits = self
+            .entries
+            .partition_point(|&(position, _)| position <= limit);
+        match self.entries.get(after..fits).and_then(<[_]>::last) {
+            Some(&(position, _)) => position,
+            None => self
+                .entries
+                .get(after)
+                .map_or(end, |&(position, _)| position.min(end)),
+        }
     }
 
     /// The stored commit and where its entry ends in the log, if the log
