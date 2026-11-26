@@ -371,6 +371,23 @@ pub fn s1_source_change() -> Case {
     case
 }
 
+/// S7 with the standby's leader crashed only once the replication was
+/// acknowledged, and restarted while the primary keeps its leader: the
+/// standby's new copy must start again from the same source
+/// (karyos#714 review).
+#[must_use]
+pub fn s7_after_acknowledgement() -> Case {
+    let mut case = followed(
+        "S7 standby leader restart after an acknowledged replication",
+        40,
+    );
+    case.schedule = vec![
+        (150, Action::Crash(STANDBY[0])),
+        (260, Action::Restart(STANDBY[0])),
+    ];
+    case
+}
+
 /// [`cases`] over the replication.
 #[must_use]
 pub fn replicated_cases() -> Vec<Case> {

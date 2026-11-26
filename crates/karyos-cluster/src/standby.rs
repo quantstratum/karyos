@@ -59,7 +59,7 @@ use std::num::NonZeroU64;
 use std::path::Path;
 
 use karyos_archive::disk::Disk;
-use karyos_archive::integrity::copies::{CopyCatalog, Enforcement};
+use karyos_archive::integrity::copies::{CopyCatalog, CopyRecord, CopyState, Enforcement};
 use karyos_archive::integrity::journal::{IntegrityError, IntegrityJournal};
 use karyos_archive::integrity::replication::{Replica, Verdict};
 use karyos_archive::integrity::{Digest, SealKind, SealRecord, digest};
@@ -132,6 +132,13 @@ pub trait SealCheck {
     ///
     /// Why it does not, for the report.
     fn verify(&mut self, source: u64, seal: &SealRecord, bytes: &[u8]) -> Result<(), String>;
+
+    /// The standby discarded `source`'s copy of `epoch` from `from` on (a
+    /// rebuild, a new source, a refused range): what was counted of it
+    /// must no longer count, since its bytes are gone (karyos#714 review).
+    fn discard(&mut self, source: u64, epoch: u64, from: u64) {
+        let _ = (source, epoch, from);
+    }
 }
 
 /// The schema 6 replica's verification of a Cluster log seal
@@ -154,7 +161,32 @@ impl<D: Disk + Clone> ReplicaCheck<D> {
     pub fn open(disk: D, dir: &Path) -> Result<Self, IntegrityError> {
         let mut journal = IntegrityJournal::open(disk.clone(), dir)?.journal;
         let copies = CopyCatalog::open(disk, dir, &mut journal)?;
-        Ok(Self { journal, copies })
+        let mut check = Self { journal, copies };
+        // The copies' bytes lived in the follower's memory, gone with the
+        // process: nothing the catalog counts survives the reopen.
+        check.remove(|_| true, 0)?;
+        Ok(check)
+    }
+
+    /// Records as removed every verified copy under [`LOG_RECORDING`] at a
+    /// location `at` admits that ends past `from`.
+    fn remove(&mut self, at: impl Fn(&Digest) -> bool, from: u64) -> Result<(), IntegrityError> {
+        let gone: Vec<CopyRecord> = self
+            .copies
+            .current()?
+            .into_iter()
+            .filter(|copy| {
+                copy.recording == LOG_RECORDING
+                    && copy.state == CopyState::Verified
+                    && copy.end > from
+                    && at(&copy.location)
+            })
+            .collect();
+        for mut copy in gone {
+            copy.state = CopyState::Removed;
+            let _ = self.copies.record(copy, &mut self.journal)?;
+        }
+        Ok(())
     }
 
     /// The copies of `source`'s epoch `epoch` that verified, as the copy
@@ -169,7 +201,11 @@ impl<D: Disk + Clone> ReplicaCheck<D> {
             .copies
             .current()?
             .into_iter()
-            .filter(|copy| copy.location == at && copy.recording == LOG_RECORDING)
+            .filter(|copy| {
+                copy.location == at
+                    && copy.recording == LOG_RECORDING
+                    && copy.state == CopyState::Verified
+            })
             .count())
     }
 }
@@ -192,6 +228,12 @@ impl<D: Disk + Clone> SealCheck for ReplicaCheck<D> {
             Ok(Verdict::Corrupt(inconsistency)) => Err(format!("{inconsistency:?}")),
             Err(error) => Err(format!("{error:?}")),
         }
+    }
+
+    fn discard(&mut self, source: u64, epoch: u64, from: u64) {
+        let at = location(source, epoch);
+        // A failure poisons the catalog: the next verify is refused.
+        let _ = self.remove(|location| *location == at, from);
     }
 }
 
@@ -348,9 +390,10 @@ pub struct CopyEnds {
     pub epoch: Option<u64>,
     /// Where the copy starts.
     pub start: u64,
-    /// The end of `V`'s frame in this copy, or its start when the copy
-    /// holds no frame at or below `V`.
-    pub verified: u64,
+    /// The end of `V`'s frame in this copy; its start for a standby with
+    /// no `V`; `None` while `V` is not yet mapped into this copy's
+    /// positions (after a rebuild or a new source).
+    pub verified: Option<u64>,
     /// Where its checked seals end.
     pub checked: u64,
     /// Where its received bytes end.
@@ -382,8 +425,10 @@ pub enum RecoveryPoint {
 /// never its exact size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gap {
-    /// At least these bytes, sealed at the source and not verified here.
-    pub sealed_unverified: u64,
+    /// At least these bytes, sealed at the source and not verified here;
+    /// `None` (unknown) while `V` is not mapped into the copy's positions,
+    /// so applied entries are never counted as loss.
+    pub sealed_unverified: Option<u64>,
     /// Plus the committed tail past the last seal, which is unknown.
     pub unsealed_tail: TailBound,
 }
@@ -448,12 +493,15 @@ struct Copy {
     source: u64,
     epoch: Option<u64>,
     start: u64,
+    /// The received bytes not yet checked, from `base`: a checked range
+    /// is released once its seal passed (karyos#714 review).
     bytes: Vec<u8>,
+    base: u64,
     checked: u64,
     verified: Option<u64>,
     sealed: Option<u64>,
-    /// When it last heard from the source.
-    seen: u64,
+    /// When its request first arrived: its grace until a status.
+    begun: u64,
     /// When a status last arrived.
     status: Option<u64>,
     ended: bool,
@@ -466,15 +514,17 @@ struct Copy {
 impl Copy {
     fn received(&self) -> u64 {
         let length = u64::try_from(self.bytes.len()).unwrap_or(u64::MAX);
-        self.start.saturating_add(length)
+        self.base.saturating_add(length)
     }
 
-    fn ends(&self) -> CopyEnds {
+    /// `fresh`: whether the standby has no `V`, so the copy's start is its
+    /// verified end until a frame maps one.
+    fn ends(&self, fresh: bool) -> CopyEnds {
         CopyEnds {
             source: self.source,
             epoch: self.epoch,
             start: self.start,
-            verified: self.verified.unwrap_or(self.start),
+            verified: self.verified.or(fresh.then_some(self.start)),
             checked: self.checked,
             received: self.received(),
             sealed: self.sealed,
@@ -483,8 +533,16 @@ impl Copy {
 
     /// Drops the unchecked bytes, so a resend replaces them.
     fn drop_unchecked(&mut self) {
-        let keep = usize::try_from(self.checked.saturating_sub(self.start)).unwrap_or(usize::MAX);
+        let keep = usize::try_from(self.checked.saturating_sub(self.base)).unwrap_or(usize::MAX);
         self.bytes.truncate(keep);
+    }
+
+    /// Releases the checked bytes: a checked seal is never verified again.
+    fn release_checked(&mut self) {
+        let done = usize::try_from(self.checked.saturating_sub(self.base)).unwrap_or(usize::MAX);
+        let done = done.min(self.bytes.len());
+        drop(self.bytes.drain(..done));
+        self.base = self.checked.max(self.base);
     }
 }
 
@@ -524,8 +582,35 @@ impl<S: SealCheck> Standby<S> {
     pub fn rebuild(&mut self, verified: Option<Position>) {
         self.verified = verified;
         self.tail = verified;
-        self.copy = None;
+        self.discard_copy();
         self.stopped = false;
+    }
+
+    /// Drops the copy, and what the seal check counted of it.
+    fn discard_copy(&mut self) {
+        if let Some(copy) = self.copy.take()
+            && let Some(epoch) = copy.epoch
+        {
+            self.check.discard(copy.source, epoch, 0);
+        }
+    }
+
+    /// The seal check behind the seam.
+    #[must_use]
+    pub fn check(&self) -> &S {
+        &self.check
+    }
+
+    /// The seal check, the follower dropped.
+    #[must_use]
+    pub fn into_check(self) -> S {
+        self.check
+    }
+
+    /// The copy's received bytes still held: at most the unchecked ones.
+    #[must_use]
+    pub fn retained(&self) -> usize {
+        self.copy.as_ref().map_or(0, |copy| copy.bytes.len())
     }
 
     /// `V`.
@@ -561,7 +646,8 @@ impl<S: SealCheck> Standby<S> {
     /// The active copy's ends.
     #[must_use]
     pub fn copy(&self) -> Option<CopyEnds> {
-        self.copy.as_ref().map(Copy::ends)
+        let fresh = self.verified.is_none();
+        self.copy.as_ref().map(|copy| copy.ends(fresh))
     }
 
     fn following(&self) -> Result<(), Refusal> {
@@ -595,25 +681,28 @@ impl<S: SealCheck> Standby<S> {
             && !copy.ended
         {
             if copy.source == source && copy.start == start {
-                copy.seen = copy.seen.max(now);
+                // A retry: it changes nothing, its grace included.
                 return Ok(());
             }
-            let fresh = now.saturating_sub(copy.seen) < self.config.status_interval;
+            let heard = copy.status.unwrap_or(copy.begun);
+            let fresh = now.saturating_sub(heard) < self.config.status_interval;
             if copy.source != source && fresh {
                 return Err(Refusal::Busy {
                     active: copy.source,
                 });
             }
         }
+        self.discard_copy();
         self.copy = Some(Copy {
             source,
             epoch: None,
             start,
             bytes: Vec::new(),
+            base: start,
             checked: start,
             verified: None,
             sealed: None,
-            seen: now,
+            begun: now,
             status: None,
             ended: false,
             last: None,
@@ -650,11 +739,11 @@ impl<S: SealCheck> Standby<S> {
     /// As [`Standby::receive`].
     pub fn status(&mut self, source: u64, sealed: u64, now: u64) -> Result<CopyEnds, Refusal> {
         self.following()?;
+        let fresh = self.verified.is_none();
         let copy = self.active(source)?;
         copy.sealed = copy.sealed.max(Some(sealed));
-        copy.seen = copy.seen.max(now);
         copy.status = Some(now);
-        Ok(copy.ends())
+        Ok(copy.ends(fresh))
     }
 
     /// The source ended its request (`state` 5): the copy stays for the
@@ -704,8 +793,8 @@ impl<S: SealCheck> Standby<S> {
         if seal.end > copy.received() {
             return Ok(Sealed::Waiting);
         }
-        let from = usize::try_from(seal.start.saturating_sub(copy.start)).unwrap_or(usize::MAX);
-        let to = usize::try_from(seal.end.saturating_sub(copy.start)).unwrap_or(usize::MAX);
+        let from = usize::try_from(seal.start.saturating_sub(copy.base)).unwrap_or(usize::MAX);
+        let to = usize::try_from(seal.end.saturating_sub(copy.base)).unwrap_or(usize::MAX);
         let walked = match copy.bytes.get(from..to) {
             None => Err(Refusal::Range {
                 checked: copy.checked,
@@ -732,6 +821,7 @@ impl<S: SealCheck> Standby<S> {
                 copy.last = walk.last.or(copy.last);
                 copy.verified = copy.verified.max(walk.verified_end);
                 copy.pending.extend(walk.pending);
+                copy.release_checked();
                 if let Some(last) = walk.ready.last() {
                     self.tail = Some(last.position);
                 }
@@ -743,6 +833,9 @@ impl<S: SealCheck> Standby<S> {
                 } else {
                     copy.drop_unchecked();
                 }
+                // The seal may have counted the range before its frames
+                // failed: it no longer counts.
+                self.check.discard(source, seal.subject, seal.start);
                 Err(refusal)
             }
         }
@@ -783,7 +876,9 @@ impl<S: SealCheck> Standby<S> {
             .is_some_and(|at| now.saturating_sub(at) < self.config.status_interval);
         match copy.sealed {
             Some(sealed) if fresh && !copy.ended => {
-                let verified = copy.verified.unwrap_or(copy.start);
+                let Some(verified) = copy.ends(self.verified.is_none()).verified else {
+                    return RecoveryPoint::Unknown;
+                };
                 match NonZeroU64::new(sealed.saturating_sub(verified)) {
                     Some(bytes) => RecoveryPoint::Behind { bytes },
                     None => RecoveryPoint::AtSealedEnd {
@@ -827,12 +922,15 @@ impl<S: SealCheck> Standby<S> {
         self.promoted = true;
         self.generation = self.generation.saturating_add(1);
         let copy = self.copy();
-        let sealed_unverified = copy.map_or(0, |ends| {
-            ends.sealed
-                .unwrap_or(ends.checked)
-                .max(ends.checked)
-                .saturating_sub(ends.verified)
-        });
+        let sealed_unverified = match copy {
+            None => self.verified.is_none().then_some(0),
+            Some(ends) => ends.verified.map(|verified| {
+                ends.sealed
+                    .unwrap_or(ends.checked)
+                    .max(ends.checked)
+                    .saturating_sub(verified)
+            }),
+        };
         unknown.sort_unstable();
         unknown.dedup();
         Ok(PromotionReport {

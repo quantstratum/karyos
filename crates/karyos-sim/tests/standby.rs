@@ -675,14 +675,11 @@ fn s2_over_replication_an_operator_stop_then_a_promotion() {
         assert_eq!(listed, unknown, "seed {seed:#x}");
         // The gap is a lower bound: the sealed bytes not verified, and an
         // unsealed tail that is unknown.
-        if let Some(copy) = follower.copy {
-            assert!(
-                follower.gap.sealed_unverified
-                    >= copy
-                        .sealed
-                        .unwrap_or(copy.checked)
-                        .saturating_sub(copy.verified)
-            );
+        // Unknown (None) while V is not mapped into the copy.
+        if let Some(copy) = follower.copy
+            && let (Some(gap), Some(verified)) = (follower.gap.sealed_unverified, copy.verified)
+        {
+            assert!(gap >= copy.sealed.unwrap_or(copy.checked).saturating_sub(verified));
         }
         assert_eq!(
             follower.gap.unsealed_tail,
@@ -814,5 +811,25 @@ fn every_replicated_scenario_runs_with_its_feed_control() {
         assert!(case.replication);
         assert_eq!(case.schedule, control.schedule);
         assert_eq!(case.feed_faults, control.feed_faults);
+    }
+}
+
+#[test]
+fn s7_over_replication_a_standby_leader_restart_after_acknowledgement_makes_progress() {
+    let case = standby::over_replication(standby::s7_after_acknowledgement());
+    for seed in corpus() {
+        let outcome = passing(&case, seed);
+        // The replication was acknowledged before the crash.
+        assert!(!copy_sources(&outcome).is_empty(), "seed {seed:#x}");
+        assert_eq!(
+            verified(&outcome, STANDBY[0]),
+            primary_commit(&outcome),
+            "seed {seed:#x}"
+        );
+        assert_eq!(
+            verified(&outcome, STANDBY[1]),
+            primary_commit(&outcome),
+            "seed {seed:#x}"
+        );
     }
 }

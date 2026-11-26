@@ -1548,6 +1548,11 @@ pub enum Wire<M> {
     },
     /// The source ended its request (`state` 5 `interrupted`).
     ReplEnd,
+    /// The standby holds no copy of the sender's request (it restarted,
+    /// or its leader changed and discarded the copy): the sender starts
+    /// its request again, its byte and seal cursors back at its start
+    /// (karyos#714 review).
+    ReplReset,
     /// The standby's acknowledgement of a status.
     ReplAck {
         /// Where its copy's received bytes end.
@@ -3385,25 +3390,31 @@ impl<C: ConsensusCore> ServerNode<C> {
                     && !standby.promoted
                     && core.leads()
                     && let Some(follower) = standby.follower.as_mut()
-                    && let Ok(ends) = follower.status(u64::from(from), sealed, self.now)
                 {
-                    let point = follower.recovery_point(self.now);
-                    self.recorder
-                        .borrow_mut()
-                        .observations
-                        .push(Observation::RecoveryPoint {
-                            node: self.id,
-                            point,
-                        });
-                    out.push((
-                        from,
-                        Wire::ReplAck {
-                            received: ends.received,
-                            checked: ends.checked,
-                            stalled: standby.stalled,
-                        },
-                    ));
-                    standby.stalled = false;
+                    match follower.status(u64::from(from), sealed, self.now) {
+                        // No copy of this request: the source starts it
+                        // again.
+                        Err(Refusal::NotActive { .. }) => out.push((from, Wire::ReplReset)),
+                        Err(_) => {}
+                        Ok(ends) => {
+                            let point = follower.recovery_point(self.now);
+                            self.recorder.borrow_mut().observations.push(
+                                Observation::RecoveryPoint {
+                                    node: self.id,
+                                    point,
+                                },
+                            );
+                            out.push((
+                                from,
+                                Wire::ReplAck {
+                                    received: ends.received,
+                                    checked: ends.checked,
+                                    stalled: standby.stalled,
+                                },
+                            ));
+                            standby.stalled = false;
+                        }
+                    }
                 }
             }
             Wire::ReplEnd => {
@@ -3413,6 +3424,17 @@ impl<C: ConsensusCore> ServerNode<C> {
                     .and_then(|standby| standby.follower.as_mut())
                 {
                     follower.end(u64::from(from));
+                }
+            }
+            Wire::ReplReset => {
+                if let Some(active) = self
+                    .replication
+                    .as_mut()
+                    .and_then(|replication| replication.active.as_mut())
+                {
+                    active.accepted = false;
+                    active.next = active.start;
+                    active.checked = active.start;
                 }
             }
             Wire::ReplAck {

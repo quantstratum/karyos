@@ -543,9 +543,12 @@ fn promotion_is_refused_until_fenced_then_reports_v_the_gap_and_unknowns() {
     assert_eq!(report.generation, 2);
     assert_eq!(report.verified, Some(at(1, 1)));
     // At least the sealed bytes past V's frame; the unsealed tail unknown.
-    assert_eq!(report.gap.sealed_unverified, (bytes.len() - one) as u64);
+    assert_eq!(
+        report.gap.sealed_unverified,
+        Some((bytes.len() - one) as u64)
+    );
     assert_eq!(report.gap.unsealed_tail, BOUND);
-    assert_eq!(report.copy.unwrap().verified, one as u64);
+    assert_eq!(report.copy.unwrap().verified, Some(one as u64));
     assert_eq!(
         report.unknown,
         vec![
@@ -581,7 +584,7 @@ fn an_expired_lease_fences_a_promotion() {
         .unwrap();
     assert_eq!(report.generation, 2);
     assert_eq!(report.verified, None);
-    assert_eq!(report.gap.sealed_unverified, 0);
+    assert_eq!(report.gap.sealed_unverified, Some(0));
 }
 
 /// The seam's test double: refuses every seal, so nothing reaches the
@@ -624,9 +627,108 @@ fn the_schema_6_replica_verifies_the_seals_and_counts_the_copy() {
     assert!(matches!(refused, Err(Refusal::Seal(_))), "{refused:?}");
     let handed = feed(&mut standby, (start, &seals, &bytes)).unwrap();
     assert_eq!(handed.len(), 200);
-    // The catalog is locked while open: closed before it is read again.
+    assert_eq!(
+        standby.check().verified_copies(0, epoch).unwrap(),
+        seals.len()
+    );
+    assert_eq!(standby.check().verified_copies(1, epoch).unwrap(), 0);
+}
+
+/// Review finding 3 (karyos#714): the catalog never counts a copy the
+/// standby discarded, nor one whose bytes died with the process.
+#[test]
+fn a_discarded_copy_no_longer_counts_and_a_reopen_counts_none() {
+    let dir = TempDir::new("discard-source");
+    let mut log = primary(&dir, Geometry::new(4096, 4096).unwrap(), 200, 1);
+    let (start, seals, bytes) = source(&mut log);
+    let epoch = log.seal_epoch();
+    let standby_dir = TempDir::new("discard-standby");
+    let check = ReplicaCheck::open(StdDisk, &standby_dir.0).unwrap();
+    let mut standby = Standby::new(config(), check, None);
+    feed(&mut standby, (start, &seals, &bytes)).unwrap();
+    assert_eq!(
+        standby.check().verified_copies(0, epoch).unwrap(),
+        seals.len()
+    );
+    // A rebuild discards the copy: nothing of it counts.
+    standby.rebuild(standby.verified());
+    assert_eq!(standby.check().verified_copies(0, epoch).unwrap(), 0);
+    // Counted again, then the process ends: a reopen counts none.
+    let mut standby = Standby::new(config(), standby.into_check(), None);
+    feed(&mut standby, (start, &seals, &bytes)).unwrap();
+    assert_eq!(
+        standby.check().verified_copies(0, epoch).unwrap(),
+        seals.len()
+    );
     drop(standby);
     let check = ReplicaCheck::open(StdDisk, &standby_dir.0).unwrap();
-    assert_eq!(check.verified_copies(0, epoch).unwrap(), seals.len());
-    assert_eq!(check.verified_copies(1, epoch).unwrap(), 0);
+    assert_eq!(check.verified_copies(0, epoch).unwrap(), 0);
+    // A new source discards the old one's copy too.
+    let mut standby = Standby::new(config(), check, None);
+    feed(&mut standby, (start, &seals, &bytes)).unwrap();
+    standby.end(0);
+    standby.begin(1, start, 1).unwrap();
+    assert_eq!(standby.check().verified_copies(0, epoch).unwrap(), 0);
+}
+
+/// Review finding 2: the copy releases its checked bytes.
+#[test]
+fn the_bytes_retained_stay_bounded_over_many_seals() {
+    let dir = TempDir::new("bounded");
+    let mut log = primary(&dir, Geometry::new(4096, 4096).unwrap(), 300, 1);
+    let (start, _, _) = source(&mut log);
+    let mut standby = fresh();
+    standby.begin(0, start, 0).unwrap();
+    // One frame per seal, hand-built over the log's own frames.
+    let mut position = start;
+    let mut most = 0;
+    for index in 1..=300 {
+        let frame = entry(index, 1).frame().unwrap();
+        standby.receive(0, position, &frame).unwrap();
+        let seal = seal_over(0, position, &frame);
+        let Ok(Sealed::Ready(ready)) = standby.seal(0, &seal) else {
+            panic!("seal {index}")
+        };
+        for entry in ready {
+            standby.applied(entry.position);
+        }
+        most = most.max(standby.retained());
+        position += frame.len() as u64;
+    }
+    assert_eq!(standby.retained(), 0);
+    assert_eq!(most, 0);
+    assert_eq!(standby.verified(), Some(at(300, 1)));
+}
+
+/// Review finding 4: retried requests of the active source do not keep it
+/// fresh; only its statuses do.
+#[test]
+fn a_retried_request_does_not_keep_another_source_busy() {
+    let mut standby = fresh();
+    standby.begin(0, 0, 0).unwrap();
+    for now in 1..STATUS {
+        standby.begin(0, 0, now).unwrap();
+        assert_eq!(standby.begin(1, 0, now), Err(Refusal::Busy { active: 0 }));
+    }
+    // Its grace ran out at the status interval, retries or not.
+    standby.begin(0, 0, STATUS).unwrap();
+    standby.begin(1, 0, STATUS).unwrap();
+    assert_eq!(standby.copy().unwrap().source, 1);
+}
+
+/// Review finding 5: V at 100, a new source sealed only through 50 bytes'
+/// worth: the loss is unknown, not the sealed bytes counted from the new
+/// copy's start.
+#[test]
+fn an_unmapped_v_reports_the_sealed_loss_unknown() {
+    let mut standby = Standby::new(config(), DigestCheck, Some(at(100, 3)));
+    standby.begin(5, 0, 0).unwrap();
+    standby.status(5, 50, 1).unwrap();
+    assert_eq!(standby.copy().unwrap().verified, None);
+    assert_eq!(standby.recovery_point(1), RecoveryPoint::Unknown);
+    let report = standby
+        .promote(&Fencing::Lease { expired: true }, Vec::new())
+        .unwrap();
+    assert_eq!(report.verified, Some(at(100, 3)));
+    assert_eq!(report.gap.sealed_unverified, None);
 }
