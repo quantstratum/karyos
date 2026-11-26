@@ -312,6 +312,12 @@ impl MembershipEntry {
         decoder.finish()?;
         let (voter_ids, rest) = ids.split_at(voters);
         let learner_ids = rest.get(..learners).ok_or(out_of_range)?;
+        // Each list ascending: an unsorted list is another encoding of the
+        // same membership, and one encoding per membership is the rule.
+        let ascending = |list: &[u64]| list.windows(2).all(|pair| matches!(pair, [low, high] if low < high));
+        if !ascending(voter_ids) || !ascending(learner_ids) {
+            return Err(out_of_range);
+        }
         let membership = Membership::new(voter_ids, learner_ids).map_err(|_| out_of_range)?;
         Ok(Self(membership))
     }
@@ -397,6 +403,16 @@ mod tests {
             out
         };
         assert!(MembershipEntry::decode(&repeated).is_err());
+        // Voters out of order (vector P-8): ids 1, 3, 2.
+        let mut unsorted = bytes.clone();
+        unsorted[ENVELOPE_LENGTH + 10] = 3;
+        unsorted[ENVELOPE_LENGTH + 18] = 2;
+        assert_eq!(
+            MembershipEntry::decode(&unsorted),
+            Err(CodecError::ValueOutOfRange {
+                field: "membership"
+            })
+        );
         // Another core entry is not one.
         let bounds = crate::service::SessionBounds::new(crate::dedup::DedupConfig::default())
             .to_vec()
