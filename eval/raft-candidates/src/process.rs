@@ -99,12 +99,6 @@ pub trait Wire: ConsensusCore {
     /// The term and index an accepted append reply acknowledges; `None`
     /// for any other message.
     fn acknowledged(message: &Self::Message) -> Option<(u64, u64)>;
-
-    /// Whether the node gives each message back to the core once it has
-    /// sent it, through the Ready buffer ([`ReadyBuf::give_sent`]), for an
-    /// adapter that pools its messages' buffers (C5 v3). Otherwise the node
-    /// frees it, counted as its encoding.
-    const RECLAIMS_SENT: bool = false;
 }
 
 /// A probed core's messages are its inner core's. [`run_server`] counts
@@ -138,8 +132,6 @@ impl<C: Wire> Wire for Probed<C> {
     fn acknowledged(message: &Self::Message) -> Option<(u64, u64)> {
         C::acknowledged(message)
     }
-
-    const RECLAIMS_SENT: bool = C::RECLAIMS_SENT;
 }
 
 /// The largest datagram a node sends or reads.
@@ -180,10 +172,6 @@ pub const TICK_MS: u64 = 10;
 /// Datagrams a node reads at most per loop: a flood never starves its
 /// ticks.
 pub const MAX_READS_PER_LOOP: usize = 256;
-
-/// Sent messages a node gives back to its core between two drives, at
-/// most without growing the Ready buffer's room for them.
-const SENT_ROOM: usize = 4096;
 
 /// The W1 cases a real-process run takes: the harness's frozen W1
 /// (`W1::skeleton().cases()`, every process count, payload and client
@@ -1043,22 +1031,18 @@ fn arrived<'d, C: Wire>(
 /// its warm-up (C5 v2, "Processes"; version 1's allocation gate counts
 /// "adapters and encoding included"); outside a measurement it counts
 /// nothing. The message itself is freed here too, as the outbox hands it
-/// over, unless the core takes its messages back ([`Wire::RECLAIMS_SENT`]):
-/// then it is returned, for the node to give back through its Ready
-/// buffer.
+/// over.
 fn send<C: Wire>(
     socket: &UdpSocket,
     (id, number): (NodeId, u32),
     message: C::Message,
     address: SocketAddr,
     buffers: &mut Buffers,
-) -> Option<C::Message> {
+) {
     probe::encoding(|| {
         transmit::<C>(socket, (id, number), &message, address, buffers);
-        // Given back for the node to return through its Ready buffer, or
-        // freed here.
-        C::RECLAIMS_SENT.then_some(message)
-    })
+        drop(message);
+    });
 }
 
 /// The buffers a node encodes and sends in, kept and prefilled at its
@@ -1194,9 +1178,6 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
         traces: config.case.limits.is_some(),
     };
     serving.record_state(&core, &log);
-    // Room for the messages given back between two drives, at
-    // initialisation.
-    serving.ready.reserve_sent(SENT_ROOM);
     let start = Instant::now();
     let mut buffer = vec![0u8; MAX_DATAGRAM];
     let mut scratch = vec![0u8; 1 << 16];
@@ -1307,17 +1288,12 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
                 .filter(|_| !cut(&cuts, now, config.id, to));
             // A message not sent (a cut link, an unknown peer) is done with
             // all the same.
-            let done = match address {
+            match address {
                 Some(address) => {
                     number = number.wrapping_add(1);
-                    send::<C>(&socket, (config.id, number), message, address, &mut buffers)
+                    send::<C>(&socket, (config.id, number), message, address, &mut buffers);
                 }
-                None => probe::encoding(|| C::RECLAIMS_SENT.then_some(message)),
-            };
-            // Back to the core through the node's Ready buffer, counted
-            // with the encoding that finished with it (C5 v3).
-            if let Some(message) = done {
-                probe::encoding(|| serving.ready.give_sent(message));
+                None => probe::encoding(|| drop(message)),
             }
         }
         for (client, message) in serving.replies.drain(..) {
