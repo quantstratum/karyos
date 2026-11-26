@@ -1066,3 +1066,271 @@ fn identity_of_inverts_publication_of() {
     };
     assert_eq!(identity_of(&publication_of(&identity)), identity);
 }
+
+/// The inner frame type each data domain carries in these tests: DATA in
+/// domain 1, an SM in domain 4.
+fn data_kind(domain: Domain) -> u16 {
+    if domain.is_receiver() { 0x03 } else { DATA }
+}
+
+/// A data sealer and opener of `domain`, with the pairwise files of
+/// receiver 66 in domain 4.
+fn data_pair(domain: Domain, files: &PairwiseFiles) -> (EncSealer, EncOpener) {
+    let pairwise = domain.is_receiver().then_some(files);
+    (
+        EncSealer::new(&keys(), pairwise, context(domain), clock).unwrap(),
+        EncOpener::new(&keys(), pairwise, context(domain), clock()).unwrap(),
+    )
+}
+
+/// Gate H9 (manifest section 7; ADR-0114 section 6, "Budgets per data
+/// key" and "Accounting before every open"): with the real
+/// `DATA_SEQ_CAP` (2^32), a data sealer of domain 1 and of domain 4 whose
+/// counter stands one below the cap seals that last sequence under its
+/// epoch, then moves to the next `party_epoch` before it would reach the
+/// cap, its counter from 0; the receiver opens both sides of the roll and
+/// promotes.
+#[test]
+fn the_sender_rolls_before_the_sequence_cap() {
+    let files = pairs(0x22);
+    for domain in [Domain::Sender, Domain::Receiver] {
+        let (mut sealer, mut opener) = data_pair(domain, &files);
+        let mut channel = EncChannel::default();
+        let kind = frame(data_kind(domain));
+        sealer.key().set_next_seq(DATA_SEQ_CAP - 1);
+        let last = seal(&mut sealer, &kind);
+        let head = header(&last).unwrap();
+        assert_eq!(
+            (head.party_epoch, head.seq),
+            (0, DATA_SEQ_CAP - 1),
+            "{domain:?}"
+        );
+        assert!(open(&mut opener, &mut channel, &last).is_ok(), "{domain:?}");
+        let next = seal(&mut sealer, &kind);
+        let head = header(&next).unwrap();
+        assert_eq!((head.party_epoch, head.seq), (1, 0), "{domain:?} rolled");
+        assert_eq!(sealer.key().next_seq(), 1);
+        assert!(open(&mut opener, &mut channel, &next).unwrap().promoted);
+        assert_eq!(opener.epochs(), (1, 1));
+        assert_eq!(channel.rejections.total(), 0, "{domain:?}");
+    }
+}
+
+/// Gate H9 (ADR-0114 section 6, the 2^42-byte budget): with the real
+/// `DATA_BYTE_BUDGET`, a datagram that fills the budget exactly is sealed
+/// under the current epoch, and one that would pass it by a single byte
+/// rolls first, in domain 1 and in domain 4, whose 20-byte pairwise
+/// trailer counts in the protected bytes as the seal charges them.
+#[test]
+fn the_sender_rolls_before_the_byte_budget() {
+    let files = pairs(0x22);
+    for domain in [Domain::Sender, Domain::Receiver] {
+        let kind = frame(data_kind(domain));
+        let (mut sealer, _) = data_pair(domain, &files);
+        let trailer = sealer.overhead() - ENVELOPE_LEN;
+        assert_eq!(trailer, if domain.is_receiver() { 20 } else { 0 });
+        let protected = u64::try_from(HEADER_LEN + kind.len() + trailer).unwrap();
+        // Exactly the budget: sealed under the current epoch.
+        sealer.key().set_sealed_bytes(DATA_BYTE_BUDGET - protected);
+        let _ = seal(&mut sealer, &kind);
+        assert_eq!(sealer.context().party_epoch, 0, "{domain:?}");
+        assert_eq!(sealer.key().sealed_bytes(), DATA_BYTE_BUDGET);
+        let next = seal(&mut sealer, &kind);
+        assert_eq!(header(&next).unwrap().party_epoch, 1, "{domain:?}");
+        assert_eq!(sealer.key().sealed_bytes(), protected);
+        // One byte short of room: it rolls before sealing.
+        let (mut sealer, mut opener) = data_pair(domain, &files);
+        let mut channel = EncChannel::default();
+        sealer
+            .key()
+            .set_sealed_bytes(DATA_BYTE_BUDGET - protected + 1);
+        let mut bytes = vec![0_u8; MAX_SEALED];
+        bytes[..kind.len()].copy_from_slice(&kind);
+        let length = sealer.seal(&mut bytes, kind.len());
+        assert!(length.is_ok(), "{domain:?}: {length:?}");
+        bytes.truncate(length.unwrap());
+        assert_eq!(header(&bytes).unwrap().party_epoch, 1, "{domain:?} rolled");
+        assert_eq!(sealer.key().sealed_bytes(), protected);
+        assert!(open(&mut opener, &mut channel, &bytes).unwrap().promoted);
+    }
+}
+
+/// Gate H9, fail closed (ADR-0114 section 6, "Epoch capacity"): a data
+/// sealer at the last `party_epoch` cannot roll, so at the sequence cap or
+/// the byte budget it refuses the seal (`EpochsExhausted`), writes
+/// nothing and keeps its key; it never seals at or past the cap.
+#[test]
+fn a_sender_that_cannot_roll_fails_closed_at_the_cap() {
+    let files = pairs(0x22);
+    for domain in [Domain::Sender, Domain::Receiver] {
+        let pairwise = domain.is_receiver().then_some(&files);
+        let mut last = context(domain);
+        last.party_epoch = u16::MAX;
+        let kind = frame(data_kind(domain));
+        for at_cap in [true, false] {
+            let mut sealer = EncSealer::new(&keys(), pairwise, last, clock).unwrap();
+            if at_cap {
+                sealer.key().set_next_seq(DATA_SEQ_CAP);
+            } else {
+                sealer.key().set_sealed_bytes(DATA_BYTE_BUDGET);
+            }
+            let mut bytes = vec![0_u8; MAX_SEALED];
+            bytes[..kind.len()].copy_from_slice(&kind);
+            let before = bytes.clone();
+            assert_eq!(
+                sealer.seal(&mut bytes, kind.len()),
+                Err(EncSendError::EpochsExhausted),
+                "{domain:?}"
+            );
+            assert_eq!(bytes, before, "nothing written");
+            assert_eq!(sealer.context(), &last, "the key is kept");
+            assert!(sealer.key().next_seq() <= DATA_SEQ_CAP);
+        }
+    }
+}
+
+/// Gate H4, "old epoch after rotation", and ADR-0114 "Validation", "an
+/// epoch roll in each domain 1, 4, 5 and 6": the data domains 1 and 4
+/// roll their `party_epoch`, the receiver promotes the next epoch and
+/// keeps the previous one for the 10 s overlap only; the bootstrap
+/// domains 5 and 6 (always `party_epoch` 0) roll with the file epoch, the
+/// new datagram current and the old one verifying but not current, so it
+/// never binds (section 7).
+#[test]
+fn an_epoch_rolls_in_each_domain() {
+    let start = clock();
+    let files = pairs(0x22);
+    for domain in [Domain::Sender, Domain::Receiver] {
+        set_now(start);
+        let kind = frame(data_kind(domain));
+        let (mut sealer, mut opener) = data_pair(domain, &files);
+        let mut channel = EncChannel::default();
+        let old = seal(&mut sealer, &kind);
+        let old_late = seal(&mut sealer, &kind);
+        assert!(open(&mut opener, &mut channel, &old).is_ok());
+        sealer.roll_now();
+        let new = seal(&mut sealer, &kind);
+        assert_eq!(header(&new).unwrap().party_epoch, 1, "{domain:?}");
+        assert!(open(&mut opener, &mut channel, &new).unwrap().promoted);
+        assert_eq!(opener.epochs(), (1, 1), "{domain:?}");
+        set_now(start + EPOCH_OVERLAP_NS - 1);
+        assert!(open(&mut opener, &mut channel, &old_late).is_ok());
+        set_now(start + EPOCH_OVERLAP_NS);
+        let mut stale = EncSealer::new(
+            &keys(),
+            domain.is_receiver().then_some(&files),
+            context(domain),
+            clock,
+        )
+        .unwrap();
+        stale.key().set_next_seq(5);
+        assert_eq!(
+            open(&mut opener, &mut channel, &seal(&mut stale, &kind)),
+            Err(EncRejection::Epoch),
+            "{domain:?}: the old epoch after the overlap"
+        );
+    }
+    set_now(start);
+    let rotated = set(vec![
+        channel_file(1, 0x11),
+        channel_file(2, 0x22),
+        pairwise_file(66, 1, 0x22),
+        pairwise_file(66, 2, 0x44),
+    ]);
+    let both = ChannelKeys::new(&[&channel_file(1, 0x11), &channel_file(2, 0x22)]).unwrap();
+    let both_pairs =
+        PairwiseFiles::new(&[&pairwise_file(66, 1, 0x22), &pairwise_file(66, 2, 0x44)]).unwrap();
+    for (domain, kind) in [(Domain::Setup, 0x05), (Domain::RspSetup, 0x07)] {
+        let pairwise = domain.is_receiver().then_some(&files);
+        let mut sealer = EncSealer::new(&keys(), pairwise, context(domain), clock).unwrap();
+        let old = seal(&mut sealer, &frame(kind));
+        sealer.apply_keys(&rotated);
+        assert!(!sealer.is_withdrawn(), "{domain:?}");
+        assert_eq!(
+            (sealer.context().key_epoch, sealer.context().party_epoch),
+            (2, 0),
+            "{domain:?}"
+        );
+        let new = seal(&mut sealer, &frame(kind));
+        let mut rate = OpenRate::default();
+        let mut out = [0_u8; MAX_PLAINTEXT];
+        let mut opened = |bytes: &[u8]| {
+            open_bootstrap(
+                &both,
+                Some(&both_pairs),
+                Some(PUBLICATION),
+                bytes,
+                &mut out,
+                &mut rate,
+                clock(),
+                |_, _| Ok(()),
+            )
+            .map(|opened| (opened.header.key_epoch, opened.current_epoch))
+        };
+        assert_eq!(opened(&new), Ok((2, true)), "{domain:?}");
+        assert_eq!(opened(&old), Ok((1, false)), "{domain:?}: never binds");
+    }
+}
+
+/// Gate H4, "cloned or restored node" (ADR-0114 section 7, "Publisher
+/// restart"): a publisher restored with the same key files and the same
+/// alias but a new `driver_id` derives other keys in every domain, so no
+/// datagram of the old incarnation (domain 1 DATA, a domain 4 SM, a domain
+/// 6 RSP_SETUP addressed to the old identity) opens under the new
+/// identity's keys, and none moves a window; its own datagrams open. A
+/// clone that keeps the `driver_id` is the VM generation case of section
+/// 10 (`vm_generation` tests): it seals nothing in the new generation.
+#[test]
+fn a_restored_publisher_with_a_new_driver_id_opens_no_old_datagram() {
+    let files = pairs(0x22);
+    let restored = PublicationIdentity {
+        driver_id: [9; 16],
+        ..PUBLICATION
+    };
+    for domain in [Domain::Sender, Domain::Receiver] {
+        let pairwise = domain.is_receiver().then_some(&files);
+        let kind = frame(data_kind(domain));
+        let mut old = EncSealer::new(&keys(), pairwise, context(domain), clock).unwrap();
+        let datagram = seal(&mut old, &kind);
+        let mut fresh_context = context(domain);
+        fresh_context.publication = restored;
+        let mut opener = EncOpener::new(&keys(), pairwise, fresh_context, clock()).unwrap();
+        let mut channel = EncChannel::default();
+        assert!(
+            open(&mut opener, &mut channel, &datagram).is_err(),
+            "{domain:?}"
+        );
+        // Its header renamed to the new identity: the key differs, so the
+        // tag refuses it.
+        if domain == Domain::Sender {
+            let mut renamed = datagram.clone();
+            renamed[36..52].copy_from_slice(&restored.driver_id);
+            assert_eq!(
+                open(&mut opener, &mut channel, &renamed),
+                Err(EncRejection::Tag)
+            );
+        }
+        assert_eq!(opener.current_window().highest(), None, "{domain:?}");
+        assert_eq!(opener.epochs(), (1, 0));
+        let mut fresh = EncSealer::new(&keys(), pairwise, fresh_context, clock).unwrap();
+        fresh.key().set_next_seq(1);
+        assert!(open(&mut opener, &mut channel, &seal(&mut fresh, &kind)).is_ok());
+    }
+    let mut rsp = EncSealer::new(&keys(), Some(&files), context(Domain::RspSetup), clock).unwrap();
+    let old = seal(&mut rsp, &frame(0x07));
+    let mut out = [0_u8; MAX_PLAINTEXT];
+    let mut rate = OpenRate::default();
+    assert!(
+        open_bootstrap(
+            &keys(),
+            Some(&files),
+            Some(restored),
+            &old,
+            &mut out,
+            &mut rate,
+            clock(),
+            |_, _| Ok(())
+        )
+        .is_err()
+    );
+}

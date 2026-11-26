@@ -751,3 +751,45 @@ fn a_retired_identity_is_dropped_for_its_quarantine_without_a_derivation() {
     assert_eq!(rejections.get(EncRejection::RetiredParty), 1);
     assert_eq!(rejections.total(), 1);
 }
+
+/// Gate H10 (manifest section 7 and section 2.1, the R4 flood; ADR-0114
+/// sections 6 and 8, "Accounting before every open"): a flood of domain 5
+/// SETUP ANNOUNCEs forged under another channel key (invalid tags) goes
+/// through the receiver role's real receive path allocating nothing; each
+/// is dropped and counted (`enc_tag`) after one scratch open, makes no
+/// challenge entry, and changes nothing of the role but its datagram
+/// count. The domain 1 flood on an established image is
+/// `an_invalid_tag_flood_on_an_encrypted_image_allocates_nothing` (images
+/// tests).
+#[test]
+fn an_invalid_tag_setup_flood_allocates_nothing_and_changes_nothing() {
+    const FLOOD: usize = 2_000;
+
+    let mut rig = rig();
+    // At most 100 bootstrap seals a second: the ANNOUNCEs cycle.
+    let mut forger = setup_sealer(0x99);
+    let announces: Vec<Vec<u8>> = (0..50).map(|_| sealed(&mut forger, &announce())).collect();
+    // One first: the scratch slot is made once, ahead of the flood.
+    rig.inject(&announces[0]);
+    let counters = rig.role.counters;
+    let before = rig.rejections();
+    let ((), allocations) = karyos_sys::alloc_count::count_allocations(|| {
+        for bytes in announces.iter().cycle().take(FLOOD) {
+            rig.inject(bytes);
+        }
+    });
+    assert_eq!(allocations, 0, "the flood allocates nothing");
+    let after = rig.rejections();
+    let flooded = u64::try_from(FLOOD).unwrap();
+    assert_eq!(
+        after.get(EncRejection::Tag),
+        before.get(EncRejection::Tag) + flooded,
+        "{after:?}"
+    );
+    assert_eq!(after.total(), before.total() + flooded, "{after:?}");
+    assert!(rig.role.posted_challenges().is_empty(), "no challenge");
+    let mut moved = rig.role.counters;
+    moved.datagrams = counters.datagrams;
+    assert_eq!(moved, counters, "nothing but the datagram count");
+    assert_eq!(rig.role.enc.unattributed, EncRejections::default());
+}

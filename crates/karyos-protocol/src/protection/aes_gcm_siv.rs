@@ -838,10 +838,21 @@ impl AesGcmSiv {
         self.window.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Starts the counter at `seq`, for tests near the cap.
-    #[cfg(test)]
-    pub(crate) fn set_next_seq(&self, seq: u64) {
+    /// Starts the counter at `seq`, for tests near the cap (feature
+    /// `test-hooks` for dependent crates' tests; never in a release
+    /// build).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_next_seq(&self, seq: u64) {
         self.next_seq.store(seq, Ordering::Relaxed);
+    }
+
+    /// Starts the byte budget's tally at `bytes`, for tests near the
+    /// budget (as [`Self::set_next_seq`]).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_sealed_bytes(&self, bytes: u64) {
+        self.sealed_bytes.store(bytes, Ordering::Relaxed);
     }
 
     /// The 96-bit nonce of `seq` (section 5).

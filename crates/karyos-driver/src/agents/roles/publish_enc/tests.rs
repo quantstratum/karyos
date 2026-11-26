@@ -8,7 +8,9 @@ use std::cell::Cell;
 
 use karyos_protocol::frame::Lane;
 use karyos_protocol::network::encrypted::{EncSetup, decode_setup};
-use karyos_protocol::network::{ChallengeBlock, Lanes, Nak, NakRange, RspChallenge, TermParams};
+use karyos_protocol::network::{
+    ChallengeBlock, LaneStatus, Lanes, Nak, NakRange, RspChallenge, StatusMessage, TermParams,
+};
 use karyos_protocol::protection::aes_gcm_siv::{EncRejection, MAX_PLAINTEXT};
 
 use super::*;
@@ -553,4 +555,196 @@ impl FreshPeer {
         });
         seal_control(&mut self.rsp, &control)
     }
+}
+
+impl Peer {
+    /// The receiver's SM for this publication.
+    fn sm(&self) -> Control {
+        let boot = self.boot;
+        Control::Status(StatusMessage {
+            alias: ALIAS,
+            identity: IDENTITY,
+            receiver: Receiver {
+                receiver_boot_id: [boot, boot],
+                receiver_id: 66,
+            },
+            group_tag: 0,
+            lanes: Lanes::new(&[LaneStatus {
+                consumption: 4096,
+                window: 65_536,
+            }])
+            .unwrap(),
+        })
+    }
+}
+
+/// A pairwise file of `receiver_id`.
+fn pairwise_of(receiver_id: u64, fill: u8) -> KeyFile {
+    let secret: String = (0..KEY_LEN).map(|_| format!("{fill:02x}")).collect();
+    file(
+        format!(
+            "format=karyos-wire-key-v1\nkey_id=9\nfile_epoch=1\npurpose=pairwise\nprofile_id=16\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret={secret}\nreceiver_id={receiver_id}\npublisher_id=5\n"
+        ),
+        "9-1.key",
+    )
+}
+
+/// Gate H3 (manifest section 7 and table 2.2; ADR-0114 section 4, "a
+/// group holder cannot impersonate a named receiver", and section 7,
+/// "Pairwise proof first"): another receiver holding the channel key
+/// forges the bound receiver's SM and NAK. Under the bound receiver's
+/// identity with its own pairwise secret the outer tag verifies and the
+/// trailer refuses them (`enc_pairwise`); under its own identity, with
+/// its own valid trailer, no binding names it (`enc_party`). Neither
+/// changes the binding nor marks the window: the genuine receiver's SM and
+/// NAK at its next sequences, below the forged ones, still open.
+#[test]
+fn another_receivers_forged_sm_and_nak_change_nothing_at_the_publisher() {
+    let mut publication = publication();
+    let mut genuine = peer(5, 0x22, 1, &keys());
+    assert!(open(&mut publication, &genuine.challenge()).is_ok());
+    let bound = publication.bound_receiver();
+    assert_eq!(bound, Some(genuine.receiver));
+    let (mut sealer, _) = genuine.data_keys();
+    let (sm, nak) = (genuine.sm(), genuine.nak());
+    // The bound receiver's identity, the forger's own pairwise secret.
+    let theirs = PairwiseFiles::new(&[&pairwise(0x55)]).unwrap();
+    let mut forged = EncSealer::new(&keys(), Some(&theirs), *sealer.context(), clock).unwrap();
+    for _ in 0..4 {
+        let _ = seal_control(&mut forged, &sm);
+    }
+    // Its own identity (receiver 67) and its own valid pairwise file.
+    let other = ReceiverIdentity {
+        receiver_boot_id: id128([6, 6]),
+        receiver_id: 67,
+    };
+    let own_files = PairwiseFiles::new(&[&pairwise_of(67, 0x66)]).unwrap();
+    let mut own_context = *sealer.context();
+    own_context.receiver = Some(other);
+    own_context.salt = Salt::Challenge {
+        receiver_boot_id: other.receiver_boot_id,
+        nonce: id128(genuine.nonce),
+    };
+    let mut own = EncSealer::new(&keys(), Some(&own_files), own_context, clock).unwrap();
+    for control in [sm, nak] {
+        assert_eq!(
+            open(&mut publication, &seal_control(&mut forged, &control)),
+            Err(EncRejection::Pairwise)
+        );
+        assert_eq!(
+            open(&mut publication, &seal_control(&mut own, &control)),
+            Err(EncRejection::Party)
+        );
+    }
+    let rejections = publication.channel.rejections;
+    assert_eq!(rejections.get(EncRejection::Pairwise), 2);
+    assert_eq!(rejections.get(EncRejection::Party), 2);
+    assert_eq!(rejections.total(), 4);
+    assert_eq!(publication.bound_receiver(), bound, "the binding stays");
+    // The genuine SM and NAK at sequences 0 and 1: the window never moved.
+    for control in [sm, nak] {
+        assert_eq!(
+            open(&mut publication, &seal_control(&mut sealer, &control)),
+            Ok(EncOpened::Receiver(control))
+        );
+    }
+}
+
+/// ADR-0114 "Validation", "a receiver that misses a whole epoch and
+/// catches up by establishment" (section 6, "Discovery for a fresh
+/// receiver"; gate H4, old epoch after a roll): the session's domain 1
+/// sealer moves two epochs on, so the receiver's opener refuses its DATA
+/// (`enc_epoch`). The receiver restarts and establishes afresh; the ENC
+/// ANSWER states the epochs of the session it binds, and an opener started
+/// at the stated pair opens that session's DATA.
+#[test]
+fn a_receiver_that_missed_a_whole_epoch_catches_up_by_establishment() {
+    let mut publication = publication();
+    let mut first = peer(5, 0x22, 1, &keys());
+    let Ok(EncOpened::RspSetup(_, establishing)) = open(&mut publication, &first.challenge())
+    else {
+        panic!()
+    };
+    let mut session = publication.data_sealer(&establishing).unwrap();
+    let mut stale = EncOpener::new(&keys(), None, *session.context(), clock()).unwrap();
+    session.roll_now();
+    session.roll_now();
+    let data = |sealer: &mut EncSealer| {
+        let mut bytes = vec![0_u8; MAX_SEALED];
+        bytes[..4].copy_from_slice(&32_i32.to_le_bytes());
+        bytes[4] = 1;
+        bytes[6] = 1;
+        let length = sealer.seal(&mut bytes, 32).unwrap();
+        bytes.truncate(length);
+        bytes
+    };
+    let mut rate = OpenRate::default();
+    let mut out = [0_u8; MAX_PLAINTEXT];
+    assert_eq!(
+        stale
+            .open(
+                &data(&mut session),
+                &mut out,
+                &mut rate,
+                clock(),
+                |_| Ok(())
+            )
+            .map(|_| ()),
+        Err(EncRejection::Epoch),
+        "a whole epoch missed"
+    );
+    // A fresh establishment under a new boot id.
+    let mut second = peer(6, 0x22, 1, &keys());
+    let Ok(EncOpened::RspSetup(_, again)) = open(&mut publication, &second.challenge()) else {
+        panic!()
+    };
+    assert!(again.bind);
+    let mut fresh = publication.data_sealer(&again).unwrap();
+    let _ = data(&mut fresh);
+    let answer = SetupAnswer {
+        alias: ALIAS,
+        identity: IDENTITY,
+        term: TermParams {
+            term_length: 65_536,
+            initial_term_id: 0,
+            mtu: 1408,
+        },
+        challenge: ChallengeBlock {
+            receiver_boot_id: [6, 6],
+            nonce: second.nonce,
+        },
+        joins: Lanes::new(&[0]).unwrap(),
+    };
+    let mut bytes = [0_u8; MAX_SEALED];
+    let length = publication
+        .seal_answer(answer, fresh.context().party_epoch, &mut bytes)
+        .unwrap();
+    let opened = open_bootstrap(
+        &keys(),
+        None,
+        None,
+        &bytes[..length],
+        &mut out,
+        &mut rate,
+        clock(),
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    assert!(opened.current_epoch);
+    let Ok(EncSetup::Answer(enc)) = decode_setup(&out[..opened.frames]) else {
+        panic!()
+    };
+    assert_eq!(
+        (enc.key_epoch, enc.party_epoch),
+        (fresh.context().key_epoch, fresh.context().party_epoch)
+    );
+    let mut stated = *fresh.context();
+    (stated.key_epoch, stated.party_epoch) = (enc.key_epoch, enc.party_epoch);
+    let mut caught_up = EncOpener::new(&keys(), None, stated, clock()).unwrap();
+    assert!(
+        caught_up
+            .open(&data(&mut fresh), &mut out, &mut rate, clock(), |_| Ok(()))
+            .is_ok()
+    );
+    let _ = &mut first;
 }

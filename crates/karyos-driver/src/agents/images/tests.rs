@@ -10996,3 +10996,300 @@ fn a_full_or_unreadable_abort_record_fails_closed() {
 }
 /// H8 round 4: insufficient evidence raised and missing properties (karyos#648).
 mod invariants_r4;
+
+/// `record` sealed again, byte for byte as it went out: AES-GCM-SIV is
+/// deterministic, so the same key context, sequence and plaintext give the
+/// same datagram. A replay an attacker captured off the wire.
+fn replayed(record: &crate::wire_enc::SealedRecord) -> Vec<u8> {
+    use crate::wire_enc::{ChannelKeys, EncSealer, MAX_SEALED, PairwiseFiles};
+
+    let (channel, pairwise) = enc_keys(77);
+    let keys = ChannelKeys::new(&[&channel]).unwrap();
+    let files = PairwiseFiles::new(&[&pairwise]).unwrap();
+    let pairwise = record.context.domain.is_receiver().then_some(&files);
+    let mut sealer = EncSealer::new(
+        &keys,
+        pairwise,
+        record.context,
+        crate::wire_enc::monotonic_ns,
+    )
+    .unwrap();
+    sealer.key().set_next_seq(record.seq);
+    let mut bytes = vec![0_u8; MAX_SEALED];
+    bytes[..record.frames.len()].copy_from_slice(&record.frames);
+    let length = sealer.seal(&mut bytes, record.frames.len()).unwrap();
+    bytes.truncate(length);
+    bytes
+}
+
+/// Gate H4 (manifest P2 and section 7; ADR-0114 section 8, ADR-0044
+/// decision 5): replayed encrypted DATA and heartbeats of a sender that
+/// went silent do not keep its image alive. Every domain 1 datagram the
+/// publication sent (its DATA and its heartbeats) is replayed byte for
+/// byte to the receiver once a second; each is refused by the image's
+/// replay window, nothing is committed, and the image still retires at
+/// `image_liveness_timeout`.
+#[test]
+fn replayed_encrypted_data_and_heartbeats_do_not_keep_the_image_alive() {
+    use karyos_protocol::protection::aes_gcm_siv::Domain;
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, b) = encrypted_rig();
+    crate::wire_enc::record_seals();
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let first: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; 100]).collect();
+    assert_eq!(enc_deliver(&mut rig, &mut subscriber, &first), first);
+    // Idle rounds: the publication's heartbeats.
+    for _ in 0..300 {
+        rig.round(true);
+    }
+    let seals = crate::wire_enc::take_seals();
+    let sent: Vec<&crate::wire_enc::SealedRecord> = seals
+        .iter()
+        .filter(|record| record.context.domain == Domain::Sender)
+        .collect();
+    let heartbeats = sent
+        .iter()
+        .filter(|record| record.frames.len() == 32)
+        .count();
+    assert!(heartbeats > 0, "heartbeats recorded: {} sealed", sent.len());
+    assert!(sent.len() > heartbeats, "DATA recorded");
+    let replays: Vec<Vec<u8>> = sent.into_iter().map(replayed).collect();
+    rig.sender_stopped = true;
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let refused = |rig: &Rig| {
+        rig.agents
+            .receiver
+            .role
+            .enc_rejections(b, alias().stream_id)
+            .unwrap()
+            .total()
+    };
+    let committed = rig.agents.receiver.counters().data_committed;
+    let mut retired_after = None;
+    for second in 1..=12u64 {
+        rig.now += 1_000 * MS;
+        VIRTUAL_NOW.with(|now| now.set(rig.now));
+        let bound = rig.agents.receiver.role.has_image(slot);
+        let before = refused(&rig);
+        for bytes in &replays {
+            let receiver = &mut rig.agents.receiver;
+            receiver
+                .role
+                .inject_datagram(&receiver.sessions, b, source, bytes, rig.now);
+        }
+        if bound {
+            assert_eq!(
+                refused(&rig),
+                before + u64::try_from(replays.len()).unwrap(),
+                "every replay refused while the image is bound"
+            );
+        }
+        rig.round(true);
+        if retired_after.is_none() && !rig.agents.receiver.role.has_image(slot) {
+            retired_after = Some(second);
+        }
+    }
+    let retired_after = retired_after.expect("the replays kept the image alive");
+    assert!(retired_after <= 11, "retired after {retired_after} s");
+    assert_eq!(
+        rig.agents.receiver.counters().data_committed,
+        committed,
+        "no replay committed"
+    );
+}
+
+/// Gate H4 (manifest section 7, "a replayed SM neither refreshes a
+/// receiver's liveness nor moves a limit"; section 2.3, Q-14; ADR-0114
+/// section 8): the receiver's domain 4 SMs are replayed byte for byte to
+/// the publisher once a second after the receiver went silent (its keys
+/// revoked, so it seals no SM any more). None is accepted, the
+/// receiver's limit and the registered position stay, and the publisher
+/// still expires the receiver's binding at the liveness timeout.
+#[test]
+fn a_replayed_encrypted_sm_neither_refreshes_the_receiver_nor_moves_its_limit() {
+    use karyos_protocol::frame::Lane;
+    use karyos_protocol::protection::aes_gcm_siv::Domain;
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, b) = encrypted_rig();
+    let a = rig.publisher;
+    crate::wire_enc::record_seals();
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let first: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; 100]).collect();
+    assert_eq!(enc_deliver(&mut rig, &mut subscriber, &first), first);
+    for _ in 0..100 {
+        rig.round(true);
+    }
+    let replays: Vec<Vec<u8>> = crate::wire_enc::take_seals()
+        .iter()
+        .filter(|record| record.context.domain == Domain::Receiver)
+        .map(replayed)
+        .collect();
+    assert!(replays.len() > 1, "SMs recorded");
+    rig.agents
+        .receiver
+        .role
+        .apply_keys(&crate::wire_auth::FixedKeys::default());
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    let from = rig.endpoints.local_address(b).unwrap();
+    let accepted = rig.agents.sender.role.counters().sm_accepted;
+    let limit = |rig: &Rig| {
+        let outbound = rig.agents.sender.role.outbound(0).unwrap();
+        outbound
+            .membership()
+            .map(|membership| format!("{:?}", membership.limit(Lane::ZERO, rig.now)))
+    };
+    let sent = |rig: &Rig| rig.agents.sender.role.outbound(0).unwrap().readers()[0].sent_position();
+    let (held_limit, held) = (limit(&rig), sent(&rig));
+    let refused_before = rig
+        .agents
+        .sender
+        .role
+        .enc_rejections(a, alias())
+        .unwrap()
+        .total();
+    let mut expired_after = None;
+    for second in 1..=12u64 {
+        rig.now += 1_000 * MS;
+        for bytes in &replays {
+            inject_at_a(&mut rig, from, bytes);
+        }
+        if second < 5 {
+            assert_eq!(limit(&rig), held_limit, "a replay moved the limit");
+        }
+        if expired_after.is_none() && rig.agents.sender.role.counters().bindings_expired >= 1 {
+            expired_after = Some(second);
+        }
+    }
+    assert_eq!(
+        rig.agents.sender.role.counters().sm_accepted,
+        accepted,
+        "no replayed SM accepted"
+    );
+    let refused = rig
+        .agents
+        .sender
+        .role
+        .enc_rejections(a, alias())
+        .unwrap()
+        .total();
+    assert!(
+        refused >= refused_before + u64::try_from(replays.len()).unwrap(),
+        "every replay refused: {refused}"
+    );
+    assert_eq!(sent(&rig), held, "the position moved");
+    let expired_after = expired_after.expect("the replays kept the receiver alive");
+    assert!(expired_after <= 11, "expired after {expired_after} s");
+}
+
+/// Gate H10 (manifest section 7 and section 2.1, the R4 flood; ADR-0114
+/// sections 6 and 8, "Accounting before every open"), on an established
+/// encrypted image through the receiver role's real receive path: 1000
+/// domain 1 datagrams forged under another channel key (valid header and
+/// context, invalid tag, sequences past the genuine sender's) are handled
+/// allocating nothing; each is dropped and counted (`enc_tag`), nothing
+/// is committed, and the image's epochs stay. 500 more forged two epochs
+/// ahead are dropped (`enc_epoch`) before any derivation and start at most
+/// one resynchronisation challenge for the binding (section 6b step 1).
+/// Delivery then goes on: no forged datagram moved the replay window.
+#[test]
+fn an_invalid_tag_flood_on_an_encrypted_image_allocates_nothing() {
+    use karyos_protocol::protection::aes_gcm_siv::{Domain, EncRejection};
+    use karyos_sys::log_buffer::Role;
+
+    use crate::wire_enc::{ChannelKeys, EncSealer, MAX_SEALED};
+
+    let (mut rig, b) = encrypted_rig();
+    crate::wire_enc::record_seals();
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let first: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; 100]).collect();
+    assert_eq!(enc_deliver(&mut rig, &mut subscriber, &first), first);
+    let last = crate::wire_enc::take_seals()
+        .into_iter()
+        .filter(|record| record.context.domain == Domain::Sender)
+        .max_by_key(|record| record.seq)
+        .unwrap();
+    let forged_keys = ChannelKeys::new(&[&crate::wire_keys::parse(
+        "3-1.key",
+        b"format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=1\npurpose=channel\nprofile_id=16\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=9999999999999999999999999999999999999999999999999999999999999999\nchannel_id=7\nstream_id=6\n",
+    )
+    .unwrap()])
+    .unwrap();
+    let forge = |context, from: u64, count: u64| -> Vec<Vec<u8>> {
+        let mut sealer =
+            EncSealer::new(&forged_keys, None, context, crate::wire_enc::monotonic_ns).unwrap();
+        sealer.key().set_next_seq(from);
+        (0..count)
+            .map(|_| {
+                let mut bytes = vec![0_u8; MAX_SEALED];
+                bytes[..last.frames.len()].copy_from_slice(&last.frames);
+                let length = sealer.seal(&mut bytes, last.frames.len()).unwrap();
+                bytes.truncate(length);
+                bytes
+            })
+            .collect()
+    };
+    let flood = forge(last.context, last.seq + 1_000, 1_000);
+    let mut ahead_context = last.context;
+    ahead_context.party_epoch += 2;
+    let ahead = forge(ahead_context, 0, 500);
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let refusals = |rig: &Rig| {
+        rig.agents
+            .receiver
+            .role
+            .enc_rejections(b, alias().stream_id)
+            .unwrap()
+    };
+    let before = refusals(&rig);
+    let epochs = rig.agents.receiver.role.enc_epochs(slot);
+    let committed = rig.agents.receiver.counters().data_committed;
+    let now = rig.now;
+    let receiver = &mut rig.agents.receiver;
+    let ((), allocations) = karyos_sys::alloc_count::count_allocations(|| {
+        for bytes in &flood {
+            receiver
+                .role
+                .inject_datagram(&receiver.sessions, b, source, bytes, now);
+        }
+    });
+    assert_eq!(allocations, 0, "the flood allocates nothing");
+    let after = refusals(&rig);
+    assert_eq!(
+        after.get(EncRejection::Tag),
+        before.get(EncRejection::Tag) + 1_000,
+        "{after:?}"
+    );
+    assert_eq!(after.total(), before.total() + 1_000, "{after:?}");
+    assert_eq!(rig.agents.receiver.role.enc_epochs(slot), epochs);
+    assert_eq!(rig.agents.receiver.counters().data_committed, committed);
+    let challenges = rig.agents.receiver.role.posted_challenges().len();
+    let receiver = &mut rig.agents.receiver;
+    for bytes in &ahead {
+        receiver
+            .role
+            .inject_datagram(&receiver.sessions, b, source, bytes, now);
+    }
+    let after_ahead = refusals(&rig);
+    assert_eq!(
+        after_ahead.get(EncRejection::Epoch),
+        after.get(EncRejection::Epoch) + 500
+    );
+    assert_eq!(
+        after_ahead.get(EncRejection::Tag),
+        after.get(EncRejection::Tag)
+    );
+    assert!(
+        rig.agents.receiver.role.posted_challenges().len() <= challenges + 1,
+        "one challenge entry at most"
+    );
+    assert_eq!(rig.agents.receiver.role.enc_epochs(slot), epochs);
+    let second: Vec<Vec<u8>> = (4..8u8).map(|i| vec![i; 100]).collect();
+    assert_eq!(enc_deliver(&mut rig, &mut subscriber, &second), second);
+}
