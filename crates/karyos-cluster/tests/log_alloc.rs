@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use karyos_archive::disk::StdDisk;
 use karyos_archive::segment::Geometry;
-use karyos_cluster::{Entry, HardState, RaftLog};
+use karyos_cluster::{Entry, HardState, LogError, RaftLog};
 use karyos_sys::alloc_count::{CountingAllocator, count};
 
 #[global_allocator]
@@ -61,7 +61,8 @@ fn append_sync_and_hard_state_save_allocate_nothing_once_warm() {
     let all: Vec<[Entry; 1]> = (1..=WARM + MEASURED)
         .map(|index| [entry(index, &payload)])
         .collect();
-    log.reserve(usize::try_from(WARM + MEASURED).unwrap());
+    log.reserve(usize::try_from(WARM + MEASURED).unwrap())
+        .unwrap();
     let step = |log: &mut RaftLog<StdDisk>, batch: &[Entry; 1]| {
         let index = batch[0].index;
         log.append(batch).unwrap();
@@ -94,4 +95,25 @@ fn append_sync_and_hard_state_save_allocate_nothing_once_warm() {
         reopened.hard_state().and_then(|state| state.commit),
         Some(WARM + MEASURED)
     );
+}
+
+/// karyos#1285 review: a reservation the index cannot hold is a typed
+/// refusal, not a panic, and the log appends on after it.
+#[test]
+fn an_impossible_reservation_is_refused() {
+    let dir = TempDir::new("reserve");
+    let mut log = RaftLog::create(
+        StdDisk,
+        &dir.0,
+        Geometry::with_default_length(65_536).unwrap(),
+        1,
+    )
+    .unwrap();
+    assert!(matches!(
+        log.reserve(usize::MAX),
+        Err(LogError::IndexFull {
+            additional: usize::MAX
+        })
+    ));
+    assert_eq!(log.append(&[entry(1, b"after")]).unwrap(), Some(1));
 }

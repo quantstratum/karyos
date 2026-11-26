@@ -221,6 +221,10 @@ impl Entry {
     ///
     /// [`LogError::TooLarge`] for a payload over `u32::MAX` bytes.
     pub fn frame(&self) -> Result<Vec<u8>, LogError> {
+        // Refused before the buffer is allocated (karyos#1285 review).
+        if u32::try_from(self.payload.len()).is_err() {
+            return Err(LogError::TooLarge { index: self.index });
+        }
         let mut frame =
             Vec::with_capacity(self.payload.len().checked_add(FRAME_HEADER).unwrap_or(0));
         self.frame_into(&mut frame)?;
@@ -357,6 +361,13 @@ pub fn read_frame(bytes: &[u8]) -> Result<Frame<'_>, ChainProblem> {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LogError {
+    /// [`RaftLog::reserve`] could not size the entry index for
+    /// `additional` more entries.
+    #[error("the entry index cannot reserve {additional} more entries")]
+    IndexFull {
+        /// The entries asked for.
+        additional: usize,
+    },
     /// An append that does not start right after the last index.
     #[error("an append at index {got}; the next index is {expected}")]
     NotNext {
@@ -1475,8 +1486,15 @@ impl<D: Disk + Clone> RaftLog<D> {
     /// Reserves the in-memory index for `additional` more entries, so the
     /// appends that fill it allocate nothing (karyos#691); the index
     /// otherwise grows by doubling, an allocation now and then.
-    pub fn reserve(&mut self, additional: usize) {
-        self.entries.reserve(additional);
+    ///
+    /// # Errors
+    ///
+    /// [`LogError::IndexFull`] when the index cannot hold `additional`
+    /// more entries: nothing changes.
+    pub fn reserve(&mut self, additional: usize) -> Result<(), LogError> {
+        self.entries
+            .try_reserve(additional)
+            .map_err(|_| LogError::IndexFull { additional })
     }
 
     /// Appends `entries`, each starting at [`RaftLog::next_index`] and not
