@@ -1338,9 +1338,11 @@ impl<const PRE_VOTE: bool, const BATCH: u64> crate::process::Wire
         crate::openraft_wire::decode(bytes)
     }
 
-    /// OpenRaft's RPCs are its own types behind `Arc`s, built new by each
-    /// decode; the lent message is stepped as a clone of those `Arc`s (C5
-    /// v3: the library's types).
+    /// OpenRaft's RPCs are its own types behind `Arc`s; the lent message
+    /// is stepped as a clone of those `Arc`s. An append is decoded into the
+    /// slot's own request once no clone of it is left, its entries and
+    /// command buffers kept ([`crate::openraft_wire::decode_into`]); what
+    /// OpenRaft still forces is listed there (C5 v3).
     type Decoder = Option<Message>;
 
     fn decoder() -> Self::Decoder {
@@ -1348,7 +1350,7 @@ impl<const PRE_VOTE: bool, const BATCH: u64> crate::process::Wire
     }
 
     fn decode_lent<'a>(decoder: &'a mut Self::Decoder, bytes: &[u8]) -> Option<&'a mut Message> {
-        *decoder = crate::openraft_wire::decode(bytes);
+        crate::openraft_wire::decode_into(decoder, bytes).then_some(())?;
         decoder.as_mut()
     }
 

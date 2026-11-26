@@ -783,21 +783,28 @@ impl<const PRE_VOTE: bool, const BATCH: u64> crate::process::Wire for RaftCore<P
         protobuf::Message::parse_from_bytes(bytes).ok()
     }
 
-    /// raft-rs's messages are `protobuf` values that its `step` takes by
-    /// value: each is decoded into a new one, its entries' `Bytes`
-    /// included (the library's types; C5 v3).
-    type Decoder = Option<eraftpb::Message>;
+    /// raft-rs's messages are `protobuf` values, decoded into the kept
+    /// slot (cleared, then merged into: `protobuf` 2's repeated fields keep
+    /// their capacity and elements; C5 v3). raft-rs's `RawNode::step`
+    /// takes its message by value, so [`ConsensusCore::step_lent`] moves it
+    /// out and the slot is left empty: each decode still allocates the
+    /// message's entries vector and each entry's data, and raft-rs frees or
+    /// keeps them inside `step` (the library's types, declared).
+    type Decoder = eraftpb::Message;
 
     fn decoder() -> Self::Decoder {
-        None
+        eraftpb::Message::default()
     }
 
     fn decode_lent<'a>(
         decoder: &'a mut Self::Decoder,
         bytes: &[u8],
     ) -> Option<&'a mut eraftpb::Message> {
-        *decoder = protobuf::Message::parse_from_bytes(bytes).ok();
-        decoder.as_mut()
+        protobuf::Clear::clear(decoder);
+        if protobuf::Message::merge_from_bytes(decoder, bytes).is_err() {
+            return None;
+        }
+        Some(decoder)
     }
 
     fn appended(message: &eraftpb::Message) -> Option<(u64, Vec<(u64, u64)>)> {
