@@ -961,6 +961,13 @@ impl ConsensusCore for Custom {
         // What the node is done with goes back to the thread's pool.
         out.take_spare(&mut self.spare);
         release(&mut self.spare);
+        // Room for a Ready's entries going back once it is done, at the
+        // first call: the recycling is the Ready stage's (C5 v3 coverage).
+        out.reserve_spare(
+            self.bounds
+                .ready_entries
+                .saturating_add(self.bounds.committed),
+        );
         // The node's vectors, grown to the reserved ones' size once.
         let (ready, reserved) = (&mut out.ready, &mut self.reserved);
         if ready.messages.capacity() < reserved.messages.capacity() {
