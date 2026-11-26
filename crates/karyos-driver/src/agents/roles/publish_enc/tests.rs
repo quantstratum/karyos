@@ -1708,3 +1708,312 @@ fn a_refused_domain_6_establishment_changes_nothing() {
         }
     }
 }
+
+/// Moves the test clock on by a second.
+fn tick() {
+    NOW.with(|now| now.set(now.get() + SECOND_NS));
+}
+
+/// H8-30 (sections 4, 6b and 7): challenge A of a receiver boot is
+/// answered and committed, and that ANSWER is lost; the receiver, still
+/// unbound, challenges again under the same boot with nonce B. Its
+/// binding, never confirmed, is re-keyed to B, the nonce the ANSWER
+/// echoes: the session's DATA opens under the receiver's domain 1 keys of
+/// B and its SM under the publisher's domain 4 keys of B. A never binds
+/// again, and once confirmed a further challenge keeps B (section 6b).
+#[test]
+fn a_lost_answer_then_a_fresh_challenge_of_the_same_boot_exchanges_data_and_sm() {
+    let (mut sender, destination, _log) = answering();
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    let a = receiver.nonce;
+    assert!(
+        establish(&mut sender, destination, &receiver.challenge()).is_some(),
+        "A is answered; the ANSWER is lost"
+    );
+    let b = [a[0] + 1, a[1] + 1];
+    receiver.nonce = b;
+    tick();
+    let Some(Control::SetupAnswer(answer)) =
+        establish(&mut sender, destination, &receiver.challenge())
+    else {
+        panic!("B is answered")
+    };
+    assert_eq!(answer.challenge.nonce, b, "the ANSWER echoes B");
+    // What the receiver derives from the answer it accepted.
+    let salt = Salt::Challenge {
+        receiver_boot_id: receiver.receiver.receiver_boot_id,
+        nonce: id128(answer.challenge.nonce),
+    };
+    assert_eq!(session_salt(&mut sender), Some(salt), "sealed under B");
+    // A, retried or replayed, binds nothing again: its key sealed.
+    receiver.nonce = a;
+    tick();
+    assert!(establish(&mut sender, destination, &receiver.challenge()).is_none());
+    assert_eq!(session_salt(&mut sender), Some(salt));
+    receiver.nonce = b;
+    // The session's DATA under the receiver's domain 1 opener.
+    let mut opener = EncOpener::new(
+        &keys(),
+        None,
+        KeyContext {
+            domain: Domain::Sender,
+            key_epoch: 1,
+            party_epoch: 0,
+            session_id: ALIAS.session_id,
+            stream_id: ALIAS.stream_id,
+            publication: publication_of(&IDENTITY),
+            receiver: None,
+            salt,
+        },
+        clock(),
+    )
+    .unwrap();
+    let mut data = [0_u8; MAX_SEALED];
+    data[..32].copy_from_slice(&{
+        let mut frame = [0_u8; 32];
+        frame[..4].copy_from_slice(&32_i32.to_le_bytes());
+        frame[4] = 1;
+        frame[6] = 1;
+        frame
+    });
+    let mut sealer = sender.publications[0].lend_enc_sealer().unwrap();
+    let length = sealer.seal(&mut data, 32).unwrap();
+    sender.publications[0].return_enc_sealer(sealer);
+    let mut out = [0_u8; MAX_PLAINTEXT];
+    let mut rate = OpenRate::default();
+    assert!(
+        opener
+            .open(&data[..length], &mut out, &mut rate, clock(), |_| Ok(()))
+            .is_ok(),
+        "DATA authenticates"
+    );
+    // The receiver's SM under its domain 4 sealer of B.
+    let (mut sm_sealer, _) = receiver.data_keys();
+    let sm = seal_control(&mut sm_sealer, &receiver.sm());
+    assert_eq!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &sm)
+            .map(|(control, _)| control),
+        Some(receiver.sm()),
+        "the SM authenticates"
+    );
+    // Confirmed: a resynchronising challenge keeps the salt.
+    receiver.nonce = [b[0] + 1, b[1] + 1];
+    tick();
+    assert!(establish(&mut sender, destination, &receiver.challenge()).is_some());
+    assert_eq!(session_salt(&mut sender), Some(salt));
+}
+
+/// H8-25: a bound receiver's CHALLENGE, which stages nothing, is admitted
+/// as a new binding's is. With its runtime binding expired and the table
+/// full of another receiver's confirmed binding, it is not answered and
+/// changes nothing; with room, the same datagram is answered and bound.
+#[test]
+fn a_bound_receivers_challenge_with_no_room_for_its_binding_is_not_answered() {
+    let (mut sender, destination, _log) = answering();
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    assert!(establish(&mut sender, destination, &receiver.challenge()).is_some());
+    let salt = session_salt(&mut sender);
+    let again = receiver.challenge();
+    sender.expire_bindings(u64::MAX / 2);
+    assert!(sender.bindings.is_empty());
+    sender.max_bindings = 1;
+    let other: SocketAddr = "10.0.0.10:5000".parse().unwrap();
+    let mut theirs = plain_answer();
+    theirs.challenge.receiver_boot_id = [7, 7];
+    sender.bind(EndpointId(1), other, &theirs, None, clock());
+    sender.bindings[0].last_sm = Some(clock());
+    assert!(
+        establish(&mut sender, destination, &again).is_none(),
+        "no ANSWER without its runtime binding"
+    );
+    assert_eq!(sender.bindings.len(), 1);
+    assert_eq!(sender.bindings[0].boot_id, [7, 7]);
+    assert_eq!(
+        sender.enc.publications[0].bound_receiver(),
+        Some(receiver.receiver)
+    );
+    assert_eq!(session_salt(&mut sender), salt);
+    sender.max_bindings = 2;
+    assert!(establish(&mut sender, destination, &again).is_some());
+    assert!(
+        sender
+            .bindings
+            .iter()
+            .any(|binding| binding.boot_id == [5, 5])
+    );
+}
+
+/// A unicast publication whose membership expects receiver 66 of boot 5
+/// at `destination`, bound to it, with its encrypted receiver bound.
+fn with_membership() -> (super::super::SenderRole, SocketAddr, Peer) {
+    let (mut sender, _): (super::super::SenderRole, super::super::ReceiverRole) =
+        super::super::roles(&crate::agents::AgentConfig::default()).unwrap();
+    sender.clock = clock;
+    let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 0,
+        mtu: 1408,
+    };
+    let (mut path, _log) =
+        crate::agents::data::testing::outbound(EndpointId(1), ALIAS, destination, term, 1, false);
+    expect_receiver(&mut path, destination, 5);
+    sender.publications.push(path);
+    sender.enc.publish(publication());
+    sender.bind(EndpointId(1), destination, &plain_answer(), None, clock());
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    assert!(open(&mut sender.enc.publications[0], &receiver.challenge()).is_ok());
+    (sender, destination, receiver)
+}
+
+/// The receiver's SM with one lane at `consumption` and `window`.
+fn sm_at(receiver: &Peer, consumption: u64, window: u32) -> StatusMessage {
+    let Control::Status(mut status) = receiver.sm() else {
+        unreachable!()
+    };
+    status.lanes = Lanes::new(&[LaneStatus {
+        consumption,
+        window,
+    }])
+    .unwrap();
+    status
+}
+
+/// H8-28: a next-epoch SM is admitted inside the domain 4 open only if
+/// the publication's membership would accept it. One reporting a
+/// consumption beyond `sent_high` (`Beyond`) and one with a window outside
+/// the join bounds (`Window`) mark nothing and promote nothing; the valid
+/// SM sealed at the same sequence then opens.
+#[test]
+fn a_next_epoch_sm_its_membership_rejects_marks_nothing() {
+    let (mut sender, destination, receiver) = with_membership();
+    let valid = Control::Status(sm_at(&receiver, 0, 32_768));
+    let sealed: Vec<Vec<u8>> = [
+        Control::Status(sm_at(&receiver, 4096, 32_768)),
+        Control::Status(sm_at(&receiver, 0, 65_536)),
+        valid,
+    ]
+    .iter()
+    .map(|control| {
+        let (mut sealer, _) = receiver.data_keys();
+        sealer.roll_now();
+        seal_control(&mut sealer, control)
+    })
+    .collect();
+    for bytes in &sealed[..2] {
+        assert!(
+            sender
+                .open_sealed_from(EndpointId(1), destination, bytes)
+                .is_none()
+        );
+        assert_eq!(
+            sender.enc.publications[0].bound_epochs(),
+            Some((1, 0)),
+            "nothing promoted"
+        );
+    }
+    assert_eq!(
+        sender.enc.publications[0]
+            .channel
+            .rejections
+            .get(EncRejection::InnerRejected),
+        2
+    );
+    assert_eq!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &sealed[2])
+            .map(|(control, _)| control),
+        Some(valid),
+        "its sequence was never marked"
+    );
+    assert_eq!(sender.enc.publications[0].bound_epochs(), Some((1, 1)));
+}
+
+/// H8-28: an SM its membership rejects moves no runtime binding: no
+/// liveness, lanes, SM source or receiver id; the valid one then does.
+#[test]
+fn an_sm_its_membership_rejects_moves_no_binding() {
+    let (mut sender, destination, receiver) = with_membership();
+    for (consumption, window) in [(4096, 32_768), (0, 65_536)] {
+        let status = sm_at(&receiver, consumption, window);
+        assert!(
+            sender
+                .status(EndpointId(1), destination, &status, clock())
+                .is_none()
+        );
+        let binding = &sender.bindings[0];
+        assert!(binding.last_sm.is_none(), "{consumption} {window}");
+        assert!(binding.lanes.is_none() && binding.sm_source.is_none());
+        assert!(binding.receiver_id.is_none());
+    }
+    let status = sm_at(&receiver, 0, 32_768);
+    let _ = sender.status(EndpointId(1), destination, &status, clock());
+    assert_eq!(sender.bindings[0].last_sm, Some(clock()));
+    assert_eq!(sender.bindings[0].receiver_id, Some(66));
+}
+
+/// H8-29: a next-epoch RTTM REQUEST is admitted inside the domain 4 open
+/// only if its reply would go. With its source's reply bucket spent, or
+/// the reply source table full of another source, it marks nothing and
+/// promotes nothing; once a reply is admissible, the REQUEST sealed at the
+/// same sequence opens.
+#[test]
+fn a_next_epoch_rttm_request_its_reply_admission_refuses_marks_nothing() {
+    use crate::rtt::{RttConfig, RttReplies};
+    use karyos_protocol::network::{Rttm, RttmKind};
+
+    let (mut sender, destination, receiver) = with_membership();
+    let request = Control::Rttm(Rttm {
+        alias: ALIAS,
+        identity: IDENTITY,
+        receiver: Receiver {
+            receiver_boot_id: [5, 5],
+            receiver_id: 66,
+        },
+        probe_id: 1,
+        kind: RttmKind::Request,
+    });
+    let (mut sealer, _) = receiver.data_keys();
+    sealer.roll_now();
+    let bytes = seal_control(&mut sealer, &request);
+    let normal = crate::sessions::rate::normalized(destination);
+    while sender.replies.admit(normal, clock()) {}
+    assert!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &bytes)
+            .is_none(),
+        "its bucket is spent"
+    );
+    assert_eq!(sender.enc.publications[0].bound_epochs(), Some((1, 0)));
+    sender.replies = RttReplies::new(&RttConfig {
+        rttm_reply_sources: 1,
+        ..RttConfig::default()
+    })
+    .unwrap();
+    let other: SocketAddr = "10.0.0.10:5000".parse().unwrap();
+    assert!(sender.replies.admit(other, clock()));
+    assert!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &bytes)
+            .is_none(),
+        "the source table is full"
+    );
+    assert_eq!(sender.enc.publications[0].bound_epochs(), Some((1, 0)));
+    assert_eq!(
+        sender.enc.publications[0]
+            .channel
+            .rejections
+            .get(EncRejection::InnerRejected),
+        2
+    );
+    sender.replies = RttReplies::new(&RttConfig::default()).unwrap();
+    assert_eq!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &bytes)
+            .map(|(control, _)| control),
+        Some(request),
+        "its sequence was never marked"
+    );
+    assert_eq!(sender.enc.publications[0].bound_epochs(), Some((1, 1)));
+}

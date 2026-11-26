@@ -825,14 +825,16 @@ struct SenderChecks {
 /// change nothing (H8-20): PATH_HB its path row and incarnation
 /// (`Intake::control`); ERR NAK_REPLY the image's incarnation, its
 /// receiver block and a lane `lane_open` admits
-/// (`Intake::nak_reply`); RTTM REPLY its path row, incarnation and
-/// receiver block (`Intake::rttm_reply`). Run inside the open,
+/// (`Intake::nak_reply`); RTTM REPLY its path row, incarnation,
+/// receiver block and a probe id `reply_takes` admits: the path's
+/// outstanding probe, submitted (`Intake::rttm_reply`, H8-29). Run inside the open,
 /// before the sequence is marked or an epoch promoted; any other control
 /// is refused.
 fn sender_control_admissible(
     control: &Control,
     checks: &SenderChecks,
     lane_open: impl Fn(Lane) -> bool,
+    reply_takes: impl Fn(u64) -> bool,
 ) -> bool {
     match control {
         Control::PathHeartbeat(heartbeat) => checks.path && heartbeat.identity == checks.identity,
@@ -846,6 +848,7 @@ fn sender_control_admissible(
                 && checks.path
                 && rttm.identity == checks.identity
                 && rttm.receiver == checks.receiver
+                && reply_takes(rttm.probe_id)
         }
         _ => false,
     }
@@ -1050,12 +1053,22 @@ impl<T: StreamTerms> Intake<'_, T> {
             source,
             alias,
         };
-        let path = self
+        let row = self
             .role
             .sessions
             .paths()
             .lookup(key)
-            .is_some_and(|(at, _)| at == slot);
+            .filter(|(at, _)| *at == slot)
+            .map(|(_, row)| row);
+        let path = row.is_some();
+        // A probe's finished send report is settled first, as the REPLY's
+        // handler settles it, so a REPLY is checked against it (H8-29).
+        if let Some(row) = row
+            && let Some(image) = bound.and_then(|index| self.role.images.get_mut(index))
+            && let Some(probe) = image.probes.get_mut(row)
+        {
+            super::collect_probe(&mut image.rtt, probe, false);
+        }
         let active = self.role.sessions.is_active(slot);
         let receiver_boot_id = self.role.sessions.boot_id();
         let installed = bound
@@ -1072,6 +1085,25 @@ impl<T: StreamTerms> Intake<'_, T> {
         };
         let (owner, term_length) = (&*installed.owner, installed.term_length);
         let lane_open = |lane: Lane| super::window_end(owner, lane, term_length).is_some();
+        // What `RttProbes::reply` takes: the outstanding probe of the path,
+        // submitted, or still sending, which the REPLY settles (H8-29).
+        let rtt = &installed.rtt;
+        let probe = row.and_then(|row| {
+            let probe = installed.probes.get(row)?;
+            Some((row, probe.pending, probe.slot.sending_start()))
+        });
+        let reply_takes = |probe_id: u64| {
+            probe.is_some_and(|(row, pending, sending)| {
+                rtt.generation(row).is_some_and(|generation| {
+                    let sending = pending
+                        .filter(|pending| {
+                            (pending.generation, pending.probe_id) == (generation, probe_id)
+                        })
+                        .and(sending);
+                    rtt.would_take(row, generation, probe_id, sending)
+                })
+            })
+        };
         let enc = &mut self.role.enc;
         let image = enc
             .images
@@ -1101,7 +1133,7 @@ impl<T: StreamTerms> Intake<'_, T> {
                 }
                 Ok(Datagram::Control(control))
                     if sender_frame_alias(&control) == Some(alias)
-                        && sender_control_admissible(&control, &checks, lane_open) =>
+                        && sender_control_admissible(&control, &checks, lane_open, reply_takes) =>
                 {
                     Some(false)
                 }
@@ -1598,6 +1630,23 @@ impl<T: StreamTerms> ReceiverRole<T> {
             .iter()
             .find(|image| image.slot == slot)
             .map(|image| image.opener.epochs())
+    }
+
+    /// Issues a fresh RTTM probe on the first path of the image at `slot`
+    /// at `now`, its earlier probes dropped, submitted at `now` when
+    /// `submit`, and returns its id (tests).
+    #[cfg(test)]
+    pub(crate) fn issued_probe(&mut self, slot: SlotRef, now: u64, submit: bool) -> Option<u64> {
+        let image = self.images.iter_mut().find(|image| image.slot == slot)?;
+        if let Some(probe) = image.probes.get_mut(0) {
+            probe.pending = None;
+        }
+        image.rtt.rebind(0);
+        let probe = image.rtt.due(0, now)?;
+        if submit {
+            image.rtt.submitted(probe, now);
+        }
+        Some(probe.probe_id)
     }
 }
 

@@ -129,6 +129,17 @@ impl ReportSlot {
         )
     }
 
+    /// The start of a control still in its backend call, which a reply to
+    /// it settles as submitted ([`Self::collect`] with `replied`); `None`
+    /// in any other state. Changes nothing (H8-29).
+    #[must_use]
+    pub fn sending_start(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+
+        (self.state.load(Ordering::Acquire) == REPORT_SENDING)
+            .then(|| self.start.load(Ordering::Relaxed))
+    }
+
     /// Takes the final report of the last control, if the sender made one,
     /// and frees the slot. With `replied` (a reply to it arrived, proving
     /// it went out), a control still in its backend call reports submitted

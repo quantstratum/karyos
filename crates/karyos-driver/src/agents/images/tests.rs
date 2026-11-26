@@ -11527,7 +11527,8 @@ fn a_tagged_batch_its_image_would_refuse_marks_no_sequence() {
 /// H8-20 (ADR-0114 sections 8 and 9): each domain 1 sender control is
 /// checked inside the open as its handler would check it (PATH_HB its path
 /// and incarnation; ERR NAK_REPLY its incarnation, receiver block and lane;
-/// RTTM REPLY its path, incarnation and receiver block). Under the next
+/// RTTM REPLY its path, incarnation and receiver block, to the submitted
+/// outstanding probe, H8-29). Under the next
 /// `party_epoch`, a correctly tagged control naming another incarnation,
 /// another receiver block or a lane the image does not have is refused
 /// before the mark: the epochs stay, and the genuine control sealed at the
@@ -11591,12 +11592,18 @@ fn a_next_epoch_sender_control_its_handler_would_refuse_marks_nothing() {
             reason: NakReplyReason::RangeUnavailable { lowest_retained: 0 },
         })
     };
+    let probe_id = rig
+        .agents
+        .receiver
+        .role
+        .issued_probe(slot, rig.now, true)
+        .unwrap();
     let rttm = |identity, receiver| {
         Control::Rttm(Rttm {
             alias: alias(),
             identity,
             receiver,
-            probe_id: 9,
+            probe_id,
             kind: RttmKind::Reply {
                 service_delay_ns: 0,
             },
@@ -11673,6 +11680,108 @@ fn a_next_epoch_sender_control_its_handler_would_refuse_marks_nothing() {
         );
         assert_eq!(refusals(&rig).total(), after.total(), "{genuine:?}");
     }
+}
+
+/// H8-29 (ADR-0114 sections 8 and 9): a domain 1 RTTM REPLY is checked
+/// inside the open as `RttProbes::reply` takes it: the path's outstanding
+/// probe, submitted. Under the next `party_epoch`, a REPLY naming no
+/// outstanding probe, or the outstanding one before its submission, is
+/// refused before the mark and the epochs stay; once a probe is submitted,
+/// its REPLY sealed at the same sequence opens and promotes.
+#[test]
+fn a_next_epoch_rttm_reply_its_probes_would_ignore_marks_nothing() {
+    use karyos_protocol::network::{Control, Datagram, Rttm, RttmKind, classify};
+    use karyos_protocol::protection::aes_gcm_siv::{Domain, EncRejection};
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, b) = encrypted_rig();
+    crate::wire_enc::record_seals();
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let first: Vec<Vec<u8>> = (0..3u8).map(|i| vec![i; 100]).collect();
+    assert_eq!(enc_deliver(&mut rig, &mut subscriber, &first), first);
+    rig.sender_stopped = true;
+    let seals = crate::wire_enc::take_seals();
+    let data = seals
+        .iter()
+        .rfind(|record| record.context.domain == Domain::Sender)
+        .unwrap()
+        .clone();
+    let receiver = seals
+        .iter()
+        .filter(|record| record.context.domain == Domain::Receiver)
+        .find_map(|record| match classify(&record.frames) {
+            Ok(Datagram::Control(Control::Status(status))) => Some(status.receiver),
+            _ => None,
+        })
+        .unwrap();
+    let mut context = data.context;
+    context.party_epoch += 1;
+    let sealed = |probe_id: u64| {
+        let control = Control::Rttm(Rttm {
+            alias: alias(),
+            identity: identity(),
+            receiver,
+            probe_id,
+            kind: RttmKind::Reply {
+                service_delay_ns: 0,
+            },
+        });
+        let mut record = data.clone();
+        let mut frames = vec![0_u8; 512];
+        let length = control.encode(&mut frames).unwrap();
+        frames.truncate(length);
+        record.context = context;
+        record.seq = 0;
+        record.frames = frames;
+        replayed(&record)
+    };
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let refusals = |rig: &Rig| {
+        rig.agents
+            .receiver
+            .role
+            .enc_rejections(b, alias().stream_id)
+            .unwrap()
+    };
+    let epochs = rig.agents.receiver.role.enc_epochs(slot);
+    let unsent = rig
+        .agents
+        .receiver
+        .role
+        .issued_probe(slot, rig.now, false)
+        .unwrap();
+    let before = refusals(&rig);
+    for probe_id in [unsent.wrapping_add(1), unsent] {
+        let receiver = &mut rig.agents.receiver;
+        receiver
+            .role
+            .inject_datagram(&receiver.sessions, b, source, &sealed(probe_id), rig.now);
+        assert_eq!(
+            rig.agents.receiver.role.enc_epochs(slot),
+            epochs,
+            "{probe_id}"
+        );
+    }
+    assert_eq!(
+        refusals(&rig).get(EncRejection::InnerRejected),
+        before.get(EncRejection::InnerRejected) + 2
+    );
+    let probe_id = rig
+        .agents
+        .receiver
+        .role
+        .issued_probe(slot, rig.now, true)
+        .unwrap();
+    let receiver = &mut rig.agents.receiver;
+    receiver
+        .role
+        .inject_datagram(&receiver.sessions, b, source, &sealed(probe_id), rig.now);
+    assert_eq!(
+        rig.agents.receiver.role.enc_epochs(slot),
+        Some((context.key_epoch, context.party_epoch)),
+        "its sequence was never marked"
+    );
 }
 
 /// H8-09 (ADR-0114 section 10 step 2): a VM generation change withdraws an

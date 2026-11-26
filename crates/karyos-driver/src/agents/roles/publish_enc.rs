@@ -39,6 +39,10 @@ use crate::wire_keys::KeyFile;
 use karyos_io::sockets::ops::SocketOps;
 use std::net::SocketAddr;
 
+/// How many fresh challenges of one receiver boot may re-key a binding
+/// its receiver never confirmed (H8-30); more are refused (fail closed).
+const MAX_RECHALLENGES: usize = 4;
+
 /// A receiver's binding: its block, the nonce of the challenge that bound
 /// it, and its committed domain 4 keys.
 #[derive(Debug)]
@@ -46,6 +50,12 @@ struct Bound {
     receiver: ReceiverIdentity,
     nonce: [u8; 16],
     opener: EncOpener,
+    /// Whether a control of the receiver opened under `opener`: the
+    /// receiver holds the keys of `nonce`, so its answer arrived.
+    confirmed: bool,
+    /// The nonces of this boot's earlier, never confirmed, bindings: each
+    /// one's domain 1 key may have sealed, so none binds again (H8-30).
+    superseded: [Option<[u8; 16]>; MAX_RECHALLENGES],
 }
 
 /// A new binding a verified RSP_SETUP staged: its domain 4 keys, made
@@ -298,7 +308,12 @@ impl PublicationEnc {
     /// [`EncRejection::RetiredBoot`] when the retired table is full (the
     /// staging checked it); nothing changes.
     pub(crate) fn commit(&mut self, staged: Staged) -> Result<(), EncRejection> {
-        if let Some(old) = &self.bound {
+        // A re-key of the same boot (H8-30) retires nothing.
+        if let Some(old) = self
+            .bound
+            .as_ref()
+            .filter(|old| old.receiver != staged.0.receiver)
+        {
             self.retired
                 .retire(&old.receiver, self.keys.current_epoch())?;
         }
@@ -378,8 +393,28 @@ impl PublicationEnc {
             return Err(EncRejection::RetiredBoot);
         }
         let nonce = id128(challenge.nonce);
+        let mut superseded = [None; MAX_RECHALLENGES];
         if let Some(bound) = &self.bound {
-            if bound.receiver == receiver {
+            // The bound boot's fresh challenge re-keys its binding only
+            // while the receiver never confirmed it: its answer was lost,
+            // so the receiver, unbound, takes the salt of the nonce it is
+            // answered with (sections 4 and 7). A confirmed binding keeps
+            // its salt (section 6b), and the bound nonce re-derives
+            // nothing; neither is staged.
+            let rekey = bound.receiver == receiver && !bound.confirmed && bound.nonce != nonce;
+            if rekey {
+                // No earlier nonce of this boot binds again: its domain 1
+                // key may have sealed under a sequence restarted at 0.
+                if bound.superseded.contains(&Some(nonce)) {
+                    return Err(EncRejection::RetiredBoot);
+                }
+                superseded = bound.superseded;
+                let free = superseded
+                    .iter_mut()
+                    .find(|held| held.is_none())
+                    .ok_or(EncRejection::RetiredBoot)?;
+                *free = Some(bound.nonce);
+            } else if bound.receiver == receiver {
                 return Ok((
                     EncOpened::RspSetup(
                         control,
@@ -391,12 +426,10 @@ impl PublicationEnc {
                     ),
                     None,
                 ));
-            }
-            if bound.receiver.receiver_id != receiver.receiver_id {
+            } else if bound.receiver.receiver_id != receiver.receiver_id {
                 // One receiver per publication (unicast).
                 return Err(EncRejection::Party);
-            }
-            if !self.retired.has_room() {
+            } else if !self.retired.has_room() {
                 return Err(EncRejection::RetiredBoot);
             }
         }
@@ -418,6 +451,8 @@ impl PublicationEnc {
                 receiver,
                 nonce,
                 opener,
+                confirmed: false,
+                superseded,
             })),
         ))
     }
@@ -459,6 +494,8 @@ impl PublicationEnc {
                 };
                 found.map(|_| ()).ok_or(EncRejection::InnerRejected)
             })?;
+        // Opened under its keys: the receiver took this binding's answer.
+        bound.confirmed = true;
         found
             .map(EncOpened::Receiver)
             .ok_or(EncRejection::InnerRejected)
@@ -914,6 +951,12 @@ impl<T: StreamTerms> SenderRole<T> {
         // aborting incarnation and a spent cycle budget (H8-24).
         let naks = !self.incarnation_aborting(endpoint, alias)
             && self.naks_this_cycle < self.repair.naks_per_cycle;
+        // The RTTM REQUEST handler's reply rate and source table at `now`,
+        // charging nothing (H8-29).
+        let replies = source.is_none_or(|source| {
+            self.replies
+                .would_admit(crate::sessions::rate::normalized(source), now)
+        });
         let Some(at) =
             self.enc.publications.iter().position(|publication| {
                 publication.endpoint == endpoint && publication.alias == alias
@@ -935,7 +978,7 @@ impl<T: StreamTerms> SenderRole<T> {
                 source,
                 identity,
                 bindings,
-                (room, naks, now),
+                (room, naks, replies, now),
                 endpoint,
                 control,
             )
@@ -944,18 +987,28 @@ impl<T: StreamTerms> SenderRole<T> {
         match publication.open_staged(bytes, &mut out, &admit) {
             Ok((EncOpened::Receiver(control), _)) => Some((control, None)),
             Ok((EncOpened::RspSetup(control, establishing), staged)) => {
+                // Admit the ANSWER and its runtime binding, of a bound
+                // receiver too (H8-25): one with no room is not answered.
+                let answered = source
+                    .is_none_or(|source| self.enc_answer_admitted(endpoint, source, &control, now));
+                if !answered {
+                    self.count(|c| &mut c.establishment_refused);
+                    return None;
+                }
                 if let Some(staged) = staged {
-                    // Admit: everything that could still refuse it.
-                    let sealer = publication.data_sealer(&establishing).ok()?;
+                    // Admit: everything else that could still refuse it.
+                    let sealer = self
+                        .enc
+                        .publications
+                        .get(at)?
+                        .data_sealer(&establishing)
+                        .ok()?;
                     let installable = self
                         .publications
                         .iter()
                         .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
                         .is_some_and(|outbound| outbound.admits_enc_sealer(&sealer));
-                    let answered = source.is_none_or(|source| {
-                        self.enc_answer_admitted(endpoint, source, &control, now)
-                    });
-                    if !(installable && answered) {
+                    if !installable {
                         self.count(|c| &mut c.establishment_refused);
                         return None;
                     }
@@ -1131,14 +1184,17 @@ impl<T: StreamTerms> SenderRole<T> {
 /// id (any while unconfirmed), and a NAK a repairing publication, `naks`
 /// (its incarnation not aborting, the cycle's NAK budget not spent) and
 /// an outcome of its repair admission and job table at `now` other than
-/// a drop ([`crate::agents::data::Outbound::nak_admissible`], H8-24) (an
-/// RTTM REPLY has no receiver alias, so it never gets here). An SM needs,
+/// a drop ([`crate::agents::data::Outbound::nak_admissible`], H8-24); an
+/// RTTM REQUEST `replies` (its reply rate and source table admit it,
+/// H8-29) (an RTTM REPLY is refused). An SM needs,
 /// as [`SenderRole::status`] finds it (`sm_binding`), a runtime binding
 /// of its receiver: one of its SM source, else one with none yet, either
 /// naming its receiver id or none, else an ANSWER-created one with room
 /// for an adoption, as `adopt` decides it from `room` (H8-15: an expired
 /// binding leaves the encrypted context bound; a full table, or one whose
-/// eviction takes the parent, adopts nothing). Run inside the domain 4
+/// eviction takes the parent, adopts nothing), and the publication's
+/// membership to accept it ([`crate::membership::Membership::would_accept`],
+/// H8-28: credit, window and lifecycle). Run inside the domain 4
 /// open, before the sequence is marked or an epoch promoted; a refused
 /// control changes no state. Any other control is refused: none is a
 /// receiver's domain 4 control.
@@ -1147,7 +1203,7 @@ fn receiver_control_admissible<T: StreamTerms>(
     source: Option<SocketAddr>,
     identity: Identity,
     bindings: &[super::ReceiverBinding],
-    (room, naks, now): (super::Room, bool, u64),
+    (room, naks, replies, now): (super::Room, bool, bool, u64),
     endpoint: EndpointId,
     control: &Control,
 ) -> bool {
@@ -1181,7 +1237,11 @@ fn receiver_control_admissible<T: StreamTerms>(
                     now,
                 );
         }
-        Control::Rttm(rttm) => return bound(rttm.alias, rttm.identity, rttm.receiver),
+        Control::Rttm(rttm) => {
+            return matches!(rttm.kind, karyos_protocol::network::RttmKind::Request)
+                && replies
+                && bound(rttm.alias, rttm.identity, rttm.receiver);
+        }
         _ => return false,
     };
     if status.identity != identity || !sm_bound(bindings, room, endpoint, source, status) {
@@ -1190,6 +1250,21 @@ fn receiver_control_admissible<T: StreamTerms>(
     let lanes = u8::try_from(outbound.readers().len()).ok() == Some(status.lanes.count());
     let tag = outbound.membership().is_none_or(|membership| {
         membership.configured_tag(status.receiver.receiver_id) == status.group_tag
+            && source.is_none_or(|source| {
+                let key = crate::membership::SmKey {
+                    endpoint,
+                    alias: status.alias,
+                    source: crate::sessions::rate::normalized(source),
+                    identity: status.identity,
+                    receiver: status.receiver,
+                };
+                // A membership of another incarnation (`Identity`) does not
+                // judge this one's SM, as `status` lets it through.
+                !matches!(
+                    membership.would_accept(&key, status, now),
+                    Err(reason) if reason != crate::membership::StatusRejected::Identity
+                )
+            })
     });
     let eligible = source.is_none_or(|source| {
         outbound.sends_to(crate::sessions::rate::normalized(source))

@@ -461,6 +461,28 @@ impl<I: ProbeIds> RttProbes<I> {
             .filter(|outstanding| outstanding.probe_id == probe.probe_id)
     }
 
+    /// Whether a REPLY with `probe_id` on `path` at binding `generation`
+    /// matches the outstanding probe and that probe was submitted, as
+    /// [`Self::reply`] requires before it takes it, changing nothing
+    /// (H8-29). `sending`: the start of a submission still being
+    /// reported, which the reply's arrival settles as submitted.
+    #[must_use]
+    pub fn would_take(
+        &self,
+        path: usize,
+        generation: u64,
+        probe_id: u64,
+        sending: Option<u64>,
+    ) -> bool {
+        self.paths.get(path).is_some_and(|state| {
+            state.generation == generation
+                && state.outstanding.is_some_and(|outstanding| {
+                    outstanding.probe_id == probe_id
+                        && (outstanding.start.is_some() || sending.is_some())
+                })
+        })
+    }
+
     /// A validated RTTM REPLY with `probe_id` from `path` at binding
     /// `generation`, seen by the receive owner at `now`.
     pub fn reply(&mut self, path: usize, generation: u64, probe_id: u64, now: u64) -> ReplyOutcome {
@@ -645,6 +667,14 @@ impl RttReplies {
                 false
             }
         }
+    }
+
+    /// Whether [`Self::admit`] would answer a REQUEST from `source` at
+    /// `now`, charging and counting nothing (H8-29): only its source's
+    /// bucket refills.
+    #[must_use]
+    pub fn would_admit(&mut self, source: SocketAddr, now: u64) -> bool {
+        self.rates.would_admit(source, now).is_ok()
     }
 
     /// REQUESTs dropped over their source's rate.

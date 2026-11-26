@@ -11047,6 +11047,31 @@ impl<T: StreamTerms> SenderRole<T> {
             }
             None => found,
         };
+        // The membership decides before the binding moves (H8-28): an SM it
+        // rejects (credit, window, lifecycle, capacity) refreshes no
+        // liveness, lane state or session; it is counted there. One of
+        // another incarnation (`Identity`, a membership not yet made again
+        // after a redraw) judges nothing, as before.
+        let key = SmKey {
+            endpoint,
+            alias: status.alias,
+            source,
+            identity: status.identity,
+            receiver: status.receiver,
+        };
+        if let Some(membership) = self
+            .publications
+            .iter_mut()
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == status.alias)
+            .and_then(|outbound| outbound.membership_mut())
+            && matches!(
+                membership.would_accept(&key, status, now),
+                Err(reason) if reason != crate::membership::StatusRejected::Identity
+            )
+        {
+            let _ = membership.status(&key, status, now);
+            return None;
+        }
         let index = match found {
             SmBinding::Bound(index) => index,
             SmBinding::Learn(index) => {
@@ -11101,13 +11126,6 @@ impl<T: StreamTerms> SenderRole<T> {
             self.binding_gone(&held, former, now);
         }
         // Accepted here, the SM goes to the publication's membership.
-        let key = SmKey {
-            endpoint,
-            alias: status.alias,
-            source,
-            identity: status.identity,
-            receiver: status.receiver,
-        };
         if let Some(membership) = self
             .publications
             .iter_mut()

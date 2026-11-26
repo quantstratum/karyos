@@ -845,6 +845,171 @@ impl Membership {
         }
     }
 
+    /// Whether [`Self::status`] would accept `sm` for `key` at `now`,
+    /// changing nothing (H8-28): the same key, identity, lane, tag, credit
+    /// (window, unchanged window, stale, `sent_high`, overflow), lifecycle
+    /// (lost, boot changed, tombstone) and capacity checks, in its order,
+    /// with an entry that `status` would expire first taken as expired.
+    /// A slot whose generation is exhausted counts as unusable.
+    ///
+    /// # Errors
+    ///
+    /// The [`StatusRejected`] `status` would give; nothing is counted.
+    pub fn would_accept(
+        &self,
+        key: &SmKey,
+        sm: &StatusMessage,
+        now: u64,
+    ) -> Result<(), StatusRejected> {
+        if key.receiver != sm.receiver || key.identity != sm.identity || key.alias != sm.alias {
+            return Err(StatusRejected::Key);
+        }
+        if sm.identity != self.identity || sm.alias != self.alias {
+            return Err(StatusRejected::Identity);
+        }
+        if sm.lanes.count() != self.config.lane_count {
+            return Err(StatusRejected::Lanes);
+        }
+        let id = sm.receiver.receiver_id;
+        if sm.group_tag != self.tag_of(id) {
+            return Err(StatusRejected::Tag);
+        }
+        let required = self.is_required(id) || self.is_required_source(key.source);
+        let mut found = self.find(sm.receiver);
+        let mut tombstone = None;
+        // The slot `status` would expire now, and the state it would take.
+        let mut expired = None;
+        if let Some(slot) = found {
+            let state = match self.entry(slot) {
+                Some(e) if e.state == State::Active && !self.live(e, now) => {
+                    expired = Some(slot);
+                    Some(if e.required {
+                        State::LostRequired
+                    } else {
+                        State::Tombstone
+                    })
+                }
+                e => e.map(|e| e.state),
+            };
+            match state {
+                Some(State::LostRequired) => return Err(StatusRejected::Lost),
+                Some(State::Active | State::Pending) => {}
+                Some(State::Tombstone) => {
+                    found = None;
+                    tombstone = Some(slot);
+                }
+                _ => found = None,
+            }
+        }
+        if found.is_none() && required && self.other_boot(sm.receiver).is_some() {
+            return Err(StatusRejected::BootChanged);
+        }
+        let joining =
+            found.is_none_or(|slot| self.entry(slot).is_some_and(|e| e.state == State::Pending));
+        let current = found.and_then(|slot| self.entry(slot));
+        let lanes = usize::from(self.config.lane_count);
+        for (lane, status) in sm.lanes.as_slice().iter().enumerate().take(lanes) {
+            let sent = self.sent_high.get(lane).copied().unwrap_or(0);
+            if joining {
+                if status.window < self.config.min_window || status.window > self.config.max_window
+                {
+                    return Err(StatusRejected::Window);
+                }
+            } else if let Some(entry) = current {
+                if entry.windows.get(lane).copied() != Some(status.window) {
+                    return Err(StatusRejected::WindowChanged);
+                }
+                if status.consumption < entry.consumption.get(lane).copied().unwrap_or(0) {
+                    return Err(StatusRejected::Stale);
+                }
+            }
+            if status.consumption > sent {
+                return Err(StatusRejected::Beyond);
+            }
+            status
+                .consumption
+                .checked_add(u64::from(status.window))
+                .ok_or(StatusRejected::Overflow)?;
+        }
+        if found.is_some() {
+            return Ok(());
+        }
+        // `tombstone_admits`: a tombstone silent for `receiver_timeout` is
+        // freed; otherwise the SM must be fresh against it.
+        let mut freed = None;
+        let mut own = None;
+        if let Some((slot, entry)) = tombstone.and_then(|slot| Some((slot, self.entry(slot)?))) {
+            let last = if expired == Some(slot) {
+                now
+            } else {
+                entry.last_accepted
+            };
+            if age_ns(now, last) >= self.config.receiver_timeout {
+                freed = Some(slot);
+            } else {
+                let mut lower = false;
+                let mut advanced = false;
+                let mut caught_up = true;
+                for ((status, last), sent) in sm
+                    .lanes
+                    .as_slice()
+                    .iter()
+                    .zip(entry.consumption)
+                    .zip(self.sent_high)
+                {
+                    lower |= status.consumption < last;
+                    advanced |= status.consumption > last;
+                    caught_up &= status.consumption == sent;
+                }
+                if !(caught_up || (advanced && !lower)) {
+                    return Err(StatusRejected::Expired);
+                }
+                own = Some(slot);
+            }
+        }
+        // `allocate(required, required, own)`, counted without taking.
+        let state = |slot: usize, e: &Entry| {
+            if freed == Some(slot) {
+                State::Free
+            } else if expired == Some(slot) {
+                State::Tombstone
+            } else {
+                e.state
+            }
+        };
+        let reserved = if required {
+            0
+        } else {
+            self.required
+                .iter()
+                .filter(|id| {
+                    !self.entries.iter().enumerate().any(|(slot, e)| {
+                        state(slot, e) != State::Free && e.receiver.receiver_id == **id
+                    })
+                })
+                .count()
+        };
+        let usable = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(slot, e)| {
+                !e.retired
+                    && e.generation.checked_add(1).is_some()
+                    && match state(*slot, e) {
+                        State::Free => true,
+                        State::Tombstone => required || own == Some(*slot),
+                        _ => false,
+                    }
+            })
+            .count();
+        if usable > reserved {
+            Ok(())
+        } else {
+            Err(StatusRejected::TableFull)
+        }
+    }
+
     /// Removes the binding `key` that the sender expired or evicted (ACS
     /// 15633, 15636). Only a member's last binding removes it: a required
     /// member is then lost, as at its timeout (M5), and an optional one
