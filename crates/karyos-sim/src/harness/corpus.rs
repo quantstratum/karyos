@@ -64,6 +64,11 @@ pub enum Evidence {
     /// `openraft` and the custom core of ADR-0105; karyos#691): evidence
     /// once that version's run record names the commit it ran at.
     C5Version2,
+    /// A run of the same cores under version 3 of the C5 comparison,
+    /// version 2 run again after its harness and adapter allocation
+    /// change (karyos#691): evidence once version 3's run record names
+    /// the commit it ran at.
+    C5Version3,
 }
 
 impl Evidence {
@@ -73,6 +78,7 @@ impl Evidence {
         match self {
             Self::HarnessValidation => "harness validation, not C5 evidence",
             Self::C5Version2 => "C5 version 2",
+            Self::C5Version3 => "C5 version 3",
         }
     }
 }

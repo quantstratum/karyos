@@ -15,7 +15,7 @@
 //! W2's and W5's skeletons instead, for a quick look; its lines say so.
 //!
 //! **Lines.** Each core writes its own JSON lines file, one line per run,
-//! marked `"evidence":"C5 version 2"` only in the manifest profile at a
+//! marked `"evidence":"C5 version 3"` only in the manifest profile at a
 //! clean, known revision (`harness validation, not C5 evidence`
 //! otherwise), naming the core, its build
 //! ([`Variant`]), the profile and the `karyos` revision it ran at, with
@@ -33,8 +33,8 @@
 //! to 101,000, split by range across processes), `KARYOS_C5_CORES` a
 //! comma-separated subset of `raft,openraft,custom`, and `KARYOS_C5_OUT`
 //! the directory the files go in (default: Cargo's `CARGO_TARGET_TMPDIR`
-//! for this test), named `c5-v2-<core>-<first>-<last>.jsonl`, with the
-//! named seeds' and minimised traces under `c5-v2-<core>-<first>-<last>.traces/`,
+//! for this test), named `c5-v3-<core>-<first>-<last>.jsonl`, with the
+//! named seeds' and minimised traces under `c5-v3-<core>-<first>-<last>.traces/`,
 //! each referenced from its line (`harness::corpus::run_corpus_with_traces`). A gate's
 //! failure is a result in the lines, never a failed test; the test fails
 //! only when the runner cannot run or write them.
@@ -148,12 +148,12 @@ fn workloads(manifest: bool) -> [Workload<'static>; 5] {
     }
 }
 
-/// What a run's lines are evidence of: C5 version 2 only in the
+/// What a run's lines are evidence of: C5 version 3 only in the
 /// manifest profile at a clean, known revision; anything else is a check
 /// of the harness, and its lines say so.
 fn evidence(profile: &str, revision: &str) -> Evidence {
     if profile == "manifest" && revision != "unknown" && !revision.ends_with("-dirty") {
-        Evidence::C5Version2
+        Evidence::C5Version3
     } else {
         Evidence::HarnessValidation
     }
@@ -216,7 +216,7 @@ fn variant(name: &str) -> Variant {
     clippy::print_stdout,
     reason = "each core's summary and timing, for the report"
 )]
-fn the_c5_version_2_corpus_over_every_core() {
+fn the_c5_version_3_corpus_over_every_core() {
     let seeds = seeds();
     let repetitions: u32 = std::env::var("KARYOS_C5_REPETITIONS")
         .ok()
@@ -234,7 +234,7 @@ fn the_c5_version_2_corpus_over_every_core() {
     for name in wanted.split(',') {
         let core = label(name, variant(name), &profile, &revision);
         let out = dir.join(format!(
-            "c5-v2-{name}-{}-{}.jsonl",
+            "c5-v3-{name}-{}-{}.jsonl",
             seeds.start(),
             seeds.end()
         ));
@@ -301,7 +301,7 @@ fn every_core_writes_one_marked_line_per_run() {
     let revision = revision();
     assert_ne!(revision, "unknown", "the checkout's revision");
     for (name, variant) in CORES {
-        let out = dir.join(format!("c5-v2-check-{name}.jsonl"));
+        let out = dir.join(format!("c5-v3-check-{name}.jsonl"));
         let core = label(name, variant, "skeleton", &revision);
         let summary = corpus(
             name,
@@ -373,11 +373,11 @@ fn the_manifest_profile_runs_the_frozen_cases() {
     );
 }
 
-/// Only a manifest run at a clean, known revision is C5 version 2
+/// Only a manifest run at a clean, known revision is C5 version 3
 /// evidence.
 #[test]
 fn only_a_clean_manifest_run_is_c5_evidence() {
-    assert_eq!(evidence("manifest", "0034dca0a1b2"), Evidence::C5Version2);
+    assert_eq!(evidence("manifest", "0034dca0a1b2"), Evidence::C5Version3);
     for (profile, revision) in [
         ("skeleton", "0034dca0a1b2"),
         ("manifest", "0034dca0a1b2-dirty"),
