@@ -314,7 +314,10 @@ impl MembershipEntry {
         let learner_ids = rest.get(..learners).ok_or(out_of_range)?;
         // Each list ascending: an unsorted list is another encoding of the
         // same membership, and one encoding per membership is the rule.
-        let ascending = |list: &[u64]| list.windows(2).all(|pair| matches!(pair, [low, high] if low < high));
+        let ascending = |list: &[u64]| {
+            list.windows(2)
+                .all(|pair| matches!(pair, [low, high] if low < high))
+        };
         if !ascending(voter_ids) || !ascending(learner_ids) {
             return Err(out_of_range);
         }
@@ -431,7 +434,13 @@ mod golden {
 
     /// A schema 5 template 2 message: the envelope, then the two counts and
     /// seven ids, little endian.
-    fn message(version: u16, block_length: u16, voters: u8, learners: u8, ids: [u64; MAX_MEMBERS]) -> Vec<u8> {
+    fn message(
+        version: u16,
+        block_length: u16,
+        voters: u8,
+        learners: u8,
+        ids: [u64; MAX_MEMBERS],
+    ) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(70);
         for half in [5u16, 2, version, block_length] {
             bytes.extend_from_slice(&half.to_le_bytes());
@@ -466,7 +475,9 @@ mod golden {
 
     #[test]
     fn the_golden_refusals_refuse_with_their_errors() {
-        let out_of_range = Err(CodecError::ValueOutOfRange { field: "membership" });
+        let out_of_range = Err(CodecError::ValueOutOfRange {
+            field: "membership",
+        });
         let cases: [(&str, Vec<u8>); 7] = [
             ("P-3", message(2, 58, 0, 0, [0; MAX_MEMBERS])),
             ("P-4", message(2, 58, 6, 0, [1, 2, 3, 4, 5, 6, 0])),
@@ -482,14 +493,21 @@ mod golden {
         let p10 = message(2, 57, 3, 0, [1, 2, 3, 0, 0, 0, 0]);
         assert_eq!(
             MembershipEntry::decode(&p10),
-            Err(CodecError::UnsupportedSchema { schema: 5, template: 2, version: 2 }),
+            Err(CodecError::UnsupportedSchema {
+                schema: 5,
+                template: 2,
+                version: 2
+            }),
             "P-10"
         );
         let full = hex(P1);
         let p11 = full.get(..69).unwrap_or_default();
         assert_eq!(
             MembershipEntry::decode(p11),
-            Err(CodecError::MessageLength { declared: 70, actual: 69 }),
+            Err(CodecError::MessageLength {
+                declared: 70,
+                actual: 69
+            }),
             "P-11"
         );
     }
@@ -508,12 +526,16 @@ mod golden {
         // A voter also named as a learner is refused.
         assert_eq!(
             MembershipEntry::decode(&message(2, 58, 3, 1, [1, 2, 3, 3, 0, 0, 0])),
-            Err(CodecError::ValueOutOfRange { field: "membership" })
+            Err(CodecError::ValueOutOfRange {
+                field: "membership"
+            })
         );
         // An unused slot after the learners must be zero.
         assert_eq!(
             MembershipEntry::decode(&message(2, 58, 3, 1, [1, 2, 3, 4, 9, 0, 0])),
-            Err(CodecError::ValueOutOfRange { field: "membership" })
+            Err(CodecError::ValueOutOfRange {
+                field: "membership"
+            })
         );
     }
 }

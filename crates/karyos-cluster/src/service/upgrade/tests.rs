@@ -767,3 +767,134 @@ fn test_b8_reissued_template_5_stops_the_container() {
         }))
     );
 }
+
+/// The input bytes of the applied vectors A-11 to A-17 and C-5 to C-7,
+/// as a session without the code derived them from the design note §4.1
+/// (ADR-0087's golden rule): the helpers above encode exactly these.
+#[test]
+fn test_applied_vector_inputs_are_the_golden_bytes() {
+    let head = "05 00 03 00 02 00 0e 00";
+    for (label, bytes, golden) in [
+        (
+            "A-11",
+            activation(2, 1, &[]),
+            format!("{head} 1c 00 00 00 02 00 00 00 01 00 64 00 00 00 00 00 00 00 00 00"),
+        ),
+        (
+            "A-12",
+            activation(1, 1, &[1]),
+            format!("{head} 1d 00 00 00 01 00 00 00 01 00 64 00 00 00 00 00 00 00 01 00 01"),
+        ),
+        (
+            "A-13",
+            activation(1, 2, &[]),
+            format!("{head} 1c 00 00 00 01 00 00 00 02 00 64 00 00 00 00 00 00 00 00 00"),
+        ),
+        (
+            "A-14",
+            activation(1, 1, &[]),
+            format!("{head} 1c 00 00 00 01 00 00 00 01 00 64 00 00 00 00 00 00 00 00 00"),
+        ),
+        (
+            "A-17",
+            activation(9, 1, &[]),
+            format!("{head} 1c 00 00 00 09 00 00 00 01 00 64 00 00 00 00 00 00 00 00 00"),
+        ),
+        (
+            "C-5",
+            stop(500, 3),
+            "05 00 04 00 02 00 0c 00 18 00 00 00 f4 01 00 00 00 00 00 00 03 00 00 00".to_owned(),
+        ),
+        (
+            "C-6",
+            stop(0, 3),
+            "05 00 04 00 02 00 0c 00 18 00 00 00 00 00 00 00 00 00 00 00 03 00 00 00".to_owned(),
+        ),
+        (
+            "C-7",
+            stop(500, 1),
+            "05 00 04 00 02 00 0c 00 18 00 00 00 f4 01 00 00 00 00 00 00 01 00 00 00".to_owned(),
+        ),
+    ] {
+        assert_eq!(bytes, hex(&golden), "{label}");
+    }
+}
+
+/// Templates 3 and 4 exist only at version 2: at version 1 each is
+/// `UnsupportedSchema` with the input's own tuple (design note §4.1).
+#[test]
+fn test_templates_3_and_4_at_version_1_are_unsupported() {
+    let mut a1 = hex(A1);
+    a1[4] = 1;
+    assert_eq!(
+        Activation::decode(&a1),
+        Err(CodecError::UnsupportedSchema {
+            schema: 5,
+            template: 3,
+            version: 1
+        })
+    );
+    let mut c1 = hex(C1);
+    c1[4] = 1;
+    assert_eq!(
+        CoordinatedStop::decode(&c1),
+        Err(CodecError::UnsupportedSchema {
+            schema: 5,
+            template: 4,
+            version: 1
+        })
+    );
+}
+
+/// ADR-0122 decision 6 at the leader: once it appended a
+/// `CoordinatedStop`, before it applies, the leader refuses every
+/// proposal, the resuming `Activation` and the core's own entries
+/// included. A node that knows the stop only from the log, as the first
+/// leader after the restart does, still proposes the `Activation`.
+#[test]
+fn test_the_leader_that_appended_a_stop_refuses_every_proposal() {
+    #[derive(Default)]
+    struct Core(usize);
+    impl Propose for Core {
+        fn propose(&mut self, _: Vec<u8>) -> Result<(), NotLeader> {
+            self.0 += 1;
+            Ok(())
+        }
+    }
+    let mut leader = up_to(2, 9);
+    let mut core = Core::default();
+    leader
+        .propose_stop(&CoordinatedStop::new(5, 3), &mut core)
+        .unwrap();
+    assert_eq!(core.0, 1);
+    assert_eq!(leader.stop(), None, "appended, not applied");
+    let resume = Activation::new(ActiveVersion::new(3, 1), 1, &[]);
+    assert_eq!(
+        leader.propose_activation(&resume, &mut core),
+        Err(ProposeRefused::Stopping)
+    );
+    assert_eq!(
+        leader.propose(
+            &Envelope::TimerFired {
+                timer: 1,
+                deadline: 1
+            },
+            &mut core
+        ),
+        Err(ProposeRefused::Stopping)
+    );
+    assert_eq!(
+        leader.propose_stop(&CoordinatedStop::new(5, 3), &mut core),
+        Err(ProposeRefused::Stopping)
+    );
+    assert_eq!(leader.propose_bounds(&mut core), Ok(false));
+    assert_eq!(leader.propose_guard_bounds(&mut core), Ok(false));
+    assert_eq!(core.0, 1, "nothing more proposed");
+    // The resumed node: the stop is in its log, it appended none.
+    let mut old = up_to(1, 9);
+    assert_eq!(old.apply(&raw(10, stop(0, 3))), Ok(Applied::Nothing));
+    let mut new = container(3);
+    new.restore(10, &reads(&old)).unwrap();
+    assert_eq!(new.propose_activation(&resume, &mut core), Ok(()));
+    assert_eq!(core.0, 2);
+}

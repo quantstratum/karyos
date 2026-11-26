@@ -555,8 +555,10 @@ pub enum ProposeRefused {
         /// The log's active version.
         active: ActiveVersion,
     },
-    /// The log carries a coordinated stop (ADR-0122 decision 6): every
-    /// service proposal is refused until the resuming `Activation` applies.
+    /// A coordinated stop (ADR-0122 decision 6): the leader that appended
+    /// it refuses every proposal until it restarts, and while the log
+    /// carries it every service proposal is refused until the resuming
+    /// `Activation` applies.
     #[error("the cluster is stopping for a coordinated restart")]
     Stopping,
 }
@@ -957,6 +959,10 @@ pub struct ServiceContainer<S> {
     /// The active version, any pending activation and any logged stop
     /// (ADR-0122): log state.
     versions: upgrade::Versions,
+    /// This node, as leader, appended a `CoordinatedStop` (ADR-0122
+    /// decision 6): it refuses every proposal until it restarts. Local,
+    /// not replicated.
+    stop_appended: bool,
 }
 
 impl<S: ClusteredService> ServiceContainer<S> {
@@ -982,6 +988,7 @@ impl<S: ClusteredService> ServiceContainer<S> {
             guards: GuardTable::new(config.guards),
             renewed_at: None,
             versions: upgrade::Versions::default(),
+            stop_appended: false,
         })
     }
 
@@ -1008,38 +1015,51 @@ impl<S: ClusteredService> ServiceContainer<S> {
     }
 
     /// Proposes `activation` through `core` (ADR-0122 decision 1). It is
-    /// checked when it applies, never here.
+    /// checked when it applies, never here. A stop known only from the
+    /// log does not refuse it, so the first leader after the resuming
+    /// restart can propose the resuming `Activation`.
     ///
     /// # Errors
     ///
-    /// [`ProposeRefused::Codec`] for an entry that does not encode,
-    /// [`ProposeRefused::NotLeader`] when `core` does not lead.
+    /// [`ProposeRefused::Stopping`] once this node appended a
+    /// `CoordinatedStop`, [`ProposeRefused::Codec`] for an entry that does
+    /// not encode, [`ProposeRefused::NotLeader`] when `core` does not lead.
     pub fn propose_activation<P: Propose>(
         &self,
         activation: &Activation<'_>,
         core: &mut P,
     ) -> Result<(), ProposeRefused> {
+        if self.stop_appended {
+            return Err(ProposeRefused::Stopping);
+        }
         core.propose(activation.to_vec()?)?;
         Ok(())
     }
 
-    /// Proposes `stop` through `core` (ADR-0122 decision 6): once it
-    /// applies, [`ServiceContainer::propose`] refuses every proposal.
+    /// Proposes `stop` through `core` (ADR-0122 decision 6): once it is
+    /// appended, this node refuses every proposal until it restarts, and
+    /// once it applies, every node refuses service proposals.
     ///
     /// # Errors
     ///
-    /// [`ProposeRefused::Stopping`] while a stop is logged,
+    /// [`ProposeRefused::Stopping`] while a stop is logged or appended,
     /// [`ProposeRefused::Codec`] and [`ProposeRefused::NotLeader`].
     pub fn propose_stop<P: Propose>(
-        &self,
+        &mut self,
         stop: &CoordinatedStop,
         core: &mut P,
     ) -> Result<(), ProposeRefused> {
-        if self.versions.stop.is_some() {
+        if self.stopping() {
             return Err(ProposeRefused::Stopping);
         }
         core.propose(stop.to_vec()?)?;
+        self.stop_appended = true;
         Ok(())
+    }
+
+    /// A stop is logged, or this node appended one.
+    fn stopping(&self) -> bool {
+        self.stop_appended || self.versions.stop.is_some()
     }
 
     /// Whether the active version runs `command`: `Ok`, or the refusal.
@@ -1094,7 +1114,7 @@ impl<S: ClusteredService> ServiceContainer<S> {
     ///
     /// [`NotLeader`] when the core does not lead.
     pub fn propose_guard_bounds<P: Propose>(&self, core: &mut P) -> Result<bool, NotLeader> {
-        if self.guards.bounds_logged() {
+        if self.guards.bounds_logged() || self.stop_appended {
             return Ok(false);
         }
         let Ok(payload) = GuardEntry::Bounds(self.guards.bounds()).to_vec() else {
@@ -1122,9 +1142,10 @@ impl<S: ClusteredService> ServiceContainer<S> {
             return Err(NotLeader::new(None));
         }
         let every = self.guards.bounds().renew_every;
-        if self
-            .renewed_at
-            .is_some_and(|at| now.saturating_sub(at) < every)
+        if self.stop_appended
+            || self
+                .renewed_at
+                .is_some_and(|at| now.saturating_sub(at) < every)
         {
             return Ok(false);
         }
@@ -1165,7 +1186,7 @@ impl<S: ClusteredService> ServiceContainer<S> {
     ///
     /// [`NotLeader`] when `core` does not lead.
     pub fn propose_bounds<P: Propose>(&self, core: &mut P) -> Result<bool, NotLeader> {
-        if self.bounds_logged {
+        if self.bounds_logged || self.stop_appended {
             return Ok(false);
         }
         // A table's bounds are never 0 (`SessionTable::new`), so this
@@ -1197,7 +1218,7 @@ impl<S: ClusteredService> ServiceContainer<S> {
         envelope: &Envelope<'_>,
         core: &mut P,
     ) -> Result<(), ProposeRefused> {
-        if self.versions.stop.is_some() {
+        if self.stopping() {
             return Err(ProposeRefused::Stopping);
         }
         if let Envelope::Request { command, .. } = envelope
