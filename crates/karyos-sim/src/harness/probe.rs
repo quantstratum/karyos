@@ -314,6 +314,14 @@ impl<C: ConsensusCore> ConsensusCore for Probed<C> {
         self.read(C::configuration)
     }
 
+    fn configuration_stamp(&self) -> Option<u64> {
+        self.read(C::configuration_stamp)
+    }
+
+    fn is_configuration_entry(payload: &[u8]) -> bool {
+        C::is_configuration_entry(payload)
+    }
+
     fn compacted(&mut self, base: SnapshotBase, log: &mut LogView<'_>) -> Result<(), Unsupported> {
         self.counted((Stage::Other, Stage::Other), |core| {
             core.compacted(base, log)

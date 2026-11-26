@@ -281,7 +281,8 @@ pub struct W5 {
 
 /// The log bytes of one W5 entry: a client's append of `payload` bytes,
 /// as the log frames it.
-fn w5_frame(payload: usize) -> u64 {
+#[must_use]
+pub fn w5_frame(payload: usize) -> u64 {
     let command = super::node::Command {
         client: 0,
         sequence: 1,
@@ -312,6 +313,7 @@ impl W5 {
                 every: 1_000,
                 keep: 100,
                 frame: w5_frame(256),
+                every_bytes: None,
             },
         }
     }
@@ -325,6 +327,7 @@ impl W5 {
                 every: 100,
                 keep: 10,
                 frame: w5_frame(256),
+                every_bytes: None,
             },
             ..Self::manifest()
         }

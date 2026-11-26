@@ -49,6 +49,17 @@
 //!
 //! decides every point of a `measure` directory and writes `report.md`
 //! and `analysis.json` into it (`analyze.rs`).
+//!
+//! ```text
+//! karyos-bench timeouts pause --seconds <s> [--tick-us <us>]
+//! karyos-bench timeouts echo --bind <addr> --seconds <s>
+//! karyos-bench timeouts rtt --to <addr> [--count <n>] [--interval-us <us>] [--size <bytes>]
+//! ```
+//!
+//! measures the inputs of the Cluster's election-timeout defaults
+//! (`timeouts.rs`): this host's timer overshoot, or the UDP round trip to
+//! an `echo` on another host, each printed as one JSON line with the
+//! host's load through the run.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -337,6 +348,69 @@ fn analyze_command(args: &[String]) -> Result<String, String> {
     ))
 }
 
+/// `karyos-bench timeouts <probe> ...`: one probe, its report on `out`.
+fn timeouts(args: &[String], out: &mut impl Write, err: &mut impl Write) -> ExitCode {
+    use karyos_bench::timeouts;
+    use std::time::Duration;
+    let usage = "usage: karyos-bench timeouts pause --seconds <s> [--tick-us <us>] | echo --bind <addr> --seconds <s> | rtt --to <addr> [--count <n>] [--interval-us <us>] [--size <bytes>]";
+    let Some(probe) = args.first() else {
+        let _ = writeln!(err, "{usage}");
+        return ExitCode::from(2);
+    };
+    let mut seconds = 10u64;
+    let mut tick_us = 1_000u64;
+    let mut count = 10_000u64;
+    let mut interval_us = 1_000u64;
+    let mut size = 64usize;
+    let mut address: Option<std::net::SocketAddr> = None;
+    let mut rest = args.iter().skip(1);
+    while let Some(flag) = rest.next() {
+        let Some(value) = rest.next() else {
+            let _ = writeln!(err, "{flag} needs a value\n{usage}");
+            return ExitCode::from(2);
+        };
+        let parsed = match flag.as_str() {
+            "--seconds" => value.parse().map(|v| seconds = v).is_ok(),
+            "--tick-us" => value.parse().map(|v| tick_us = v).is_ok(),
+            "--count" => value.parse().map(|v| count = v).is_ok(),
+            "--interval-us" => value.parse().map(|v| interval_us = v).is_ok(),
+            "--size" => value.parse().map(|v| size = v).is_ok(),
+            "--bind" | "--to" => value.parse().map(|v| address = Some(v)).is_ok(),
+            _ => false,
+        };
+        if !parsed {
+            let _ = writeln!(err, "bad {flag} {value}\n{usage}");
+            return ExitCode::from(2);
+        }
+    }
+    let line = match (probe.as_str(), address) {
+        ("pause", _) => Ok(timeouts::pause(
+            Duration::from_secs(seconds),
+            Duration::from_micros(tick_us),
+        )
+        .json()),
+        ("echo", Some(bind)) => timeouts::echo(bind, Duration::from_secs(seconds))
+            .map(|answered| format!("{{\"probe\":\"echo\",\"answered\":{answered}}}")),
+        ("rtt", Some(to)) => {
+            timeouts::rtt(to, count, Duration::from_micros(interval_us), size).map(|r| r.json())
+        }
+        _ => {
+            let _ = writeln!(err, "{usage}");
+            return ExitCode::from(2);
+        }
+    };
+    match line {
+        Ok(line) => {
+            let _ = writeln!(out, "{line}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            let _ = writeln!(err, "karyos-bench timeouts: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     // The child of an IPC workload runs its part and nothing else.
     #[cfg(target_os = "linux")]
@@ -362,6 +436,9 @@ fn main() -> ExitCode {
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("timeouts") {
+        return timeouts(args.get(1..).unwrap_or(&[]), &mut out, &mut err);
+    }
     if args.first().map(String::as_str) == Some("inventory") {
         return match inventory_command(args.get(1..).unwrap_or_default()) {
             Ok(report) => {

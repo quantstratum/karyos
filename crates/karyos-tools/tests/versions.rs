@@ -23,6 +23,7 @@ fn every_binary_prints_the_versions_and_touches_no_driver() {
         env!("CARGO_BIN_EXE_karyos-tools"),
         env!("CARGO_BIN_EXE_karyos-stat"),
         env!("CARGO_BIN_EXE_karyos-errors"),
+        env!("CARGO_BIN_EXE_karyos-backup"),
         env!("CARGO_BIN_EXE_karyos-catalog"),
         env!("CARGO_BIN_EXE_karyos-replay"),
         env!("CARGO_BIN_EXE_karyos-trace"),

@@ -860,6 +860,9 @@ impl Server {
                         agent.guard_close_for(Path::new(dir), guard, requester, reason.as_bytes());
                     (json::guard_answer(&answer), Served::Operated)
                 } else {
+                    // Journalled, refused `not_authorised`, and never sent
+                    // (karyos#719).
+                    agent.guard_refused(Path::new(dir), guard, None, requester, reason.as_bytes());
                     forbidden()
                 }
             }
@@ -888,6 +891,13 @@ impl Server {
                     };
                     (json::guard_answer(&answer), served)
                 } else {
+                    agent.guard_refused(
+                        Path::new(dir),
+                        guard,
+                        Some(expected),
+                        requester,
+                        reason.as_bytes(),
+                    );
                     forbidden()
                 }
             }
@@ -931,6 +941,9 @@ impl Server {
                         agent.retention(operation, recording, requester, reason.as_bytes());
                     (json::retention_answer(&answer), Served::Operated)
                 } else {
+                    // Journalled, refused `not_authorised`, and never sent
+                    // (karyos#719).
+                    agent.retention_refused(operation, recording, requester, reason.as_bytes());
                     forbidden()
                 }
             }

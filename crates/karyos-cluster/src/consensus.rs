@@ -3,7 +3,8 @@
 //! The custom Raft core's state machine (ADR-0105, part (b) of
 //! quantstratum/karyos#681): terms, votes, roles, pre-vote, randomised
 //! election timeouts from a seeded source, log matching and the commit
-//! rule, for a static membership of 3 or 5 voters.
+//! rule, over a membership of up to 5 voters and 2 learners that changes
+//! one server at a time ([`crate::membership`]; karyos#711).
 //!
 //! The core is pure: it does no I/O and allocates nothing after
 //! [`Core::new`]. It reads the log through [`LogTerms`], C4's log being
@@ -76,10 +77,28 @@
 //! acknowledges it to the leader once durable. The core sees no snapshot
 //! bytes: the store and its CRC-32C checks are the driver's, and those
 //! checks detect corruption only; they claim no tamper evidence.
+//!
+//! **Membership** (karyos#711). A cluster starts from a bootstrap set of 3
+//! or 5 voters and changes one server at a time: [`Core::propose_change`]
+//! adds a learner, promotes a learner or removes a member, refused while a
+//! change is uncommitted or before the leader has committed an entry of
+//! its own term (the single-server errata), and a promotion while the
+//! learner is further behind the commit than the given lag. A
+//! configuration takes effect when its entry is in the log, committed or
+//! not: the leader adopts it as it proposes it, a follower when its driver
+//! reports the received entry ([`Core::configured`]), and a truncation of
+//! the entry restores the configuration before it. Learners receive every
+//! append and snapshot and count toward no quorum, never stand for
+//! election and grant no vote that counts. A leader whose removal
+//! commits steps down. The membership at a snapshot's base is the
+//! driver's to keep with the snapshot and give back
+//! ([`Core::restore_membership`]); a restart replays the configuration
+//! entries its log holds through [`Core::configured`].
 
 use crate::hard_state::HardState;
+use crate::membership::{MAX_MEMBERS, Membership, MembershipChange};
 
-/// The most voters a static membership has.
+/// The most voters a membership has.
 pub const MAX_VOTERS: usize = 5;
 
 /// What the core reads of its node's log: C4's [`RaftLog`](crate::RaftLog)
@@ -315,10 +334,31 @@ pub enum ProposeError {
     Backpressure(Backpressure),
 }
 
+/// Why a membership change is refused ([`Core::propose_change`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeError {
+    /// The node does not lead.
+    NotLeader(NotLeader),
+    /// An earlier change is not committed yet, or the leader has not yet
+    /// committed an entry of its own term (the single-server errata).
+    InProgress,
+    /// The learner is further behind the leader's commit than the lag.
+    Lagging {
+        /// Entries it is behind.
+        behind: u64,
+    },
+    /// The change does not apply to the current membership: a member added
+    /// again, a promotion of anyone but a learner, the removal of a
+    /// stranger or of the last voter, or a bound passed.
+    Invalid,
+    /// A flow limit refuses the entry.
+    Backpressure(Backpressure),
+}
+
 /// Why a message is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepError {
-    /// The sender is not a voter, or is this node.
+    /// The sender is not a member, or is this node.
     UnknownSender,
     /// An append's entry terms do not match its count, or are not
     /// ascending from its previous term.
@@ -352,6 +392,90 @@ pub struct NotLeader {
     /// The leader it knows, if any.
     pub leader: Option<u64>,
 }
+
+/// An election-timeout profile for one deployment (ADR-0039; ADR-0105,
+/// decision 5): the timer tick its driver runs the core at, and the
+/// election timeout's range and the heartbeat in ticks. Each profile's
+/// values are chosen by the rule in `tests/timeout_profiles.rs` from its
+/// deployment's measured process pauses and network round trips
+/// (quantstratum-docs: karyos/environments/election-timeouts.md), which
+/// also states each one's false elections and recovery time; no value
+/// holds outside its stated deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeoutProfile {
+    /// The deployment it is for.
+    pub name: &'static str,
+    /// The driver's timer tick, in microseconds.
+    pub tick_us: u64,
+    /// The shortest election timeout, in ticks.
+    pub election_min: u32,
+    /// The election timeout's exclusive upper bound, in ticks.
+    pub election_max: u32,
+    /// A leader's heartbeat, in ticks.
+    pub heartbeat: u32,
+}
+
+impl TimeoutProfile {
+    /// A configuration for node `id` of `voters` under this profile, with
+    /// appends of at most `batch` entries and the election draw's `seed`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Config::new`].
+    pub fn config(
+        &self,
+        id: u64,
+        voters: &[u64],
+        batch: u64,
+        seed: u64,
+    ) -> Result<Config, ConfigError> {
+        Config::new(
+            id,
+            voters,
+            self.election_min,
+            self.election_max,
+            self.heartbeat,
+            batch,
+            seed,
+        )
+    }
+}
+
+/// One host: the members are processes on it, over loopback, the host
+/// running other load. Measured on a host under build load (one-minute load
+/// 10 to 94): leader changes at 6 ticks, none from 8; recovery about
+/// 17 ms median, 22 ms worst of 40 runs.
+pub const SAME_HOST: TimeoutProfile = TimeoutProfile {
+    name: "same host",
+    tick_us: 1_000,
+    election_min: 16,
+    election_max: 32,
+    heartbeat: 4,
+};
+
+/// Dedicated hosts, idle but for the Cluster, on a direct link. Measured on
+/// two idle hosts over a bond (load under 1): no false election at the
+/// smallest swept value, 4 ticks; recovery about 10 ms median, 15 ms
+/// worst of 40 runs.
+pub const LAN_DEDICATED: TimeoutProfile = TimeoutProfile {
+    name: "LAN, dedicated hosts",
+    tick_us: 1_000,
+    election_min: 8,
+    election_max: 16,
+    heartbeat: 2,
+};
+
+/// Hosts shared with heavy unrelated load (builds) on a switched LAN.
+/// Measured on build hosts (load up to 100): false elections up to 24
+/// ticks, none from 32; recovery about 100 ms median, 135 ms worst of 40
+/// runs.
+pub const LAN_SHARED: TimeoutProfile = TimeoutProfile {
+    name: "LAN, shared hosts",
+    tick_us: 1_000,
+    election_min: 64,
+    election_max: 128,
+    heartbeat: 16,
+};
 
 /// A core's configuration.
 #[derive(Debug, Clone, Copy)]
@@ -387,6 +511,42 @@ impl Config {
         batch: u64,
         seed: u64,
     ) -> Result<Self, ConfigError> {
+        let config = Self::joining(
+            id,
+            voters,
+            election_min,
+            election_max,
+            heartbeat,
+            batch,
+            seed,
+        )?;
+        if !voters.contains(&id) {
+            return Err(ConfigError::NotAVoter);
+        }
+        Ok(config)
+    }
+
+    /// As [`Config::new`], for node `id` that is not among the bootstrap
+    /// `voters`: a server that joins an existing cluster, as a learner
+    /// once the leader adds it. It follows whichever of `voters` leads, and
+    /// learns its membership from the log.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError`] for each rule it breaks but
+    /// [`ConfigError::NotAVoter`].
+    pub fn joining(
+        id: u64,
+        voters: &[u64],
+        election_min: u32,
+        election_max: u32,
+        heartbeat: u32,
+        batch: u64,
+        seed: u64,
+    ) -> Result<Self, ConfigError> {
+        if id == 0 {
+            return Err(ConfigError::BadVoter);
+        }
         if voters.len() != 3 && voters.len() != 5 {
             return Err(ConfigError::VoterCount(voters.len()));
         }
@@ -396,9 +556,6 @@ impl Config {
                 return Err(ConfigError::BadVoter);
             }
             *slot = voter;
-        }
-        if !voters.contains(&id) {
-            return Err(ConfigError::NotAVoter);
         }
         // At least two timeout values, so nodes that time out together
         // draw apart.
@@ -461,19 +618,20 @@ impl Config {
         self.id
     }
 
-    fn voters(&self) -> impl Iterator<Item = u64> + '_ {
-        self.voters.iter().copied().take(self.count)
-    }
-
-    const fn quorum(&self) -> usize {
-        self.count / 2 + 1
+    /// The bootstrap membership: its voters, no learner.
+    fn membership(&self) -> Membership {
+        let voters = self.voters.get(..self.count).unwrap_or(&[]);
+        // Validated by Config::joining: 3 or 5 distinct nonzero voters.
+        Membership::new(voters, &[]).unwrap_or(Membership::EMPTY)
     }
 }
 
-/// What a leader knows of one voter.
+/// What a leader knows of one member.
 #[derive(Debug, Clone, Copy, Default)]
 struct Peer {
     id: u64,
+    /// Whether it votes.
+    voter: bool,
     /// The next index to send it.
     next: u64,
     /// The highest index known durable on it.
@@ -582,7 +740,22 @@ pub struct Core {
     term_vote: TermVote,
     role: Role,
     commit: u64,
-    peers: [Peer; MAX_VOTERS],
+    /// The membership it acts under: the latest configuration entry's,
+    /// else `settled`.
+    members: Membership,
+    /// The membership before the configuration entries below, and the
+    /// index from which it is known: `None` for the bootstrap one, in
+    /// force from the log's start.
+    settled: Membership,
+    settled_at: Option<u64>,
+    /// The configuration entries its log holds, as (index, membership):
+    /// the one before the latest, and the latest.
+    prior: Option<(u64, Membership)>,
+    latest: Option<(u64, Membership)>,
+    /// One per member, in `members` order: voters, then learners.
+    peers: [Peer; MAX_MEMBERS],
+    /// How many times `members` was taken anew.
+    changes: u64,
     elapsed: u32,
     timeout: u32,
     rng: u64,
@@ -601,16 +774,24 @@ impl Core {
     /// index it kept (0 when none).
     #[must_use]
     pub fn new(config: Config, term_vote: TermVote, commit: u64) -> Self {
-        let mut peers = [Peer::default(); MAX_VOTERS];
-        for (peer, id) in peers.iter_mut().zip(config.voters()) {
+        let members = config.membership();
+        let mut peers = [Peer::default(); MAX_MEMBERS];
+        for (peer, (id, voter)) in peers.iter_mut().zip(members.members()) {
             peer.id = id;
+            peer.voter = voter;
         }
         let mut core = Self {
             config,
             term_vote,
             role: Role::Follower { leader: None },
             commit,
+            members,
+            settled: members,
+            settled_at: None,
+            prior: None,
+            latest: None,
             peers,
+            changes: 0,
             elapsed: 0,
             timeout: 0,
             rng: config.seed ^ config.id.wrapping_mul(0x9E37_79B9_7F4A_7C15),
@@ -655,27 +836,212 @@ impl Core {
         if self.role != Role::Leader || id == self.config.id {
             return None;
         }
-        let peer = self
-            .peers
-            .iter()
-            .take(self.config.count)
-            .find(|peer| peer.id == id)?;
+        let peer = self.member_peers().find(|peer| peer.id == id)?;
         Some((peer.flight, peer.bytes))
     }
 
-    /// A leader's pipeline epoch for voter `id`, which its appends carry
+    /// A leader's pipeline epoch for member `id`, which its appends carry
     /// and their replies echo; `None` unless it leads and `id` is another
-    /// voter.
+    /// member.
     #[must_use]
     pub fn pipeline_epoch(&self, id: u64) -> Option<u64> {
         if self.role != Role::Leader || id == self.config.id {
             return None;
         }
-        self.peers
-            .iter()
-            .take(self.config.count)
+        self.member_peers()
             .find(|peer| peer.id == id)
             .map(|peer| peer.epoch)
+    }
+
+    /// The membership it acts under: the latest configuration entry in its
+    /// log, committed or not, or the one before any.
+    #[must_use]
+    pub const fn membership(&self) -> Membership {
+        self.members
+    }
+
+    /// How many times its membership was taken anew (each configuration
+    /// entry, truncation or restore): a driver that reports the membership
+    /// looks again only when it moved, so the replication path allocates
+    /// nothing for it.
+    #[must_use]
+    pub const fn configuration_changes(&self) -> u64 {
+        self.changes
+    }
+
+    /// The index of the configuration entry it acts under; `None` for the
+    /// bootstrap membership, or the one a snapshot restored.
+    #[must_use]
+    pub fn configuration_index(&self) -> Option<u64> {
+        self.latest.or(self.prior).map(|(index, _)| index)
+    }
+
+    /// The membership at index `index`: the latest configuration entry at
+    /// or below it. What a driver keeps with a snapshot whose base is
+    /// `index`. `None` below the oldest configuration it still knows,
+    /// where it cannot say.
+    #[must_use]
+    pub fn membership_at(&self, index: u64) -> Option<Membership> {
+        if let Some((_, membership)) = [self.latest, self.prior]
+            .into_iter()
+            .flatten()
+            .find(|(at, _)| *at <= index)
+        {
+            return Some(membership);
+        }
+        self.settled_at
+            .is_none_or(|at| at <= index)
+            .then_some(self.settled)
+    }
+
+    /// The node's log holds a configuration entry at `index`: its driver
+    /// wrote it, a follower from a leader's append, or replays it at a
+    /// restart, in log order. It takes effect now, committed or not. An
+    /// entry at or below the latest one known is ignored.
+    pub fn configured(&mut self, index: u64, membership: Membership, log: &impl LogTerms) {
+        if self.latest.is_some_and(|(latest, _)| index <= latest) {
+            return;
+        }
+        debug_assert!(
+            index <= Based::new(log, self.base).last_index().saturating_add(1),
+            "a configuration entry past the log's end"
+        );
+        if let Some((at, older)) = self.prior {
+            // Two entries on, the oldest is committed: a leader appends a
+            // change only once the one before is (the errata).
+            self.settled = older;
+            self.settled_at = Some(at);
+        }
+        self.prior = self.latest;
+        self.latest = Some((index, membership));
+        let next = Based::new(log, self.base).last_index().saturating_add(1);
+        self.adopt(next.min(index));
+    }
+
+    /// The membership a snapshot whose base is `index` was taken under,
+    /// restored by the driver after [`Core::install`] or at a restart
+    /// over the snapshot ([`Core::with_snapshot`]): configuration entries
+    /// at or below the base are replaced by it.
+    pub fn restore_membership(&mut self, index: u64, membership: Membership) {
+        self.settled = membership;
+        self.settled_at = Some(index);
+        if self.prior.is_some_and(|(at, _)| at <= index) {
+            self.prior = None;
+        }
+        if self.latest.is_some_and(|(at, _)| at <= index) {
+            self.latest = self.prior.take();
+        }
+        self.adopt(index.saturating_add(1));
+    }
+
+    /// Proposes one membership change, of a configuration entry of `size`
+    /// bytes: a promotion only while the learner is at most `lag` entries
+    /// behind the commit. The driver writes the entry at the returned
+    /// index and term, as [`Core::propose`]'s, carrying the returned
+    /// membership, then calls [`Core::replicate`]. The leader acts under
+    /// it from now on.
+    ///
+    /// # Errors
+    ///
+    /// [`ChangeError`]; nothing changes.
+    pub fn propose_change(
+        &mut self,
+        change: MembershipChange,
+        size: u64,
+        lag: u64,
+        log: &impl LogTerms,
+        out: &mut impl Effects,
+    ) -> Result<(u64, u64, Membership), ChangeError> {
+        let (index, term) = self.propose(size, log).map_err(|error| match error {
+            ProposeError::NotLeader(not_leader) => ChangeError::NotLeader(not_leader),
+            ProposeError::Backpressure(limit) => ChangeError::Backpressure(limit),
+        })?;
+        let based = Based::new(log, self.base);
+        // The errata: an entry of its own term committed first, and one
+        // change at a time.
+        if based.term(self.commit) != Some(term)
+            || self.latest.is_some_and(|(at, _)| at > self.commit)
+        {
+            return Err(ChangeError::InProgress);
+        }
+        let membership = self.members.changed(change).ok_or(ChangeError::Invalid)?;
+        if let MembershipChange::Promote(learner) = change {
+            let matched = self
+                .member_peers()
+                .find(|peer| peer.id == learner)
+                .map_or(0, |peer| peer.matched);
+            let behind = self.commit.saturating_sub(matched);
+            if behind > lag {
+                return Err(ChangeError::Lagging { behind });
+            }
+        }
+        self.configured(index, membership, log);
+        // A removal can leave a majority that already holds more.
+        self.advance_commit(&based, out);
+        Ok((index, term, membership))
+    }
+
+    /// Takes `self.members` from the configuration entries: each member
+    /// keeps what the leader knew of it, and a new one starts at `next`.
+    fn adopt(&mut self, next: u64) {
+        let members = self.latest.or(self.prior).map_or(self.settled, |(_, m)| m);
+        let mut peers = [Peer::default(); MAX_MEMBERS];
+        for (slot, (id, voter)) in peers.iter_mut().zip(members.members()) {
+            *slot = match self.peers.iter().find(|peer| peer.id == id) {
+                Some(known) => *known,
+                None => {
+                    self.epoch = self.epoch.wrapping_add(1);
+                    Peer {
+                        id,
+                        next: next.max(1),
+                        epoch: self.epoch,
+                        granted: false,
+                        ..Peer::default()
+                    }
+                }
+            };
+            slot.voter = voter;
+        }
+        self.members = members;
+        self.peers = peers;
+        self.changes = self.changes.wrapping_add(1);
+    }
+
+    /// The configuration entries at or past `from` are gone from the log:
+    /// the latest one left takes effect.
+    fn truncated(&mut self, from: u64) {
+        let mut changed = false;
+        while let Some((at, _)) = self.latest.or(self.prior) {
+            if at < from {
+                break;
+            }
+            if self.latest.is_some() {
+                self.latest = self.prior.take();
+            } else {
+                self.prior = None;
+            }
+            changed = true;
+        }
+        if changed {
+            self.adopt(from);
+        }
+    }
+
+    /// The peers of the current members.
+    fn member_peers(&self) -> impl Iterator<Item = &Peer> + '_ {
+        self.peers.iter().filter(|peer| peer.id != 0)
+    }
+
+    /// A leader whose own removal has committed steps down.
+    fn settle_removal(&mut self) {
+        let committed = self
+            .latest
+            .or(self.prior)
+            .is_none_or(|(at, _)| at <= self.commit);
+        if self.role == Role::Leader && committed && !self.members.is_voter(self.config.id) {
+            self.role = Role::Follower { leader: None };
+            self.reset_timer();
+        }
     }
 
     /// The same core recovered over a snapshot whose base is `index`, of
@@ -797,15 +1163,13 @@ impl Core {
                 self.quorum_elapsed = 0;
                 let id = self.config.id;
                 let heard = self
-                    .peers
-                    .iter()
-                    .take(self.config.count)
-                    .filter(|peer| peer.recent || peer.id == id)
+                    .member_peers()
+                    .filter(|peer| peer.voter && (peer.recent || peer.id == id))
                     .count();
                 for peer in &mut self.peers {
                     peer.recent = false;
                 }
-                if heard < self.config.quorum() {
+                if heard < self.members.quorum() {
                     self.role = Role::Follower { leader: None };
                     self.reset_timer();
                     return;
@@ -831,7 +1195,8 @@ impl Core {
                 self.elapsed = 0;
                 self.replicate(log, out);
             }
-        } else if self.elapsed >= self.timeout {
+        } else if self.elapsed >= self.timeout && self.members.is_voter(self.config.id) {
+            // A learner never stands for election.
             self.pre_campaign(log, out);
         }
     }
@@ -895,12 +1260,12 @@ impl Core {
             return;
         }
         let mut budget = Duty::of(self.config.limits);
-        for at in 0..self.config.count {
+        for at in 0..MAX_MEMBERS {
             self.send_append(at, &mut budget, true, log, out);
         }
     }
 
-    /// One message from voter `from`; `terms` are the entry terms of an
+    /// One message from member `from`; `terms` are the entry terms of an
     /// [`Message::Append`], empty otherwise.
     ///
     /// # Errors
@@ -916,7 +1281,10 @@ impl Core {
         out: &mut impl Effects,
     ) -> Result<(), StepError> {
         let log = &Based::new(log, self.base);
-        if from == self.config.id || !self.config.voters().any(|voter| voter == from) {
+        // A node outside its own membership (joining, or removed) follows
+        // whoever leads: the voters it was started with may be gone.
+        let joining = !self.members.contains(self.config.id);
+        if from == self.config.id || (!joining && !self.members.contains(from)) {
             return Err(StepError::UnknownSender);
         }
         match message {
@@ -1008,7 +1376,9 @@ impl Core {
             last_term,
             round: self.round,
         };
-        for voter in self.config.voters().filter(|&v| v != self.config.id) {
+        let id = self.config.id;
+        let members = self.members;
+        for voter in members.voters().filter(|&v| v != id) {
             out.send(voter, message);
         }
     }
@@ -1028,7 +1398,9 @@ impl Core {
             last_index,
             last_term,
         };
-        for voter in self.config.voters().filter(|&v| v != self.config.id) {
+        let id = self.config.id;
+        let members = self.members;
+        for voter in members.voters().filter(|&v| v != id) {
             out.send_after_persist(voter, message);
         }
     }
@@ -1051,8 +1423,11 @@ impl Core {
             }
             Role::PreCandidate | Role::Candidate => false,
         };
-        let granted =
-            term > self.term_vote.term && !live_leader && up_to_date(log, last_index, last_term);
+        // Only a voter grants: a learner's or a stranger's vote is no vote.
+        let granted = term > self.term_vote.term
+            && !live_leader
+            && self.members.is_voter(self.config.id)
+            && up_to_date(log, last_index, last_term);
         let reply_term = if granted { term } else { self.term_vote.term };
         out.send(
             from,
@@ -1098,6 +1473,7 @@ impl Core {
         let granted = term == self.term_vote.term
             && free
             && self.role != Role::Leader
+            && self.members.is_voter(self.config.id)
             && up_to_date(log, last_index, last_term);
         if granted {
             if self.term_vote.voted_for.is_none() {
@@ -1136,7 +1512,7 @@ impl Core {
         self.elapsed = 0;
         self.quorum_elapsed = 0;
         let next = log.last_index().saturating_add(1);
-        for peer in self.peers.iter_mut().take(self.config.count) {
+        for peer in self.peers.iter_mut().filter(|peer| peer.id != 0) {
             self.epoch = self.epoch.wrapping_add(1);
             peer.next = next;
             peer.matched = 0;
@@ -1220,6 +1596,8 @@ impl Core {
             }
         } else {
             if let Some((index, skip)) = conflict {
+                // Configuration entries from `index` on are replaced.
+                self.truncated(index);
                 out.write(index, skip);
             }
             let matched = append.prev_index.saturating_add(count);
@@ -1378,7 +1756,11 @@ impl Core {
         out: &mut impl Effects,
     ) {
         let id = self.config.id;
-        if self.peers.get(at).is_none_or(|peer| peer.id == id) {
+        if self
+            .peers
+            .get(at)
+            .is_none_or(|peer| peer.id == id || peer.id == 0)
+        {
             return;
         }
         let commit = self.commit;
@@ -1494,23 +1876,29 @@ impl Core {
     /// The highest index a majority holds durably, committed when its
     /// entry is of this term.
     fn advance_commit(&mut self, log: &impl LogTerms, out: &mut impl Effects) {
+        if self.role != Role::Leader {
+            return;
+        }
         let mut matched = [0_u64; MAX_VOTERS];
+        let mut count = 0;
         for (slot, peer) in matched
             .iter_mut()
-            .zip(self.peers.iter().take(self.config.count))
+            .zip(self.member_peers().filter(|peer| peer.voter))
         {
             *slot = peer.matched;
+            count += 1;
         }
-        let Some(live) = matched.get_mut(..self.config.count) else {
+        let Some(live) = matched.get_mut(..count) else {
             return;
         };
         live.sort_unstable_by(|a, b| b.cmp(a));
-        let Some(&index) = live.get(self.config.quorum().saturating_sub(1)) else {
+        let Some(&index) = live.get(self.members.quorum().saturating_sub(1)) else {
             return;
         };
         if index > self.commit && log.term(index) == Some(self.term_vote.term) {
             self.commit = index;
             out.commit(index);
+            self.settle_removal();
         }
     }
 
@@ -1521,14 +1909,13 @@ impl Core {
             peer.granted = true;
         }
         let after = self.grants();
-        before < self.config.quorum() && after >= self.config.quorum()
+        let quorum = self.members.quorum();
+        before < quorum && after >= quorum
     }
 
     fn grants(&self) -> usize {
-        self.peers
-            .iter()
-            .take(self.config.count)
-            .filter(|peer| peer.granted)
+        self.member_peers()
+            .filter(|peer| peer.voter && peer.granted)
             .count()
     }
 
