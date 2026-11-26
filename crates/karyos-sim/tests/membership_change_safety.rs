@@ -48,11 +48,12 @@
 
 use std::collections::BTreeMap;
 
+use karyos_cluster::standby::TailBound;
 use karyos_sim::harness::check::{self, Violation};
 use karyos_sim::harness::core::{Change, ChangeRefused};
 use karyos_sim::harness::custom::{Custom, PROMOTION_LAG};
 use karyos_sim::harness::membership::{self, SPARE};
-use karyos_sim::harness::node::Observation;
+use karyos_sim::harness::node::{Observation, SEAL_TICKS};
 use karyos_sim::harness::standby::{self, Fencing, PRIMARY, STANDBY};
 use karyos_sim::harness::workloads::{self, Case, Liveness, Outcome};
 use karyos_sim::net::NodeId;
@@ -148,9 +149,6 @@ fn lagging_conditions(case: &Case, outcome: &Outcome) -> Result<(), Breach> {
 /// the primary's and the standby's servers.
 const ON_OLD_PRIMARY: NodeId = 7;
 
-/// The step S3 cuts the primary off, after the warm-up.
-const CUT: u64 = standby::S3_CUT + membership::SETTLED;
-
 /// A standby promoted while a partitioned old primary keeps its quorum:
 /// the four conditions, in order.
 fn promotion_conditions(case: &Case, outcome: &Outcome) -> Result<(), Breach> {
@@ -168,23 +166,41 @@ fn promotion_conditions(case: &Case, outcome: &Outcome) -> Result<(), Breach> {
             workloads::pass(case, outcome)
         )));
     }
-    // The old primary keeps its quorum after the cut: a leader of it
-    // commits, and its client still reaches it (an answer at or past the
-    // cut, on the answering server's clock).
+    // The old primary keeps its quorum after the cut: its three servers
+    // on one side of the partition, a leader of it commits past what it
+    // had committed at the cut, and its client still reaches it with an
+    // answer to such an entry.
+    let split = observations
+        .iter()
+        .position(|observation| {
+            matches!(observation, Observation::Split { left, .. }
+                if PRIMARY.iter().all(|node| left.contains(node)))
+        })
+        .ok_or(Breach::OldPrimaryNotServing)?;
+    let committed_at_split = observations[..split]
+        .iter()
+        .filter_map(|observation| match observation {
+            Observation::Commit { node, index, .. } if PRIMARY.contains(node) => Some(*index),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let after = &observations[split..];
+    let primary_commits = after.iter().any(|observation| {
+        matches!(observation, Observation::Commit { node, leader: true, index, .. }
+            if PRIMARY.contains(node) && *index > committed_at_split)
+    });
+    let reached = after.iter().any(|observation| {
+        matches!(observation, Observation::Reply { node, client, index, .. }
+            if PRIMARY.contains(node) && *client == ON_OLD_PRIMARY && *index > committed_at_split)
+    });
+    if !primary_commits || !reached {
+        return Err(Breach::OldPrimaryNotServing);
+    }
     let cut = observations
         .iter()
         .position(|observation| matches!(observation, Observation::Fenced { .. }))
         .ok_or(Breach::NotFencedFirst)?;
-    let primary_leads = observations.iter().any(|observation| {
-        matches!(observation, Observation::Commit { node, leader: true, .. } if PRIMARY.contains(node))
-    });
-    let reached = observations.iter().any(|observation| {
-        matches!(observation, Observation::Reply { node, client, at, .. }
-            if PRIMARY.contains(node) && *client == ON_OLD_PRIMARY && *at >= CUT)
-    });
-    if !primary_leads || !reached {
-        return Err(Breach::OldPrimaryNotServing);
-    }
 
     // 1. Verified fencing first.
     let promoted_at = observations
@@ -261,6 +277,19 @@ fn promotion_conditions(case: &Case, outcome: &Outcome) -> Result<(), Breach> {
         || listed != unknown
         || follower.verified.map(|position| position.index) != Some(verified)
     {
+        return Err(Breach::UnknownNotReported);
+    }
+    // The follower's gap: the sealed bytes it has not verified, known once
+    // its verified position is mapped into the copy, and exactly those (a
+    // lower bound is never above the true gap), plus the unsealed tail
+    // within the configured seal interval.
+    let copy = follower.copy.as_ref().ok_or(Breach::UnknownNotReported)?;
+    let sealed_gap = match (copy.verified, follower.gap.sealed_unverified) {
+        (Some(at), Some(gap)) => gap == copy.sealed.unwrap_or(copy.checked).saturating_sub(at),
+        (None, None) => true,
+        _ => false,
+    };
+    if !sealed_gap || follower.gap.unsealed_tail != TailBound::Interval(SEAL_TICKS) {
         return Err(Breach::UnknownNotReported);
     }
 
@@ -536,5 +565,49 @@ fn test_cluster_membership_change_safety_catches_an_old_primary_cut_off_from_its
     assert_eq!(
         promotion_conditions(&case, &outcome),
         Err(Breach::OldPrimaryNotServing)
+    );
+}
+
+#[test]
+fn test_cluster_membership_change_safety_catches_an_old_primary_that_stops_committing_at_the_cut() {
+    let (case, mut outcome) = promotion_record();
+    let split = at(&outcome, |o| matches!(o, Observation::Split { .. }));
+    let mut index = 0;
+    outcome.observations.retain(|o| {
+        index += 1;
+        index <= split + 1
+            || !matches!(o, Observation::Commit { node, leader: true, .. } if PRIMARY.contains(node))
+    });
+    assert_eq!(
+        promotion_conditions(&case, &outcome),
+        Err(Breach::OldPrimaryNotServing)
+    );
+}
+
+#[test]
+fn test_cluster_membership_change_safety_catches_an_overstated_replication_gap() {
+    let (case, mut outcome) = promotion_record();
+    let promoted = at(&outcome, |o| matches!(o, Observation::Promoted { .. }));
+    let Observation::Promoted { report, .. } = &mut outcome.observations[promoted] else {
+        unreachable!()
+    };
+    report.replication.as_mut().unwrap().gap.sealed_unverified = Some(u64::MAX);
+    assert_eq!(
+        promotion_conditions(&case, &outcome),
+        Err(Breach::UnknownNotReported)
+    );
+}
+
+#[test]
+fn test_cluster_membership_change_safety_catches_a_wrong_unsealed_tail_bound() {
+    let (case, mut outcome) = promotion_record();
+    let promoted = at(&outcome, |o| matches!(o, Observation::Promoted { .. }));
+    let Observation::Promoted { report, .. } = &mut outcome.observations[promoted] else {
+        unreachable!()
+    };
+    report.replication.as_mut().unwrap().gap.unsealed_tail = TailBound::Interval(SEAL_TICKS - 1);
+    assert_eq!(
+        promotion_conditions(&case, &outcome),
+        Err(Breach::UnknownNotReported)
     );
 }

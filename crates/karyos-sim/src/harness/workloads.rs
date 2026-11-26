@@ -1434,7 +1434,13 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             Action::Restart(id) => sim.restart(id).map_err(RunError::Node)?,
             Action::Isolate(id) => sim.net_mut().isolate(id, &everyone),
             Action::Cut { from, to } => sim.net_mut().cut(from, to),
-            Action::Split { left, right } => sim.net_mut().split(&left, &right),
+            Action::Split { left, right } => {
+                sim.net_mut().split(&left, &right);
+                recorder
+                    .borrow_mut()
+                    .observations
+                    .push(Observation::Split { left, right });
+            }
             Action::Heal => {
                 sim.net_mut().heal();
                 recorder.borrow_mut().observations.push(Observation::Healed);
