@@ -382,3 +382,68 @@ fn the_read_back_compares_in_place_and_allocates_nothing() {
         &mut reads
     ));
 }
+
+/// Codex re-review of docs#1080 (C5 v3): a server's pending requests,
+/// prefilled from the case's bounds, take a request and give it back once
+/// answered, over and over, with no allocation and no free.
+#[test]
+fn the_pending_requests_neither_allocate_nor_free_past_their_prefill() {
+    let _serial = serial();
+    let bounds = karyos_sim::harness::node::ServiceBounds {
+        clients: vec![1, 2, 3, 4],
+        values: 16,
+        payload: 32,
+        answers: 2,
+    };
+    let mut pending = process::Pending::prefilled(process::pending_room(&bounds));
+    let ((), counts) = window(|| {
+        let _enrolled = enroll();
+        for round in 0..8u64 {
+            for client in 1..=4u32 {
+                for sequence in [2 * round, 2 * round + 1] {
+                    pending.insert((client, sequence));
+                    // A retry of a pending request is not added again.
+                    pending.insert((client, sequence));
+                }
+            }
+            assert_eq!(pending.len(), 8);
+            for client in 1..=4u32 {
+                for sequence in [2 * round, 2 * round + 1] {
+                    assert!(pending.remove((client, sequence)));
+                }
+            }
+            assert!(!pending.remove((1, 2 * round)));
+        }
+    })
+    .unwrap();
+    assert!(pending.is_empty());
+    assert_eq!(counts, SetCounts::default());
+}
+
+/// Codex re-review of docs#1080 (C5 v3): the reply queue, prefilled from
+/// the case's bounds, queues an answer for every pending request and a
+/// refusal for every client with no allocation and no free.
+#[test]
+fn the_reply_queue_takes_its_bound_without_allocating() {
+    use karyos_sim::harness::node::Wire as Harness;
+    let _serial = serial();
+    let bounds = karyos_sim::harness::node::ServiceBounds {
+        clients: vec![1, 2, 3, 4],
+        values: 16,
+        payload: 32,
+        answers: 2,
+    };
+    let room = process::reply_room(&bounds);
+    let mut replies: Vec<(NodeId, Harness<()>)> = Vec::with_capacity(room);
+    let ((), counts) = window(|| {
+        let _enrolled = enroll();
+        for _ in 0..4 {
+            for sequence in 0..u64::try_from(room).unwrap() {
+                replies.push((1, Harness::Refused { sequence }));
+            }
+            replies.clear();
+        }
+    })
+    .unwrap();
+    assert_eq!(counts, SetCounts::default());
+}

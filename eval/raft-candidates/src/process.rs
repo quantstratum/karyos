@@ -42,7 +42,7 @@
 //! each adapter counts in ticks.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -431,6 +431,72 @@ pub fn frame_into<M>(client: NodeId, message: &Harness<M>, out: &mut Vec<u8>) ->
     true
 }
 
+/// The requests a server has proposed and not yet answered, by client and
+/// sequence (C5 v3): a vector prefilled at initialisation from the case's
+/// bounds, so inserting a request and removing it once answered neither
+/// allocates nor frees within them. A request already pending is not
+/// added again.
+#[derive(Debug)]
+pub struct Pending(Vec<(NodeId, u64)>);
+
+impl Pending {
+    /// Room for `room` requests.
+    #[must_use]
+    pub fn prefilled(room: usize) -> Self {
+        Self(Vec::with_capacity(room))
+    }
+
+    /// Adds `request` unless it is pending already.
+    pub fn insert(&mut self, request: (NodeId, u64)) {
+        if !self.0.contains(&request) {
+            self.0.push(request);
+        }
+    }
+
+    /// Removes `request`: whether it was pending.
+    pub fn remove(&mut self, request: (NodeId, u64)) -> bool {
+        match self.0.iter().position(|pending| *pending == request) {
+            Some(at) => {
+                let _ = self.0.swap_remove(at);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Forgets every request, keeping the room.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Requests pending.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether none is pending.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// The pending requests a server holds at most within the case's bounds:
+/// each client's answers kept ([`ServiceBounds::answers`]), at least one.
+#[must_use]
+pub fn pending_room(bounds: &ServiceBounds) -> usize {
+    bounds.clients.len().saturating_mul(bounds.answers.max(1))
+}
+
+/// Replies a server queues between two sends at most within the case's
+/// bounds: an answer for each pending request and a refusal, a busy or a
+/// redirect for each client.
+#[must_use]
+pub fn reply_room(bounds: &ServiceBounds) -> usize {
+    pending_room(bounds).saturating_add(bounds.clients.len())
+}
+
 /// A reply frame's header: its length, the session, the kind, the
 /// sequence, the index and the generation.
 const FRAME_HEADER: usize = 4 + 8 + 1 + 8 + 8 + 8;
@@ -692,7 +758,7 @@ struct Serving<M> {
     /// The service's answer to the entry it applies, kept (C5 v3).
     response: Vec<u8>,
     /// Requests it took, by client and sequence: it answers them.
-    pending: BTreeSet<(NodeId, u64)>,
+    pending: Pending,
     commit: Option<u64>,
     configuration: Option<karyos_sim::harness::core::Configuration>,
     positions: Option<Positions>,
@@ -806,7 +872,7 @@ impl<M> Serving<M> {
         let budget = self.metered();
         match core.propose_slice(&self.command, &mut LogView::metered(log, budget.as_ref())) {
             Ok(()) => {
-                let _ = self.pending.insert((command.client, sequence));
+                self.pending.insert((command.client, sequence));
             }
             Err(Refused::Backpressure(limit)) => {
                 self.observe(Observation::Backpressure {
@@ -897,10 +963,12 @@ impl<M> Serving<M> {
                 // allocates nothing (C5 v3).
                 // A reply's bytes are the application's output: copied into
                 // a pooled buffer inside the same window (C5 v3).
+                // Its client's request leaves the pending set in the same
+                // window: the set is prefilled and frees nothing (C5 v3).
                 let answered = probe::application(|| {
                     let applied = service.apply_into(entry, response)?;
                     let bytes = pending
-                        .contains(&(applied.client, applied.sequence))
+                        .remove((applied.client, applied.sequence))
                         .then(|| reply_bytes.copy(response));
                     Some((applied, bytes))
                 });
@@ -908,9 +976,7 @@ impl<M> Serving<M> {
                 // declared path, so outside the window (C5 v3 run record).
                 let response = answered.is_some().then(|| response.clone());
                 let mut items = items.borrow_mut();
-                if let Some((applied, Some(bytes))) = answered
-                    && pending.remove(&(applied.client, applied.sequence))
-                {
+                if let Some((applied, Some(bytes))) = answered {
                     if applied.replayed {
                         observe(
                             &mut items,
@@ -932,15 +998,19 @@ impl<M> Serving<M> {
                             at: now,
                         },
                     );
-                    replies.push((
-                        applied.client,
-                        Harness::Response {
-                            sequence: applied.sequence,
-                            bytes,
-                            index: entry.index,
-                            generation: FIRST_GENERATION,
-                        },
-                    ));
+                    // The reply is the application's output: queued in the
+                    // window, on the prefilled queue (C5 v3).
+                    probe::application(|| {
+                        replies.push((
+                            applied.client,
+                            Harness::Response {
+                                sequence: applied.sequence,
+                                bytes,
+                                index: entry.index,
+                                generation: FIRST_GENERATION,
+                            },
+                        ));
+                    });
                 }
                 observe(
                     &mut items,
@@ -1204,12 +1274,12 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
         id: config.id,
         service: TestService::prefilled(&bounds),
         response: Vec::with_capacity(bounds.response_bytes()),
-        pending: BTreeSet::new(),
+        pending: Pending::prefilled(pending_room(&bounds)),
         commit: core.committed(),
         configuration: None,
         positions: None,
         items: Vec::new(),
-        replies: Vec::new(),
+        replies: Vec::with_capacity(reply_room(&bounds)),
         reply_bytes: ReplyBytes::prefilled(&bounds),
         framed: Vec::with_capacity(bounds.response_bytes().saturating_add(FRAME_HEADER)),
         ready: ReadyBuf::default(),
