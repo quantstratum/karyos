@@ -108,6 +108,13 @@ struct Arena {
     /// shares a line with another.
     stride: usize,
     next: std::cell::Cell<usize>,
+    /// One cache-line-aligned buffer every sample's value is copied into
+    /// by the untimed setup ([`Arena::stage`]): the timed operation always
+    /// reads the same address whatever the class, so the slots' own
+    /// addresses (cache sets, pages, prefetch) cannot become a class
+    /// difference.
+    staged: std::cell::RefCell<Vec<u8>>,
+    staged_base: usize,
 }
 
 /// The cache line every [`Arena`] slot is aligned to.
@@ -118,13 +125,33 @@ impl Arena {
         let stride = len.div_ceil(LINE) * LINE;
         let bytes = vec![0_u8; stride * timing::SLOTS + LINE];
         let base = bytes.as_ptr().align_offset(LINE);
+        let staged = vec![0_u8; stride + LINE];
+        let staged_base = staged.as_ptr().align_offset(LINE);
         Self {
             bytes: std::cell::RefCell::new(bytes),
             base,
             len,
             stride,
             next: std::cell::Cell::new(0),
+            staged: std::cell::RefCell::new(staged),
+            staged_base,
         }
+    }
+
+    /// Copies slot `at` into the staging buffer (untimed setup).
+    fn stage(&self, at: usize) {
+        let start = self.base + at * self.stride;
+        let bytes = self.bytes.borrow();
+        self.staged.borrow_mut()[self.staged_base..self.staged_base + self.len]
+            .copy_from_slice(&bytes[start..start + self.len]);
+    }
+
+    /// The staged value (the timed run reads only this).
+    fn staged(&self) -> std::cell::Ref<'_, [u8]> {
+        let start = self.staged_base;
+        std::cell::Ref::map(self.staged.borrow(), |bytes| {
+            &bytes[start..start + self.len]
+        })
     }
 
     /// Copies `value` into the next slot and returns the slot.
@@ -135,11 +162,6 @@ impl Arena {
         let start = self.base + at * self.stride;
         self.bytes.borrow_mut()[start..start + self.len].copy_from_slice(value);
         at
-    }
-
-    fn slot(&self, at: usize) -> std::cell::Ref<'_, [u8]> {
-        let start = self.base + at * self.stride;
-        std::cell::Ref::map(self.bytes.borrow(), |bytes| &bytes[start..start + self.len])
     }
 }
 
@@ -168,8 +190,8 @@ fn first_against_last(samples: usize) -> Report {
             }
             arena.push(&bad)
         },
-        |_| {},
-        |slot| opens_to_tag(&key, &arena.slot(*slot), &mut out.borrow_mut()),
+        |slot| arena.stage(*slot),
+        |_| opens_to_tag(&key, &arena.staged(), &mut out.borrow_mut()),
     )
 }
 
@@ -194,8 +216,8 @@ fn fixed_against_random_tag(samples: usize) -> Report {
             }
             arena.push(&bad)
         },
-        |_| {},
-        |slot| opens_to_tag(&key, &arena.slot(*slot), &mut out.borrow_mut()),
+        |slot| arena.stage(*slot),
+        |_| opens_to_tag(&key, &arena.staged(), &mut out.borrow_mut()),
     )
 }
 
@@ -215,9 +237,9 @@ fn open_fixed_against_random(samples: usize) -> Report {
             seq += 1;
             arena.push(&sealed(&key, &frames, seq))
         },
-        |_| {},
-        |slot| {
-            key.open_into(black_box(&arena.slot(*slot)), &mut out.borrow_mut())
+        |slot| arena.stage(*slot),
+        |_| {
+            key.open_into(black_box(&arena.staged()), &mut out.borrow_mut())
                 .is_ok()
         },
     )
@@ -238,12 +260,12 @@ fn seal_fixed_against_random(samples: usize) -> Report {
             }
             arena.push(&frames)
         },
-        |_| {},
+        |slot| arena.stage(*slot),
         // Every repetition seals the slot's own plaintext: the copy into
         // the shared work buffer is timed, the same for both classes.
-        |slot| {
+        |_| {
             let mut held = work.borrow_mut();
-            held[..FRAMES].copy_from_slice(&arena.slot(*slot));
+            held[..FRAMES].copy_from_slice(&arena.staged());
             key.seal_next(black_box(&mut held[..]), FRAMES).is_ok()
         },
     )
@@ -265,9 +287,9 @@ fn valid_against_invalid(samples: usize) -> Report {
             }
             (class, arena.push(&datagram))
         },
-        |_| {},
-        |(class, slot)| {
-            let datagram = arena.slot(*slot);
+        |(_, slot)| arena.stage(*slot),
+        |(class, _)| {
+            let datagram = arena.staged();
             match class {
                 Class::A => key
                     .open_into(black_box(&datagram), &mut out.borrow_mut())
@@ -323,17 +345,17 @@ fn bisect(samples: usize) -> Vec<Report> {
         0x4840,
         samples,
         by_class,
-        |_| {},
-        |slot| key.precheck(black_box(&arena.slot(*slot))).is_ok(),
+        |slot| arena.stage(*slot),
+        |_| key.precheck(black_box(&arena.staged())).is_ok(),
     ));
     reports.push(compare(
         "bisect open: precheck, aad and nonce",
         0x4841,
         samples,
         by_class,
-        |_| {},
-        |slot| {
-            let datagram = arena.slot(*slot);
+        |slot| arena.stage(*slot),
+        |_| {
+            let datagram = arena.staged();
             let Ok((seq, _)) = key.precheck(black_box(&datagram)) else {
                 return false;
             };
@@ -348,9 +370,9 @@ fn bisect(samples: usize) -> Vec<Report> {
         0x4842,
         samples,
         by_class,
-        |_| {},
-        |slot| {
-            let datagram = arena.slot(*slot);
+        |slot| arena.stage(*slot),
+        |_| {
+            let datagram = arena.staged();
             let Ok((seq, plaintext)) = key.precheck(&datagram) else {
                 return false;
             };
@@ -371,9 +393,9 @@ fn bisect(samples: usize) -> Vec<Report> {
         0x4843,
         samples,
         by_class,
-        |_| {},
-        |slot| {
-            key.open_into(black_box(&arena.slot(*slot)), &mut out.borrow_mut())
+        |slot| arena.stage(*slot),
+        |_| {
+            key.open_into(black_box(&arena.staged()), &mut out.borrow_mut())
                 .is_ok()
         },
     ));
@@ -405,9 +427,9 @@ fn bisect(samples: usize) -> Vec<Report> {
         0x4844,
         samples,
         bare_by_class,
-        |_| {},
-        |slot| {
-            let held = bare_arena.slot(*slot);
+        |slot| bare_arena.stage(*slot),
+        |_| {
+            let held = bare_arena.staged();
             let (body, tag) = held.split_at(FRAMES);
             let tag = Tag::try_from(tag).unwrap();
             let mut target = out.borrow_mut();
@@ -435,10 +457,10 @@ fn bisect(samples: usize) -> Vec<Report> {
         0x4845,
         samples,
         plain_by_class,
-        |_| {},
-        |slot| {
+        |slot| plain_arena.stage(*slot),
+        |_| {
             let mut held = work.borrow_mut();
-            held[..FRAMES].copy_from_slice(&plain_arena.slot(*slot));
+            held[..FRAMES].copy_from_slice(&plain_arena.staged());
             bare.encrypt_inout_detached(&nonce, &[], InOutBuf::from(&mut held[..FRAMES]))
                 .is_ok()
         },
@@ -448,10 +470,10 @@ fn bisect(samples: usize) -> Vec<Report> {
         0x4846,
         samples,
         plain_by_class,
-        |_| {},
-        |slot| {
+        |slot| plain_arena.stage(*slot),
+        |_| {
             let mut held = work.borrow_mut();
-            held[..FRAMES].copy_from_slice(&plain_arena.slot(*slot));
+            held[..FRAMES].copy_from_slice(&plain_arena.staged());
             key.seal_next(black_box(&mut held[..]), FRAMES).is_ok()
         },
     ));
