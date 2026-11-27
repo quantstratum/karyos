@@ -29,7 +29,7 @@ pub use karyos_cluster::node::{Answer, Delivery, Proposer};
 
 /// A server of the delivery path: the shipped node on a simulated disk,
 /// whose crash keeps what `survives`.
-pub struct DeliveryServer<C, S> {
+pub struct DeliveryServer<C: ConsensusCore, S> {
     node: ClusterNode<C, S, SimDisk>,
     survives: Survives,
     /// What survived the last crash: the disk the restart opens.
@@ -102,6 +102,14 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
     #[must_use]
     pub fn without_bounds_proposal(mut self) -> Self {
         self.node = self.node.without_bounds_proposal();
+        self
+    }
+
+    /// As [`ClusterNode::with_drive_fault`].
+    #[cfg(feature = "test-hooks")]
+    #[must_use]
+    pub fn with_drive_fault(mut self, fault: karyos_cluster::driver::DriveFault) -> Self {
+        self.node = self.node.with_drive_fault(fault);
         self
     }
 
@@ -364,14 +372,14 @@ impl<M> Node<Delivery<M>> for DeliveryClient {
 }
 
 /// A node of a delivery run.
-pub enum DeliveryMember<C, S> {
+pub enum DeliveryMember<C: ConsensusCore, S> {
     /// A server.
     Server(Box<DeliveryServer<C, S>>),
     /// A client.
     Client(DeliveryClient),
 }
 
-impl<C, S> DeliveryMember<C, S> {
+impl<C: ConsensusCore, S> DeliveryMember<C, S> {
     /// The server, if it is one.
     #[must_use]
     pub fn server(&self) -> Option<&DeliveryServer<C, S>> {

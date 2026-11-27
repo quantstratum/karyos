@@ -47,7 +47,9 @@ use karyos_archive::disk::Disk;
 use karyos_archive::segment::Geometry;
 
 use crate::dedup::{ConfigError, Outcome, Request};
-use crate::driver::{Change, ConsensusCore, LogView, NodeId, Refused, drive};
+use crate::driver::{
+    Change, ConsensusCore, DriveFault, LogView, NodeId, ReadyBuf, Refused, Release, drive_inner,
+};
 use crate::service::{
     Applied, ApplyError, ClusteredService, ContainerConfig, Envelope, NotLeader, Propose,
     ProposeRefused, ServiceContainer, SessionBounds,
@@ -264,7 +266,7 @@ impl Taker {
 
 /// A Cluster node: a core over C4's log in its own directory on its own
 /// disk, and a service container.
-pub struct ClusterNode<C, S, D: Disk + Clone> {
+pub struct ClusterNode<C: ConsensusCore, S, D: Disk + Clone> {
     id: NodeId,
     peers: Vec<NodeId>,
     geometry: Geometry,
@@ -274,6 +276,13 @@ pub struct ClusterNode<C, S, D: Disk + Clone> {
     /// The longest a committed tail waits unsealed, in the node's ticks.
     seal_interval: u64,
     running: Option<(C, RaftLog<D>)>,
+    /// The Ready the core fills in place, reused across duties.
+    ready: ReadyBuf<C::Message>,
+    /// The driver's injected fault: [`DriveFault::None`] outside tests.
+    fault: DriveFault,
+    /// Messages the driver released before what they wait for was
+    /// durable: refused, never sent (persist then send).
+    early: u64,
     /// The service as it starts, for a rebuild.
     fresh: S,
     config: ContainerConfig,
@@ -356,6 +365,9 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
             kinds: Vec::new(),
             outcomes: Vec::new(),
             halted: None,
+            ready: ReadyBuf::default(),
+            fault: DriveFault::None,
+            early: 0,
         })
     }
 
@@ -364,6 +376,22 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
     pub fn with_seal_interval(mut self, ticks: u64) -> Self {
         self.seal_interval = ticks;
         self
+    }
+
+    /// Drives with `fault` injected, so a test shows the node refuses what
+    /// a faulty driver releases early (the `test-hooks` feature).
+    #[cfg(feature = "test-hooks")]
+    #[must_use]
+    pub fn with_drive_fault(mut self, fault: DriveFault) -> Self {
+        self.fault = fault;
+        self
+    }
+
+    /// The messages refused because the driver released them before what
+    /// they wait for was durable: zero for a correct driver.
+    #[must_use]
+    pub fn early_sends(&self) -> u64 {
+        self.early
     }
 
     /// Its disk.
@@ -653,13 +681,24 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
             return;
         };
         let mut committed = Vec::new();
-        let driven = drive(
+        let mut ready = std::mem::take(&mut self.ready);
+        let early = &mut self.early;
+        let driven = drive_inner(
             &mut core,
             &mut log,
-            &mut |to, message, _| out.push((to, Delivery::Core(message))),
+            &mut ready,
+            (None, None, self.fault),
+            &mut |to, message, release| {
+                if release.is_some_and(|release| !durable(&release)) {
+                    *early = early.saturating_add(1);
+                } else {
+                    out.push((to, Delivery::Core(message)));
+                }
+            },
             &mut |entry, _| committed.push(entry.clone()),
             &mut |_| {},
         );
+        self.ready = ready;
         // A failed persistence stops the node until a restart, as for
         // `ServerNode`; what it committed before still applies.
         let failed = driven.is_err();
@@ -830,4 +869,11 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
         }
         self.duty(out);
     }
+}
+
+/// Whether what an `after_persist` message waits for was durable when it
+/// was released: its Ready's last entry and its hard state.
+fn durable(release: &Release) -> bool {
+    release.needs <= release.durable
+        && (release.needs_state.is_none() || release.needs_state == release.stored_state)
 }
