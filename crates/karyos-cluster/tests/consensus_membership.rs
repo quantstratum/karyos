@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use karyos_cluster::consensus::{
-    ChangeError, Config, Core, Effects, LogTerms, Message, Role, StepError, TermVote,
+    AppendOutcome, ChangeError, Config, Core, Effects, LogTerms, Message, Role, StepError, TermVote,
 };
 use karyos_cluster::membership::{Membership, MembershipChange};
 
@@ -556,6 +556,222 @@ fn four_voters(cluster: &mut Cluster, leader: u64) {
         .change(leader, MembershipChange::Promote(4))
         .unwrap();
     cluster.run(4);
+}
+
+/// Voters 1 to 4 under a leader, and a follower other than 4 that holds
+/// an uncommitted removal of 4 at the end of its log, as a minority's
+/// leader would have left it (ADR-0125; the C5 scenario of karyos#711).
+/// Returns the cluster, the follower and the removal's index.
+fn holding_a_removal_of_four(seed: u64) -> (Cluster, u64, u64) {
+    let (mut cluster, leader) = led(4, seed);
+    four_voters(&mut cluster, leader);
+    let follower = [1, 2, 3].into_iter().find(|&id| id != leader).unwrap();
+    let node = cluster.node(follower);
+    let term = node.core.term_vote().term;
+    let index = node.log.last_index() + 1;
+    let three = Membership::new(&[1, 2, 3], &[]).unwrap();
+    node.log.entries.push((term, Some(three)));
+    node.core.configured(index, three, &node.log);
+    assert_eq!(node.core.membership(), three);
+    assert!(node.core.commit() < index);
+    (cluster, follower, index)
+}
+
+/// An append of one entry of `term` that conflicts with `follower`'s log
+/// at `index`.
+fn conflicting_append(cluster: &mut Cluster, follower: u64, index: u64, term: u64) -> Message {
+    let node = cluster.node(follower);
+    Message::Append {
+        term,
+        prev_index: index - 1,
+        prev_term: node.log.term(index - 1).unwrap(),
+        entries: 1,
+        commit: node.core.commit(),
+        epoch: 7,
+    }
+}
+
+/// Node 4, elected in a later term by a majority that never held its
+/// removal, is outside the follower's configuration and still truncates
+/// the removal (ADR-0125).
+#[test]
+fn an_append_from_a_leader_outside_the_configuration_truncates_its_removal() {
+    let (mut cluster, follower, index) = holding_a_removal_of_four(11);
+    let term = cluster.node(follower).core.term_vote().term + 1;
+    let append = conflicting_append(&mut cluster, follower, index, term);
+    let node = cluster.node(follower);
+    let mut recorded = Recorded::default();
+    node.core
+        .step(4, append, &[term], &node.log, &mut recorded)
+        .unwrap();
+    assert!(
+        recorded.0.contains(&Effect::Write(index, 0)),
+        "{recorded:?}"
+    );
+    assert!(
+        recorded.0.contains(&Effect::Send(
+            4,
+            Message::AppendReply {
+                term,
+                outcome: AppendOutcome::Accepted { index },
+                epoch: 7,
+            }
+        )),
+        "{recorded:?}"
+    );
+    cluster.apply(follower, recorded, &[(term, None)]);
+    let node = cluster.node(follower);
+    assert_eq!(
+        node.core.membership(),
+        Membership::new(&[1, 2, 3, 4], &[]).unwrap()
+    );
+    assert_eq!(node.log.term(index), Some(term));
+    assert_eq!(node.core.term_vote().term, term);
+    assert_eq!(node.core.role(), Role::Follower { leader: Some(4) });
+}
+
+#[test]
+fn a_heartbeat_of_the_same_term_from_outside_the_configuration_is_taken() {
+    let (mut cluster, follower, index) = holding_a_removal_of_four(12);
+    let node = cluster.node(follower);
+    let term = node.core.term_vote().term;
+    let heartbeat = Message::Append {
+        term,
+        prev_index: index - 1,
+        prev_term: node.log.term(index - 1).unwrap(),
+        entries: 0,
+        commit: node.core.commit(),
+        epoch: 3,
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(
+        node.core.step(4, heartbeat, &[], &node.log, &mut recorded),
+        Ok(())
+    );
+    assert!(
+        recorded.0.contains(&Effect::Send(
+            4,
+            Message::AppendReply {
+                term,
+                outcome: AppendOutcome::Accepted { index: index - 1 },
+                epoch: 3,
+            }
+        )),
+        "{recorded:?}"
+    );
+    assert_eq!(node.core.role(), Role::Follower { leader: Some(4) });
+}
+
+#[test]
+fn only_a_current_append_is_taken_from_outside_the_configuration() {
+    let (mut cluster, follower, index) = holding_a_removal_of_four(13);
+    let term = cluster.node(follower).core.term_vote().term;
+    let stale = conflicting_append(&mut cluster, follower, index, term - 1);
+    let node = cluster.node(follower);
+    let (last, three) = (node.log.last_index(), node.core.membership());
+    let refused = [
+        (stale, vec![term - 1]),
+        (
+            Message::PreVote {
+                term: term + 1,
+                last_index: last + 5,
+                last_term: term + 1,
+                round: 1,
+            },
+            Vec::new(),
+        ),
+        (
+            Message::Vote {
+                term: term + 1,
+                last_index: last + 5,
+                last_term: term + 1,
+            },
+            Vec::new(),
+        ),
+        (
+            Message::PreVoteReply {
+                term: term + 1,
+                granted: true,
+                round: 1,
+            },
+            Vec::new(),
+        ),
+        (
+            Message::VoteReply {
+                term: term + 1,
+                granted: true,
+            },
+            Vec::new(),
+        ),
+        (
+            Message::AppendReply {
+                term: term + 1,
+                outcome: AppendOutcome::Accepted { index: last },
+                epoch: 0,
+            },
+            Vec::new(),
+        ),
+    ];
+    for (message, terms) in refused {
+        let mut recorded = Recorded::default();
+        assert_eq!(
+            node.core.step(4, message, &terms, &node.log, &mut recorded),
+            Err(StepError::UnknownSender),
+            "{message:?}"
+        );
+        assert!(recorded.0.is_empty(), "{message:?}: {recorded:?}");
+    }
+    assert_eq!(node.core.membership(), three);
+    assert_eq!(node.core.term_vote().term, term);
+    assert_eq!(node.log.last_index(), last);
+}
+
+/// A follower that holds 4 as a learner, not yet its promotion, takes a
+/// later term's append from 4, which leads after a promotion it has not
+/// seen; the append carries the promotion (ADR-0125).
+#[test]
+fn a_leader_the_follower_holds_as_a_learner_is_followed() {
+    let (mut cluster, leader) = led(4, 14);
+    cluster
+        .change(leader, MembershipChange::AddLearner(4))
+        .unwrap();
+    cluster.run(4);
+    let follower = [1, 2, 3].into_iter().find(|&id| id != leader).unwrap();
+    assert_eq!(cluster.node(follower).core.membership(), three_and(4));
+    let node = cluster.node(follower);
+    let term = node.core.term_vote().term + 1;
+    let prev_index = node.log.last_index();
+    let four = Membership::new(&[1, 2, 3, 4], &[]).unwrap();
+    let append = Message::Append {
+        term,
+        prev_index,
+        prev_term: node.log.term(prev_index).unwrap(),
+        entries: 1,
+        commit: node.core.commit(),
+        epoch: 5,
+    };
+    let mut recorded = Recorded::default();
+    node.core
+        .step(4, append, &[term], &node.log, &mut recorded)
+        .unwrap();
+    assert!(
+        recorded.0.contains(&Effect::Send(
+            4,
+            Message::AppendReply {
+                term,
+                outcome: AppendOutcome::Accepted {
+                    index: prev_index + 1
+                },
+                epoch: 5,
+            }
+        )),
+        "{recorded:?}"
+    );
+    cluster.apply(follower, recorded, &[(term, Some(four))]);
+    let node = cluster.node(follower);
+    assert_eq!(node.core.membership(), four);
+    assert_eq!(node.core.configuration_index(), Some(prev_index + 1));
+    assert_eq!(node.core.role(), Role::Follower { leader: Some(4) });
 }
 
 #[test]

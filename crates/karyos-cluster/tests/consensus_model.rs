@@ -888,8 +888,15 @@ fn malformed_messages_and_strangers_are_refused() {
         Err(StepError::Malformed),
         "an entry above the leader's term"
     );
+    // A stranger's append of a current term is its leader's (ADR-0125);
+    // anything else from a stranger is refused.
+    let vote = Message::Vote {
+        term: 1,
+        last_index: 0,
+        last_term: 0,
+    };
     assert_eq!(
-        node.step(9, append, &[1, 1], &log, &mut recorded),
+        node.step(9, vote, &[], &log, &mut recorded),
         Err(StepError::UnknownSender)
     );
     assert_eq!(
