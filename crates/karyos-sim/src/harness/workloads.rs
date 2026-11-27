@@ -1347,6 +1347,11 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                 ServerError::Unsupported(unsupported) => RunError::Unsupported(unsupported),
             })?,
         };
+        // Its service prefilled from the case's bounds, by the policy a
+        // real process uses (C5 v3).
+        if let Some(bounds) = service_bounds(case) {
+            server = server.with_service_bounds(bounds);
+        }
         if in_standby {
             server = server.as_standby(primary.clone());
             if case.replication {

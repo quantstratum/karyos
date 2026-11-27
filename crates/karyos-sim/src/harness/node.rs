@@ -48,7 +48,7 @@
 //! [`ClusterSim`]: crate::cluster::ClusterSim
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -423,6 +423,65 @@ impl PartialEq for Pool {
 }
 
 impl Eq for Pool {}
+
+/// The requests a server has proposed and not yet answered, by client and
+/// sequence (C5 v3), in the simulator's [`ServerNode`] and in a real
+/// process alike: a vector prefilled at initialisation from the case's
+/// bounds, so inserting a request and removing it once answered neither
+/// allocates nor frees within them. A request already pending is not
+/// added again.
+#[derive(Debug, Default)]
+pub struct Pending(Vec<(NodeId, u64)>);
+
+impl Pending {
+    /// Room for `room` requests.
+    #[must_use]
+    pub fn prefilled(room: usize) -> Self {
+        Self(Vec::with_capacity(room))
+    }
+
+    /// Adds `request` unless it is pending already.
+    pub fn insert(&mut self, request: (NodeId, u64)) {
+        if !self.0.contains(&request) {
+            self.0.push(request);
+        }
+    }
+
+    /// Removes `request`: whether it was pending.
+    pub fn remove(&mut self, request: (NodeId, u64)) -> bool {
+        match self.0.iter().position(|pending| *pending == request) {
+            Some(at) => {
+                let _ = self.0.swap_remove(at);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Forgets every request, keeping the room.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Requests pending.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether none is pending.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// The pending requests a server holds at most within the case's bounds:
+/// each client's answers kept ([`ServiceBounds::answers`]), at least one.
+#[must_use]
+pub fn pending_room(bounds: &ServiceBounds) -> usize {
+    bounds.clients.len().saturating_mul(bounds.answers.max(1))
+}
 
 /// What [`TestService::prefilled`] sizes a service for: the case's declared
 /// bounds, by one policy for every variant ([`super::workloads::service_bounds`]).
@@ -1982,6 +2041,185 @@ struct StandbyIn {
     stalled: bool,
 }
 
+/// Bytes of a reply's room for an append's answer, which is 9.
+const REPLY_SMALL: usize = 16;
+
+/// A server's application buffers (C5 v3): the service's answer to the
+/// entry it applies, and the replies its application queues for the
+/// waiting clients with their bytes, all kept across duties and, under
+/// [`ServerNode::with_service_bounds`], prefilled from the case's bounds
+/// at initialisation, so that answering allocates nothing within them.
+#[derive(Debug, Default)]
+struct Answering {
+    /// The bounds the service, the pending requests and these buffers are
+    /// prefilled for, at every start.
+    bounds: Option<ServiceBounds>,
+    /// The canonical response bytes of the entry applied last.
+    response: Vec<u8>,
+    /// The replies queued in the duty, in the order of their entries.
+    replies: Vec<Reply>,
+    /// The replies' bytes, one after the other.
+    bytes: Vec<u8>,
+}
+
+impl Answering {
+    /// Buffers prefilled for `bounds`: the largest answer, and a reply
+    /// for every request that may be pending.
+    fn prefilled(bounds: ServiceBounds) -> Self {
+        let room = pending_room(&bounds);
+        Self {
+            response: Vec::with_capacity(bounds.response_bytes()),
+            replies: Vec::with_capacity(room),
+            bytes: Vec::with_capacity(
+                bounds
+                    .response_bytes()
+                    .saturating_add(room.saturating_mul(REPLY_SMALL)),
+            ),
+            bounds: Some(bounds),
+        }
+    }
+}
+
+/// A reply the application queued: its client, the request's sequence,
+/// the entry's index, and where its bytes are in [`Answering::bytes`].
+#[derive(Debug, Clone, Copy)]
+struct Reply {
+    client: NodeId,
+    sequence: u64,
+    index: u64,
+    bytes: (usize, usize),
+}
+
+/// What applying one committed entry did, for the run's record (kept
+/// outside the application window).
+struct AppliedEntry {
+    /// The service applied a command: whether from its deduplication
+    /// table; `None` for an entry with no command.
+    applied: Option<Applied>,
+    /// The application answered a waiting client.
+    answered: bool,
+    /// The primary position a standby's service applied, first time.
+    fed: Option<(u64, u64)>,
+}
+
+/// Runs `apply`, a server's application of a committed entry, counted in
+/// the probe's apply stage (`probe::application`) when the probe is built
+/// (C5 v3 coverage): the window a real process counts it in.
+fn in_apply_window<R>(apply: impl FnOnce() -> R) -> R {
+    #[cfg(feature = "alloc-probe")]
+    {
+        super::probe::application(apply)
+    }
+    #[cfg(not(feature = "alloc-probe"))]
+    {
+        apply()
+    }
+}
+
+/// Applies the committed `entry` (C5 v3): the server's application, which
+/// [`ServerNode`] runs inside the apply window ([`in_apply_window`])
+/// over the borrowed entry, as a real process does. The service answers
+/// into [`Answering::response`] ([`TestService::apply_into`]); a waiting
+/// client's request leaves `pending` and, when the server `acts`, its
+/// reply is queued with its bytes. `None` for an entry a snapshot already
+/// holds (W5), which the service skips.
+fn apply_committed<C: ConsensusCore>(
+    (service, pending, answering): (&mut TestService, &mut Pending, &mut Answering),
+    standby: Option<&mut StandbyIn>,
+    (base, acts, alters): (Option<SnapshotBase>, bool, bool),
+    entry: &Entry,
+) -> Option<AppliedEntry> {
+    if base.is_some()
+        && service
+            .applied()
+            .is_some_and(|applied| entry.index <= applied)
+    {
+        return None;
+    }
+    // A standby's service applies the primary entry an entry wraps, once.
+    let mut fed = None;
+    let mut wrapped = None;
+    if let Some(standby) = standby
+        && let Some((index, term, payload)) = standby::unwrap(&entry.payload)
+    {
+        let payload = if standby
+            .verified
+            .is_none_or(|(verified, _)| index > verified)
+        {
+            standby.verified = Some((index, term));
+            if let Some(follower) = standby.follower.as_mut() {
+                follower.applied(Position { index, term });
+            }
+            if standby
+                .proposed
+                .is_none_or(|(proposed, _)| index > proposed)
+            {
+                standby.proposed = Some((index, term));
+            }
+            fed = Some((index, term));
+            payload.to_vec()
+        } else {
+            // Applied before: the service only moves its position.
+            Vec::new()
+        };
+        wrapped = Some(Entry {
+            index: entry.index,
+            term: entry.term,
+            event_time: entry.event_time,
+            payload,
+        });
+    }
+    let served = wrapped.as_ref().unwrap_or(entry);
+    if C::is_configuration_entry(&served.payload) {
+        service.set_configuration(&served.payload);
+    }
+    let applied = answer_into(service, served, &mut answering.response, alters);
+    let answered = applied
+        .as_ref()
+        .is_some_and(|applied| pending.remove((applied.client, applied.sequence)) && acts);
+    if answered && let Some(applied) = &applied {
+        let from = answering.bytes.len();
+        answering.bytes.extend_from_slice(&answering.response);
+        answering.replies.push(Reply {
+            client: applied.client,
+            sequence: applied.sequence,
+            index: entry.index,
+            bytes: (from, answering.bytes.len()),
+        });
+    }
+    Some(AppliedEntry {
+        applied,
+        answered,
+        fed,
+    })
+}
+
+/// `service`'s answer to `entry`, its canonical bytes in `response`
+/// ([`TestService::apply_into`]); with `alters`, a faulty service's other
+/// valid answer, recorded and sent (karyos#1038, tests).
+fn answer_into(
+    service: &mut TestService,
+    entry: &Entry,
+    response: &mut Vec<u8>,
+    alters: bool,
+) -> Option<Applied> {
+    #[cfg(feature = "test-hooks")]
+    if alters {
+        let deduplicated = service.deduplicated();
+        let (command, ret) = service.apply(entry)?;
+        response.clear();
+        response.extend_from_slice(&ret.altered().canonical());
+        return Some(Applied {
+            client: command.client,
+            sequence: command.sequence,
+            replayed: service.deduplicated() > deduplicated,
+        });
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    let _ = alters;
+    service.apply_into(entry, response)
+}
+
 /// A server: a core over C4's log on its own disk, and the test service.
 pub struct ServerNode<C: ConsensusCore> {
     id: NodeId,
@@ -1991,8 +2229,11 @@ pub struct ServerNode<C: ConsensusCore> {
     survives: Survives,
     running: Option<(C, RaftLog<SimDisk>)>,
     service: TestService,
-    /// Requests this server took, by client and sequence: it answers them.
-    pending: BTreeSet<(NodeId, u64)>,
+    /// Requests this server took, by client and sequence: it answers them
+    /// (prefilled under [`ServerNode::with_service_bounds`]).
+    pending: Pending,
+    /// What its application answers into (C5 v3).
+    answering: Answering,
     commit: Option<u64>,
     /// The highest term its core was seen to lead ([`Observation::Leading`]).
     led: Option<u64>,
@@ -2179,7 +2420,8 @@ impl<C: ConsensusCore> ServerNode<C> {
             survives,
             running,
             service: TestService::default(),
-            pending: BTreeSet::new(),
+            pending: Pending::default(),
+            answering: Answering::default(),
             commit,
             led: None,
             configuration: None,
@@ -2238,7 +2480,8 @@ impl<C: ConsensusCore> ServerNode<C> {
             survives,
             running: None,
             service: TestService::default(),
-            pending: BTreeSet::new(),
+            pending: Pending::default(),
+            answering: Answering::default(),
             commit: None,
             led: None,
             configuration: None,
@@ -3173,6 +3416,19 @@ impl<C: ConsensusCore> ServerNode<C> {
         self
     }
 
+    /// The server with its test service, its pending requests and its
+    /// application buffers prefilled for `bounds` at initialisation and
+    /// at every start without a snapshot (C5 v3): the same sizing policy
+    /// as a real process ([`super::workloads::service_bounds`]), so that
+    /// applying an entry within the bounds allocates and frees nothing.
+    #[must_use]
+    pub fn with_service_bounds(mut self, bounds: ServiceBounds) -> Self {
+        self.service = TestService::prefilled(&bounds);
+        self.pending = Pending::prefilled(pending_room(&bounds));
+        self.answering = Answering::prefilled(bounds);
+        self
+    }
+
     /// Drives the core, then records its commit and positions.
     fn duty(&mut self, out: &mut Outbox<Wire<C::Message>>) {
         let Some((mut core, mut log)) = self.running.take() else {
@@ -3181,14 +3437,35 @@ impl<C: ConsensusCore> ServerNode<C> {
         let node = self.id;
         let cluster = self.identity.identity;
         let recorder = Rc::clone(&self.recorder);
-        let mut applied = Vec::new();
         let mut snapshot_to = Vec::new();
         let budget = self.limits.is_some().then_some(&self.budget);
+        // The application runs as the driver hands out each committed
+        // entry, in the apply window ([`in_apply_window`]; C5 v3
+        // coverage), over the borrowed entry: the service answers into the
+        // kept response buffer ([`TestService::apply_into`]), the request
+        // leaves the pending set and the reply is queued with its bytes,
+        // all on buffers prefilled from the case's bounds, as a real
+        // process does. What the run records of it is instrumentation,
+        // kept outside the window and recorded after the drive.
+        let acts = self.acts();
+        let base = self.base;
+        let verified_before = self.standby.as_ref().and_then(|standby| standby.verified);
+        #[cfg(feature = "test-hooks")]
+        let alters = self.alters_responses;
+        #[cfg(not(feature = "test-hooks"))]
+        let alters = false;
+        let (service, pending, answering, standby) = (
+            &mut self.service,
+            &mut self.pending,
+            &mut self.answering,
+            &mut self.standby,
+        );
+        let mut recorded = Vec::new();
         let driven = drive_inner(
             &mut core,
             &mut log,
             &mut self.ready,
-            (budget, self.base, self.drive_fault),
+            (budget, base, self.drive_fault),
             &mut |to, message, release| {
                 if let Some(release) = release {
                     recorder
@@ -3198,7 +3475,20 @@ impl<C: ConsensusCore> ServerNode<C> {
                 }
                 out.push((to, Wire::Core(cluster, message)));
             },
-            &mut |entry, applying| applied.push((entry.clone(), applying)),
+            &mut |entry, applying| {
+                let done = in_apply_window(|| {
+                    apply_committed::<C>(
+                        (&mut *service, &mut *pending, &mut *answering),
+                        standby.as_mut(),
+                        (base, acts, alters),
+                        entry,
+                    )
+                });
+                if let Some(done) = done {
+                    let response = done.applied.is_some().then(|| answering.response.clone());
+                    recorded.push((entry.clone(), applying, done, response));
+                }
+            },
             &mut |step| {
                 if let Step::SnapshotTo(to) = step {
                     snapshot_to.push(to);
@@ -3209,6 +3499,69 @@ impl<C: ConsensusCore> ServerNode<C> {
                     .push(Observation::Drive { node, step });
             },
         );
+        // The replies leave through the simulated network, which carries
+        // each as its own message, as a process's connection carries the
+        // bytes its application queued: the network's, not the
+        // application's.
+        for reply in self.answering.replies.drain(..) {
+            let bytes = self
+                .answering
+                .bytes
+                .get(reply.bytes.0..reply.bytes.1)
+                .unwrap_or_default()
+                .to_vec();
+            out.push((
+                reply.client,
+                Wire::Response {
+                    cluster,
+                    sequence: reply.sequence,
+                    bytes,
+                    index: reply.index,
+                    generation: self.generation,
+                },
+            ));
+        }
+        self.answering.bytes.clear();
+        for (entry, applying, done, response) in recorded {
+            if let Some((index, term)) = done.fed {
+                let payload = standby::unwrap(&entry.payload)
+                    .map(|(_, _, payload)| payload.to_vec())
+                    .unwrap_or_default();
+                self.observe(Observation::FeedApplied {
+                    node,
+                    index,
+                    term,
+                    payload,
+                });
+            }
+            if let Some(applied) = done.applied
+                && done.answered
+            {
+                // The evidence of a retry is a retained answer actually sent
+                // to a waiting client, not a replica's application.
+                if applied.replayed {
+                    self.observe(Observation::Deduplicated {
+                        node,
+                        client: applied.client,
+                        sequence: applied.sequence,
+                    });
+                }
+                self.observe(Observation::Reply {
+                    node,
+                    client: applied.client,
+                    index: entry.index,
+                    term: entry.term,
+                    generation: self.generation,
+                    at: self.now,
+                });
+            }
+            self.observe(Observation::Applied {
+                node,
+                entry,
+                applying,
+                response,
+            });
+        }
         if let Err(error) = driven {
             // The node stops until a restart reopens the log.
             let observation = match &error {
@@ -3231,106 +3584,6 @@ impl<C: ConsensusCore> ServerNode<C> {
             };
             self.observe(observation);
             return;
-        }
-        let acts = self.acts();
-        let verified_before = self.standby.as_ref().and_then(|standby| standby.verified);
-        for (entry, applying) in applied {
-            // A snapshot already holds it (W5): the service skips it.
-            if self
-                .service
-                .applied()
-                .is_some_and(|applied| entry.index <= applied)
-                && self.base.is_some()
-            {
-                continue;
-            }
-            // A standby's service applies the primary entry an entry
-            // wraps, once.
-            let mut served = entry.clone();
-            if let Some(standby) = self.standby.as_mut()
-                && let Some((index, term, payload)) = standby::unwrap(&entry.payload)
-            {
-                if standby
-                    .verified
-                    .is_none_or(|(verified, _)| index > verified)
-                {
-                    standby.verified = Some((index, term));
-                    if let Some(follower) = standby.follower.as_mut() {
-                        follower.applied(Position { index, term });
-                    }
-                    if standby
-                        .proposed
-                        .is_none_or(|(proposed, _)| index > proposed)
-                    {
-                        standby.proposed = Some((index, term));
-                    }
-                    served.payload = payload.to_vec();
-                    recorder
-                        .borrow_mut()
-                        .observations
-                        .push(Observation::FeedApplied {
-                            node,
-                            index,
-                            term,
-                            payload: payload.to_vec(),
-                        });
-                } else {
-                    // Applied before: the service only moves its position.
-                    served.payload = Vec::new();
-                }
-            }
-            if C::is_configuration_entry(&served.payload) {
-                self.service.set_configuration(&served.payload);
-            }
-            let deduplicated = self.service.deduplicated();
-            let answer = self.service.apply(&served);
-            // A faulty service (tests): another valid answer, both recorded
-            // and sent.
-            #[cfg(feature = "test-hooks")]
-            let answer = match answer {
-                Some((command, ret)) if self.alters_responses => Some((command, ret.altered())),
-                other => other,
-            };
-            let replayed = self.service.deduplicated() > deduplicated;
-            let response = answer.as_ref().map(|(_, ret)| ret.canonical());
-            if let Some((command, ret)) = answer
-                && self.pending.remove(&(command.client, command.sequence))
-                && acts
-            {
-                // The evidence of a retry is a retained answer actually sent
-                // to a waiting client, not a replica's application.
-                if replayed {
-                    self.observe(Observation::Deduplicated {
-                        node,
-                        client: command.client,
-                        sequence: command.sequence,
-                    });
-                }
-                self.observe(Observation::Reply {
-                    node,
-                    client: command.client,
-                    index: entry.index,
-                    term: entry.term,
-                    generation: self.generation,
-                    at: self.now,
-                });
-                out.push((
-                    command.client,
-                    Wire::Response {
-                        cluster: self.identity.identity,
-                        sequence: command.sequence,
-                        bytes: ret.canonical(),
-                        index: entry.index,
-                        generation: self.generation,
-                    },
-                ));
-            }
-            self.observe(Observation::Applied {
-                node,
-                entry,
-                applying,
-                response,
-            });
         }
         // A standby's leader acknowledges a verified position that moved.
         if let Some(standby) = &self.standby
@@ -3513,7 +3766,12 @@ impl<C: ConsensusCore> ServerNode<C> {
         // baseline, not a new commit.
         self.service = latest
             .and_then(|(_, bytes)| TestService::decode(&bytes))
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                self.answering
+                    .bounds
+                    .as_ref()
+                    .map_or_else(TestService::default, TestService::prefilled)
+            });
         self.commit = core.committed();
         // A standby rebuilds its verified position as its service does.
         if let Some(standby) = self.standby.as_mut() {
@@ -3665,7 +3923,7 @@ impl<C: ConsensusCore> ServerNode<C> {
                 command.encode_into(&mut self.command);
                 match core.propose_slice(&self.command, &mut view) {
                     Ok(()) => {
-                        let _ = self.pending.insert(key);
+                        self.pending.insert(key);
                     }
                     Err(refused) => {
                         if let Refused::Backpressure(limit) = refused {

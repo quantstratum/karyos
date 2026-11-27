@@ -59,6 +59,9 @@ use karyos_sim::harness::node::{
     Breach, Command, HARNESS_CLUSTER, Observation, Positions, SEAL_TICKS, ServiceBounds,
     TestService, Wire as Harness,
 };
+/// The pending requests and their room, the simulator's own: a process
+/// and the simulator answer through the same implementation (C5 v3).
+pub use karyos_sim::harness::node::{Pending, pending_room};
 use karyos_sim::harness::probe::{self, Probed};
 use karyos_sim::harness::standby::FIRST_GENERATION;
 use karyos_sim::harness::workloads::{self, Action, Case};
@@ -432,64 +435,6 @@ pub fn frame_into<M>(client: NodeId, message: &Harness<M>, out: &mut Vec<u8>) ->
         prefix.copy_from_slice(&length.to_le_bytes());
     }
     true
-}
-
-/// The requests a server has proposed and not yet answered, by client and
-/// sequence (C5 v3): a vector prefilled at initialisation from the case's
-/// bounds, so inserting a request and removing it once answered neither
-/// allocates nor frees within them. A request already pending is not
-/// added again.
-#[derive(Debug)]
-pub struct Pending(Vec<(NodeId, u64)>);
-
-impl Pending {
-    /// Room for `room` requests.
-    #[must_use]
-    pub fn prefilled(room: usize) -> Self {
-        Self(Vec::with_capacity(room))
-    }
-
-    /// Adds `request` unless it is pending already.
-    pub fn insert(&mut self, request: (NodeId, u64)) {
-        if !self.0.contains(&request) {
-            self.0.push(request);
-        }
-    }
-
-    /// Removes `request`: whether it was pending.
-    pub fn remove(&mut self, request: (NodeId, u64)) -> bool {
-        match self.0.iter().position(|pending| *pending == request) {
-            Some(at) => {
-                let _ = self.0.swap_remove(at);
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Forgets every request, keeping the room.
-    pub fn clear(&mut self) {
-        self.0.clear();
-    }
-
-    /// Requests pending.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Whether none is pending.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-/// The pending requests a server holds at most within the case's bounds:
-/// each client's answers kept ([`ServiceBounds::answers`]), at least one.
-#[must_use]
-pub fn pending_room(bounds: &ServiceBounds) -> usize {
-    bounds.clients.len().saturating_mul(bounds.answers.max(1))
 }
 
 /// Replies a server queues between two sends at most within the case's

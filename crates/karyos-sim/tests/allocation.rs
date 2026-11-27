@@ -473,3 +473,94 @@ fn a_probed_cores_persistence_is_counted_in_its_advance_stage() {
     );
     assert_eq!(log.durable_index(), Some(1));
 }
+
+/// Codex review of docs#1092 (C5 v3 coverage): a simulated server applies
+/// each committed entry inside the apply window, over the borrowed entry
+/// and through `TestService::apply_into`, as a real process does. A
+/// service left to grow on every application is counted in the probed
+/// core's apply stage, not left outside every window; the same server
+/// prefilled from the case's bounds applies, answers and queues every
+/// reply at 0 allocations and 0 frees.
+#[test]
+fn a_simulated_servers_application_is_counted_in_its_apply_stage() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use karyos_sim::cluster::ClusterSim;
+    use karyos_sim::disk::{SimDisk, Survives};
+    use karyos_sim::harness::custom::Custom;
+    use karyos_sim::harness::node::{
+        ClientNode, Member, Op, Recorder, ServerNode, ServiceBounds, Shared, Wire,
+    };
+    use karyos_sim::harness::probe::{Probed, measure_with};
+    use karyos_sim::harness::workloads::geometry;
+    use karyos_sim::net::LinkConfig;
+
+    type Core = Probed<Custom>;
+    /// Appends: well past the warm-up.
+    const OPERATIONS: usize = 64;
+    const PAYLOAD: usize = 8;
+    const SERVERS: u32 = 3;
+
+    let _serial = serial();
+    let applied = |prefilled: bool| {
+        let recorder: Shared = Rc::new(RefCell::new(Recorder::default()));
+        let mut sim: ClusterSim<Member<Core>, Wire<<Core as ConsensusCore>::Message>> =
+            ClusterSim::new("apply", 1, LinkConfig::default()).unwrap();
+        for id in 0..SERVERS {
+            let mut server = ServerNode::<Core>::new(
+                id,
+                (0..SERVERS).collect(),
+                SimDisk::new(),
+                Survives::Synced,
+                geometry().unwrap(),
+                Rc::clone(&recorder),
+            )
+            .unwrap();
+            if prefilled {
+                server = server.with_service_bounds(ServiceBounds {
+                    clients: vec![SERVERS],
+                    values: OPERATIONS,
+                    payload: PAYLOAD,
+                    answers: OPERATIONS,
+                });
+            }
+            assert_eq!(
+                sim.add_node(Member::Server(Box::new(server)), 0, 0)
+                    .unwrap(),
+                id
+            );
+        }
+        let script = (0..OPERATIONS)
+            .map(|value| Op::Append(vec![u8::try_from(value).unwrap(); PAYLOAD]))
+            .collect();
+        let client =
+            ClientNode::new(SERVERS, 0, script, Rc::clone(&recorder)).with_servers(SERVERS);
+        assert_eq!(sim.add_node(Member::Client(client), 0, 0).unwrap(), SERVERS);
+        let ((), measured) = measure_with(|| sim.run_for(5_000).unwrap()).unwrap();
+        let client = sim.node(SERVERS).and_then(Member::client).unwrap();
+        assert!(
+            client.done(),
+            "every append answered: {:?}",
+            recorder
+                .borrow()
+                .observations
+                .iter()
+                .rev()
+                .take(12)
+                .collect::<Vec<_>>()
+        );
+        assert!(measured.entries > 0, "nothing past the warm-up");
+        measured
+            .stages
+            .iter()
+            .find(|(stage, _)| *stage == Stage::Apply)
+            .map(|(_, counts)| *counts)
+            .unwrap()
+    };
+    // The service's tables grow as it applies: counted as the application.
+    let growing = applied(false);
+    assert!(growing.allocations >= 1, "{growing:?}");
+    // Prefilled, the application allocates and frees nothing.
+    assert_eq!(applied(true), SetCounts::default());
+}
