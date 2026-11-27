@@ -183,7 +183,8 @@ fn capabilities_tell_unavailable_from_forbidden() {
             r#"{"name":"clocks","state":"served","reason":null},"#,
             r#"{"name":"rate-limits","state":"served","reason":null},"#,
             r#"{"name":"cluster-command","state":"unavailable","reason":"not_configured"},"#,
-            r#"{"name":"journal-history","state":"unavailable","reason":"not_configured"}]}"#,
+            r#"{"name":"journal-history","state":"unavailable","reason":"not_configured"},"#,
+            r#"{"name":"journal-append","state":"unavailable","reason":"not_configured"}]}"#,
             "\n"
         )
     );
@@ -229,7 +230,7 @@ fn a_configured_journal_and_catalog_are_served_by_role() {
                 ),
             ),
     );
-    let caps = agent.capabilities(false, false, false, false);
+    let caps = agent.capabilities(false, false, false, false, false);
     let state = |name: &str| {
         caps.iter()
             .find(|capability| capability.name == name)

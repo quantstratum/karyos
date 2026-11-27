@@ -15,6 +15,10 @@
 //!   and leaves after it, so it holds no client slot between operations.
 //!   No answer within the timeout is an unknown outcome, journalled as
 //!   such ([`UNKNOWN_OUTCOME`]).
+//! - **Denied.** A close or reopen the requester's role does not allow is
+//!   never sent; its request and its outcome, refused `not_authorised`,
+//!   are journalled without waiting (`refuse_unauthorised`; SPEC §13,
+//!   Audited operations, karyos#719).
 //! - **Rate change (R-CORE-21, karyos#740).** A rate policy change on a
 //!   guarded stream: the safety path (a tightening) goes ahead whatever
 //!   the journal does, as a close; an administrator's change needs its
@@ -120,6 +124,26 @@ impl Command<'_> {
         record.relay = self.relay;
         record
     }
+}
+
+/// Journals `command`, which its requester's role does not allow, as
+/// refused `not_authorised` (karyos#719): its request record, then its
+/// outcome record with the refusal, both without waiting. Nothing is
+/// sent; a journal that cannot record them changes nothing else, the
+/// answer being `forbidden` either way.
+pub(crate) fn refuse_unauthorised(journal: Option<&mut Journal>, command: &Command<'_>, now: u64) {
+    let Some(journal) = journal else {
+        return;
+    };
+    let (request, outcome) = match command.transition {
+        Transition::Reopen(_) => (Kind::ReopenRequest, Kind::ReopenOutcome),
+        Transition::Close | Transition::CloseAt(_) => (Kind::CloseRequest, Kind::CloseOutcome),
+    };
+    let _ = journal.append(&command.record(request, now), now);
+    let mut record = command.record(outcome, now);
+    record.code = crate::journal::retention::REFUSED;
+    record.word = crate::journal::retention::refusal_word("not_authorised");
+    let _ = journal.append(&record, now);
 }
 
 /// A guard command's transition (karyos#738).

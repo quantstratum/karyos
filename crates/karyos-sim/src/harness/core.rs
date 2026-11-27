@@ -80,6 +80,9 @@ pub struct LogView<'a> {
     base: Option<SnapshotBase>,
     /// That snapshot's log time, where the node knows it (ADR-0111).
     base_time: Option<u64>,
+    /// The configuration entry in force at that snapshot's base, as its
+    /// service section records it (karyos#711).
+    base_configuration: Option<Vec<u8>>,
 }
 
 /// What a [`LogView`] reads: C4's log over any disk, so the same core runs
@@ -227,6 +230,7 @@ impl<'a> LogView<'a> {
             budget: None,
             base: None,
             base_time: None,
+            base_configuration: None,
         }
     }
 
@@ -240,6 +244,7 @@ impl<'a> LogView<'a> {
             budget,
             base: None,
             base_time: None,
+            base_configuration: None,
         }
     }
 
@@ -333,6 +338,22 @@ impl<'a> LogView<'a> {
     pub fn with_base(mut self, base: Option<SnapshotBase>) -> Self {
         self.base = base;
         self
+    }
+
+    /// It, with `entry` as the payload of the configuration entry in force
+    /// at the snapshot's base (karyos#711): a log purged below the base no
+    /// longer holds it.
+    #[must_use]
+    pub fn with_base_configuration(mut self, entry: Option<Vec<u8>>) -> Self {
+        self.base_configuration = entry;
+        self
+    }
+
+    /// The payload of the configuration entry in force at the snapshot's
+    /// base, if the node gave it.
+    #[must_use]
+    pub fn base_configuration(&self) -> Option<&[u8]> {
+        self.base_configuration.as_deref()
     }
 
     /// It, with `log_time` as the log time of the node's latest snapshot:
@@ -721,6 +742,13 @@ pub trait ConsensusCore: Sized {
         None
     }
 
+    /// A stamp that moves whenever [`ConsensusCore::configuration`] may
+    /// answer differently, for a core that can tell without building it;
+    /// `None`, the default, has the node ask every time.
+    fn configuration_stamp(&self) -> Option<u64> {
+        None
+    }
+
     /// The node compacted its log below a snapshot at `base`: entries at
     /// or below it may no longer be in the log (W5).
     ///
@@ -762,6 +790,19 @@ pub trait ConsensusCore: Sized {
     ) -> Result<(), TransferRefused> {
         let _ = (to, log);
         Err(TransferRefused::Unsupported)
+    }
+
+    /// Whether `payload` is one of this core's configuration entries: the
+    /// node keeps the last one it applies with its service state, so a
+    /// snapshot carries the configuration at its base (karyos#711). None
+    /// is, by default.
+    #[must_use]
+    fn is_configuration_entry(payload: &[u8]) -> bool
+    where
+        Self: Sized,
+    {
+        let _ = payload;
+        false
     }
 
     /// Proposes one membership change.

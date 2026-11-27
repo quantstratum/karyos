@@ -365,6 +365,46 @@ fn history_record(out: &mut Out<'_>, record: &crate::journal::HistoryRecord) {
     });
 }
 
+/// The answer to a product service's append (R-CORE-42; karyos#773):
+/// `{"journalled":{"recording":R,"position":P,"durable":B}}`; `{"error":
+/// "journal unavailable","journalled":false}` when nothing was recorded,
+/// so a fail-closed command is not sent; `{"error":"not an unknown
+/// interval","recording":R,"position":P}` for an import that names none
+/// the current journal holds.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn product_answer(answer: &crate::product::ProductAnswer) -> String {
+    use crate::product::ProductAnswer;
+
+    let mut text = String::new();
+    Out(&mut text).object(|fields| match *answer {
+        ProductAnswer::Journalled {
+            recording,
+            position,
+            durable,
+        } => {
+            fields.key("journalled").object(|fields| {
+                fields.number("recording", recording);
+                fields.number("position", position);
+                fields.key("durable").bool(durable);
+            });
+        }
+        ProductAnswer::NotAnInterval {
+            recording,
+            position,
+        } => {
+            fields.string("error", "not an unknown interval");
+            fields.number("recording", recording);
+            fields.number("position", position);
+        }
+        _ => {
+            fields.string("error", "journal unavailable");
+            fields.key("journalled").bool(false);
+        }
+    });
+    text
+}
+
 /// A refused history read (R-CORE-14; karyos#725), typed:
 /// `{"error":TEXT,"refusal":NAME}` with the recording and floor of a
 /// cursor of another recording or below the floor, the durable end of

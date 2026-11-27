@@ -362,7 +362,17 @@ fn the_retention_kinds_keep_the_existing_codes() {
         assert_eq!(kind.code(), code);
         assert_eq!(Kind::from_code(code), Some(kind));
     }
-    assert_eq!(Kind::from_code(27), None);
+    // R-CORE-42 (karyos#773): a product service's four kinds.
+    for (code, kind) in (27u64..).zip([
+        Kind::ProductRequest,
+        Kind::ProductOutcome,
+        Kind::ProductRequestImported,
+        Kind::ProductOutcomeImported,
+    ]) {
+        assert_eq!(kind.code(), code);
+        assert_eq!(Kind::from_code(code), Some(kind));
+    }
+    assert_eq!(Kind::from_code(31), None);
 }
 
 /// karyos#739: an approval record round-trips with its target, command,

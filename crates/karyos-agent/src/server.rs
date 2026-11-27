@@ -118,6 +118,12 @@
 //!   O(journals) and O(counter cells) a request. An unknown `DIR` is
 //!   `{"error":"unknown driver"}`, one not attached yet `{"error":"driver
 //!   unavailable"}`.
+//! - **A product service's records (R-CORE-42, karyos#773).**
+//!   `journal-append request|outcome durable|ordinary OPID SERVICE COMMAND
+//!   VALUE CORRELATION [REASON]` and `journal-import RECORDING INTERVAL TIME
+//!   request|outcome OPID SERVICE COMMAND VALUE CORRELATION [REASON]`,
+//!   for the role `service` and an administrator, answer
+//!   [`json::product_answer`]; [`crate::product`] states the contract.
 //! - **Journal history (R-CORE-14, karyos#725).** `journal-history
 //!   [RECORDING POSITION [COUNT]]`, for every role, answers
 //!   [`json::journal_history`]: a page of the operations journal's
@@ -407,6 +413,10 @@ pub enum Role {
     /// Reads, and writes the join metadata registry, nothing else
     /// (karyos#736): a product's uid.
     Registrar,
+    /// Reads, and appends a product service's records to the operations
+    /// journal, nothing else (R-CORE-42, karyos#773): a product service's
+    /// uid.
+    Service,
 }
 
 impl Role {
@@ -456,8 +466,15 @@ impl Role {
         matches!(self, Self::Registrar | Self::Administrator)
     }
 
+    /// Whether the role may append a product service's records to the
+    /// operations journal: a service or an administrator (karyos#773).
+    #[must_use]
+    pub const fn may_append(self) -> bool {
+        matches!(self, Self::Service | Self::Administrator)
+    }
+
     /// The role named `name`: `viewer`, `operator`, `risk-officer`,
-    /// `administrator` or `registrar`.
+    /// `administrator`, `registrar` or `service`.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         Some(match name {
@@ -466,6 +483,7 @@ impl Role {
             "risk-officer" => Self::RiskOfficer,
             "administrator" => Self::Administrator,
             "registrar" => Self::Registrar,
+            "service" => Self::Service,
             _ => return None,
         })
     }
@@ -829,6 +847,7 @@ impl Server {
                     role.may_reopen(),
                     role.may_acknowledge(),
                     role.may_register(),
+                    role.may_append(),
                 )),
                 Served::Capabilities,
             ),
@@ -841,6 +860,9 @@ impl Server {
                         agent.guard_close_for(Path::new(dir), guard, requester, reason.as_bytes());
                     (json::guard_answer(&answer), Served::Operated)
                 } else {
+                    // Journalled, refused `not_authorised`, and never sent
+                    // (karyos#719).
+                    agent.guard_refused(Path::new(dir), guard, None, requester, reason.as_bytes());
                     forbidden()
                 }
             }
@@ -869,6 +891,13 @@ impl Server {
                     };
                     (json::guard_answer(&answer), served)
                 } else {
+                    agent.guard_refused(
+                        Path::new(dir),
+                        guard,
+                        Some(expected),
+                        requester,
+                        reason.as_bytes(),
+                    );
                     forbidden()
                 }
             }
@@ -912,6 +941,9 @@ impl Server {
                         agent.retention(operation, recording, requester, reason.as_bytes());
                     (json::retention_answer(&answer), Served::Operated)
                 } else {
+                    // Journalled, refused `not_authorised`, and never sent
+                    // (karyos#719).
+                    agent.retention_refused(operation, recording, requester, reason.as_bytes());
                     forbidden()
                 }
             }
@@ -1060,6 +1092,19 @@ impl Server {
                 Err(answer) => (json::guard_answer(&answer), Served::Refused),
             },
             // Every role reads the history (R-CORE-14).
+            // A product service's records (R-CORE-42, karyos#773).
+            (Some((requester, role)), Request::JournalAppend(append)) => {
+                if role.may_append() {
+                    let answer = agent.journal_append(&append, requester);
+                    let served = match answer {
+                        crate::product::ProductAnswer::Journalled { .. } => Served::Operated,
+                        _ => Served::Refused,
+                    };
+                    (json::product_answer(&answer), served)
+                } else {
+                    forbidden()
+                }
+            }
             (Some(_), Request::JournalHistory { from, count }) => {
                 match agent.journal_history(from, count) {
                     Ok(page) => (json::journal_history(&page), Served::JournalHistory),
@@ -1318,6 +1363,9 @@ enum Request<'a> {
     Clocks {
         dir: &'a str,
     },
+    /// `journal-append ...` and `journal-import ...` (R-CORE-42,
+    /// karyos#773; [`crate::product`]).
+    JournalAppend(crate::product::ProductAppend<'a>),
     /// `journal-history [RECORDING POSITION [COUNT]]` (R-CORE-14,
     /// karyos#725).
     JournalHistory {
@@ -1607,7 +1655,7 @@ const fn clearance(role: Role) -> crate::cluster_admin::Clearance {
     match role {
         Role::Administrator => Clearance::Administrator,
         Role::Operator | Role::RiskOfficer => Clearance::Operator,
-        Role::Viewer | Role::Registrar => Clearance::None,
+        Role::Viewer | Role::Registrar | Role::Service => Clearance::None,
     }
 }
 
@@ -1663,6 +1711,18 @@ fn request(rest: &str) -> Option<Request<'_>> {
         "clocks" => Some(Request::Clocks { dir: arguments }),
         // `journal-history [RECORDING POSITION [COUNT]]` (R-CORE-14): a
         // count of 0 or above HISTORY_MAX is a bad argument.
+        // A product service's records (R-CORE-42, karyos#773): the
+        // contract's form, checked in `product::parse`.
+        "journal-append" | "journal-import" => Some(
+            crate::product::parse(arguments, name == "journal-import").map_or(
+                Request::BadArguments(if name == "journal-append" {
+                    "journal-append"
+                } else {
+                    "journal-import"
+                }),
+                Request::JournalAppend,
+            ),
+        ),
         "journal-history" => {
             let parsed = (|| {
                 if arguments.is_empty() {

@@ -36,6 +36,14 @@
 //!   releases a reply only while it holds the lease on its own clock. Every
 //!   reply carries its server's generation, and a client rejects a lower
 //!   one once it has seen a higher one.
+//! - **Cluster log replication** (ADR-0120, karyos#714): in place of the
+//!   feed, a primary server whose core leads pushes its log's stored
+//!   bytes, its `ClusterLog` seals of one epoch and a status to the
+//!   standby ([`Wire::ReplStart`] and the rest), as schema 6 would; the
+//!   standby's leader checks them with
+//!   [`karyos_cluster::standby::Standby`] and proposes what passes. Its
+//!   acknowledgement names its copy's received and checked ends, and
+//!   whether a seal stalled, so the sender resends from there.
 //!
 //! [`ClusterSim`]: crate::cluster::ClusterSim
 
@@ -44,9 +52,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::rc::Rc;
 
+use karyos_archive::integrity::SealRecord;
 use karyos_archive::segment::Geometry;
 use karyos_cluster::snapshot::{
-    PendingSnapshot, Section, SectionKind, SnapshotConfig, SnapshotStore, WRITE_CHUNK,
+    PendingSnapshot, Section, SectionKind, SnapshotConfig, SnapshotError, SnapshotReader,
+    SnapshotStore, WRITE_CHUNK,
+};
+use karyos_cluster::standby::{
+    Position, RecoveryPoint, Refusal, ReplicaCheck, Sealed, Standby, StandbyConfig, TailBound,
 };
 use karyos_cluster::{Entry, LogError, RaftLog};
 
@@ -57,7 +70,7 @@ use super::core::{
 };
 use super::standby::{
     self, ExternalLease, FEED_BATCH_BYTES, FEED_PERIOD, FIRST_GENERATION, FeedEntry, FeedFault,
-    FeedRefusal, Fencing, PromotionReport,
+    FeedRefusal, Fencing, PromotionReport, STATUS_INTERVAL,
 };
 use crate::cluster::{Node, Outbox};
 use crate::disk::{SimDisk, Survives};
@@ -77,6 +90,17 @@ pub const SEAL_TICKS: u64 = 10;
 pub const SNAPSHOT_DIR: &str = "/snap";
 /// The version of the service section a snapshot holds.
 pub const SERVICE_SECTION_VERSION: u64 = 2;
+/// A snapshot transfer's window: the pieces a leader has sent a follower
+/// and not had acknowledged, at most (karyos#682).
+pub const SNAPSHOT_WINDOW: u64 = 4;
+/// Ticks a follower's transfer may go without a piece before it is
+/// dropped: its leader asks again, and a stale one goes.
+pub const SNAPSHOT_STALL: u64 = 2_000;
+/// Ticks a leader's transfer may go without its window moving before the
+/// core's next ask starts it again: a piece lost, or sent to a follower
+/// that was down. Well under [`SNAPSHOT_STALL`], so a follower that comes
+/// back is served again long before it would give up.
+pub const SNAPSHOT_RETRY: u64 = 200;
 
 /// A case's log compaction (W5), driven by the snapshot store's own
 /// policy ([`SnapshotConfig`]; karyos#682): a snapshot is due after
@@ -95,6 +119,8 @@ pub struct Compaction {
     /// The log bytes of one of the case's entries (its frame), which turns
     /// `keep` into the allowance's bytes.
     pub frame: u64,
+    /// The byte trigger, when not item 37's default.
+    pub every_bytes: Option<u64>,
 }
 
 impl Compaction {
@@ -103,10 +129,60 @@ impl Compaction {
     /// frames.
     #[must_use]
     pub fn config(&self) -> SnapshotConfig {
-        SnapshotConfig::default()
+        let config = SnapshotConfig::default()
             .with_every_entries(self.every.max(1))
-            .with_allowance(self.keep.saturating_mul(self.frame))
+            .with_allowance(self.keep.saturating_mul(self.frame));
+        match self.every_bytes {
+            Some(bytes) => config.with_every_bytes(bytes.max(1)),
+            None => config,
+        }
     }
+}
+
+/// One piece of a snapshot transfer, as [`Wire::Snapshot`] carries it.
+#[derive(Debug)]
+struct Piece {
+    base: SnapshotBase,
+    term: u64,
+    transfer: u64,
+    digest: u32,
+    length: u64,
+    offset: u64,
+    bytes: Vec<u8>,
+}
+
+/// A snapshot a follower receives: its sender's transfer, the frozen
+/// metadata every piece must repeat, and the bytes so far, streamed into
+/// its store (karyos#682).
+#[derive(Debug)]
+struct Incoming {
+    from: NodeId,
+    /// Its sender's term when it started the transfer.
+    term: u64,
+    transfer: u64,
+    base: SnapshotBase,
+    digest: u32,
+    length: u64,
+    pending: PendingSnapshot<SimDisk>,
+    /// When the last piece arrived.
+    last: u64,
+}
+
+/// A snapshot a leader sends: read from its store as the follower
+/// acknowledges, at most [`SNAPSHOT_WINDOW`] pieces ahead.
+#[derive(Debug)]
+struct Outgoing {
+    /// Its term when it started the transfer.
+    term: u64,
+    transfer: u64,
+    base: SnapshotBase,
+    digest: u32,
+    length: u64,
+    reader: SnapshotReader<SimDisk>,
+    sent: u64,
+    acked: u64,
+    /// When it started, or last saw its window move.
+    moved: u64,
 }
 
 /// A client's operation on the test service.
@@ -284,6 +360,9 @@ pub struct TestService {
     /// The log time: the largest event time applied, as the sessions
     /// section of a shipped snapshot records it (ADR-0111, decision 4).
     log_time: u64,
+    /// The last configuration entry applied, as the consensus section of
+    /// a shipped snapshot records the configuration (karyos#711).
+    configuration: Option<Vec<u8>>,
 }
 
 impl Default for TestService {
@@ -305,7 +384,20 @@ impl TestService {
             expired: 0,
             retention: retention.max(1),
             log_time: 0,
+            configuration: None,
         }
+    }
+
+    /// The core's configuration entry `payload` applied: kept, so its
+    /// snapshot carries the configuration at its base.
+    pub fn set_configuration(&mut self, payload: &[u8]) {
+        self.configuration = Some(payload.to_vec());
+    }
+
+    /// The last configuration entry applied, if any.
+    #[must_use]
+    pub fn configuration(&self) -> Option<&[u8]> {
+        self.configuration.as_deref()
     }
 
     /// Applies the committed `entry`; returns the command and its answer:
@@ -403,6 +495,12 @@ impl TestService {
         bytes.extend_from_slice(&self.deduplicated.to_le_bytes());
         bytes.extend_from_slice(&self.expired.to_le_bytes());
         bytes.extend_from_slice(&self.log_time.to_le_bytes());
+        // Only when there is one, so a service of a static membership
+        // encodes as before.
+        if let Some(configuration) = &self.configuration {
+            count(&mut bytes, configuration.len())?;
+            bytes.extend_from_slice(configuration);
+        }
         Some(bytes)
     }
 
@@ -465,6 +563,12 @@ impl TestService {
         let deduplicated = u64_at(&mut rest)?;
         let expired = u64_at(&mut rest)?;
         let log_time = u64_at(&mut rest)?;
+        let configuration = if rest.is_empty() {
+            None
+        } else {
+            let length = u32_at(&mut rest)?;
+            Some(take(&mut rest, length)?.to_vec())
+        };
         rest.is_empty().then_some(Self {
             values,
             answered,
@@ -473,6 +577,7 @@ impl TestService {
             expired,
             retention,
             log_time,
+            configuration,
         })
     }
 
@@ -1028,6 +1133,33 @@ pub enum Observation {
         /// The fencing it asked for.
         fencing: Fencing,
     },
+    /// A standby server refused a replicated request, range or seal
+    /// (ADR-0120).
+    ReplicationRefused {
+        /// The server.
+        node: NodeId,
+        /// The source server.
+        source: NodeId,
+        /// Why.
+        refusal: Refusal,
+    },
+    /// A standby server started a copy of a source's log.
+    CopyStarted {
+        /// The server.
+        node: NodeId,
+        /// The source server.
+        source: NodeId,
+        /// Where the copy starts in the source's log.
+        start: u64,
+    },
+    /// A standby server's recovery point, at a status (ADR-0120 decision
+    /// 8).
+    RecoveryPoint {
+        /// The server.
+        node: NodeId,
+        /// The point.
+        point: RecoveryPoint,
+    },
     /// A standby server whose core leads was promoted.
     Promoted {
         /// The server.
@@ -1105,6 +1237,15 @@ pub enum Observation {
     /// The harness healed every link ([`super::workloads::Action::Heal`]):
     /// a mark in the order of observations.
     Healed,
+    /// The harness split the links between `left` and `right`
+    /// ([`super::workloads::Action::Split`]): a mark in the order of
+    /// observations, so a check can tell what came after the partition.
+    Split {
+        /// One side.
+        left: Vec<NodeId>,
+        /// The other.
+        right: Vec<NodeId>,
+    },
     /// A leader-relative trigger of a case acted, at harness step `at`
     /// ([`super::workloads::LostReply`], C5 version 2's W5 retry).
     Triggered {
@@ -1148,6 +1289,8 @@ pub enum Observation {
         node: NodeId,
         /// The snapshot's base.
         base: SnapshotBase,
+        /// The sender's transfer.
+        transfer: u64,
         /// Where the piece starts.
         offset: u64,
         /// Its bytes.
@@ -1161,8 +1304,34 @@ pub enum Observation {
         node: NodeId,
         /// The snapshot's base.
         base: SnapshotBase,
+        /// The sender's transfer.
+        transfer: u64,
         /// The piece's offset.
         offset: u64,
+    },
+    /// A leader sent a piece of a snapshot transfer.
+    SnapshotSent {
+        /// The leader.
+        node: NodeId,
+        /// The follower.
+        to: NodeId,
+        /// The transfer.
+        transfer: u64,
+        /// The piece's offset.
+        offset: u64,
+    },
+    /// A server dropped a snapshot transfer it was receiving: `"gap"`,
+    /// `"superseded"`, `"overtaken"`, `"stalled"`, `"metadata changed"` or
+    /// `"write failed"`.
+    SnapshotAbandoned {
+        /// The server.
+        node: NodeId,
+        /// The snapshot's base.
+        base: SnapshotBase,
+        /// The transfer.
+        transfer: u64,
+        /// Why.
+        reason: &'static str,
     },
     /// A server refused a snapshot it was sent.
     SnapshotRefused {
@@ -1302,21 +1471,43 @@ pub enum Wire<M> {
     /// An operator's leadership handover to a server, which the core takes
     /// or refuses ([`Observation::Transfer`]); nothing answers it (W5).
     Transfer(NodeId),
-    /// One piece of a leader's snapshot (W5; karyos#682): its base, its
-    /// service section's length, and `bytes` at `offset` in it. The
-    /// leader streams the section from its store through a
-    /// `SnapshotReader`, in pieces of at most `WRITE_CHUNK`, and the
-    /// follower streams each into its own store as it arrives; neither
-    /// holds the section whole.
+    /// One piece of a leader's snapshot (W5; karyos#682): `bytes` at
+    /// `offset` of the service section of the snapshot at `base`, whose
+    /// section is `length` bytes and whose whole snapshot's CRC-32C is
+    /// `digest`, in transfer `transfer` of its sender. The leader streams
+    /// the section from its store through a `SnapshotReader`, at most
+    /// [`SNAPSHOT_WINDOW`] pieces of `WRITE_CHUNK` unacknowledged, and the
+    /// follower writes each into its own store as it arrives.
     Snapshot {
         /// The snapshot's base.
         base: SnapshotBase,
+        /// The sender's term when it started the transfer: with the base
+        /// and the transfer, what orders two transfers' starts.
+        term: u64,
+        /// The sender's transfer.
+        transfer: u64,
+        /// The whole snapshot's CRC-32C, as the sender's store holds it.
+        digest: u32,
         /// The service section's length.
         length: u64,
         /// Where `bytes` start in it.
         offset: u64,
         /// The piece.
         bytes: Vec<u8>,
+    },
+    /// A follower's acknowledgement of a transfer: it holds the section's
+    /// bytes before `next`; once `installed`, it has checked, published and
+    /// installed the snapshot (or holds state past it), and only that ends
+    /// the sender's transfer.
+    SnapshotAck {
+        /// The snapshot's base.
+        base: SnapshotBase,
+        /// The transfer.
+        transfer: u64,
+        /// The bytes it holds.
+        next: u64,
+        /// Whether the snapshot is installed.
+        installed: bool,
     },
     /// The primary's committed entries after the standby's verified
     /// position, and its commit.
@@ -1336,8 +1527,50 @@ pub enum Wire<M> {
     },
     /// The harness promotes the standby, the old primary fenced.
     Promote {
+        /// How the old primary was fenced.
+        fencing: Fencing,
         /// The requests known to be in flight, by client and sequence.
         unknown: Vec<(NodeId, u64)>,
+    },
+    /// A primary server's Cluster log replication starts at `start`, the
+    /// first seal boundary of its epoch at or after its store's start.
+    ReplStart {
+        /// The position.
+        start: u64,
+    },
+    /// Stored bytes of the source's log, whole frames.
+    ReplBytes {
+        /// Their position in the source's log.
+        position: u64,
+        /// The bytes.
+        bytes: Vec<u8>,
+    },
+    /// A `ClusterLog` seal of the replication's epoch.
+    ReplSeal {
+        /// The seal.
+        seal: SealRecord,
+    },
+    /// The source's status: where its epoch's seals end.
+    ReplStatus {
+        /// The sealed end.
+        sealed: u64,
+    },
+    /// The source ended its request (`state` 5 `interrupted`).
+    ReplEnd,
+    /// The standby holds no copy of the sender's request (it restarted,
+    /// or its leader changed and discarded the copy): the sender starts
+    /// its request again, its byte and seal cursors back at its start
+    /// (karyos#714 review).
+    ReplReset,
+    /// The standby's acknowledgement of a status.
+    ReplAck {
+        /// Where its copy's received bytes end.
+        received: u64,
+        /// Where its checked seals end.
+        checked: u64,
+        /// Whether a seal waited or was refused since the last one: the
+        /// sender resends from `received`.
+        stalled: bool,
     },
     /// The harness sends a client to another server.
     Redirect {
@@ -1357,8 +1590,34 @@ struct FeedOut {
     faults: BTreeMap<u64, FeedFault>,
 }
 
+/// A primary server's Cluster log replication to the standby
+/// (ADR-0120).
+#[derive(Debug, Clone)]
+struct ReplicationOut {
+    /// The standby's servers.
+    to: Vec<NodeId>,
+    /// Damage still to apply in transit, one send each, by the index of
+    /// the frame sent.
+    faults: BTreeMap<u64, FeedFault>,
+    /// The request under way.
+    active: Option<ReplicationActive>,
+}
+
+/// A replication request under way.
+#[derive(Debug, Clone, Copy)]
+struct ReplicationActive {
+    epoch: u64,
+    start: u64,
+    /// The next byte to send.
+    next: u64,
+    /// Where the standby's checked seals end.
+    checked: u64,
+    /// The standby acknowledged it.
+    accepted: bool,
+}
+
 /// A standby server's state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 struct StandbyIn {
     /// The primary's servers, which acknowledgements go to.
     primary: Vec<NodeId>,
@@ -1370,6 +1629,15 @@ struct StandbyIn {
     learnt: Option<u64>,
     /// Promoted: it takes requests and replies.
     promoted: bool,
+    /// Its follower of the primary's Cluster log, when it follows over
+    /// replication rather than the feed.
+    follower: Option<Standby<ReplicaCheck<SimDisk>>>,
+    /// It follows over replication.
+    replicated: bool,
+    /// Whether its core led at its last duty.
+    leading: bool,
+    /// A seal waited or was refused since the last acknowledgement.
+    stalled: bool,
 }
 
 /// A server: a core over C4's log on its own disk, and the test service.
@@ -1388,6 +1656,8 @@ pub struct ServerNode<C: ConsensusCore> {
     led: Option<u64>,
     /// The configuration last recorded.
     configuration: Option<Configuration>,
+    /// The core's configuration stamp when it was last asked.
+    configuration_stamp: Option<u64>,
     /// Why the disk cannot come back, when its crash could not be taken.
     lost: Option<String>,
     recorder: Shared,
@@ -1397,6 +1667,8 @@ pub struct ServerNode<C: ConsensusCore> {
     now: u64,
     /// The feed to a standby, for a primary server.
     feed: Option<FeedOut>,
+    /// The Cluster log replication to a standby, for a primary server.
+    replication: Option<ReplicationOut>,
     /// The lease it holds to act, for a primary server.
     lease: Option<Rc<RefCell<ExternalLease>>>,
     /// The standby state, for a standby server.
@@ -1412,7 +1684,11 @@ pub struct ServerNode<C: ConsensusCore> {
     snapshots: Option<SnapshotStore<SimDisk>>,
     /// A leader's snapshot being received: its base and the bytes so far,
     /// streamed into the store as they arrive.
-    incoming: Option<(SnapshotBase, PendingSnapshot<SimDisk>)>,
+    incoming: Option<Incoming>,
+    /// The snapshot transfers it sends, by follower.
+    outgoing: BTreeMap<NodeId, Outgoing>,
+    /// Its next transfer's number.
+    next_transfer: u64,
     /// The piece of its first received transfer it drops, and the pieces
     /// of that transfer seen so far; `None` once dropped, or never.
     lose_piece: Option<(u64, u64)>,
@@ -1561,11 +1837,13 @@ impl<C: ConsensusCore> ServerNode<C> {
             commit,
             led: None,
             configuration: None,
+            configuration_stamp: None,
             lost: None,
             recorder,
             generation: FIRST_GENERATION,
             now: 0,
             feed: None,
+            replication: None,
             lease: None,
             standby: None,
             limits,
@@ -1573,6 +1851,8 @@ impl<C: ConsensusCore> ServerNode<C> {
             compaction: None,
             snapshots: None,
             incoming: None,
+            outgoing: BTreeMap::new(),
+            next_transfer: 1,
             lose_piece: None,
             since_bytes: (0, 0),
             base: None,
@@ -1614,11 +1894,13 @@ impl<C: ConsensusCore> ServerNode<C> {
             commit: None,
             led: None,
             configuration: None,
+            configuration_stamp: None,
             lost: None,
             recorder,
             generation: FIRST_GENERATION,
             now: 0,
             feed: None,
+            replication: None,
             lease: None,
             standby: None,
             limits: None,
@@ -1626,6 +1908,8 @@ impl<C: ConsensusCore> ServerNode<C> {
             compaction: None,
             snapshots: None,
             incoming: None,
+            outgoing: BTreeMap::new(),
+            next_transfer: 1,
             lose_piece: None,
             since_bytes: (0, 0),
             base: None,
@@ -1734,8 +2018,21 @@ impl<C: ConsensusCore> ServerNode<C> {
         if start != counted_to {
             bytes = 0;
         }
+        let held = log.first_index();
         for index in start.saturating_add(1)..=applied {
-            bytes = bytes.saturating_add(log.frame_span(index).unwrap_or(0));
+            match log.frame_span(index) {
+                Some(span) => bytes = bytes.saturating_add(span),
+                // Below the log's first index after an install: not this
+                // node's bytes to count.
+                None if index < held => {}
+                None => {
+                    return self.observe(Observation::SnapshotRefused {
+                        node: self.id,
+                        base: SnapshotBase { index, term: 0 },
+                        reason: "an applied entry's frame is missing".to_owned(),
+                    });
+                }
+            }
         }
         self.since_bytes = (applied, bytes);
         if !config.due(entries, bytes) {
@@ -1785,7 +2082,15 @@ impl<C: ConsensusCore> ServerNode<C> {
                 .and_then(|offset| usize::try_from(offset).ok())
                 .and_then(|offset| starts.get(offset).copied())
         });
-        let _ = log.purge_prefix(floor);
+        if let Err(error) = log.purge_prefix(floor) {
+            // The snapshot is published: the core is told of it, and the
+            // log keeps what the purge did not remove.
+            self.observe(Observation::SnapshotRefused {
+                node: self.id,
+                base,
+                reason: format!("purge: {error}"),
+            });
+        }
         let first = log.first_index();
         // The duty's budget holds for the hook's reads too.
         let budget = self.limits.map(|_| self.budget.clone());
@@ -1810,21 +2115,24 @@ impl<C: ConsensusCore> ServerNode<C> {
         });
     }
 
-    /// Sends its latest snapshot to `to`, which needs entries its log no
-    /// longer holds.
-    fn send_snapshot(&self, to: NodeId, out: &mut Outbox<Wire<C::Message>>) {
+    /// Sends `to`, which needs entries its log no longer holds, its latest
+    /// snapshot, streamed from its store as `to` acknowledges it. A
+    /// transfer of that snapshot already moving goes on, however often the
+    /// core asks; a new one starts only for a newer snapshot, or when the
+    /// last has gone [`SNAPSHOT_RETRY`] ticks without an acknowledgement.
+    fn send_snapshot(&mut self, to: NodeId, term: u64, out: &mut Outbox<Wire<C::Message>>) {
         let Some(store) = self.snapshots.as_ref() else {
             return;
         };
         let Some(info) = store.latest() else {
             return;
         };
-        let base = SnapshotBase {
-            index: info.index,
-            term: info.term,
-        };
-        // Streamed from the store, never read whole: a damaged snapshot
-        // sends what it read, and the follower's store refuses the rest.
+        if self.outgoing.get(&to).is_some_and(|outgoing| {
+            outgoing.base.index == info.index
+                && self.now.saturating_sub(outgoing.moved) <= SNAPSHOT_RETRY
+        }) {
+            return;
+        }
         let Ok(mut reader) = store.reader(&info) else {
             return;
         };
@@ -1835,143 +2143,421 @@ impl<C: ConsensusCore> ServerNode<C> {
                 Ok(None) | Err(_) => return,
             }
         };
-        let mut offset = 0u64;
-        loop {
-            let mut bytes = vec![0u8; WRITE_CHUNK];
-            let Ok(read) = reader.read(&mut bytes) else {
-                return;
+        let transfer = self.next_transfer;
+        self.next_transfer = transfer.saturating_add(1);
+        let outgoing = Outgoing {
+            term,
+            transfer,
+            base: SnapshotBase {
+                index: info.index,
+                term: info.term,
+            },
+            digest: info.digest,
+            length,
+            reader,
+            sent: 0,
+            acked: 0,
+            moved: self.now,
+        };
+        let _ = self.outgoing.insert(to, outgoing);
+        self.pump_snapshot(to, out);
+    }
+
+    /// Sends `to` the next pieces of its transfer that fit the window. The
+    /// last is sent only once the reader has checked the snapshot's end:
+    /// a snapshot that does not verify is not sent whole.
+    fn pump_snapshot(&mut self, to: NodeId, out: &mut Outbox<Wire<C::Message>>) {
+        let Some(outgoing) = self.outgoing.get_mut(&to) else {
+            return;
+        };
+        let window = SNAPSHOT_WINDOW.saturating_mul(WRITE_CHUNK as u64);
+        let mut broken = false;
+        while outgoing.sent < outgoing.length
+            && outgoing.sent.saturating_sub(outgoing.acked) < window
+        {
+            let left = outgoing.length - outgoing.sent;
+            let take = usize::try_from(left)
+                .unwrap_or(WRITE_CHUNK)
+                .min(WRITE_CHUNK);
+            let mut bytes = vec![0u8; take];
+            let read = match outgoing.reader.read(&mut bytes) {
+                Ok(read) if read > 0 => read,
+                _ => {
+                    broken = true;
+                    break;
+                }
             };
             bytes.truncate(read);
-            let last = read == 0 || offset.saturating_add(read as u64) >= length;
-            if read > 0 || length == 0 {
-                out.push((
+            let read = read as u64;
+            // The last piece waits for the end's check: the digest over the
+            // whole snapshot.
+            if outgoing.sent.saturating_add(read) >= outgoing.length
+                && !matches!(outgoing.reader.next_section(), Ok(None))
+            {
+                broken = true;
+                break;
+            }
+            self.recorder
+                .borrow_mut()
+                .observations
+                .push(Observation::SnapshotSent {
+                    node: self.id,
                     to,
-                    Wire::Snapshot {
-                        base,
-                        length,
-                        offset,
-                        bytes,
-                    },
-                ));
-            }
-            offset = offset.saturating_add(read as u64);
-            if last {
-                return;
-            }
+                    transfer: outgoing.transfer,
+                    offset: outgoing.sent,
+                });
+            out.push((
+                to,
+                Wire::Snapshot {
+                    base: outgoing.base,
+                    term: outgoing.term,
+                    transfer: outgoing.transfer,
+                    digest: outgoing.digest,
+                    length: outgoing.length,
+                    offset: outgoing.sent,
+                    bytes,
+                },
+            ));
+            outgoing.sent = outgoing.sent.saturating_add(read);
+        }
+        if broken {
+            let _ = self.outgoing.remove(&to);
         }
     }
 
-    /// Takes one piece of a leader's snapshot: the first starts a
-    /// streamed write (an older one being received is abandoned), each
-    /// next one in order is written, a gap or a duplicate drops the
-    /// transfer (the leader asks again), and the last publishes it and
-    /// installs it. A snapshot already staged at that base is installed
-    /// without being received again.
+    /// A follower's acknowledgement: the window moves, and a transfer ends
+    /// only once the follower has installed it. One received whole but not
+    /// installed (its check or its install failed) waits, and once it has
+    /// gone [`SNAPSHOT_RETRY`] ticks without moving the core's next ask
+    /// starts it again.
+    fn snapshot_acked(
+        &mut self,
+        from: NodeId,
+        (base, transfer, next, installed): (SnapshotBase, u64, u64, bool),
+        out: &mut Outbox<Wire<C::Message>>,
+    ) {
+        let Some(outgoing) = self.outgoing.get_mut(&from) else {
+            return;
+        };
+        if outgoing.transfer != transfer || outgoing.base != base {
+            return;
+        }
+        if installed {
+            let _ = self.outgoing.remove(&from);
+            return;
+        }
+        let acked = next.min(outgoing.sent);
+        if acked > outgoing.acked {
+            outgoing.acked = acked;
+            outgoing.moved = self.now;
+        }
+        self.pump_snapshot(from, out);
+    }
+
+    /// Drops the transfer it receives, with `reason`.
+    fn abandon_incoming(&mut self, reason: &'static str) {
+        let Some(incoming) = self.incoming.take() else {
+            return;
+        };
+        if let Some(store) = self.snapshots.as_mut() {
+            let _ = store.abandon(incoming.pending);
+        }
+        self.observe(Observation::SnapshotAbandoned {
+            node: self.id,
+            base: incoming.base,
+            transfer: incoming.transfer,
+            reason,
+        });
+    }
+
+    /// Drops a transfer its service has overtaken, or that has gone
+    /// [`SNAPSHOT_STALL`] ticks without a piece.
+    fn expire_incoming(&mut self) {
+        let Some(incoming) = self.incoming.as_ref() else {
+            return;
+        };
+        let overtaken = self
+            .service
+            .applied()
+            .is_some_and(|applied| incoming.base.index <= applied);
+        let stalled = self.now.saturating_sub(incoming.last) > SNAPSHOT_STALL;
+        if overtaken {
+            self.abandon_incoming("overtaken");
+        } else if stalled {
+            self.abandon_incoming("stalled");
+        }
+    }
+
+    /// Reopens its snapshot store after a failure that leaves it refusing
+    /// writes: what was published stays, what was not is removed.
+    fn reopen_snapshots(&mut self) {
+        let Some(compaction) = self.compaction else {
+            return;
+        };
+        match Self::open_snapshots(&self.disk, self.geometry, compaction.config()) {
+            Ok(store) => self.snapshots = Some(store),
+            Err(error) => self.lost = Some(error),
+        }
+    }
+
+    /// Takes one piece of a leader's snapshot. The first piece of a
+    /// transfer starts it, superseding the one it receives only when it is
+    /// newer: a later base, a later sender's term at the same base, or a
+    /// later transfer of the same sender and term; every next piece must repeat the transfer's metadata
+    /// and continue it exactly: a duplicate is acknowledged again and
+    /// changes nothing, a gap drops the transfer (its leader asks again),
+    /// and a piece of another transfer is ignored. Each piece is written
+    /// into the store as it arrives and acknowledged; the last seals the
+    /// snapshot, which is read back and checked before it is published and
+    /// installed, and only then acknowledged installed. A snapshot already
+    /// staged at that base is installed without being received again; a
+    /// piece of a base its state has reached is acknowledged installed.
     fn receive_snapshot(
         &mut self,
         core: &mut C,
         log: &mut RaftLog<SimDisk>,
-        (base, length, offset, bytes): (SnapshotBase, u64, u64, Vec<u8>),
+        (from, piece): (NodeId, Piece),
+        out: &mut Outbox<Wire<C::Message>>,
     ) {
         let node = self.id;
+        self.expire_incoming();
+        let ack = |out: &mut Outbox<Wire<C::Message>>, next: u64, installed: bool| {
+            out.push((
+                from,
+                Wire::SnapshotAck {
+                    base: piece.base,
+                    transfer: piece.transfer,
+                    next,
+                    installed,
+                },
+            ));
+        };
         if self
             .service
             .applied()
-            .is_some_and(|applied| base.index <= applied)
+            .is_some_and(|applied| piece.base.index <= applied)
         {
-            return;
+            // It holds that state already: an installed acknowledgement
+            // lost, or a transfer it no longer needs.
+            return ack(out, piece.length, true);
         }
         if let Some((lose, seen)) = self.lose_piece.as_mut() {
             if *seen == *lose {
                 self.lose_piece = None;
-                return self.observe(Observation::SnapshotPieceLost { node, base, offset });
+                return self.observe(Observation::SnapshotPieceLost {
+                    node,
+                    base: piece.base,
+                    transfer: piece.transfer,
+                    offset: piece.offset,
+                });
             }
             *seen += 1;
         }
-        let Some(store) = self.snapshots.as_mut() else {
-            return self.observe(Observation::SnapshotRefused {
-                node,
-                base,
-                reason: "no snapshot store".to_owned(),
-            });
-        };
-        if offset == 0 {
-            if let Some((_, old)) = self.incoming.take() {
-                let _ = store.abandon(old);
+        let current = self
+            .incoming
+            .as_ref()
+            .is_some_and(|incoming| incoming.from == from && incoming.transfer == piece.transfer);
+        if !current {
+            if piece.offset != 0 {
+                // A piece of a transfer it is not receiving: stale.
+                return;
             }
+            if let Some(incoming) = self.incoming.as_ref() {
+                let start = (piece.base.index, piece.term);
+                let held = (incoming.base.index, incoming.term);
+                let newer = start > held
+                    || (start == held
+                        && from == incoming.from
+                        && piece.transfer > incoming.transfer);
+                if !newer {
+                    return;
+                }
+                self.abandon_incoming("superseded");
+            }
+            let Some(store) = self.snapshots.as_mut() else {
+                return self.observe(Observation::SnapshotRefused {
+                    node,
+                    base: piece.base,
+                    reason: "no snapshot store".to_owned(),
+                });
+            };
             // A retry of an install a refusal or a crash cut short finds
             // the snapshot staged: verified, it is reused, not received
             // again.
             let staged = store.latest().is_some_and(|info| {
-                info.index == base.index && info.term == base.term && store.verify(&info).is_ok()
+                info.index == piece.base.index
+                    && info.term == piece.base.term
+                    && info.digest == piece.digest
+                    && store.verify(&info).is_ok()
             });
             if staged {
-                return self.install_snapshot(core, log, base);
+                if self.install_snapshot(core, log, piece.base) {
+                    ack(out, piece.length, true);
+                }
+                return;
             }
-            let started = store.begin(base.index, base.term).and_then(|mut pending| {
-                pending.section(SectionKind::Service, SERVICE_SECTION_VERSION, length)?;
-                Ok(pending)
-            });
-            match started {
-                Ok(pending) => self.incoming = Some((base, pending)),
+            let mut pending = match store.begin(piece.base.index, piece.base.term) {
+                Ok(pending) => pending,
                 Err(error) => {
                     return self.observe(Observation::SnapshotRefused {
                         node,
-                        base,
+                        base: piece.base,
                         reason: format!("begin: {error}"),
                     });
                 }
+            };
+            if let Err(error) =
+                pending.section(SectionKind::Service, SERVICE_SECTION_VERSION, piece.length)
+            {
+                let _ = store.abandon(pending);
+                return self.observe(Observation::SnapshotRefused {
+                    node,
+                    base: piece.base,
+                    reason: format!("section: {error}"),
+                });
             }
+            self.incoming = Some(Incoming {
+                from,
+                term: piece.term,
+                transfer: piece.transfer,
+                base: piece.base,
+                digest: piece.digest,
+                length: piece.length,
+                pending,
+                last: self.now,
+            });
         }
-        let Some((receiving, mut pending)) = self.incoming.take() else {
+        let Some(incoming) = self.incoming.as_mut() else {
             return;
         };
-        let expected = length.saturating_sub(pending.left());
-        if receiving != base || offset != expected {
-            // Not the next piece: the transfer is dropped, and the leader's
-            // core asks again.
-            let _ = store.abandon(pending);
-            return;
+        if piece.base != incoming.base
+            || piece.digest != incoming.digest
+            || piece.length != incoming.length
+        {
+            return self.abandon_incoming("metadata changed");
         }
-        if let Err(error) = pending.write(&bytes) {
-            let _ = store.abandon(pending);
+        let expected = incoming.length - incoming.pending.left();
+        let pieced = u64::try_from(piece.bytes.len()).unwrap_or(u64::MAX);
+        if piece.offset < expected {
+            // A duplicate: it holds it already.
+            return ack(out, expected, false);
+        }
+        if piece.offset > expected || pieced > incoming.pending.left() {
+            return self.abandon_incoming("gap");
+        }
+        if let Err(error) = incoming.pending.write(&piece.bytes) {
+            self.abandon_incoming("write failed");
             return self.observe(Observation::SnapshotRefused {
                 node,
-                base,
+                base: piece.base,
                 reason: format!("write: {error}"),
             });
         }
+        incoming.last = self.now;
+        let next = expected.saturating_add(pieced);
         self.observe(Observation::SnapshotPiece {
             node,
-            base,
-            offset,
-            length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            total: length,
+            base: piece.base,
+            transfer: piece.transfer,
+            offset: piece.offset,
+            length: pieced,
+            total: piece.length,
         });
-        if pending.left() > 0 {
-            self.incoming = Some((base, pending));
-            return;
+        if next < piece.length {
+            return ack(out, next, false);
         }
-        let Some(store) = self.snapshots.as_mut() else {
+        // The last piece: acknowledged only once the snapshot is installed.
+        let Some(incoming) = self.incoming.take() else {
             return;
         };
-        if let Err(error) = store.publish(pending) {
-            return self.observe(Observation::SnapshotRefused {
-                node,
-                base,
-                reason: format!("publish: {error}"),
-            });
+        if self.finish_snapshot(core, log, incoming) {
+            ack(out, next, true);
         }
-        self.install_snapshot(core, log, base);
+    }
+
+    /// Seals a received snapshot, reads it back and checks it (its digest
+    /// is the sender's, its service decodes at its base) before publishing
+    /// it, keeping the snapshot the node stands on from the purge, then
+    /// installs it: whether it did.
+    fn finish_snapshot(
+        &mut self,
+        core: &mut C,
+        log: &mut RaftLog<SimDisk>,
+        incoming: Incoming,
+    ) -> bool {
+        let node = self.id;
+        let base = incoming.base;
+        let refuse = |this: &Self, reason: String| {
+            this.observe(Observation::SnapshotRefused { node, base, reason });
+            false
+        };
+        let Some(store) = self.snapshots.as_mut() else {
+            return refuse(self, "no snapshot store".to_owned());
+        };
+        let sealed = match store.seal(incoming.pending) {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                let failed = matches!(error, SnapshotError::Failed);
+                let refused = refuse(self, format!("seal: {error}"));
+                if failed {
+                    self.reopen_snapshots();
+                }
+                return refused;
+            }
+        };
+        let info = sealed.info();
+        let service = store.read(&info).ok().and_then(|sections| {
+            sections
+                .into_iter()
+                .find(|section| section.kind == SectionKind::Service)
+                .and_then(|section| TestService::decode(&section.bytes))
+        });
+        let valid = info.digest == incoming.digest
+            && service
+                .as_ref()
+                .is_some_and(|service| service.applied() == Some(base.index));
+        if !valid {
+            let _ = store.abandon_sealed(sealed);
+            return refuse(
+                self,
+                "a snapshot not its sender's, or not at its base".to_owned(),
+            );
+        }
+        let pin = self.base.and_then(|active| {
+            store
+                .snapshots()
+                .iter()
+                .find(|kept| kept.index == active.index && kept.term == active.term)
+                .map(|kept| kept.id)
+        });
+        if let Err(error) = store.publish_sealed(sealed, pin) {
+            let failed = matches!(
+                error,
+                SnapshotError::Failed | SnapshotError::Store(_) | SnapshotError::Io(_)
+            );
+            let refused = refuse(self, format!("publish: {error}"));
+            if failed {
+                self.reopen_snapshots();
+            }
+            return refused;
+        }
+        self.install_snapshot(core, log, base)
     }
 
     /// Installs a leader's snapshot its store holds published at `base`:
     /// the log restarts after it, the service restores it, and the core is
-    /// told; any refusal is recorded and changes nothing further.
-    fn install_snapshot(&mut self, core: &mut C, log: &mut RaftLog<SimDisk>, base: SnapshotBase) {
+    /// told; any refusal is recorded and changes nothing further. Whether
+    /// its log and service now stand on it.
+    fn install_snapshot(
+        &mut self,
+        core: &mut C,
+        log: &mut RaftLog<SimDisk>,
+        base: SnapshotBase,
+    ) -> bool {
         let node = self.id;
         let refuse = |this: &Self, reason: String| {
             this.observe(Observation::SnapshotRefused { node, base, reason });
+            false
         };
         let Some(store) = self.snapshots.as_mut() else {
             return refuse(self, "no snapshot store".to_owned());
@@ -1994,6 +2580,7 @@ impl<C: ConsensusCore> ServerNode<C> {
         self.base = Some(base);
         let digest = service.digest();
         let base_time = service.log_time();
+        let configuration = service.configuration().map(<[u8]>::to_vec);
         self.service = service;
         self.observe(Observation::Installed { node, base, digest });
         let budget = self.limits.map(|_| self.budget.clone());
@@ -2001,7 +2588,8 @@ impl<C: ConsensusCore> ServerNode<C> {
             base,
             &mut LogView::metered(log, budget.as_ref())
                 .with_base(Some(base))
-                .with_base_time(Some(base_time)),
+                .with_base_time(Some(base_time))
+                .with_base_configuration(configuration),
         ) {
             match refused {
                 super::core::InstallRefused::Unsupported => {
@@ -2012,10 +2600,11 @@ impl<C: ConsensusCore> ServerNode<C> {
                     });
                 }
                 super::core::InstallRefused::Stale => {
-                    refuse(self, "the core holds the base already".to_owned());
+                    let _ = refuse(self, "the core holds the base already".to_owned());
                 }
             }
         }
+        true
     }
 
     /// Feeds its committed entries to the standby servers `to` while its
@@ -2038,6 +2627,31 @@ impl<C: ConsensusCore> ServerNode<C> {
         self
     }
 
+    /// Replicates its Cluster log to the standby servers `to` while its
+    /// core leads (ADR-0120), damaging in transit one send of each frame
+    /// `faults` names.
+    #[must_use]
+    pub fn with_replication(mut self, to: Vec<NodeId>, faults: &[(u64, FeedFault)]) -> Self {
+        self.replication = Some(ReplicationOut {
+            to,
+            faults: faults.iter().copied().collect(),
+            active: None,
+        });
+        self
+    }
+
+    /// A standby server that follows the primary's Cluster log over
+    /// replication rather than the feed (after [`ServerNode::as_standby`]).
+    #[must_use]
+    pub fn over_replication(mut self) -> Self {
+        let follower = follower_on(&self.disk);
+        if let Some(standby) = self.standby.as_mut() {
+            standby.replicated = true;
+            standby.follower = follower;
+        }
+        self
+    }
+
     /// A standby server, fed by the servers `primary`.
     #[must_use]
     pub fn as_standby(mut self, primary: Vec<NodeId>) -> Self {
@@ -2052,12 +2666,20 @@ impl<C: ConsensusCore> ServerNode<C> {
     fn recovered(
         id: NodeId,
         peers: &[NodeId],
-        (limits, base, base_time): (Option<Limits>, Option<SnapshotBase>, Option<u64>),
+        (limits, base, restored): (Option<Limits>, Option<SnapshotBase>, Option<&TestService>),
         log: &mut RaftLog<SimDisk>,
     ) -> Result<C, Unsupported> {
         // The core sees the snapshot its node recovers over (karyos#903
-        // review), and its log time (ADR-0111).
-        let mut view = LogView::new(log).with_base(base).with_base_time(base_time);
+        // review), its log time (ADR-0111) and the configuration at its
+        // base (karyos#711).
+        let mut view = LogView::new(log)
+            .with_base(base)
+            .with_base_time(restored.map(TestService::log_time))
+            .with_base_configuration(
+                restored
+                    .and_then(TestService::configuration)
+                    .map(<[u8]>::to_vec),
+            );
         match limits {
             Some(limits) => C::recover_with(id, peers, &limits, &mut view),
             None => Ok(C::recover(id, peers, &mut view)),
@@ -2216,6 +2838,9 @@ impl<C: ConsensusCore> ServerNode<C> {
                     .is_none_or(|(verified, _)| index > verified)
                 {
                     standby.verified = Some((index, term));
+                    if let Some(follower) = standby.follower.as_mut() {
+                        follower.applied(Position { index, term });
+                    }
                     if standby
                         .proposed
                         .is_none_or(|(proposed, _)| index > proposed)
@@ -2236,6 +2861,9 @@ impl<C: ConsensusCore> ServerNode<C> {
                     // Applied before: the service only moves its position.
                     served.payload = Vec::new();
                 }
+            }
+            if C::is_configuration_entry(&served.payload) {
+                self.service.set_configuration(&served.payload);
             }
             let deduplicated = self.service.deduplicated();
             let answer = self.service.apply(&served);
@@ -2288,6 +2916,7 @@ impl<C: ConsensusCore> ServerNode<C> {
         }
         // A standby's leader acknowledges a verified position that moved.
         if let Some(standby) = &self.standby
+            && standby.follower.is_none()
             && standby.verified != verified_before
             && core.leads()
         {
@@ -2296,7 +2925,30 @@ impl<C: ConsensusCore> ServerNode<C> {
                 out.push((to, Wire::FeedAck { verified }));
             }
         }
-        if let Some(configuration) = core.configuration()
+        // A standby leader change (ADR-0120 decision 7): the new leader
+        // rebuilds V from its own log, as its service applied it, and
+        // discards any copy it held.
+        if let Some(standby) = self.standby.as_mut() {
+            let leads = core.leads();
+            if leads
+                && !standby.leading
+                && let Some(follower) = standby.follower.as_mut()
+            {
+                follower.rebuild(
+                    standby
+                        .verified
+                        .map(|(index, term)| Position { index, term }),
+                );
+            }
+            standby.leading = leads;
+        }
+        // Asked only when the core says it may have moved: building it
+        // allocates, and the replication path must not (ADR-0105).
+        let stamp = core.configuration_stamp();
+        let moved = stamp.is_none() || stamp != self.configuration_stamp;
+        self.configuration_stamp = stamp;
+        if moved
+            && let Some(configuration) = core.configuration()
             && self.configuration.as_ref() != Some(&configuration)
         {
             let entry_term = configuration.index.and_then(|index| log.term(index));
@@ -2323,8 +2975,9 @@ impl<C: ConsensusCore> ServerNode<C> {
             self.commit = committed;
         }
         self.compact(&mut core, &mut log);
+        self.expire_incoming();
         for to in snapshot_to {
-            self.send_snapshot(to, out);
+            self.send_snapshot(to, core.term(), out);
         }
         self.positions(&core, &log);
         self.running = Some((core, log));
@@ -2370,6 +3023,7 @@ impl<C: ConsensusCore> ServerNode<C> {
         // A transfer a crash cut short is gone: the store's reopen removes
         // what it wrote, unpublished.
         self.incoming = None;
+        self.outgoing.clear();
         self.since_bytes = (0, 0);
         if let Some(compaction) = self.compaction {
             match Self::open_snapshots(&self.disk, self.geometry, compaction.config()) {
@@ -2405,12 +3059,12 @@ impl<C: ConsensusCore> ServerNode<C> {
             .as_ref()
             .and_then(|store| Self::active_service(store, commit));
         self.base = latest.as_ref().map(|(base, _)| *base);
-        // The snapshot's log time: the C-TIME watermark of a log empty
-        // after it (ADR-0111, decision 4).
-        let base_time = latest
+        // The snapshot's service: its log time is the C-TIME watermark of
+        // a log empty after it (ADR-0111, decision 4), and it holds the
+        // configuration at its base (karyos#711).
+        let restored = latest
             .as_ref()
-            .and_then(|(_, bytes)| TestService::decode(bytes))
-            .map(|service| service.log_time());
+            .and_then(|(_, bytes)| TestService::decode(bytes));
         let first = log.first_index();
         let entries: Vec<(u64, u64)> = log
             .last_index()
@@ -2425,7 +3079,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             entries,
             durable: log.durable_index(),
         });
-        let recovering = (self.limits, self.base, base_time);
+        let recovering = (self.limits, self.base, restored.as_ref());
         let core = match Self::recovered(self.id, &self.peers, recovering, &mut log) {
             Ok(core) => core,
             // The core took its limits at its creation: it is not the
@@ -2447,8 +3101,17 @@ impl<C: ConsensusCore> ServerNode<C> {
         if let Some(standby) = self.standby.as_mut() {
             standby.verified = None;
             standby.proposed = None;
+            standby.leading = false;
+            standby.stalled = false;
+            // Its replica's journal and catalog reopen on the disk the
+            // crash left; V is rebuilt as its service applies its log.
+            if standby.replicated {
+                standby.follower = follower_on(&self.disk);
+            }
         }
-        // Recorded at every start, so a check compares it with the log.
+        // Recorded at every start, so a check compares it with the log; the
+        // new core's stamp starts again.
+        self.configuration_stamp = core.configuration_stamp();
         if let Some(configuration) = core.configuration() {
             let entry_term = configuration.index.and_then(|index| log.term(index));
             self.record_configuration(configuration, entry_term);
@@ -2504,6 +3167,11 @@ impl<C: ConsensusCore> ServerNode<C> {
                     send_feed(feed, core.committed(), log, out);
                 }
             }
+            if let Some(replication) = self.replication.as_mut()
+                && now.is_multiple_of(FEED_PERIOD)
+            {
+                send_replication(replication, core.leads(), log, out);
+            }
         }
         self.duty(out);
     }
@@ -2516,8 +3184,21 @@ impl<C: ConsensusCore> ServerNode<C> {
         out: &mut Outbox<Wire<C::Message>>,
     ) {
         self.now = now;
+        if let Wire::SnapshotAck {
+            base,
+            transfer,
+            next,
+            installed,
+        } = message
+        {
+            self.snapshot_acked(from, (base, transfer, next, installed), out);
+            return;
+        }
         if let Wire::Snapshot {
             base,
+            term,
+            transfer,
+            digest,
             length,
             offset,
             bytes,
@@ -2526,7 +3207,16 @@ impl<C: ConsensusCore> ServerNode<C> {
             // A delivery is a duty: its budget refills.
             let _ = self.refill();
             if let Some((mut core, mut log)) = self.running.take() {
-                self.receive_snapshot(&mut core, &mut log, (base, length, offset, bytes));
+                let piece = Piece {
+                    base,
+                    term,
+                    transfer,
+                    digest,
+                    length,
+                    offset,
+                    bytes,
+                };
+                self.receive_snapshot(&mut core, &mut log, (from, piece), out);
                 self.running = Some((core, log));
             }
             self.duty(out);
@@ -2635,23 +3325,191 @@ impl<C: ConsensusCore> ServerNode<C> {
                     }
                 }
             }
+            Wire::ReplStart { start } => {
+                if let Some(standby) = self.standby.as_mut()
+                    && !standby.promoted
+                    && core.leads()
+                    && let Some(follower) = standby.follower.as_mut()
+                {
+                    let before = follower.copy();
+                    let observation = match follower.begin(u64::from(from), start, self.now) {
+                        Ok(()) if follower.copy() != before => Some(Observation::CopyStarted {
+                            node: self.id,
+                            source: from,
+                            start,
+                        }),
+                        Ok(()) => None,
+                        Err(refusal) => Some(Observation::ReplicationRefused {
+                            node: self.id,
+                            source: from,
+                            refusal,
+                        }),
+                    };
+                    if let Some(observation) = observation {
+                        self.recorder.borrow_mut().observations.push(observation);
+                    }
+                }
+            }
+            Wire::ReplBytes { position, bytes } => {
+                if let Some(standby) = self.standby.as_mut()
+                    && !standby.promoted
+                    && core.leads()
+                    && let Some(follower) = standby.follower.as_mut()
+                {
+                    let _ = follower.receive(u64::from(from), position, &bytes);
+                }
+            }
+            Wire::ReplSeal { seal } => {
+                if let Some(standby) = self.standby.as_mut()
+                    && !standby.promoted
+                    && core.leads()
+                    && let Some(follower) = standby.follower.as_mut()
+                {
+                    match follower.seal(u64::from(from), &seal) {
+                        Ok(Sealed::Ready(ready)) => {
+                            for entry in ready {
+                                if core.propose(entry.wrapped, &mut view).is_err() {
+                                    // Not proposed: a new copy from V.
+                                    follower.rebuild(
+                                        standby
+                                            .verified
+                                            .map(|(index, term)| Position { index, term }),
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Sealed::Waiting) => standby.stalled = true,
+                        Err(Refusal::NotActive { .. }) => {}
+                        Err(refusal) => {
+                            standby.stalled = true;
+                            self.recorder.borrow_mut().observations.push(
+                                Observation::ReplicationRefused {
+                                    node: self.id,
+                                    source: from,
+                                    refusal,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Wire::ReplStatus { sealed } => {
+                if let Some(standby) = self.standby.as_mut()
+                    && !standby.promoted
+                    && core.leads()
+                    && let Some(follower) = standby.follower.as_mut()
+                {
+                    match follower.status(u64::from(from), sealed, self.now) {
+                        // No copy of this request: the source starts it
+                        // again.
+                        Err(Refusal::NotActive { .. }) => out.push((from, Wire::ReplReset)),
+                        Err(_) => {}
+                        Ok(ends) => {
+                            let point = follower.recovery_point(self.now);
+                            self.recorder.borrow_mut().observations.push(
+                                Observation::RecoveryPoint {
+                                    node: self.id,
+                                    point,
+                                },
+                            );
+                            out.push((
+                                from,
+                                Wire::ReplAck {
+                                    received: ends.received,
+                                    checked: ends.checked,
+                                    stalled: standby.stalled,
+                                },
+                            ));
+                            standby.stalled = false;
+                        }
+                    }
+                }
+            }
+            Wire::ReplEnd => {
+                if let Some(follower) = self
+                    .standby
+                    .as_mut()
+                    .and_then(|standby| standby.follower.as_mut())
+                {
+                    follower.end(u64::from(from));
+                }
+            }
+            Wire::ReplReset => {
+                if let Some(active) = self
+                    .replication
+                    .as_mut()
+                    .and_then(|replication| replication.active.as_mut())
+                {
+                    active.accepted = false;
+                    active.next = active.start;
+                    active.checked = active.start;
+                }
+            }
+            Wire::ReplAck {
+                received,
+                checked,
+                stalled,
+            } => {
+                if let Some(active) = self
+                    .replication
+                    .as_mut()
+                    .and_then(|replication| replication.active.as_mut())
+                {
+                    active.accepted = true;
+                    active.checked = active.checked.max(checked);
+                    if stalled {
+                        active.next = received.max(active.start);
+                    }
+                }
+            }
             Wire::FeedAck { verified } => {
                 if let Some(feed) = self.feed.as_mut() {
                     feed.acked = feed.acked.max(verified);
                 }
             }
-            Wire::Promote { unknown } => {
+            Wire::Promote { fencing, unknown } => {
                 if let Some(standby) = self.standby.as_mut()
                     && !standby.promoted
                 {
                     standby.promoted = true;
                     self.generation = self.generation.saturating_add(1);
+                    // The harness verified the fencing: the follower is
+                    // told so, as the operator or the arbiter would.
+                    let evidence = match fencing {
+                        Fencing::OperatorStop => karyos_cluster::standby::Fencing::OperatorStop {
+                            members: standby.primary.iter().map(|&id| u64::from(id)).collect(),
+                            confirmed: standby.primary.iter().map(|&id| u64::from(id)).collect(),
+                        },
+                        Fencing::Lease => karyos_cluster::standby::Fencing::Lease { expired: true },
+                    };
+                    let in_flight = unknown
+                        .iter()
+                        .map(|&(client, sequence)| karyos_cluster::standby::InFlight {
+                            client: u64::from(client),
+                            sequence,
+                        })
+                        .collect();
+                    let replication = standby
+                        .follower
+                        .as_mut()
+                        .and_then(|follower| follower.promote(&evidence, in_flight).ok());
+                    // Over replication the primary's commit is not learnt:
+                    // the last sealed entry the standby took stands for it.
+                    let learnt_commit = match &standby.follower {
+                        Some(follower) => follower
+                            .tail()
+                            .map(|tail| tail.index)
+                            .max(standby.verified.map(|(index, _)| index)),
+                        None => standby.learnt,
+                    };
                     if core.leads() {
                         let report = PromotionReport {
                             generation: self.generation,
                             verified: standby.verified.map(|(index, _)| index),
-                            learnt_commit: standby.learnt,
+                            learnt_commit,
                             unknown,
+                            replication,
                         };
                         self.recorder
                             .borrow_mut()
@@ -2665,6 +3523,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             }
             Wire::Response { .. }
             | Wire::Snapshot { .. }
+            | Wire::SnapshotAck { .. }
             | Wire::Refused { .. }
             | Wire::Busy { .. }
             | Wire::Redirect { .. } => {}
@@ -2691,6 +3550,10 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
     fn crash(&mut self) {
         self.running = None;
         self.pending.clear();
+        // Its transfers die with it: the restart's store reopen removes
+        // what a receive wrote, unpublished.
+        self.incoming = None;
+        self.outgoing.clear();
         self.observe(Observation::Crashed { node: self.id });
         match self.disk.after_crash(self.survives) {
             Ok(disk) => self.disk = disk,
@@ -2702,6 +3565,162 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
 
     fn restart(&mut self, _now: u64) {
         let _ = self.guarded(Self::start);
+    }
+}
+
+/// The follower settings of every standby server over replication: the
+/// harness's logs start at [`standby::PRIMARY_FIRST_INDEX`], and the
+/// log's seal duty runs every [`SEAL_TICKS`].
+fn follower_config() -> StandbyConfig {
+    StandbyConfig {
+        primary_first_index: standby::PRIMARY_FIRST_INDEX,
+        status_interval: STATUS_INTERVAL,
+        tail_bound: TailBound::Interval(SEAL_TICKS),
+        generation: FIRST_GENERATION,
+    }
+}
+
+/// The directory of a standby server's replica journal and copy
+/// catalog, beside its log.
+pub const REPLICA_DIR: &str = "/replica";
+
+/// A fresh follower whose seals the schema 6 replica on `disk` verifies;
+/// `None` when the replica cannot open (the server then follows nothing).
+fn follower_on(disk: &SimDisk) -> Option<Standby<ReplicaCheck<SimDisk>>> {
+    let check = ReplicaCheck::open(disk.clone(), Path::new(REPLICA_DIR)).ok()?;
+    Some(Standby::new(follower_config(), check, None))
+}
+
+/// One period of `replication` from a server whose core leads (or no
+/// longer does): ends a request the log says must end; starts one at the
+/// log's replication start; sends its stored frames up to its epoch's
+/// sealed end, from the next position, [`FEED_BATCH_BYTES`] at most,
+/// damaging the first one its faults name (one per period, so each
+/// damage fails or stalls a send of its own); then the seals past the standby's
+/// checked end that the bytes sent cover, and a status. A failed read
+/// stops the period.
+fn send_replication<M>(
+    replication: &mut ReplicationOut,
+    leads: bool,
+    log: &mut RaftLog<SimDisk>,
+    out: &mut Outbox<Wire<M>>,
+) {
+    if let Some(active) = replication.active
+        && log
+            .replication_end(active.epoch, active.next, leads)
+            .is_some()
+    {
+        for &to in &replication.to {
+            out.push((to, Wire::ReplEnd));
+        }
+        replication.active = None;
+    }
+    if !leads {
+        return;
+    }
+    if replication.active.is_none() {
+        let Ok(Some(start)) = log.replication_start() else {
+            return;
+        };
+        replication.active = Some(ReplicationActive {
+            epoch: log.seal_epoch(),
+            start,
+            next: start,
+            checked: start,
+            accepted: false,
+        });
+    }
+    let Some(active) = replication.active.as_mut() else {
+        return;
+    };
+    let Ok((epoch, seals)) = log.replication_seals() else {
+        return;
+    };
+    if epoch != active.epoch {
+        return;
+    }
+    if !active.accepted {
+        for &to in &replication.to {
+            out.push((
+                to,
+                Wire::ReplStart {
+                    start: active.start,
+                },
+            ));
+        }
+    }
+    let sealed = seals
+        .last()
+        .map_or(active.start, |seal| seal.end)
+        .max(active.start);
+    let mut budget = FEED_BATCH_BYTES;
+    let mut damaged = false;
+    while active.next < sealed && budget > 0 {
+        let mut header = [0u8; karyos_cluster::log::FRAME_HEADER];
+        if log.read_stored(active.next, &mut header).is_err() {
+            return;
+        }
+        let length = header
+            .get(4..8)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map_or(0, u32::from_le_bytes);
+        let span = u64::from(length).saturating_add(karyos_cluster::log::FRAME_HEADER_LEN);
+        let Ok(size) = usize::try_from(span) else {
+            return;
+        };
+        let mut frame = vec![0u8; size];
+        if log.read_stored(active.next, &mut frame).is_err() {
+            return;
+        }
+        let index = frame
+            .get(8..16)
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+            .map(u64::from_le_bytes);
+        let fault = index
+            .filter(|_| !damaged)
+            .and_then(|index| replication.faults.remove(&index));
+        damaged |= fault.is_some();
+        match fault {
+            Some(FeedFault::Skip) => {}
+            Some(FeedFault::Corrupt) => {
+                if let Some(byte) = frame.get_mut(karyos_cluster::log::FRAME_HEADER) {
+                    *byte ^= 0xFF;
+                }
+            }
+            Some(FeedFault::Term) => {
+                if let Some(term) = frame.get_mut(16..24) {
+                    let raised = <[u8; 8]>::try_from(&*term)
+                        .map_or(0, u64::from_le_bytes)
+                        .saturating_add(1);
+                    term.copy_from_slice(&raised.to_le_bytes());
+                }
+            }
+            None => {}
+        }
+        if fault != Some(FeedFault::Skip) {
+            for &to in &replication.to {
+                out.push((
+                    to,
+                    Wire::ReplBytes {
+                        position: active.next,
+                        bytes: frame.clone(),
+                    },
+                ));
+            }
+        }
+        active.next = active.next.saturating_add(span);
+        budget = budget.saturating_sub(span);
+    }
+    for seal in seals
+        .iter()
+        .filter(|seal| seal.end > active.checked && seal.end <= active.next)
+    {
+        for &to in &replication.to {
+            out.push((to, Wire::ReplSeal { seal: *seal }));
+        }
+    }
+    for &to in &replication.to {
+        out.push((to, Wire::ReplStatus { sealed }));
     }
 }
 

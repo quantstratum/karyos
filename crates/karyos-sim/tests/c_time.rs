@@ -320,6 +320,7 @@ fn test_c_time_a_restart_from_a_snapshot_with_an_empty_log_continues_from_its_lo
         every: u64::from(FIRST),
         keep: 0,
         frame: 1,
+        every_bytes: None,
     };
     for seed in [1, 7, 42] {
         let (mut sim, recorder) = build::<Reference>(seed, LEADER, Some(compaction));

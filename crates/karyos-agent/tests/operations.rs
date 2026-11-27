@@ -813,3 +813,132 @@ fn stream_config() -> karyos_driver::StreamConfig {
         conflation: None,
     }
 }
+
+/// SPEC §13's Audited operations (karyos#719): a guard close or reopen the
+/// role does not allow is refused before anything is sent, and journalled
+/// with its requester, request then outcome refused `not_authorised`.
+#[test]
+fn test_agent_audited_operations_a_denied_guard_request_is_journalled_and_never_sent() {
+    let _serial = serial();
+    let dir = dir("denied-journalled");
+    let mut driver = driver(&dir.join("driver"));
+    let guard = driver.add_guard("orders").unwrap().id();
+    let driver_dir = dir.join("driver");
+    let mut agent = agent(&dir, true);
+    for (role, request) in [
+        (
+            Role::Viewer,
+            format!(
+                "KARYOS-AGENT 1 guard-close {} {guard} drill\n",
+                driver_dir.display()
+            ),
+        ),
+        (
+            Role::Operator,
+            format!(
+                "KARYOS-AGENT 1 guard-reopen {} {guard} 1 drill\n",
+                driver_dir.display()
+            ),
+        ),
+    ] {
+        let mut server =
+            Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), role)])).unwrap();
+        let (answer, served) = ask(&mut driver, &mut server, &mut agent, &request);
+        assert_eq!(answer, "{\"error\":\"forbidden\"}\n", "{role:?}");
+        assert_eq!(served, [Served::Refused]);
+    }
+    assert!(driver.guard_audit().records.is_empty(), "nothing sent");
+    agent.settle_journal();
+    let records: Vec<JournalRecord> = agent
+        .journal_history(None, karyos_agent::journal::HISTORY_MAX)
+        .unwrap()
+        .records
+        .into_iter()
+        .filter_map(|record| record.record)
+        .filter(|record| {
+            matches!(
+                record.kind,
+                Kind::CloseRequest | Kind::CloseOutcome | Kind::ReopenRequest | Kind::ReopenOutcome
+            )
+        })
+        .collect();
+    assert_eq!(
+        records.iter().map(|record| record.kind).collect::<Vec<_>>(),
+        [
+            Kind::CloseRequest,
+            Kind::CloseOutcome,
+            Kind::ReopenRequest,
+            Kind::ReopenOutcome
+        ]
+    );
+    assert!(records.iter().all(|record| record.guard == guard
+        && record.operator == u64::from(own())
+        && record.reason == b"drill"));
+    for pair in records.chunks(2) {
+        assert_eq!(pair[0].operation, pair[1].operation);
+        assert_eq!(
+            (pair[1].code, pair[1].word),
+            (
+                karyos_agent::journal::retention::REFUSED,
+                karyos_agent::journal::retention::refusal_word("not_authorised")
+            )
+        );
+    }
+    assert_eq!(records[2].expected, 1, "the reopen's epoch");
+}
+
+/// SPEC §13's Audited operations (karyos#719): a guard close while the
+/// journal is down goes ahead, then the agent's host is lost before the
+/// journal returns. The close appears with its requester in the driver's
+/// audit, and the next start that opens the journal records the outage as
+/// an unknown interval, with its alert, that the unrecorded close falls
+/// inside.
+#[test]
+fn test_agent_audited_operations_a_close_during_an_outage_then_host_loss_falls_in_a_recorded_interval()
+ {
+    let _serial = serial();
+    let dir = dir("outage-host-loss");
+    let mut driver = driver(&dir.join("driver"));
+    let guard = driver.add_guard("orders").unwrap();
+    let _ = driver.reopen_guard(guard, 1, 1).unwrap();
+    std::fs::write(dir.join("journal"), b"not a journal").unwrap();
+    let mut down = agent(&dir, true);
+    assert!(down.view().journal.unwrap().unavailable);
+    let mut server = Server::bind(ApiConfig::new(
+        dir.join("api"),
+        vec![(own(), Role::RiskOfficer)],
+    ))
+    .unwrap();
+    let close = format!(
+        "KARYOS-AGENT 1 guard-close {} {}\n",
+        dir.join("driver").display(),
+        guard.id()
+    );
+    let (answer, _) = ask(&mut driver, &mut server, &mut down, &close);
+    assert!(answer.contains(r#""open":false"#), "{answer}");
+    assert!(
+        !driver.guard_state(guard).unwrap().open,
+        "the close took effect"
+    );
+    // Its requester, in the driver's audit.
+    let audit = driver.guard_audit();
+    assert!(matches!(
+        audit.records.last().unwrap().requester,
+        Requester::Operator { uid, .. } if uid == u64::from(own())
+    ));
+    // The host is lost with the journal still down: no stop, nothing
+    // written.
+    drop(server);
+    drop(down);
+    std::fs::remove_file(dir.join("journal")).unwrap();
+    let up = agent(&dir, true);
+    let journal = up.view().journal.unwrap();
+    let gap = journal.gap.unwrap();
+    assert_eq!(gap.reason, "journal_unavailable_at_start");
+    assert_ne!(
+        gap.position,
+        karyos_agent::journal::UNOPENED_POSITION,
+        "recorded in the journal, not held in memory"
+    );
+    assert_eq!(journal.alerts.len(), 1, "with its alert");
+}

@@ -11,14 +11,18 @@
 //! sections published by a manifest ([`snapshot`]); and C10's service
 //! container, a [`service::ClusteredService`] fed committed entries
 //! ([`service`]); and the custom Raft core's state machine of ADR-0105
-//! ([`consensus`]), not yet driven over the log. The guards do not exist
-//! yet.
+//! ([`consensus`]), not yet driven over the log; and the standby
+//! cluster's follower of the primary's Cluster log, ADR-0120
+//! ([`standby`]). The guards do not exist yet.
 //!
 //! Internal to the Karyos workspace and unstable in alpha, with no
 //! compatibility promise. The supported API is the `karyos` facade,
 //! `karyos-client` and `karyos-archive`, and the C ABI of `karyos-ffi`
 //! under its own `0.y.z` rule.
 
+#[cfg(feature = "backup")]
+pub mod backup;
+pub mod client;
 pub mod consensus;
 pub mod dedup;
 mod file;
@@ -26,8 +30,10 @@ pub mod guards;
 pub mod hard_state;
 pub mod log;
 pub mod mark;
+pub mod membership;
 pub mod service;
 pub mod snapshot;
+pub mod standby;
 
 pub use dedup::{DecodeError, DedupConfig, Outcome, Registered, Request, SessionTable};
 pub use hard_state::HardState;

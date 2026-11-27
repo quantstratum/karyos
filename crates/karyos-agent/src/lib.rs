@@ -110,6 +110,8 @@ pub mod operations;
 #[cfg(target_os = "linux")]
 pub mod preview;
 #[cfg(target_os = "linux")]
+pub mod product;
+#[cfg(target_os = "linux")]
 pub mod server;
 
 #[cfg(target_os = "linux")]

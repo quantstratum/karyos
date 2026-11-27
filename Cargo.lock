@@ -1028,6 +1028,7 @@ version = "0.1.0-alpha.4"
 dependencies = [
  "karyos-archive",
  "karyos-codec",
+ "karyos-sys",
  "karyos-trace",
  "thiserror",
 ]

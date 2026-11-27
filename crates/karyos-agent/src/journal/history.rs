@@ -221,6 +221,22 @@ impl Journal {
         }
     }
 
+    /// Whether the journal holds an unknown interval's record at
+    /// `position` (R-CORE-42, karyos#773: an import names one).
+    #[must_use]
+    pub fn holds_unknown_interval(&mut self, position: u64) -> bool {
+        let cursor = HistoryCursor::new(self.recording, position);
+        self.history(Some(cursor), 1).is_ok_and(|page| {
+            page.records.first().is_some_and(|record| {
+                record.position == position
+                    && record
+                        .record
+                        .as_ref()
+                        .is_some_and(|record| record.kind == Kind::UnknownInterval)
+            })
+        })
+    }
+
     /// Up to `count` records (at most [`HISTORY_MAX`]) of the journal's
     /// history from `from`, or from the floor when `from` is `None`, up to
     /// the journal's durable end (see the module).

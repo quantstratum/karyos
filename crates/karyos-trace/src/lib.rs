@@ -57,6 +57,7 @@ pub mod record;
 pub mod report;
 pub mod sampling;
 pub mod source;
+pub mod stream;
 pub mod trace_clock;
 
 pub use agent::{AgentCounter, AgentCounts, TraceAgent};
