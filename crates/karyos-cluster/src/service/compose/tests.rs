@@ -552,3 +552,43 @@ fn logged_session_bounds_restore_within_the_budget() {
         panic!("the tight container does not hold its own table");
     }
 }
+
+/// Different logged bounds after a snapshot install with a live session
+/// are a typed stop, never a rebuild: the restored container is not fresh
+/// (karyos#1019).
+#[test]
+fn different_bounds_after_a_restore_with_a_live_session_stop() {
+    use crate::service::{ApplyError, SessionBounds};
+
+    let mut source = ServiceContainer::new(Sequencer::new(), config()).unwrap();
+    apply_range(&mut source, 1, 6);
+    assert!(source.sessions().live_sessions() > 0);
+    let mut parts = ServiceSnapshot::new(4096, 8);
+    let sections = reads(&source.snapshot(&mut parts).unwrap());
+    let other = DedupConfig::default()
+        .with_sessions(8)
+        .with_window(8)
+        .with_response_bytes(16)
+        .with_ttl(1_000_000);
+    let bounds = SessionBounds::new(other).to_vec().unwrap();
+    // As restored, and with the snapshot's fresh flag forced on: both stop.
+    let mut forged = sections.clone();
+    let timers = forged
+        .iter_mut()
+        .find(|section| section.kind == SectionKind::Timers)
+        .unwrap();
+    timers.bytes[0] |= FRESH;
+    for sections in [sections, forged] {
+        let mut restored = ServiceContainer::new(Sequencer::new(), config()).unwrap();
+        restored.restore(6, &sections).unwrap();
+        let before = restored.sessions().encode();
+        let table = restored.sessions().config();
+        let result = restored.apply(&raw(7, 7, bounds.clone())).map(|_| ());
+        assert!(
+            matches!(result, Err(ApplyError::BoundsDiffer { .. })),
+            "{result:?}"
+        );
+        assert_eq!(restored.sessions().encode(), before);
+        assert_eq!(restored.sessions().config(), table);
+    }
+}

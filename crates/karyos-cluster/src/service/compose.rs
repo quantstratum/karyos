@@ -552,6 +552,11 @@ impl<S: ClusteredService> ServiceContainer<S> {
         // Every container section holds: the service's parts last, so a
         // refusal leaves everything as it was.
         self.service.restore(&parts)?;
+        // A table holding a live session is never fresh, whatever the
+        // flags say: different logged bounds must then stop the container
+        // (`ApplyError::BoundsDiffer`), never rebuild the table and drop
+        // the restored sessions (karyos#1019).
+        let fresh = fresh && table.live_sessions() == 0;
         self.sessions = table;
         self.timers = timers;
         self.guards = guards;

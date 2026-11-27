@@ -670,6 +670,9 @@ pub struct Case {
     pub replication: bool,
     /// Clients, by index, that stay on the primary after a promotion.
     pub stay_on_primary: Vec<usize>,
+    /// Every client's failover is the Cluster client's
+    /// ([`super::failover`]; karyos#720).
+    pub cluster_clients: bool,
     /// The limits every server's core is declared (W2), if any: a core
     /// that takes none cannot run the case ([`RunError::Unsupported`]).
     pub limits: Option<Limits>,
@@ -774,6 +777,7 @@ impl Case {
             feed_faults: Vec::new(),
             replication: false,
             stay_on_primary: Vec::new(),
+            cluster_clients: false,
             limits: None,
             window: 1,
             converged: false,
@@ -1276,9 +1280,11 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             .ok()
             .and_then(|index| standby_end.checked_add(index))
             .ok_or(RunError::Count)?;
-        #[cfg_attr(not(feature = "test-hooks"), allow(unused_mut))]
         let mut client = ClientNode::new(id, leader, script(case, index), Rc::clone(&recorder))
             .with_retry_after(case.retry_after);
+        if case.cluster_clients {
+            client = client.with_cluster_client();
+        }
         #[cfg(feature = "test-hooks")]
         if case.faults.corrupt_reads.contains(&index) {
             client = client.corrupting_reads();

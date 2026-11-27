@@ -357,6 +357,16 @@ pub fn over_replication(mut case: Case) -> Case {
     case
 }
 
+/// `case` with every client's failover the Cluster client's
+/// ([`super::failover`]; karyos#720): the same scenario, the harness
+/// client's run its control.
+#[must_use]
+pub fn with_cluster_clients(mut case: Case) -> Case {
+    case.cluster_clients = true;
+    case.name.push_str(" with Cluster clients");
+    case
+}
+
 /// S1 with the primary's leadership handed over twice while the standby
 /// follows: whichever server led first, one of the handovers moves it, so
 /// the standby takes a second source, a new copy (ADR-0120 decisions 4

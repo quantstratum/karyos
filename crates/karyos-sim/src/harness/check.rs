@@ -964,6 +964,8 @@ fn server_of(observation: &Observation) -> Option<NodeId> {
         | Observation::Leading { node, .. } => Some(*node),
         Observation::Success { .. }
         | Observation::StaleGeneration { .. }
+        | Observation::ClientEvent { .. }
+        | Observation::ClientRetry { .. }
         | Observation::ForeignCluster { .. }
         | Observation::Fenced { .. }
         | Observation::PromotionRefused { .. }

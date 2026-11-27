@@ -21,20 +21,27 @@
 //!   karyos#714), the feed's runs their control: S6's damage applied to
 //!   the bytes in transit, S7's restarted standby leader rebuilding its
 //!   verified position from its own log, and a primary leader change
-//!   starting a new copy.
+//!   starting a new copy;
+//! - S2 and S5 again with the Cluster client's failover (karyos#720): a
+//!   client reaching the old primary and the promoted standby, no command
+//!   applied twice, an unknown request retried only by its caller, and
+//!   generation 1 refused once generation 2 is seen.
 
 // Test helpers outside #[test] functions are not covered by clippy.toml's
 // test exemptions (ADR-0007 exempts tests from these lints).
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
+use karyos_cluster::client::Event;
 use karyos_cluster::standby::{RecoveryPoint, Refusal};
 use karyos_sim::cluster::Node;
 use karyos_sim::harness::check::{self, Violation};
 use karyos_sim::harness::node::{
-    ClientNode, HARNESS_CLUSTER, Observation, Op, Recorder, Ret, Shared, Wire,
+    ClientNode, Command, HARNESS_CLUSTER, HARNESS_STANDBY, Observation, Op, Recorder, Ret, Shared,
+    Wire,
 };
 use karyos_sim::harness::reference::{Message, Reference};
 use karyos_sim::harness::standby::{
@@ -833,6 +840,366 @@ fn s7_over_replication_a_standby_leader_restart_after_acknowledgement_makes_prog
             verified(&outcome, STANDBY[1]),
             primary_commit(&outcome),
             "seed {seed:#x}"
+        );
+    }
+}
+
+/// Each server's application of each command, by client and sequence, is
+/// one: a command its service applied twice would answer two different
+/// appends (the deduplication check of karyos#720).
+fn applied_once(outcome: &Outcome) {
+    let mut answered: BTreeMap<(NodeId, NodeId, u64), Vec<u8>> = BTreeMap::new();
+    for observation in &outcome.observations {
+        let Observation::Applied {
+            node,
+            entry,
+            response: Some(response),
+            ..
+        } = observation
+        else {
+            continue;
+        };
+        let payload = standby::unwrap(&entry.payload)
+            .map_or(entry.payload.as_slice(), |(_, _, payload)| payload);
+        let Some(command) = Command::decode(payload) else {
+            continue;
+        };
+        if let Some(earlier) =
+            answered.insert((*node, command.client, command.sequence), response.clone())
+        {
+            assert_eq!(&earlier, response, "{command:?} applied twice on {node}");
+        }
+    }
+}
+
+/// The Cluster client's events and its caller's retries, of `client`, in
+/// order.
+fn client_events(outcome: &Outcome, client: NodeId) -> Vec<&Observation> {
+    outcome
+        .observations
+        .iter()
+        .filter(|observation| {
+            matches!(
+                observation,
+                Observation::ClientEvent { client: c, .. }
+                    | Observation::ClientRetry { client: c, .. }
+                    if *c == client
+            )
+        })
+        .collect()
+}
+
+/// S2 with every client's failover the Cluster client's
+/// (`karyos_cluster::client::ClusterClient`; karyos#720), over the feed
+/// and over the replication: each client reaches the old primary and the
+/// promoted standby; the harness's checks hold (generations monotone, no
+/// old-generation reply or success after the promotion, the history
+/// linearizable across it); no command is applied twice; each request in
+/// flight at the change is reported unknown and sent again only by its
+/// caller's retry, which, with slow answers, the standby answers from its
+/// deduplication.
+#[test]
+fn s2_cluster_clients_fail_over_to_the_promoted_standby() {
+    // With slow answers, the stop lands while answers are in flight for
+    // requests the feed already carried: each one's retry is answered
+    // by the promoted standby from its deduplication. In the others, every
+    // request in flight at the stop is past what the standby holds (over
+    // the replication, in the unsealed tail): its retry applies there, once.
+    let mut slow = standby::with_cluster_clients(standby::s2());
+    slow.reply_delay = 12;
+    slow.name.push_str(" and slow answers");
+    for (case, deduplicates) in [
+        (standby::with_cluster_clients(standby::s2()), false),
+        (
+            standby::with_cluster_clients(standby::over_replication(standby::s2())),
+            false,
+        ),
+        (slow, true),
+    ] {
+        let mut unknown_at_change = 0;
+        let mut retries_deduplicated = 0;
+        for seed in corpus() {
+            let outcome = passing(&case, seed);
+            let observations = &outcome.observations;
+            let (_, report) = promoted(&outcome).unwrap();
+            assert_eq!(report.generation, 2, "{} seed {seed:#x}", case.name);
+            applied_once(&outcome);
+            let clients: Vec<NodeId> = (0..case.clients)
+                .map(|index| u32::try_from(PRIMARY.len() + STANDBY.len() + index).unwrap())
+                .collect();
+            for &client in &clients {
+                // It reached the old primary, then the promoted standby.
+                for (group, generation) in [(&PRIMARY, 1), (&STANDBY, 2)] {
+                    assert!(
+                        observations.iter().any(|observation| matches!(
+                            observation,
+                            Observation::Reply { node, client: c, generation: g, .. }
+                                if group.contains(node) && *c == client && *g == generation
+                        )),
+                        "{} seed {seed:#x}: client {client} not answered in generation {generation}",
+                        case.name
+                    );
+                }
+                // An unknown request is sent again only by its caller's
+                // retry, never by the Cluster client on its own, and has
+                // its outcome in the end.
+                let mut unknown = BTreeSet::new();
+                for observation in client_events(&outcome, client) {
+                    match observation {
+                        Observation::ClientEvent {
+                            event: Event::Unknown { sequence, .. },
+                            ..
+                        } => {
+                            let _ = unknown.insert(*sequence);
+                        }
+                        Observation::ClientRetry { sequence, .. }
+                        | Observation::ClientEvent {
+                            event: Event::Completed { sequence, .. },
+                            ..
+                        } => {
+                            let _ = unknown.remove(sequence);
+                        }
+                        Observation::ClientEvent {
+                            event: Event::Resend(send),
+                            ..
+                        } => assert!(
+                            !unknown.contains(&send.key.sequence),
+                            "{} seed {seed:#x}: unknown {} resent",
+                            case.name,
+                            send.key.sequence
+                        ),
+                        _ => {}
+                    }
+                }
+                assert!(unknown.is_empty(), "{} seed {seed:#x}", case.name);
+            }
+            // Each request in flight at the promotion was reported unknown.
+            for &(client, sequence) in &report.unknown {
+                assert!(
+                    observations.iter().any(|observation| matches!(
+                        observation,
+                        Observation::ClientEvent {
+                            client: c,
+                            event: Event::Unknown { client: id, sequence: s },
+                        } if *c == client && *id == u64::from(client) && *s + 1 == sequence
+                    )),
+                    "{} seed {seed:#x}: ({client}, {sequence}) not unknown",
+                    case.name
+                );
+                unknown_at_change += 1;
+            }
+            // A caller's retry after the change, answered by the promoted
+            // standby from its deduplication: applied once, as
+            // `applied_once` shows.
+            let fenced = observations
+                .iter()
+                .position(|observation| matches!(observation, Observation::Fenced { .. }))
+                .unwrap();
+            for (at, observation) in observations.iter().enumerate().skip(fenced) {
+                if let Observation::ClientRetry { client, sequence } = observation
+                    && observations.iter().skip(at).any(|later| {
+                        matches!(
+                            later,
+                            Observation::Deduplicated { node, client: c, sequence: s }
+                                if STANDBY.contains(node) && c == client && *s == sequence + 1
+                        )
+                    })
+                {
+                    retries_deduplicated += 1;
+                }
+            }
+        }
+        assert!(unknown_at_change > 0, "{}", case.name);
+        if deduplicates {
+            assert!(retries_deduplicated > 0, "{}", case.name);
+        }
+    }
+}
+
+/// S5 with the Cluster client: answered by the old primary in generation
+/// 1, sent to the promoted standby by the operator, the client reports
+/// its open request unknown and sends nothing until its caller's retry;
+/// once it has seen generation 2, every generation 1 answer is refused,
+/// to an open request or to one already settled (karyos#720).
+#[test]
+fn s5_a_cluster_client_rejects_generation_1_once_it_saw_generation_2() {
+    const OLD: NodeId = PRIMARY[0];
+    const NEW: NodeId = STANDBY[0];
+    const OPERATOR: NodeId = 99;
+    let recorder: Shared = Rc::new(RefCell::new(Recorder::default()));
+    let script = vec![
+        Op::Append(vec![1]),
+        Op::Append(vec![2]),
+        Op::Append(vec![3]),
+    ];
+    let mut client = ClientNode::new(10, OLD, script, Rc::clone(&recorder)).with_cluster_client();
+    let mut out: Vec<(NodeId, Wire<Message>)> = Vec::new();
+    // The old primary answers in generation 1 under the run's identity,
+    // the promoted standby in generation 2 under its own.
+    let answer = |sequence: u64, generation: u64| Wire::<Message>::Response {
+        cluster: if generation == 1 {
+            HARNESS_CLUSTER
+        } else {
+            HARNESS_STANDBY
+        },
+        sequence,
+        bytes: Ret::Appended(sequence).canonical(),
+        index: sequence,
+        generation,
+    };
+    let sent = |out: &[(NodeId, Wire<Message>)]| match out.last() {
+        Some((to, Wire::Request(_, command))) => (*to, command.sequence),
+        other => panic!("{other:?}"),
+    };
+    client.tick(0, &mut out);
+    assert_eq!(sent(&out), (OLD, 1));
+    client.deliver(OLD, answer(1, 1), 1, &mut out);
+    client.tick(2, &mut out);
+    assert_eq!(sent(&out), (OLD, 2));
+    // The promotion: the operator sends the client to the standby. The
+    // open request is unknown, and nothing is sent on its own.
+    let before = out.len();
+    let redirect = Wire::Redirect {
+        cluster: HARNESS_STANDBY,
+        server: NEW,
+    };
+    client.deliver(OPERATOR, redirect, 3, &mut out);
+    assert_eq!(out.len(), before);
+    assert_eq!(client.open(), Some(2));
+    // The caller's retry: the same request, to the standby.
+    client.tick(4, &mut out);
+    assert_eq!(sent(&out), (NEW, 2));
+    client.deliver(NEW, answer(2, 2), 5, &mut out);
+    client.tick(6, &mut out);
+    assert_eq!(sent(&out), (NEW, 3));
+    // The old primary's generation 1 answers: to the open request,
+    // refused; to the settled one, nothing.
+    client.deliver(OLD, answer(3, 1), 7, &mut out);
+    client.deliver(OLD, answer(2, 1), 8, &mut out);
+    assert_eq!(client.open(), Some(3));
+    client.deliver(NEW, answer(3, 2), 9, &mut out);
+    assert!(client.done());
+    let observations = &recorder.borrow().observations;
+    let events: Vec<Event> = observations
+        .iter()
+        .filter_map(|observation| match observation {
+            Observation::ClientEvent { client: 10, event } => Some(*event),
+            _ => None,
+        })
+        .collect();
+    let unknown: Vec<&Event> = events
+        .iter()
+        .filter(|event| matches!(event, Event::Unknown { .. }))
+        .collect();
+    assert_eq!(
+        unknown,
+        [&Event::Unknown {
+            client: 10,
+            sequence: 1
+        }]
+    );
+    assert!(!events.iter().any(|event| matches!(event, Event::Resend(_))));
+    assert!(observations.contains(&Observation::ClientRetry {
+        client: 10,
+        sequence: 1
+    }));
+    assert!(events.contains(&Event::StaleGeneration {
+        generation: 1,
+        highest: 2
+    }));
+    assert!(observations.contains(&Observation::StaleGeneration {
+        client: 10,
+        generation: 1
+    }));
+    let successes: Vec<u64> = observations
+        .iter()
+        .filter_map(|observation| match observation {
+            Observation::Success { generation, .. } => Some(*generation),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(successes, [1, 2, 2]);
+    assert_eq!(check::standby(observations, &STANDBY), Ok(()));
+}
+
+/// A late refusal from the old primary, to the attempt sent there before
+/// the promotion, arrives after the caller's retry on the standby: it is
+/// the old attempt's, so it steers nothing, and the client keeps sending
+/// to the standby (karyos#720 review).
+#[test]
+fn a_late_old_primary_refusal_after_a_retry_on_the_standby_steers_nothing() {
+    const OLD: NodeId = PRIMARY[0];
+    const NEW: NodeId = STANDBY[0];
+    const OPERATOR: NodeId = 99;
+    let recorder: Shared = Rc::new(RefCell::new(Recorder::default()));
+    let script = vec![Op::Append(vec![1])];
+    let mut client = ClientNode::new(10, OLD, script, Rc::clone(&recorder)).with_cluster_client();
+    let mut out: Vec<(NodeId, Wire<Message>)> = Vec::new();
+    client.tick(0, &mut out);
+    let redirect = Wire::Redirect {
+        cluster: HARNESS_STANDBY,
+        server: NEW,
+    };
+    client.deliver(OPERATOR, redirect, 1, &mut out);
+    client.tick(2, &mut out);
+    assert!(matches!(
+        out.last(),
+        Some((NEW, Wire::Request(HARNESS_STANDBY, _)))
+    ));
+    let before = out.len();
+    let refused = Wire::Refused {
+        cluster: HARNESS_CLUSTER,
+        sequence: 1,
+    };
+    client.deliver(OLD, refused, 3, &mut out);
+    assert_eq!(out.len(), before, "{:?}", out.last());
+    let failover = client.failover().unwrap().cluster_client();
+    assert_eq!(failover.leader(), Some(u64::from(NEW)));
+    assert!(
+        !recorder
+            .borrow()
+            .observations
+            .iter()
+            .any(|observation| matches!(
+                observation,
+                Observation::ClientEvent {
+                    event: Event::Resend(_),
+                    ..
+                }
+            ))
+    );
+    client.deliver(
+        NEW,
+        Wire::Response {
+            cluster: HARNESS_STANDBY,
+            sequence: 1,
+            bytes: Ret::Appended(1).canonical(),
+            index: 1,
+            generation: 2,
+        },
+        4,
+        &mut out,
+    );
+    assert!(client.done());
+}
+
+/// A client corrupting its reads is caught with Cluster clients as without
+/// them: the history is not linearizable (karyos#1038, karyos#720 review).
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_corrupting_cluster_client_is_caught() {
+    for cluster_clients in [false, true] {
+        let mut case = standby::s1();
+        case.faults.corrupt_reads = vec![0];
+        if cluster_clients {
+            case = standby::with_cluster_clients(case);
+        }
+        let outcome = workloads::run::<Reference>(&case, CORPUS[0]).unwrap();
+        assert!(
+            matches!(outcome.safety, Err(Violation::NotLinearizable(_))),
+            "{}: {:?}",
+            case.name,
+            outcome.safety
         );
     }
 }

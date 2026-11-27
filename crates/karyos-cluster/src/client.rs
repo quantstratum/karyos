@@ -530,8 +530,13 @@ impl ClusterClient {
                 highest: self.generation,
             });
         }
+        // The identity requests name moves only with a higher generation:
+        // a late answer of the old primary in the same generation, after
+        // the client moved to the standby, does not move it back.
+        if generation > self.generation {
+            self.cluster = from.cluster;
+        }
         self.generation = generation;
-        self.cluster = from.cluster;
         let Some(slot) = self.outstanding.get(at).copied() else {
             return;
         };
@@ -627,8 +632,13 @@ impl ClusterClient {
                 highest: self.generation,
             });
         }
+        // The identity requests name moves only with a higher generation:
+        // a late answer of the old primary in the same generation, after
+        // the client moved to the standby, does not move it back.
+        if generation > self.generation {
+            self.cluster = from.cluster;
+        }
         self.generation = generation;
-        self.cluster = from.cluster;
         self.leader = leader;
         self.report_unknown(sink);
     }
