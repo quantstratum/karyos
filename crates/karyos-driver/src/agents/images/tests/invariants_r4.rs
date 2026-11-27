@@ -1905,3 +1905,42 @@ fn inv_r5_a_held_fence_hands_no_repair_or_staged_data_to_the_backend() {
     );
     assert_eq!(rig.agents.receiver.counters().data_committed, committed);
 }
+
+/// karyos#649, ADR-0076 clause 1 (SPEC §13 "Receiver restart freshness"),
+/// the authenticated unicast case: after a receiver-only restart that
+/// rebinds through its fresh challenge, old DATA with a valid MAC under the
+/// previous establishment fails authentication at the new binding: it is
+/// refused, commits nothing and the new image stays.
+#[test]
+fn inv_649_old_data_after_a_receiver_restart_fails_its_mac_at_the_new_binding() {
+    use crate::wire_auth::Sealer;
+
+    let (mut rig, b, channel) = authenticated_rig();
+    let _slot = established(&mut rig);
+    assert!(send_one(&mut rig, 100) >= 1);
+    let old = bound_party(&rig);
+    let old_party = old.unwrap();
+    assert!(restart_and_rebind(&mut rig, old), "rebound");
+    assert!(
+        send_one(&mut rig, 100) >= 1,
+        "the new establishment delivers"
+    );
+    assert_ne!(bound_party(&rig), old, "a new establishment");
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    // DATA sealed under the old establishment, its MAC valid there.
+    let mut old_sealer = Sealer::new(&channel, old_party, alias()).unwrap();
+    old_sealer.jump_to(0, 1 << 20);
+    let data = sealed(&mut old_sealer, &stale_frame(9, 64, 32));
+    let before = rig.agents.receiver.counters();
+    let receiver = &mut rig.agents.receiver;
+    receiver
+        .role
+        .inject_datagram(&receiver.sessions, b, source, &data, rig.now);
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    let after = rig.agents.receiver.counters();
+    assert_eq!(after.auth_rejected, before.auth_rejected + 1, "{after:?}");
+    assert_eq!(after.data_committed, before.data_committed);
+    assert!(send_one(&mut rig, 100) >= 1, "the new image stays");
+}
