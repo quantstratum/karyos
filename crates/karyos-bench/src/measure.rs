@@ -96,6 +96,7 @@ pub fn result_line(
     let load = match run.load {
         StageLoad::Closed => "R1".to_string(),
         StageLoad::Open { rate } => format!("R2@{rate}"),
+        StageLoad::Rotation { rate } => format!("R5@{rate}"),
     };
     let mut fields = vec![
         format!("\"index\":{index}"),

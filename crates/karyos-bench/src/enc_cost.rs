@@ -270,6 +270,17 @@ fn context(domain: Domain, party_epoch: u16) -> KeyContext {
     }
 }
 
+/// The domain 1 DATA key of the measured establishment, the same in every
+/// process that derives it: the sender seals and the receiver opens under
+/// it (the wire harness's `encrypted` profile).
+///
+/// # Errors
+///
+/// A key that does not derive.
+pub fn data_key() -> Result<AesGcmSiv, BenchError> {
+    key(Domain::Sender)
+}
+
 fn key(domain: Domain) -> Result<AesGcmSiv, BenchError> {
     let pairwise = if domain.is_receiver() {
         vec![
@@ -513,5 +524,150 @@ mod tests {
         let mut v: Vec<u64> = (1..=1000).rev().collect();
         let q = Quantiles::of(&mut v);
         assert_eq!((q.p50, q.p99, q.p999), (500, 990, 999));
+    }
+}
+
+/// The keys of an R5 run (karyos#650, manifest 6.1 R5): the starting key
+/// (file epoch 1, in-band epoch 1), its in-band successor (in-band epoch
+/// 2) and the next file epoch's key (file epoch 2, in-band epoch 1), each
+/// derived before the run, as the driver derives a successor ahead of its
+/// cutover. The sender seals under each in turn at its cutovers, a third
+/// and two thirds into the measured messages (after the warmup), so both
+/// transitions fall inside what is recorded (#1294 review); the receiver
+/// opens under the key the datagram's header names. The
+/// derivation's own cost is the `rekey` point of this module.
+#[derive(Debug)]
+pub struct Rotation {
+    keys: [AesGcmSiv; 3],
+    /// The seals before the in-band change and before the file change.
+    at: [u64; 2],
+    sealed: std::sync::atomic::AtomicU64,
+}
+
+impl Rotation {
+    /// The keys of a run of `warmup` then `messages` one-datagram messages:
+    /// the cutovers at `warmup + messages / 3` and `warmup + 2 messages / 3`
+    /// seals.
+    ///
+    /// # Errors
+    ///
+    /// Fewer than three measured messages, which cannot place both
+    /// transitions inside the measurement; or a key that does not derive.
+    pub fn new(warmup: u64, messages: u64) -> Result<Self, BenchError> {
+        if messages < 3 {
+            return Err(BenchError(format!(
+                "R5 needs at least 3 measured messages to place both epoch changes, not {messages}"
+            )));
+        }
+        let at = [
+            warmup.saturating_add(messages / 3),
+            warmup.saturating_add(messages / 3 * 2),
+        ];
+        let derive = |key_epoch: u32, party_epoch: u16| {
+            let context = KeyContext {
+                key_epoch,
+                ..context(Domain::Sender, party_epoch)
+            };
+            AesGcmSiv::new(&IKM, context, &[]).map_err(|e| BenchError(e.to_string()))
+        };
+        Ok(Self {
+            keys: [derive(1, 1)?, derive(1, 2)?, derive(2, 1)?],
+            at,
+            sealed: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Moves the sender to seal `n` next (tests).
+    #[cfg(test)]
+    fn skip_to(&self, n: u64) {
+        self.sealed.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The key the next seal uses.
+    fn sealer(&self) -> &AesGcmSiv {
+        let n = self
+            .sealed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let index = self.at.iter().filter(|&&at| n >= at).count();
+        let [first, second, third] = &self.keys;
+        match index {
+            0 => first,
+            1 => second,
+            _ => third,
+        }
+    }
+
+    /// The key `datagram`'s header names (`key_epoch` at 12, `party_epoch`
+    /// at 16), if it is one of the run's.
+    #[must_use]
+    pub fn opener(&self, datagram: &[u8]) -> Option<&AesGcmSiv> {
+        let key_epoch = u32::from_le_bytes(datagram.get(12..16)?.try_into().ok()?);
+        let party_epoch = u16::from_le_bytes(datagram.get(16..18)?.try_into().ok()?);
+        match (key_epoch, party_epoch) {
+            (1, 1) => self.keys.first(),
+            (1, 2) => self.keys.get(1),
+            (2, 1) => self.keys.get(2),
+            _ => None,
+        }
+    }
+}
+
+impl Protection for Rotation {
+    fn envelope_len(&self) -> usize {
+        let [first, ..] = &self.keys;
+        first.envelope_len()
+    }
+
+    fn seal(
+        &self,
+        datagram: &mut [u8],
+        frames: usize,
+    ) -> Result<usize, karyos_protocol::protection::SealError> {
+        self.sealer().seal(datagram, frames)
+    }
+
+    fn open(&self, datagram: &[u8]) -> Verdict {
+        match self.opener(datagram) {
+            Some(key) => key.open(datagram),
+            None => Verdict::Reject(karyos_protocol::protection::Rejection::Short),
+        }
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    /// R5 (karyos#650): the sender's seals cross one in-band and one file
+    /// epoch change inside the measured messages; the receiver opens each datagram
+    /// under the key its header names, and a datagram of an unknown epoch
+    /// is refused.
+    #[test]
+    fn a_rotation_crosses_an_in_band_and_a_file_epoch_and_every_datagram_opens() {
+        // 100 warmup and 300 measured: the cutovers at 200 and 300 seals.
+        let sender = Rotation::new(100, 300).unwrap();
+        let receiver = Rotation::new(100, 300).unwrap();
+        assert_eq!(sender.at, [200, 300], "both inside the measured messages");
+        assert!(Rotation::new(100, 2).is_err(), "too short to place both");
+        let mut epochs = Vec::new();
+        for at in [0, 200, 300] {
+            sender.skip_to(at);
+            let mut datagram = vec![0_u8; 1408];
+            datagram[..64].fill(3);
+            let length = sender.seal(&mut datagram, 64).unwrap();
+            let datagram = &datagram[..length];
+            epochs.push((
+                u32::from_le_bytes(datagram[12..16].try_into().unwrap()),
+                u16::from_le_bytes(datagram[16..18].try_into().unwrap()),
+            ));
+            assert!(
+                matches!(receiver.open(datagram), Verdict::Accept { .. }),
+                "{at}"
+            );
+        }
+        assert_eq!(epochs, [(1, 1), (1, 2), (2, 1)]);
+        let mut foreign = vec![0_u8; 128];
+        foreign[12] = 9;
+        assert!(matches!(receiver.open(&foreign), Verdict::Reject(_)));
     }
 }
