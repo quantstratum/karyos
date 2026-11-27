@@ -272,9 +272,14 @@ fn r4(invalid_percent: u64) -> String {
     }
     percentiles("receiver duty, every poll", &mut duties, &mut report);
     percentiles("receiver duty, polls that did work", &mut busy, &mut report);
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/evB-r4");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join(format!("r4-{invalid_percent}.txt")), &report).unwrap();
+    // The report goes to stdout (run with --nocapture), and to a file in
+    // the directory KARYOS_R4_OUT names, when set.
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), report.as_bytes());
+    if let Some(dir) = std::env::var_os("KARYOS_R4_OUT") {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("r4-{invalid_percent}.txt")), &report).unwrap();
+    }
 
     assert_eq!(forged_allocs, 0, "{report}");
     assert_eq!(receiver_allocs, 0, "{report}");
