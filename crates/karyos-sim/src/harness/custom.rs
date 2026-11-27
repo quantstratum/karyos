@@ -427,6 +427,10 @@ pub struct Custom {
     /// Vectors reserved at start, swapped into the node's Ready when its
     /// own are smaller (see [`Bounds`] and [`READY_MESSAGES`]).
     reserved: Ready<Message>,
+    /// The messages the node gave back once it sent them
+    /// ([`ReadyBuf::take_sent`]), on their way to the pool: their entries
+    /// and entry vectors are the pool's (C5 v3).
+    returned: Vec<Message>,
 }
 
 /// What one core call asked for, applied after it.
@@ -737,6 +741,7 @@ impl Custom {
                 snapshot_to: Vec::with_capacity(voters.len()),
                 ..Ready::default()
             },
+            returned: Vec::with_capacity(READY_MESSAGES.saturating_mul(2)),
         })
     }
 
@@ -1108,7 +1113,9 @@ impl ConsensusCore for Custom {
     }
 
     fn ready_into(&mut self, out: &mut ReadyBuf<Message>, log: &mut LogView<'_>) -> bool {
-        // What the node is done with goes back to the thread's pool.
+        // What the node is done with goes back to the thread's pool: the
+        // entries it persisted and applied, and the messages it sent, whose
+        // entries and vectors the pool gave out (C5 v3).
         out.take_spare(&mut self.spare);
         release(&mut self.spare);
         // Room for a Ready's entries going back once it is done, at the
@@ -1118,6 +1125,10 @@ impl ConsensusCore for Custom {
                 .ready_entries
                 .saturating_add(self.bounds.committed),
         );
+        out.take_sent(&mut self.returned);
+        for message in self.returned.drain(..) {
+            recycle(message.entries);
+        }
         // The node's vectors, grown to the reserved ones' size once.
         let (ready, reserved) = (&mut out.ready, &mut self.reserved);
         if ready.messages.capacity() < reserved.messages.capacity() {
