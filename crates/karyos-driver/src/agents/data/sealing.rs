@@ -280,8 +280,13 @@ impl<T: StreamTerms> Outbound<T> {
     /// inputs, replaces it.
     pub(crate) fn follow_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
         let live = self.auth.live();
+        let mut rekeyed = false;
         match &mut self.auth {
-            SenderAuth::Sealing(sealer) => sealer.follow(keys),
+            SenderAuth::Sealing(sealer) => {
+                let before = sealer.key_ref();
+                sealer.follow(keys);
+                rekeyed = sealer.key_ref() != before;
+            }
             // An encrypted publication's domain 1 sealer: withdrawn, its
             // key erased in place, once its key epoch is revoked or
             // expired. It stays installed as a tombstone: it seals nothing,
@@ -291,9 +296,13 @@ impl<T: StreamTerms> Outbound<T> {
             SenderAuth::Encrypting(sealer) => sealer.apply_keys(keys),
             SenderAuth::Off | SenderAuth::Pending | SenderAuth::EncPending => {}
         }
-        // A withdrawal makes what it sealed obsolete; a routine re-key
-        // keeps it, as its file still verifies through the overlap.
-        if live && !self.auth.live() {
+        // A withdrawal makes what it sealed obsolete, and so does a routine
+        // re-key (H8 R6-01): a head sealed under the predecessor file would
+        // otherwise keep a current stamp, and a later view revoking that
+        // file while the re-keyed sealer stays live would not stop it. The
+        // obsolete heads are returned unsent; the endpoint reset rewinds a
+        // reliable lane, so their data leaves sealed under the new file.
+        if (live && !self.auth.live()) || rekeyed {
             self.obsolete_sealed();
         }
     }

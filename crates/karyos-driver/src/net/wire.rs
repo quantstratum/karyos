@@ -420,6 +420,16 @@ impl crate::remote_guard::AbortRecord for SharedAborted {
             .map_err(|_| crate::remote_guard::MarkError::Unreadable)?
             .record(identity)
     }
+
+    fn admit(
+        &mut self,
+        identity: karyos_protocol::network::Identity,
+    ) -> Result<(), crate::remote_guard::MarkError> {
+        self.0
+            .lock()
+            .map_err(|_| crate::remote_guard::MarkError::Unreadable)?
+            .admit(identity)
+    }
 }
 
 /// The driver's durable guard marks, shared by every follow binding that

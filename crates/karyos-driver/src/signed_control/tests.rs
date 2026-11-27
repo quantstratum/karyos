@@ -384,3 +384,56 @@ fn the_cache_follows_key_application_and_prunes_expired_entries() {
     intake.prune(u64::MAX);
     assert_eq!(intake.cached(), 0, "pruned past its deadline");
 }
+
+/// H8 review 6, R5-08: replacement in the digest cache, under allocation
+/// counting. The cache is filled to its capacity with applied digests;
+/// then a new applied digest replaces an expired entry (the others still
+/// live), and, with none expired, one replaces the oldest at capacity.
+/// Each held digest hits until it is replaced, the cache never grows past
+/// its capacity, and no insertion or lookup allocates.
+#[test]
+fn the_digest_cache_replaces_an_expired_entry_and_the_oldest_at_capacity_without_allocating() {
+    use super::{CACHE_ENTRIES, CACHE_RETENTION_NS};
+    let mut intake = SignedIntake::<u8>::new(vec![authority(true)], 0);
+    let digest = |n: usize| {
+        let mut digest = [0u8; 32];
+        digest[..8].copy_from_slice(&(n as u64).to_le_bytes());
+        digest
+    };
+    // Entry 0 first, the rest a second later: entry 0 expires first.
+    intake.applied(1, source(), digest(0), 0, 0);
+    for n in 1..CACHE_ENTRIES {
+        intake.applied(1, source(), digest(n), 1, SECOND);
+    }
+    assert_eq!(intake.cached(), CACHE_ENTRIES);
+    // Past entry 0's retention only: a new applied digest takes its slot.
+    let now = CACHE_RETENTION_NS;
+    let ((), allocations) = karyos_sys::alloc_count::count(|| {
+        intake.applied(1, source(), digest(1000), 2, now);
+    });
+    assert_eq!(allocations, 0, "replacing an expired entry");
+    assert_eq!(intake.cached(), CACHE_ENTRIES);
+    assert_eq!(intake.cache.find(&digest(1000), 1, source(), now), Some(2));
+    assert_eq!(intake.cache.find(&digest(0), 1, source(), now), None);
+    assert_eq!(intake.cache.find(&digest(5), 1, source(), now), Some(1));
+    // At capacity with none expired: the oldest slot is replaced.
+    let ((), allocations) = karyos_sys::alloc_count::count(|| {
+        intake.applied(1, source(), digest(2000), 3, now);
+    });
+    assert_eq!(allocations, 0, "replacing at capacity");
+    assert_eq!(intake.cached(), CACHE_ENTRIES);
+    assert_eq!(intake.cache.find(&digest(2000), 1, source(), now), Some(3));
+    let held = (0..CACHE_ENTRIES)
+        .chain([1000])
+        .filter(|&n| intake.cache.find(&digest(n), 1, source(), now).is_some())
+        .count();
+    assert_eq!(
+        held,
+        CACHE_ENTRIES - 1,
+        "exactly one earlier entry replaced"
+    );
+    // The oldest went: entry 1 (applied at one second, the earliest left),
+    // not the entry just put in the expired slot.
+    assert_eq!(intake.cache.find(&digest(1000), 1, source(), now), Some(2));
+    assert_eq!(intake.cache.find(&digest(1), 1, source(), now), None);
+}

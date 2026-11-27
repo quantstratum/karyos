@@ -8101,6 +8101,17 @@ fn guarded_abort_rig_tuned(
     signs: bool,
     tune: Option<fn(&mut AgentConfig)>,
 ) -> (Rig, std::sync::Arc<karyos_client::HeapWords>, EndpointId) {
+    guarded_abort_rig_with(trusted, signs, tune, None)
+}
+
+/// [`guarded_abort_rig_tuned`] whose guard's policy and control reserve
+/// are both `limit` when given (karyos#1021).
+fn guarded_abort_rig_with(
+    trusted: bool,
+    signs: bool,
+    tune: Option<fn(&mut AgentConfig)>,
+    limit: Option<karyos_sys::rate_limit::Rate>,
+) -> (Rig, std::sync::Arc<karyos_client::HeapWords>, EndpointId) {
     use std::sync::Arc;
 
     use crate::agents::roles::publish_auth::{AbortAuthority, PublicationAuth};
@@ -8122,8 +8133,11 @@ fn guarded_abort_rig_tuned(
             cell: Arc::new(AppliedEpoch::new()),
             epoch: 2,
             empty_since: None,
-            rate: None,
-            reserve: None,
+            rate: limit.map(|messages| karyos_sys::rate_limit::RatePolicy {
+                messages,
+                bytes: None,
+            }),
+            reserve: limit,
             policy: None,
             frontier: Default::default(),
         }),
@@ -8163,6 +8177,77 @@ fn guarded_abort_rig_tuned(
     rig.agents.sender.role.set_abort_guard(a, alias(), 11);
     let _slot = established(&mut rig);
     (rig, word, b)
+}
+
+/// karyos#1021 (karyos#840 through the data agent): the guard's policy and
+/// control reserve are both one message a second, burst one. Ordinary
+/// traffic spends the publication's bucket; the guard's close still sends
+/// its SESSION_ABORT at once, from the control bucket. The receiver never
+/// acknowledges it (it does not trust the authority), so its resends run
+/// past the reserve: they wait for the control bucket's refill, are held
+/// and counted, never dropped, and the publication's tokens are never
+/// borrowed.
+#[test]
+fn an_abort_pays_from_the_control_reserve_and_its_resends_wait_for_its_refill() {
+    let one = karyos_sys::rate_limit::Rate {
+        per_second: 1,
+        burst: 1,
+    };
+    let (mut rig, word, _b) = guarded_abort_rig_with(false, true, None, Some(one));
+    // Ordinary traffic spends the publication's bucket.
+    for _ in 0..3 {
+        let _ = send_one(&mut rig, 100);
+    }
+    let gate = |rig: &Rig| {
+        let gate = rig
+            .agents
+            .sender
+            .role
+            .outbound(0)
+            .unwrap()
+            .guard_gate()
+            .unwrap();
+        (gate.message_tokens(), gate.control_message_tokens())
+    };
+    assert_eq!(gate(&rig).0, Some(0), "the publication's bucket is spent");
+    close_guard(&mut rig, &word);
+    for _ in 0..50 {
+        rig.round(true);
+        if rig.agents.sender.role.counters().aborts_sent == 1 {
+            break;
+        }
+    }
+    let sender = rig.agents.sender.role.counters();
+    assert_eq!(sender.aborts_sent, 1, "sent at once: {sender:?}");
+    // The resends, from 10 ms on, are past the reserve within the second.
+    for _ in 0..500 {
+        rig.round(true);
+    }
+    let sender = rig.agents.sender.role.counters();
+    assert_eq!(sender.aborts_resent, 0, "{sender:?}");
+    assert!(sender.aborts_held > 0, "held, not dropped: {sender:?}");
+    assert_eq!(sender.aborts_interrupted, 0);
+    // The second earns one control token: one resend leaves.
+    for _ in 0..600 {
+        rig.round(true);
+    }
+    let sender = rig.agents.sender.role.counters();
+    assert!(sender.aborts_resent >= 1, "{sender:?}");
+    assert!(
+        sender.aborts_resent <= 2,
+        "never past the reserve: {sender:?}"
+    );
+    let held = rig
+        .agents
+        .sender
+        .role
+        .outbound(0)
+        .unwrap()
+        .guard_gate()
+        .unwrap()
+        .counts()
+        .control_held;
+    assert!(held > 0);
 }
 
 /// Closes the local guard and appends, so the gate applies the close.
@@ -11143,6 +11228,100 @@ fn a_failed_record_write_with_the_ack_lost_stays_terminal_across_a_restart() {
     assert!(lost.terminal(&other), "a missing record fails closed");
 }
 
+/// H8 round 7 (R5-02 / MP-2 at the agents): an abort the receiver applies
+/// while both durable writes fail, then a crash. The restarted receiver,
+/// through its real SETUP path, refuses the aborted incarnation; a clean
+/// stop and another restart still refuse it; a later incarnation of the
+/// same publisher establishes.
+#[test]
+fn an_abort_lost_to_two_failed_writes_is_refused_at_the_agents_after_a_crash() {
+    use crate::remote_guard::{ABORTED_FILE, ABORTED_REPLICA};
+    use karyos_protocol::network::authenticated::GUARD_CLOSED;
+
+    let state = MemDir::initialised();
+    let (mut rig, b) = abort_record_rig(&state, 1);
+    let _slot = established(&mut rig);
+    rig.sender_stopped = true;
+    state.fail_writes(&[ABORTED_FILE, ABORTED_REPLICA]);
+    let after = inject_abort(&mut rig, b, &signed_abort(10, 11, GUARD_CLOSED));
+    assert_eq!(after.abort_acks_sent, 0, "not durable, not acknowledged");
+    // A crash: no clean stop.
+    std::mem::forget(rig);
+    state.fail_writes(&[]);
+    let installed = |rig: &Rig| {
+        rig.events
+            .iter()
+            .any(|event| matches!(event, ImageEvent::Installed { .. }))
+    };
+    for _ in 0..2 {
+        // The restart after the crash, then one after a clean stop.
+        let (mut rig, _b) = abort_record_rig(&state, 1);
+        resend_rounds(&mut rig);
+        assert!(!installed(&rig), "{:?}", rig.events);
+        assert!(rig.agents.receiver.counters().setup_after_abort >= 1);
+        drop(rig);
+    }
+    let (mut rig, _b) = abort_record_rig(&state, 2);
+    let _slot = established(&mut rig);
+    assert_eq!(rig.agents.receiver.counters().setup_after_abort, 0);
+}
+
+/// H8 round 7, R7-01: a record at its every capacity and widest line
+/// (every terminal identity, every publisher's high-water and floor, each
+/// value `u64::MAX`) round-trips through its bounded read: a restart reads
+/// it whole, never fails closed for size.
+#[test]
+fn a_full_width_abort_record_round_trips() {
+    use crate::remote_guard::{
+        ABORTED_FILE, ABORTED_MAX_LEN, AbortRecord, AbortedIncarnations, MAX_ABORTED,
+        MAX_PUBLISHERS,
+    };
+
+    let state = MemDir::initialised();
+    let wide = |n: u64| Identity {
+        driver_id: [u64::MAX - n, u64::MAX],
+        registration_id: u64::MAX,
+        incarnation: u64::MAX - 1,
+    };
+    let mut record = AbortedIncarnations::new(state.clone());
+    for n in 0..MAX_PUBLISHERS as u64 {
+        record.admit(wide(n)).unwrap();
+    }
+    // Crash and restart: every publisher's floor is raised and committed.
+    std::mem::forget(record);
+    let mut record = AbortedIncarnations::new(state.clone());
+    let later = |n: u64| Identity {
+        incarnation: u64::MAX,
+        ..wide(n)
+    };
+    for n in 0..MAX_PUBLISHERS as u64 {
+        record.admit(later(n)).unwrap();
+    }
+    for n in 0..MAX_ABORTED as u64 {
+        record
+            .record(Identity {
+                driver_id: [u64::MAX - n, u64::MAX - 1],
+                registration_id: u64::MAX,
+                incarnation: u64::MAX,
+            })
+            .unwrap();
+    }
+    drop(record);
+    let mut buf = vec![0u8; 2 * ABORTED_MAX_LEN];
+    let length = crate::wire_keys::store::Files::read(&state, ABORTED_FILE, &mut buf).unwrap();
+    assert!(length <= ABORTED_MAX_LEN, "{length} > {ABORTED_MAX_LEN}");
+    let restarted = AbortedIncarnations::new(state);
+    assert!(restarted.terminal(&wide(3)), "the floor holds");
+    assert!(
+        !restarted.terminal(&Identity {
+            driver_id: [1, 1],
+            registration_id: 1,
+            incarnation: 1,
+        }),
+        "read whole, not failed closed"
+    );
+}
+
 /// H8 R5-02: a repeated record of an identity whose commit failed retries
 /// the commit rather than reporting the in-memory entry as durable.
 #[test]
@@ -11155,10 +11334,101 @@ fn a_repeated_record_retries_a_failed_commit() {
     assert!(record.record(identity()).is_err());
     assert!(record.terminal(&identity()), "terminal in memory");
     assert!(record.record(identity()).is_err(), "not durable yet");
-    assert!(!AbortedIncarnations::new(state.clone()).terminal(&identity()));
     state.fail_writes(&[]);
     assert!(record.record(identity()).is_ok());
+    drop(record);
     assert!(AbortedIncarnations::new(state).terminal(&identity()));
+}
+
+/// H8 review 6, R5-02 / MP-2 (RCV-6): both writes of an abort fail, then
+/// the receiver stops uncleanly (no `Drop`, the marker stays armed). The
+/// restart cannot know the abort, but its publisher's incarnation was
+/// recorded at install: every incarnation up to it is terminal, and a
+/// later one, never live here, is admitted.
+#[test]
+fn an_abort_lost_to_two_failed_writes_stays_terminal_after_an_unclean_stop() {
+    use crate::remote_guard::{ABORTED_FILE, ABORTED_REPLICA, AbortRecord, AbortedIncarnations};
+
+    let state = MemDir::initialised();
+    let mut record = AbortedIncarnations::new(state.clone());
+    record.admit(identity()).unwrap();
+    state.fail_writes(&[ABORTED_FILE, ABORTED_REPLICA]);
+    assert!(record.record(identity()).is_err(), "neither copy committed");
+    // Crash: no clean stop.
+    std::mem::forget(record);
+    state.fail_writes(&[]);
+    let mut restarted = AbortedIncarnations::new(state.clone());
+    assert!(restarted.terminal(&identity()), "the lost abort holds");
+    let earlier = Identity {
+        incarnation: identity().incarnation - 1,
+        ..identity()
+    };
+    assert!(restarted.terminal(&earlier));
+    assert!(restarted.admit(identity()).is_err(), "no install");
+    let later = Identity {
+        incarnation: identity().incarnation + 1,
+        ..identity()
+    };
+    assert!(!restarted.terminal(&later), "a new incarnation is admitted");
+    restarted.admit(later).unwrap();
+    let stranger = Identity {
+        registration_id: identity().registration_id + 1,
+        ..identity()
+    };
+    assert!(!restarted.terminal(&stranger), "never live here");
+    // A genuinely new incarnation admitted after the unclean restart is not
+    // made terminal by its own admission (#1288 review).
+    assert!(!restarted.terminal(&later), "the new run's install");
+    // A clean stop now does not forget the recovered floor (#1288 review).
+    drop(restarted);
+    let again = AbortedIncarnations::new(state);
+    assert!(
+        again.terminal(&identity()),
+        "still terminal after a clean stop"
+    );
+    assert!(!again.terminal(&later));
+}
+
+/// H8 review 6, R5-02: an unclean stop with no failed write refuses the
+/// incarnations that were live (their abort cannot be ruled out), never
+/// a later one; a clean stop with nothing uncommitted refuses nothing.
+#[test]
+fn the_marker_tells_a_clean_stop_from_an_unclean_one() {
+    use crate::remote_guard::{AbortRecord, AbortedIncarnations};
+
+    let state = MemDir::initialised();
+    let mut record = AbortedIncarnations::new(state.clone());
+    record.admit(identity()).unwrap();
+    drop(record);
+    let restarted = AbortedIncarnations::new(state.clone());
+    assert!(!restarted.terminal(&identity()), "clean: nothing refused");
+    std::mem::forget(restarted);
+    let after_crash = AbortedIncarnations::new(state.clone());
+    assert!(after_crash.terminal(&identity()), "unclean: the live one");
+    let later = Identity {
+        incarnation: identity().incarnation + 1,
+        ..identity()
+    };
+    assert!(!after_crash.terminal(&later));
+}
+
+/// H8 review 6, R5-02: the high-water is written before the install; when
+/// it cannot be committed the install is refused (fail closed).
+#[test]
+fn an_install_whose_high_water_cannot_be_committed_is_refused() {
+    use crate::remote_guard::{ABORTED_FILE, ABORTED_REPLICA, AbortRecord, AbortedIncarnations};
+
+    let state = MemDir::initialised();
+    let mut record = AbortedIncarnations::new(state.clone());
+    state.fail_writes(&[ABORTED_FILE, ABORTED_REPLICA]);
+    assert!(record.admit(identity()).is_err());
+    // Raised in memory only: a repeat retries the commit (#1288 review).
+    assert!(record.admit(identity()).is_err(), "still not durable");
+    state.fail_writes(&[]);
+    assert!(
+        record.admit(identity()).is_ok(),
+        "retried once the disk works"
+    );
 }
 /// H8 round 4: insufficient evidence raised and missing properties (karyos#648).
 mod invariants_r4;
@@ -12113,6 +12383,16 @@ fn a_blocked_key_read_stops_live_agents_within_the_bound() {
     let late = genuine_envelope(&mut rig);
     let source = rig.endpoints.local_address(rig.publisher).unwrap();
     let (mut sent_while_blocked, mut last_send_start) = (false, 0u64);
+    // DATA has its own observer (H8 review 6, R5-05): the publication's
+    // backend submissions, not the controls counter.
+    let data_submitted = |rig: &Rig| {
+        rig.agents
+            .sender
+            .role
+            .outbound(0)
+            .map_or(0, |outbound| outbound.counters().submitted)
+    };
+    let (mut data_while_blocked, mut last_data_start) = (false, 0u64);
     let mut opened_while_blocked = false;
     let end = after + FRESH_NS + 1_000_000_000;
     let mut round = 0u64;
@@ -12125,10 +12405,15 @@ fn a_blocked_key_read_stops_live_agents_within_the_bound() {
         let blocked = keys.blocked();
         let started = monotonic_ns();
         let sent = rig.agents.sender.role.counters().sent;
+        let data = data_submitted(&rig);
         rig.round(true);
         if rig.agents.sender.role.counters().sent > sent {
             last_send_start = started;
             sent_while_blocked |= blocked;
+        }
+        if data_submitted(&rig) > data {
+            last_data_start = started;
+            data_while_blocked |= blocked;
         }
         if blocked && !opened_while_blocked {
             // Ingress inside the bound with the reload blocked: opened.
@@ -12152,6 +12437,14 @@ fn a_blocked_key_read_stops_live_agents_within_the_bound() {
     assert!(
         last_send_start <= after + FRESH_NS,
         "sent at {last_send_start}, bound {}",
+        after + FRESH_NS
+    );
+    // DATA, observed at the backend: it flowed inside the bound with the
+    // reload blocked, and none was submitted from a cycle past it.
+    assert!(data_while_blocked, "DATA flowed inside the bound");
+    assert!(
+        last_data_start <= after + FRESH_NS,
+        "DATA submitted at {last_data_start}, bound {}",
         after + FRESH_NS
     );
     // Ingress past the bound: a genuine envelope sealed inside it is

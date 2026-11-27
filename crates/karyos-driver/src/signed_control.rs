@@ -273,12 +273,11 @@ struct Entry<R> {
 
 /// The SHA-256 digests of verified, applied datagrams, each with what a
 /// hit resends: bounded, preallocated, expired entries replaced first,
-/// then the oldest. A hit needs the same digest, ingress and source
+/// then the oldest (the earliest to expire). A hit needs the same digest, ingress and source
 /// before its deadline (H8 finding 8).
 #[derive(Debug)]
 pub struct DigestCache<R: Clone> {
     entries: Vec<Entry<R>>,
-    next: usize,
 }
 
 impl<R: Clone> DigestCache<R> {
@@ -287,7 +286,6 @@ impl<R: Clone> DigestCache<R> {
     pub fn new() -> Self {
         Self {
             entries: Vec::with_capacity(CACHE_ENTRIES),
-            next: 0,
         }
     }
 
@@ -314,18 +312,16 @@ impl<R: Clone> DigestCache<R> {
             *slot = entry;
         } else if self.entries.len() < CACHE_ENTRIES {
             self.entries.push(entry);
-        } else if let Some(slot) = self.entries.get_mut(self.next) {
+        } else if let Some(slot) = self.entries.iter_mut().min_by_key(|held| held.expires) {
+            // Full and none expired: the oldest, the one that expires
+            // first (H8 review 6, R5-08; a scan of the bounded cache).
             *slot = entry;
-            self.next = (self.next + 1) % CACHE_ENTRIES;
         }
     }
 
     /// Drops every entry whose resend `drop` names; allocates nothing.
     fn forget(&mut self, mut drop: impl FnMut(&R) -> bool) {
         self.entries.retain(|entry| !drop(&entry.resend));
-        if self.next >= self.entries.len() {
-            self.next = 0;
-        }
     }
 
     /// The entries held (tests).
@@ -559,9 +555,6 @@ impl<R: Clone> SignedIntake<R> {
     /// sealer it holds (H8 finding 8). Allocates nothing.
     pub fn prune(&mut self, now: u64) {
         self.cache.entries.retain(|entry| now < entry.expires);
-        if self.cache.next >= self.cache.entries.len() {
-            self.cache.next = 0;
-        }
     }
 
     /// The digest cache entries held (tests).
