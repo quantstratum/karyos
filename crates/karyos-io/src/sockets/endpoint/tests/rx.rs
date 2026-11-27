@@ -403,3 +403,80 @@ fn rx_results_of_a_batch_stay_pending_across_polls() {
     // The EAGAIN that stopped it was pending too: still no new call.
     assert_eq!(h.socket.recv_calls(), 7);
 }
+
+/// Steady state of the scripted batched receive: once a warm-up batch has
+/// run, repeated batches, full and then on an empty script, allocate
+/// nothing.
+#[test]
+fn scripted_recv_batch_does_not_allocate_in_steady_state() {
+    let mut socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    socket.open(&config()).unwrap();
+    for at in 0..40_u8 {
+        observer.push_recv_datagram(&[at; 10], Some(peer()));
+    }
+    let stride = 257;
+    let mut slab = vec![0_u8; stride * 8];
+    let mut results = [RecvResult::Error(Errno::INVAL); 8];
+    assert_eq!(socket.recv_batch(&mut slab, stride, &mut results), 8);
+    let (filled, allocations) = karyos_sys::alloc_count::count(|| {
+        let mut filled = 0;
+        for _ in 0..4 {
+            filled += socket.recv_batch(&mut slab, stride, &mut results);
+        }
+        for _ in 0..4 {
+            assert_eq!(socket.recv_batch(&mut slab, stride, &mut results), 1);
+            assert_eq!(results[0], RecvResult::Error(Errno::AGAIN));
+        }
+        filled
+    });
+    assert_eq!((filled, allocations), (32, 0));
+    assert_eq!(
+        &slab[..10],
+        &[32_u8; 10],
+        "the last full batch starts at 32"
+    );
+    socket.close();
+}
+
+/// Steady state of the RX path: once a warm-up poll has run, polls that
+/// drive `recv_batch`, through full batches, pending results and the empty
+/// queue, allocate nothing.
+#[test]
+fn rx_batched_polls_do_not_allocate_in_steady_state() {
+    struct Count(u32);
+    impl RxHandler for Count {
+        fn datagram(&mut self, datagram: RxDatagram<'_>) -> ControlFlow<()> {
+            assert_eq!(datagram.bytes().len(), 10);
+            self.0 += 1;
+            ControlFlow::Continue(())
+        }
+        fn dropped(&mut self, _: RxDrop) {}
+    }
+    let mut h = Harness::new();
+    for at in 0..48_u8 {
+        h.socket.push_recv_datagram(&[at; 10], Some(peer()));
+    }
+    // Warm the clock and the scripted lock on the control path.
+    let _ = karyos_sys::host_clock::host_monotonic_ns();
+    let _ = h.socket.recv_calls();
+    let mut handler = Count(0);
+    let outcome = h.rx.poll_rx(budget(8), &mut handler);
+    assert_eq!(outcome.delivered, 8);
+    let (delivered, allocations) = karyos_sys::alloc_count::count(|| {
+        let mut delivered = 0;
+        // Budgets of 3 split batches, so results stay pending across polls.
+        for _ in 0..10 {
+            delivered += h.rx.poll_rx(budget(3), &mut handler).delivered;
+        }
+        for _ in 0..2 {
+            delivered += h.rx.poll_rx(budget(8), &mut handler).delivered;
+        }
+        for _ in 0..4 {
+            let outcome = h.rx.poll_rx(budget(8), &mut handler);
+            assert_eq!((outcome.stop, outcome.delivered), (RxStop::WouldBlock, 0));
+        }
+        delivered
+    });
+    assert_eq!((delivered, allocations, handler.0), (40, 0, 48));
+}

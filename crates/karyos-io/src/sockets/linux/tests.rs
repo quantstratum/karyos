@@ -909,3 +909,38 @@ fn a_batched_receive_does_not_allocate() {
     });
     assert_eq!((filled, allocations), (4, 0));
 }
+
+/// Steady state: once a warm-up batch has run, repeated batched receives,
+/// full and then on an empty queue, allocate nothing.
+#[test]
+fn a_batched_receive_does_not_allocate_in_steady_state() {
+    let (mut sender, _) = open_ipv4();
+    let (mut receiver, to) = open_ipv4();
+    let route = RouteAddr::new(to);
+    for _ in 0..32 {
+        assert!(matches!(
+            sender.send(&route, &[b"steady"]),
+            SendResult::Sent { sent: 1, .. }
+        ));
+    }
+    let stride = 257;
+    let mut slab = vec![0_u8; stride * 8];
+    let mut results = [RecvResult::Error(Errno::INVAL); 8];
+    let mut warm = 0;
+    while warm < 8 {
+        warm += recv_batch_some(&mut receiver, &mut slab, stride, &mut results[warm..]);
+    }
+    let (filled, allocations) = karyos_sys::alloc_count::count(|| {
+        let mut filled = 0;
+        while filled < 24 {
+            let batch = 8.min(24 - filled);
+            filled += recv_batch_some(&mut receiver, &mut slab, stride, &mut results[..batch]);
+        }
+        for _ in 0..4 {
+            assert_eq!(receiver.recv_batch(&mut slab, stride, &mut results), 1);
+            assert_eq!(results[0], RecvResult::Error(Errno::AGAIN));
+        }
+        filled
+    });
+    assert_eq!((filled, allocations), (24, 0));
+}

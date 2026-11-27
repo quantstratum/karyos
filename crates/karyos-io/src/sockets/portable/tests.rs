@@ -411,3 +411,195 @@ fn data_calls_do_not_allocate() {
     });
     assert_eq!(allocations, 0);
 }
+
+/// Receives a batch into `results`, retrying `EAGAIN` until [`PATIENCE`]
+/// runs out, like [`recv_one`]. Neither the clock nor the yield
+/// allocates, so the no allocation test uses it too.
+fn recv_batch_some(
+    socket: &mut PortableSocket,
+    slab: &mut [u8],
+    stride: usize,
+    results: &mut [RecvResult],
+) -> usize {
+    let start = Instant::now();
+    loop {
+        let filled = socket.recv_batch(slab, stride, results);
+        match results.first() {
+            Some(RecvResult::Error(Errno::AGAIN)) if filled == 1 && start.elapsed() < PATIENCE => {
+                std::thread::yield_now();
+            }
+            _ => return filled,
+        }
+    }
+}
+
+/// Section 4.4 batched on macOS: the default batch of single receives
+/// returns several datagrams in order, each with its own source and
+/// length exactly as `recv` reports them (a long datagram fills its slot
+/// without a length); a batch smaller than the queue leaves the rest for
+/// the next call, and an empty queue ends the batch with `EAGAIN`.
+#[test]
+fn a_batched_receive_returns_each_datagram_with_its_source() {
+    let (mut first, from_first) = open_ipv4();
+    let (mut second, from_second) = open_ipv4();
+    let (mut receiver, to) = open_ipv4();
+    let route = RouteAddr::new(to);
+    let long = vec![7_u8; 9000];
+    let exact = vec![8_u8; 257];
+    let sends: [(bool, &[u8]); 5] = [
+        (true, b"one"),
+        (false, b"two"),
+        (true, &long),
+        (false, &exact),
+        (true, b"five"),
+    ];
+    for (from_first_socket, datagram) in sends {
+        let socket = if from_first_socket {
+            &mut first
+        } else {
+            &mut second
+        };
+        assert_eq!(
+            socket.send(&route, &[datagram]),
+            SendResult::Sent {
+                sent: 1,
+                error: None
+            }
+        );
+    }
+    let stride = 257;
+    let mut slab = vec![0_u8; stride * 8];
+    let mut results = [RecvResult::Error(Errno::INVAL); 8];
+    // A partial batch: two slots of the five queued.
+    let mut filled = 0;
+    while filled < 2 {
+        filled += recv_batch_some(&mut receiver, &mut slab, stride, &mut results[filled..2]);
+    }
+    assert_eq!(
+        results[..2],
+        [
+            RecvResult::Datagram {
+                len: 3,
+                truncated: None,
+                source: Some(from_first),
+            },
+            RecvResult::Datagram {
+                len: 3,
+                truncated: None,
+                source: Some(from_second),
+            },
+        ]
+    );
+    assert_eq!(
+        (&slab[..3], &slab[stride..stride + 3]),
+        (&b"one"[..], &b"two"[..])
+    );
+    // The rest, then the EAGAIN that ends the batch.
+    assert_eq!(
+        recv_batch_some(&mut receiver, &mut slab, stride, &mut results),
+        4
+    );
+    assert_eq!(
+        results[..4],
+        [
+            RecvResult::Datagram {
+                len: 257,
+                truncated: None,
+                source: Some(from_first),
+            },
+            RecvResult::Datagram {
+                len: 257,
+                truncated: None,
+                source: Some(from_second),
+            },
+            RecvResult::Datagram {
+                len: 4,
+                truncated: None,
+                source: Some(from_first),
+            },
+            RecvResult::Error(Errno::AGAIN),
+        ]
+    );
+    assert_eq!(&slab[..stride], &long[..stride]);
+    assert_eq!(&slab[stride..2 * stride], &exact[..]);
+    assert_eq!(&slab[2 * stride..2 * stride + 4], b"five");
+    assert_eq!(receiver.recv_batch(&mut slab, stride, &mut results), 1);
+    assert_eq!(results[0], RecvResult::Error(Errno::AGAIN));
+    // Nothing to fill makes no call; a closed socket is EBADF.
+    assert_eq!(receiver.recv_batch(&mut slab, stride, &mut []), 0);
+    assert_eq!(receiver.recv_batch(&mut slab, 0, &mut results), 0);
+    receiver.close();
+    assert_eq!(receiver.recv_batch(&mut slab, stride, &mut results), 1);
+    assert_eq!(results[0], RecvResult::Error(Errno::BADF));
+}
+
+/// The batched receive of an IPv6 socket reports the IPv6 source, as
+/// `recv` does.
+#[test]
+fn a_batched_receive_reports_an_ipv6_source() {
+    let mut receiver = PortableSocket::new();
+    let Ok(probes) = receiver.open(&config(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)))) else {
+        skip("no IPv6 loopback");
+        return;
+    };
+    let mut sender = PortableSocket::new();
+    let from = sender
+        .open(&config(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))))
+        .unwrap()
+        .local;
+    let route = RouteAddr::new(probes.local);
+    assert!(matches!(
+        sender.send(&route, &[b"six"]),
+        SendResult::Sent { sent: 1, .. }
+    ));
+    let mut slab = [0_u8; 64];
+    let mut results = [RecvResult::Error(Errno::INVAL); 1];
+    assert_eq!(
+        recv_batch_some(&mut receiver, &mut slab, 64, &mut results),
+        1
+    );
+    assert_eq!(
+        results[0],
+        RecvResult::Datagram {
+            len: 3,
+            truncated: None,
+            source: Some(from),
+        }
+    );
+    assert_eq!(&slab[..3], b"six");
+}
+
+/// Steady state: once a warm-up batch has run, repeated batched receives,
+/// full and then on an empty queue, allocate nothing.
+#[test]
+fn a_batched_receive_does_not_allocate_in_steady_state() {
+    let (mut sender, _) = open_ipv4();
+    let (mut receiver, to) = open_ipv4();
+    let route = RouteAddr::new(to);
+    for _ in 0..32 {
+        assert!(matches!(
+            sender.send(&route, &[b"steady"]),
+            SendResult::Sent { sent: 1, .. }
+        ));
+    }
+    let stride = 257;
+    let mut slab = vec![0_u8; stride * 8];
+    let mut results = [RecvResult::Error(Errno::INVAL); 8];
+    let mut warm = 0;
+    while warm < 8 {
+        warm += recv_batch_some(&mut receiver, &mut slab, stride, &mut results[warm..]);
+    }
+    let (filled, allocations) = karyos_sys::alloc_count::count(|| {
+        let mut filled = 0;
+        while filled < 24 {
+            let batch = 8.min(24 - filled);
+            filled += recv_batch_some(&mut receiver, &mut slab, stride, &mut results[..batch]);
+        }
+        for _ in 0..4 {
+            assert_eq!(receiver.recv_batch(&mut slab, stride, &mut results), 1);
+            assert_eq!(results[0], RecvResult::Error(Errno::AGAIN));
+        }
+        filled
+    });
+    assert_eq!((filled, allocations), (24, 0));
+}
