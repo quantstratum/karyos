@@ -830,6 +830,12 @@ mod w1 {
             })
     }
 
+    /// The most entries any server measured past the warm-up while it
+    /// led: each entry once, as the run record counts it.
+    pub fn entries_of(probes: &[Probe]) -> u64 {
+        probes.iter().map(|probe| probe.entries).max().unwrap_or(0)
+    }
+
     /// The index of the W1 case of `servers`, `payload` and `clients`.
     pub fn case_of(servers: usize, payload: usize, clients: usize) -> usize {
         w1_cases()
@@ -1174,4 +1180,148 @@ fn w2_full() {
             w2_case_is_judged(core, index);
         }
     }
+}
+
+/// The custom cores replication path on W2 past the warm-up, on 3
+/// Each stage's bound, in allocations and frees per hundred entries,
+/// summed over every W2 case and its servers: see
+/// [`custom_w2_replication_stays_near_zero_after_the_warm_up`].
+#[cfg(target_os = "linux")]
+const W2_BOUNDS: [(&str, u64, u64); 6] = [
+    ("propose", 1, 1),
+    ("ready_leader", 1, 6),
+    ("step_leader", 7, 1),
+    ("advance", 9, 3),
+    ("encoding", 1, 5),
+    ("total", 20, 20),
+];
+
+/// The custom core's leader past the warm-up on every W2 case
+/// (`process::w2_cases()`), on 3 processes: the node hands each sent
+/// message back to the core's pool (C5 v3, "Buffer recycling"), so the
+/// pool does not drain under W2's load and the leader stops allocating a
+/// fresh entry per append.
+///
+/// Each stage's allocations and frees are summed over every case and its
+/// servers and bounded per entry (`entries` summed over the cases, each
+/// the most a leader committed past the warm-up), so the bound does not
+/// scale with a run's length. Measured on xaskar, 35,014 entries:
+///
+/// | stage            | without the hand-back (502b5973) | with it (4729f24c)      |
+/// |------------------|----------------------------------|-------------------------|
+/// | total            | 111,933 / 116,862 (3.20 / 3.34)  | 4,271 / 3,452 (0.12 / 0.10) |
+/// | propose          | 40,445 / 0 (1.16 / 0)            | 54 / 0 (0.002 / 0)      |
+/// | step_leader      | 50,913 / 76 (1.45 / 0.002)       | 1,593 / 68 (0.045 / 0.002) |
+/// | ready_leader     | 17,784 / 14 (0.51 / 0.0004)      | 74 / 1,426 (0.002 / 0.041) |
+/// | advance          | 2,310 / 724 (0.066 / 0.021)      | 2,117 / 658 (0.060 / 0.019) |
+/// | encoding         | 0 / 115,958 (0 / 3.31)           | 0 / 1,188 (0 / 0.034)   |
+///
+/// The bounds ([`W2_BOUNDS`], per hundred entries) take those figures
+/// with about 1.5 times their rate as margin:
+/// - total: each at most 0.20 per entry;
+/// - propose: at most 0.01 per entry each;
+/// - ready_leader: allocations at most 0.01 per entry;
+/// - named residuals:
+///   - `step_leader` (at most 0.07 / 0.01) and `ready_leader`'s frees (at
+///     most 0.06): in the bursts a leader steps more acknowledgements than
+///     its pool holds at that moment and allocates entries that the next
+///     ready frees again, at most one per stepped message, with the pool
+///     no longer draining;
+///   - `advance` (leader and follower, at most 0.09 / 0.03): C4's
+///     persistence on the real disk (the log's append, sync and hard
+///     state) and, in the byte case and the paused follower's, the
+///     catch-up's log reads, which the hand-back does not touch (the same
+///     with and without it);
+///   - `encoding`'s frees (at most 0.05): about 198 per case whatever its
+///     length, the messages that are not appends, which are not handed
+///     back; without the hand-back every sent append was freed here.
+///
+/// Every case runs before the assertion; a failure prints every stage's
+/// allocations, frees and rates per entry. `#[ignore]`d for its length
+/// (about three minutes), as `w2_full`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "W2 on processes takes minutes; run it with --ignored"]
+fn custom_w2_replication_stays_near_zero_after_the_warm_up() {
+    let core = "custom";
+    let offset = karyos_raft_eval::process::w1_cases().len();
+    let names = [
+        "propose",
+        "step_leader",
+        "step_follower",
+        "tick",
+        "ready_leader",
+        "ready_follower",
+        "advance_leader",
+        "advance_follower",
+        "encoding",
+        "apply",
+        "other",
+        "unattributed",
+    ];
+    let mut totals: Vec<(String, u64, u64)> = names
+        .iter()
+        .map(|name| ((*name).to_owned(), 0, 0))
+        .collect();
+    let mut entries = 0;
+    for (index, case) in karyos_raft_eval::process::w2_cases()
+        .into_iter()
+        .enumerate()
+    {
+        let ran = run_case(core, offset + index, &case);
+        entries += entries_of(&ran.probes);
+        for (name, allocated, freed) in &mut totals {
+            let (more_allocated, more_freed) = stage_total(&ran.probes, name);
+            *allocated += more_allocated;
+            *freed += more_freed;
+        }
+    }
+    let (leader, follower) = (
+        of_all(&totals, "advance_leader"),
+        of_all(&totals, "advance_follower"),
+    );
+    let total = totals.iter().fold((0, 0), |(a, f), (_, more_a, more_f)| {
+        (a + more_a, f + more_f)
+    });
+    totals.push((
+        "advance".to_owned(),
+        leader.0 + follower.0,
+        leader.1 + follower.1,
+    ));
+    totals.push(("total".to_owned(), total.0, total.1));
+    let table: Vec<String> = totals
+        .iter()
+        .map(|(name, allocated, freed)| {
+            #[allow(clippy::cast_precision_loss)]
+            let rate = |count: u64| count as f64 / entries.max(1) as f64;
+            format!(
+                "{name}: {allocated} / {freed} ({:.4} / {:.4} per entry)",
+                rate(*allocated),
+                rate(*freed)
+            )
+        })
+        .collect();
+    assert!(entries > 0, "{core} W2: no entry measured: {table:#?}");
+    let over: Vec<&str> = W2_BOUNDS
+        .iter()
+        .filter(|(name, allocations, frees)| {
+            let (allocated, freed) = of_all(&totals, name);
+            100 * allocated > allocations * entries || 100 * freed > frees * entries
+        })
+        .map(|(name, _, _)| *name)
+        .collect();
+    assert!(
+        over.is_empty(),
+        "{core} W2, {entries} entries: over the bound per entry: {over:?}; {table:#?}"
+    );
+}
+
+/// `name`'s allocations and frees in `totals`.
+#[cfg(target_os = "linux")]
+fn of_all(totals: &[(String, u64, u64)], name: &str) -> (u64, u64) {
+    totals
+        .iter()
+        .find(|(other, _, _)| other == name)
+        .map(|(_, allocated, freed)| (*allocated, *freed))
+        .unwrap()
 }
