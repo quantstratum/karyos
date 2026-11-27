@@ -187,6 +187,9 @@ fn configure(config: &SocketsConfig) -> Result<(UdpSocket, SocketProbes), OpenEr
         dont_fragment: LIBRARY_API,
         // macOS has no `sendmmsg`: single sends, the declared fallback.
         tx_batch: CapabilityState::Fallback(Reason::Platform),
+        // macOS has no `recvmmsg`: `recv_batch` is the default loop of
+        // single `recv_from` calls, which is not batching.
+        rx_batch: CapabilityState::Unavailable(Reason::Platform),
         send_buffer: buffer(config.send_buffer),
         recv_buffer: buffer(config.recv_buffer),
         multicast,

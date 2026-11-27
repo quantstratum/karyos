@@ -215,7 +215,9 @@ fn decode_name(name: &[u8]) -> Option<SocketAddr> {
             Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), port)))
         }
         libc::AF_INET6 => {
-            let flowinfo = u32::from_ne_bytes(name.get(4..8)?.try_into().ok()?);
+            // `sin6_flowinfo` is in network byte order; `sin6_scope_id`
+            // is a host order interface index.
+            let flowinfo = u32::from_be_bytes(name.get(4..8)?.try_into().ok()?);
             let ip: [u8; 16] = name.get(8..24)?.try_into().ok()?;
             let scope = u32::from_ne_bytes(name.get(24..28)?.try_into().ok()?);
             Some(SocketAddr::V6(SocketAddrV6::new(
@@ -354,7 +356,28 @@ mod tests {
     use std::net::UdpSocket;
     use std::os::fd::AsFd;
 
-    use super::{attach_reuseport_first, set_multicast_all_off, set_priority};
+    use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+
+    use super::{attach_reuseport_first, decode_name, set_multicast_all_off, set_priority};
+
+    #[test]
+    fn an_ipv6_name_decodes_flowinfo_in_network_order_and_scope_in_host_order() {
+        let ip = Ipv6Addr::new(0xfe80, 0, 0, 0, 0x1234, 0x5678, 0x9abc, 0xdef0);
+        let (port, flowinfo, scope) = (40_000_u16, 0x000a_bcde_u32, 0x0102_0304_u32);
+        // A `sockaddr_in6` as the kernel writes it.
+        let mut name = [0_u8; 28];
+        let family = u16::try_from(libc::AF_INET6).unwrap();
+        name[..2].copy_from_slice(&family.to_ne_bytes());
+        name[2..4].copy_from_slice(&port.to_be_bytes());
+        name[4..8].copy_from_slice(&flowinfo.to_be_bytes());
+        name[8..24].copy_from_slice(&ip.octets());
+        name[24..28].copy_from_slice(&scope.to_ne_bytes());
+        assert_eq!(
+            decode_name(&name),
+            Some(SocketAddr::V6(SocketAddrV6::new(ip, port, flowinfo, scope)))
+        );
+        assert_eq!(decode_name(&name[..27]), None, "a short name");
+    }
 
     #[test]
     fn the_option_is_accepted_on_an_ipv4_socket() {

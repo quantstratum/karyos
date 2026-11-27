@@ -305,13 +305,13 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     let start = Instant::now();
     let done = AtomicBool::new(false);
     let mut phases = Phases::default();
-    std::thread::scope(|scope| {
+    {
         // The receiver duty on its own thread, as `ThreadingMode::Dedicated`
         // runs it: nothing but its duty cycle, timed, on the shared clock.
         let receiver = &mut rig.agents.receiver;
         let (done, intakes, busy, allocating) = (&done, &mut intakes, &mut busy, &mut allocating);
         let (receiver_allocs, iterations) = (&mut receiver_allocs, &mut iterations);
-        let receiving = scope.spawn(move || {
+        let receive = move || {
             while !done.load(Ordering::Acquire) {
                 let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap();
                 *iterations += 1;
@@ -335,65 +335,67 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
                     busy.push(interval);
                 }
             }
-        });
+        };
         // The valid side on this thread: appends, conductors, the sender
-        // duty, the control plane and the subscriber.
-        loop {
-            let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap();
-            if elapsed >= total_ns {
-                break;
-            }
-            rig.now = base + elapsed;
-            let now = rig.now;
-            VIRTUAL_NOW.with(|cell| cell.set(now));
-            // Valid load on its schedule; a back-pressured append retries.
-            let due = elapsed * rate / 1_000_000_000;
-            let timed = Instant::now();
-            while appended < due {
-                message[..8].copy_from_slice(&appended.to_le_bytes());
-                match rig.log.as_mut().unwrap().publications[0]
-                    .append(&message, AppendOptions::default())
-                    .unwrap()
-                {
-                    AppendOutcome::Appended { .. } => appended += 1,
-                    _ => {
-                        back_pressured += 1;
-                        break;
+        // duty, the control plane and the subscriber. A panic here sets
+        // `done` while unwinding, so the receiver stops and the scope's
+        // join returns.
+        with_receiver(done, receive, || {
+            loop {
+                let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap();
+                if elapsed >= total_ns {
+                    break;
+                }
+                rig.now = base + elapsed;
+                let now = rig.now;
+                VIRTUAL_NOW.with(|cell| cell.set(now));
+                // Valid load on its schedule; a back-pressured append retries.
+                let due = elapsed * rate / 1_000_000_000;
+                let timed = Instant::now();
+                while appended < due {
+                    message[..8].copy_from_slice(&appended.to_le_bytes());
+                    match rig.log.as_mut().unwrap().publications[0]
+                        .append(&message, AppendOptions::default())
+                        .unwrap()
+                    {
+                        AppendOutcome::Appended { .. } => appended += 1,
+                        _ => {
+                            back_pressured += 1;
+                            break;
+                        }
                     }
                 }
-            }
-            late_ns = late_ns.max((due - appended) * 1_000_000_000 / rate);
-            let timed = phases.lap(0, timed);
-            if let Some(log) = rig.log.as_mut() {
-                for conductor in &mut log.conductors {
-                    let _ = conductor.duty_cycle().unwrap();
+                late_ns = late_ns.max((due - appended) * 1_000_000_000 / rate);
+                let timed = phases.lap(0, timed);
+                if let Some(log) = rig.log.as_mut() {
+                    for conductor in &mut log.conductors {
+                        let _ = conductor.duty_cycle().unwrap();
+                    }
                 }
-            }
-            // The image's own conductor cleans and rotates its terms.
-            let _ = image_conductor.duty_cycle().unwrap();
-            let timed = phases.lap(1, timed);
-            let sender = &mut rig.agents.sender;
-            let (result, allocations) = count_allocations(|| sender.do_work(now));
-            result.unwrap();
-            sender_allocs += allocations;
-            let timed = phases.lap(2, timed);
-            rig.endpoints.poll(&rig.links, now, |_| {}, |_| {});
-            rig.images
-                .poll(&rig.links.sessions, &mut LaneSource::heap(), |_| {});
-            while let PollOutcome::Message { length, .. } = subscriber.poll(&mut out).unwrap() {
-                subscriber.acknowledge();
-                let index = u64::from_le_bytes(out[..8].try_into().unwrap());
-                if length != 32 || index != next_expected {
-                    out_of_order += 1;
+                // The image's own conductor cleans and rotates its terms.
+                let _ = image_conductor.duty_cycle().unwrap();
+                let timed = phases.lap(1, timed);
+                let sender = &mut rig.agents.sender;
+                let (result, allocations) = count_allocations(|| sender.do_work(now));
+                result.unwrap();
+                sender_allocs += allocations;
+                let timed = phases.lap(2, timed);
+                rig.endpoints.poll(&rig.links, now, |_| {}, |_| {});
+                rig.images
+                    .poll(&rig.links.sessions, &mut LaneSource::heap(), |_| {});
+                while let PollOutcome::Message { length, .. } = subscriber.poll(&mut out).unwrap() {
+                    subscriber.acknowledge();
+                    let index = u64::from_le_bytes(out[..8].try_into().unwrap());
+                    if length != 32 || index != next_expected {
+                        out_of_order += 1;
+                    }
+                    next_expected = index + 1;
+                    delivered += 1;
                 }
-                next_expected = index + 1;
-                delivered += 1;
+                let _ = phases.lap(3, timed);
             }
-            let _ = phases.lap(3, timed);
-        }
-        done.store(true, Ordering::Release);
-        receiving.join().unwrap();
-    });
+        });
+    }
     let (mut forged_sent, mut send_refused, mut forged_late_ns) = (0_u64, 0_u64, 0_u64);
     for flood in floods {
         let (sent, refused, late) = flood.join().unwrap();
@@ -573,6 +575,63 @@ fn r4_encrypted_1m_invalid_tags_at_10_percent() {
 #[ignore = "H10 R4 measurement: run explicitly in release"]
 fn r4_encrypted_1m_invalid_tags_at_100_percent() {
     let _ = r4(RATE_HIGH, 100);
+}
+
+/// Sets the receiver's shutdown flag when dropped, also while the parent
+/// side unwinds, so a scope joining a receiver that loops until the flag
+/// is set cannot hang.
+struct Shutdown<'a>(&'a AtomicBool);
+
+impl Drop for Shutdown<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Runs `receive` on a scoped thread and `parent` on this one. `done` is
+/// set when `parent` returns or panics, before the scope joins `receive`,
+/// which must return once `done` is set; a panic of `parent` resumes after
+/// the join.
+fn with_receiver<R>(
+    done: &AtomicBool,
+    receive: impl FnOnce() + Send,
+    parent: impl FnOnce() -> R,
+) -> R {
+    std::thread::scope(|scope| {
+        let receiving = scope.spawn(receive);
+        let shutdown = Shutdown(done);
+        let result = parent();
+        drop(shutdown);
+        receiving.join().unwrap();
+        result
+    })
+}
+
+#[test]
+fn a_parent_panic_stops_the_receiver_instead_of_hanging() {
+    let (finished, outcome) = std::sync::mpsc::channel();
+    // The run on its own thread: a hang fails the test after the timeout
+    // instead of blocking it.
+    std::thread::spawn(move || {
+        let done = AtomicBool::new(false);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_receiver(
+                &done,
+                || {
+                    while !done.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                },
+                || -> u8 { panic!("injected parent panic") },
+            )
+        }));
+        let _ = finished.send((unwound.is_err(), done.load(Ordering::Acquire)));
+    });
+    let (panicked, done) = outcome
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the scope hung on the receiver after a parent panic");
+    assert!(panicked, "the parent panic propagates after the join");
+    assert!(done, "the shutdown flag was set while unwinding");
 }
 
 #[test]

@@ -543,7 +543,7 @@ impl CapabilitySnapshot {
             },
             dont_fragment: probes.dont_fragment,
             tx_batch: probes.tx_batch,
-            rx_batch: LIBRARY_API,
+            rx_batch: probes.rx_batch,
             gso: LIBRARY_API,
             gro: LIBRARY_API,
             kernel_stamps: LIBRARY_API,

@@ -82,6 +82,10 @@ fn open_binds_and_records_the_gaps_of_std() {
         CapabilityState::Fallback(Reason::LibraryApi)
     );
     assert_eq!(probes.tx_batch, CapabilityState::Fallback(Reason::Platform));
+    assert_eq!(
+        probes.rx_batch,
+        CapabilityState::Unavailable(Reason::Platform)
+    );
     assert_eq!(probes.send_buffer, BufferSize::NOT_REQUESTED);
     assert_eq!(probes.recv_buffer, BufferSize::NOT_REQUESTED);
     assert_eq!(probes.multicast, None);
@@ -569,32 +573,77 @@ fn a_batched_receive_reports_an_ipv6_source() {
     assert_eq!(&slab[..3], b"six");
 }
 
+/// Receives exactly `want` datagrams in batches of at most `batch`
+/// results, each checked to be a whole datagram of `payload` from `from`
+/// in its slot of `slab`. Any other result (an error, or `EAGAIN` after
+/// `PATIENCE`) fails the test instead of counting as progress. Allocates
+/// nothing unless it fails.
+fn recv_exactly(
+    socket: &mut PortableSocket,
+    slab: &mut [u8],
+    stride: usize,
+    results: &mut [RecvResult],
+    (batch, want): (usize, usize),
+    (payload, from): (&[u8], SocketAddr),
+) -> usize {
+    let expected = RecvResult::Datagram {
+        len: payload.len(),
+        truncated: None,
+        source: Some(from),
+    };
+    let mut received = 0;
+    while received < want {
+        let ask = batch.min(want - received);
+        let filled = recv_batch_some(socket, slab, stride, &mut results[..ask]);
+        assert!(filled > 0, "no result after {received} datagrams");
+        for (index, result) in results[..filled].iter().enumerate() {
+            assert_eq!(*result, expected, "result {index} after {received}");
+            let slot = index * stride;
+            assert_eq!(&slab[slot..slot + payload.len()], payload);
+        }
+        received += filled;
+    }
+    received
+}
+
 /// Steady state: once a warm-up batch has run, repeated batched receives,
 /// full and then on an empty queue, allocate nothing.
 #[test]
 fn a_batched_receive_does_not_allocate_in_steady_state() {
-    let (mut sender, _) = open_ipv4();
+    let (mut sender, from) = open_ipv4();
     let (mut receiver, to) = open_ipv4();
     let route = RouteAddr::new(to);
     for _ in 0..32 {
-        assert!(matches!(
+        assert_eq!(
             sender.send(&route, &[b"steady"]),
-            SendResult::Sent { sent: 1, .. }
-        ));
+            SendResult::Sent {
+                sent: 1,
+                error: None
+            }
+        );
     }
     let stride = 257;
     let mut slab = vec![0_u8; stride * 8];
     let mut results = [RecvResult::Error(Errno::INVAL); 8];
-    let mut warm = 0;
-    while warm < 8 {
-        warm += recv_batch_some(&mut receiver, &mut slab, stride, &mut results[warm..]);
-    }
+    let datagram: (&[u8], SocketAddr) = (b"steady", from);
+    let warm = recv_exactly(
+        &mut receiver,
+        &mut slab,
+        stride,
+        &mut results,
+        (8, 8),
+        datagram,
+    );
+    assert_eq!(warm, 8);
     let (filled, allocations) = karyos_sys::alloc_count::count(|| {
-        let mut filled = 0;
-        while filled < 24 {
-            let batch = 8.min(24 - filled);
-            filled += recv_batch_some(&mut receiver, &mut slab, stride, &mut results[..batch]);
-        }
+        let filled = recv_exactly(
+            &mut receiver,
+            &mut slab,
+            stride,
+            &mut results,
+            (8, 24),
+            datagram,
+        );
         for _ in 0..4 {
             assert_eq!(receiver.recv_batch(&mut slab, stride, &mut results), 1);
             assert_eq!(results[0], RecvResult::Error(Errno::AGAIN));

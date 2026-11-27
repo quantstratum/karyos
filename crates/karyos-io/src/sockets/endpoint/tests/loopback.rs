@@ -427,9 +427,14 @@ fn snapshot_of_a_linux_socket() {
     assert_ne!(snapshot.local.port(), 0);
     assert_eq!(snapshot.dont_fragment, CapabilityState::Active);
     assert_eq!(snapshot.tx_batch, CapabilityState::Active);
+    // Every batched receive is one `recvmmsg`, so requiring it opens.
+    assert_eq!(snapshot.rx_batch, CapabilityState::Active);
+    let mut batched = wanted;
+    batched.require = CapabilitySet::EMPTY.with(Capability::RxBatch);
+    let rx_batched = SocketsEndpoint::open(&batched, InstanceId::FIRST, OsSocket::new()).unwrap();
+    assert_eq!(rx_batched.capabilities().rx_batch, CapabilityState::Active);
     let library = CapabilityState::Unavailable(Reason::LibraryApi);
     for state in [
-        snapshot.rx_batch,
         snapshot.gso,
         snapshot.gro,
         snapshot.kernel_stamps,
@@ -490,9 +495,13 @@ fn snapshot_of_a_macos_socket() {
     let snapshot = *endpoint.capabilities();
     assert_eq!(snapshot.platform, Platform::MacOs);
     assert_ne!(snapshot.local.port(), 0);
+    // The receive loop of single `recv_from` calls is not batching.
+    assert_eq!(
+        snapshot.rx_batch,
+        CapabilityState::Unavailable(Reason::Platform)
+    );
     let library = CapabilityState::Unavailable(Reason::LibraryApi);
     for state in [
-        snapshot.rx_batch,
         snapshot.gso,
         snapshot.gro,
         snapshot.kernel_stamps,
@@ -525,6 +534,7 @@ fn snapshot_of_a_macos_socket() {
     let missing = [
         (Capability::DontFragment, fallback),
         (Capability::TxBatch, snapshot.tx_batch),
+        (Capability::RxBatch, snapshot.rx_batch),
         (Capability::SendBuffer, fallback),
         (Capability::RecvBuffer, fallback),
     ];

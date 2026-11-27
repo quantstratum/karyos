@@ -346,6 +346,11 @@ pub struct SocketProbes {
     /// The `sendmmsg` probe. `Active` means every
     /// [`SocketOps::send`] of the epoch is one `sendmmsg` call.
     pub tx_batch: CapabilityState,
+    /// Batched receive. `Active` means every [`SocketOps::recv_batch`] of
+    /// the epoch is one `recvmmsg` call; a backend whose `recv_batch` is
+    /// single receives in a loop reports it `Unavailable`, since a loop of
+    /// receive calls is not a batch.
+    pub rx_batch: CapabilityState,
     /// The send buffer request and its read back.
     pub send_buffer: BufferSize,
     /// The receive buffer request and its read back.

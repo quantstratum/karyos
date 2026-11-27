@@ -196,6 +196,8 @@ fn snapshot_records_the_baseline() {
     assert_eq!(snapshot.queue_assignment, QueueAssignment::KernelSelected);
     assert_eq!(snapshot.max_datagram, 256);
     let library = CapabilityState::Unavailable(Reason::LibraryApi);
+    // The probes' RX batching: the scripted loop is not a batch.
+    assert_eq!(snapshot.rx_batch, default_probes(&config()).rx_batch);
     for capability in [
         Capability::RxBatch,
         Capability::Gso,
@@ -263,6 +265,35 @@ fn required_capability_loss() {
     let snapshot = *endpoint.reopen(&cfg).unwrap();
     assert_eq!(snapshot.epoch.get().get(), 2);
     assert_eq!(snapshot.tx_batch, CapabilityState::Active);
+    retire_all(&mut endpoint);
+}
+
+/// RX batching is the probes' state: required, it opens when the backend
+/// batches and is refused, closing the socket, when it does not.
+#[test]
+fn rx_batching_follows_the_probes() {
+    let mut cfg = config();
+    cfg.require = CapabilitySet::EMPTY.with(Capability::RxBatch);
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    assert_eq!(
+        SocketsEndpoint::open(&cfg, InstanceId::FIRST, socket).unwrap_err(),
+        OpenError::RequiredCapability {
+            capability: Capability::RxBatch,
+            state: CapabilityState::Unavailable(Reason::LibraryApi),
+        }
+    );
+    assert_eq!(observer.live_descriptors(), 0);
+    let socket = ScriptedSocket::new();
+    let mut probes = default_probes(&cfg);
+    probes.rx_batch = CapabilityState::Active;
+    socket.observer().push_open(Ok(probes));
+    let mut endpoint = SocketsEndpoint::open(&cfg, InstanceId::FIRST, socket).unwrap();
+    assert_eq!(endpoint.capabilities().rx_batch, CapabilityState::Active);
+    assert_eq!(
+        endpoint.capabilities().state(Capability::RxBatch),
+        CapabilityState::Active
+    );
     retire_all(&mut endpoint);
 }
 

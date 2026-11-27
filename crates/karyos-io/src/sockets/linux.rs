@@ -25,8 +25,9 @@
 //! - `split` duplicates with `fcntl_dupfd_cloexec` (3.10); `add_route`
 //!   measures `IP_MTU` or `IPV6_MTU` on a temporary connected socket (4.5).
 //! - Probes (8.2): `sendmmsg` with zero messages, the buffer and don't
-//!   fragment read backs. The capabilities `rustix` 1.1.5 has no API for
-//!   (`recvmmsg`, GSO, GRO, `SO_TIMESTAMPING`, `SO_BUSY_POLL`) are reported
+//!   fragment read backs. RX batching is `Active`: every batched receive
+//!   is one `recvmmsg`. The capabilities `rustix` 1.1.5 has no API for
+//!   (GSO, GRO, `SO_TIMESTAMPING`, `SO_BUSY_POLL`) are reported
 //!   `Unavailable(LibraryApi)` by the snapshot (decision O-3);
 //!   `IP_PKTINFO` is not set. `IP_MULTICAST_ALL` (or `IPV6_MULTICAST_ALL`)
 //!   is set off on every socket that joins a group, through the one safe
@@ -419,6 +420,8 @@ fn configure(config: &SocketsConfig) -> Result<(OwnedFd, SocketProbes), OpenErro
         interface,
         dont_fragment,
         tx_batch,
+        // `recv_batch` is always one `recvmmsg` (`crate::linux_sys`).
+        rx_batch: CapabilityState::Active,
         send_buffer,
         recv_buffer,
         multicast,
