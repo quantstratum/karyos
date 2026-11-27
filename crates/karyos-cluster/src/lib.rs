@@ -25,6 +25,7 @@ pub mod backup;
 pub mod client;
 pub mod cluster_identity;
 pub mod consensus;
+pub mod custom;
 pub mod dedup;
 pub mod driver;
 mod file;
