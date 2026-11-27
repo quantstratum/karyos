@@ -77,6 +77,20 @@ const MAX_LAG_NS: u64 = 10_000_000;
 /// average).
 const MIN_SAMPLES_PER_SECOND: u64 = 1_000;
 
+/// Nanoseconds the valid side's thread spent per phase: appends,
+/// conductors, the sender duty, the control plane and subscriber.
+#[derive(Debug, Default)]
+struct Phases([u64; 4]);
+
+impl Phases {
+    /// Adds the time since `from` to phase `at`; returns now.
+    fn lap(&mut self, at: usize, from: Instant) -> Instant {
+        let now = Instant::now();
+        self.0[at] += u64::try_from(now.duration_since(from).as_nanos()).unwrap();
+        now
+    }
+}
+
 /// The `q` quantile of sorted `samples`.
 fn quantile(samples: &[u64], q: f64) -> u64 {
     if samples.is_empty() {
@@ -228,7 +242,6 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     let mut busy: Vec<u64> = Vec::with_capacity(MAX_SAMPLES);
     let mut out = vec![0_u8; 65_536];
     let mut allocating: Vec<(u64, u64, String)> = Vec::with_capacity(32);
-    let counters_of = |rig: &Rig| format!("{:?}", rig.agents.receiver.counters());
     let mut message = [0_u8; 32];
     let (mut appended, mut back_pressured) = (0_u64, 0_u64);
     let (mut delivered, mut out_of_order, mut next_expected) = (0_u64, 0_u64, 0_u64);
@@ -290,72 +303,97 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
         .collect();
     go.store(true, Ordering::Release);
     let start = Instant::now();
-    loop {
-        let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap();
-        if elapsed >= total_ns {
-            break;
-        }
-        iterations += 1;
-        rig.now = base + elapsed;
-        let now = rig.now;
-        VIRTUAL_NOW.with(|cell| cell.set(now));
-        // Valid load on its schedule; a back-pressured append retries.
-        let due = elapsed * rate / 1_000_000_000;
-        while appended < due {
-            message[..8].copy_from_slice(&appended.to_le_bytes());
-            match rig.log.as_mut().unwrap().publications[0]
-                .append(&message, AppendOptions::default())
-                .unwrap()
-            {
-                AppendOutcome::Appended { .. } => appended += 1,
-                _ => {
-                    back_pressured += 1;
-                    break;
+    let done = AtomicBool::new(false);
+    let mut phases = Phases::default();
+    std::thread::scope(|scope| {
+        // The receiver duty on its own thread, as `ThreadingMode::Dedicated`
+        // runs it: nothing but its duty cycle, timed, on the shared clock.
+        let receiver = &mut rig.agents.receiver;
+        let (done, intakes, busy, allocating) = (&done, &mut intakes, &mut busy, &mut allocating);
+        let (receiver_allocs, iterations) = (&mut receiver_allocs, &mut iterations);
+        let receiving = scope.spawn(move || {
+            while !done.load(Ordering::Acquire) {
+                let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap();
+                *iterations += 1;
+                let now = base + elapsed;
+                VIRTUAL_NOW.with(|cell| cell.set(now));
+                // The receiver's complete intake: its duty cycle reads the
+                // socket, where the flood and the valid load arrive,
+                // verifies and refuses the forged datagrams and delivers
+                // the valid ones.
+                let timed = Instant::now();
+                let (work, allocations) = count_allocations(|| receiver.do_work(now));
+                let interval = u64::try_from(timed.elapsed().as_nanos()).unwrap();
+                *receiver_allocs += allocations;
+                if allocations > 0 && allocating.len() < allocating.capacity() {
+                    allocating.push((elapsed, allocations, format!("{:?}", receiver.counters())));
+                }
+                if intakes.len() < MAX_SAMPLES {
+                    intakes.push(interval);
+                }
+                if work.unwrap() > 0 && busy.len() < MAX_SAMPLES {
+                    busy.push(interval);
                 }
             }
-        }
-        late_ns = late_ns.max((due - appended) * 1_000_000_000 / rate);
-        if let Some(log) = rig.log.as_mut() {
-            for conductor in &mut log.conductors {
-                let _ = conductor.duty_cycle().unwrap();
+        });
+        // The valid side on this thread: appends, conductors, the sender
+        // duty, the control plane and the subscriber.
+        loop {
+            let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap();
+            if elapsed >= total_ns {
+                break;
             }
-        }
-        // The image's own conductor cleans and rotates its terms.
-        let _ = image_conductor.duty_cycle().unwrap();
-        let sender = &mut rig.agents.sender;
-        let (result, allocations) = count_allocations(|| sender.do_work(now));
-        result.unwrap();
-        sender_allocs += allocations;
-        // The receiver's complete intake: its duty cycle reads the socket,
-        // where the flood and the valid load arrive, verifies and refuses
-        // the forged datagrams and delivers the valid ones.
-        let receiver = &mut rig.agents.receiver;
-        let timed = Instant::now();
-        let (work, allocations) = count_allocations(|| receiver.do_work(now));
-        let interval = u64::try_from(timed.elapsed().as_nanos()).unwrap();
-        receiver_allocs += allocations;
-        if allocations > 0 && allocating.len() < allocating.capacity() {
-            allocating.push((elapsed, allocations, counters_of(&rig)));
-        }
-        if intakes.len() < MAX_SAMPLES {
-            intakes.push(interval);
-        }
-        if work.unwrap() > 0 && busy.len() < MAX_SAMPLES {
-            busy.push(interval);
-        }
-        rig.endpoints.poll(&rig.links, now, |_| {}, |_| {});
-        rig.images
-            .poll(&rig.links.sessions, &mut LaneSource::heap(), |_| {});
-        while let PollOutcome::Message { length, .. } = subscriber.poll(&mut out).unwrap() {
-            subscriber.acknowledge();
-            let index = u64::from_le_bytes(out[..8].try_into().unwrap());
-            if length != 32 || index != next_expected {
-                out_of_order += 1;
+            rig.now = base + elapsed;
+            let now = rig.now;
+            VIRTUAL_NOW.with(|cell| cell.set(now));
+            // Valid load on its schedule; a back-pressured append retries.
+            let due = elapsed * rate / 1_000_000_000;
+            let timed = Instant::now();
+            while appended < due {
+                message[..8].copy_from_slice(&appended.to_le_bytes());
+                match rig.log.as_mut().unwrap().publications[0]
+                    .append(&message, AppendOptions::default())
+                    .unwrap()
+                {
+                    AppendOutcome::Appended { .. } => appended += 1,
+                    _ => {
+                        back_pressured += 1;
+                        break;
+                    }
+                }
             }
-            next_expected = index + 1;
-            delivered += 1;
+            late_ns = late_ns.max((due - appended) * 1_000_000_000 / rate);
+            let timed = phases.lap(0, timed);
+            if let Some(log) = rig.log.as_mut() {
+                for conductor in &mut log.conductors {
+                    let _ = conductor.duty_cycle().unwrap();
+                }
+            }
+            // The image's own conductor cleans and rotates its terms.
+            let _ = image_conductor.duty_cycle().unwrap();
+            let timed = phases.lap(1, timed);
+            let sender = &mut rig.agents.sender;
+            let (result, allocations) = count_allocations(|| sender.do_work(now));
+            result.unwrap();
+            sender_allocs += allocations;
+            let timed = phases.lap(2, timed);
+            rig.endpoints.poll(&rig.links, now, |_| {}, |_| {});
+            rig.images
+                .poll(&rig.links.sessions, &mut LaneSource::heap(), |_| {});
+            while let PollOutcome::Message { length, .. } = subscriber.poll(&mut out).unwrap() {
+                subscriber.acknowledge();
+                let index = u64::from_le_bytes(out[..8].try_into().unwrap());
+                if length != 32 || index != next_expected {
+                    out_of_order += 1;
+                }
+                next_expected = index + 1;
+                delivered += 1;
+            }
+            let _ = phases.lap(3, timed);
         }
-    }
+        done.store(true, Ordering::Release);
+        receiving.join().unwrap();
+    });
     let (mut forged_sent, mut send_refused, mut forged_late_ns) = (0_u64, 0_u64, 0_u64);
     for flood in floods {
         let (sent, refused, late) = flood.join().unwrap();
@@ -439,8 +477,16 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     );
     let _ = writeln!(
         report,
-        "receiver duties: iterations={iterations} (refused below {} per second)",
+        "receiver duties (own thread): iterations={iterations} (refused below {} per second)",
         MIN_SAMPLES_PER_SECOND
+    );
+    let _ = writeln!(
+        report,
+        "valid side thread ms: append={} conductors={} sender={} control+subscriber={}",
+        phases.0[0] / 1_000_000,
+        phases.0[1] / 1_000_000,
+        phases.0[2] / 1_000_000,
+        phases.0[3] / 1_000_000,
     );
     for (at, allocations, counters) in &allocating {
         let _ = writeln!(

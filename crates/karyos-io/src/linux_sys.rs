@@ -24,11 +24,18 @@
 //!   `SO_REUSEPORT` socket with `SO_ATTACH_REUSEPORT_CBPF`, so every
 //!   inbound datagram of its group goes to the group's first socket, the
 //!   endpoint socket, never to the `etf` socket that joins it later.
+//! - [`recv_batch`]: one `recvmmsg(MSG_DONTWAIT | MSG_TRUNC)` of the
+//!   sockets backend's receive path (sockets-backend.md 4.4), up to
+//!   [`RECV_BATCH`] datagrams into fixed slots of one caller buffer, over
+//!   stack arrays of `iovec`, `mmsghdr` and source address bytes. The
+//!   addresses are decoded in safe code from their bytes; the `unsafe`
+//!   is the system call and the zero initialisation of the `mmsghdr`s.
 //! - [`set_priority`]: `setsockopt(SOL_SOCKET, SO_PRIORITY)` of the `etf`
 //!   socket, through the same integer option call as
 //!   [`set_multicast_all_off`].
 
 use std::io;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
 use crate::sockets::errqueue::{ErrEntry, parse_control};
@@ -84,6 +91,142 @@ pub(crate) fn drain_error_queue(fd: impl AsFd, out: &mut [ErrEntry]) -> Result<u
         drained = drained.saturating_add(1);
     }
     Ok(drained)
+}
+
+/// Datagrams of one [`recv_batch`]: the stack arrays of one call.
+pub(crate) const RECV_BATCH: usize = 64;
+
+/// Bytes of one source address slot: a `sockaddr_in6`, which also holds a
+/// `sockaddr_in`.
+const NAME: usize = std::mem::size_of::<libc::sockaddr_in6>();
+/// [`NAME`] as the kernel's `socklen_t`: 28 always fits.
+const NAME_LEN: libc::socklen_t = 28;
+const _: () = assert!(NAME == 28);
+
+/// One message of [`recv_batch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecvMessage {
+    /// `msg_len`: the true datagram length, as `MSG_TRUNC` asks.
+    pub(crate) bytes: usize,
+    /// Whether the kernel set `MSG_TRUNC` in the message's flags.
+    pub(crate) truncated: bool,
+    /// The sender, when the kernel reported an IPv4 or IPv6 address.
+    pub(crate) source: Option<SocketAddr>,
+}
+
+impl RecvMessage {
+    /// A placeholder slot before a call writes it.
+    pub(crate) const EMPTY: Self = Self {
+        bytes: 0,
+        truncated: false,
+        source: None,
+    };
+}
+
+/// Receives up to `out.len()` (at most [`RECV_BATCH`]) datagrams with one
+/// nonblocking `recvmmsg`, the `i`th into the `i`th `stride` bytes of
+/// `slab`, and returns how many it wrote. Never allocates.
+///
+/// # Errors
+///
+/// The errno of `recvmmsg` when it receives nothing (`EAGAIN` when the
+/// queue is empty).
+pub(crate) fn recv_batch(
+    fd: BorrowedFd<'_>,
+    slab: &mut [u8],
+    stride: usize,
+    out: &mut [RecvMessage],
+) -> Result<usize, i32> {
+    if stride == 0 {
+        return Ok(0);
+    }
+    let mut iovs: [libc::iovec; RECV_BATCH] = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    }; RECV_BATCH];
+    let mut names = [[0_u8; NAME]; RECV_BATCH];
+    // SAFETY: `mmsghdr` is a plain C struct for which all zero bytes is a
+    // valid value (null pointers, zero lengths).
+    let mut headers: [libc::mmsghdr; RECV_BATCH] = unsafe { std::mem::zeroed() };
+    let mut count: usize = 0;
+    for (((buffer, iov), name), header) in slab
+        .chunks_exact_mut(stride)
+        .zip(iovs.iter_mut())
+        .zip(names.iter_mut())
+        .zip(headers.iter_mut())
+        .take(out.len())
+    {
+        iov.iov_base = buffer.as_mut_ptr().cast();
+        iov.iov_len = stride;
+        header.msg_hdr.msg_iov = std::ptr::from_mut(iov);
+        header.msg_hdr.msg_iovlen = 1;
+        header.msg_hdr.msg_name = name.as_mut_ptr().cast();
+        header.msg_hdr.msg_namelen = NAME_LEN;
+        count = count.saturating_add(1);
+    }
+    if count == 0 {
+        return Ok(0);
+    }
+    let Ok(vlen) = libc::c_uint::try_from(count) else {
+        return Ok(0);
+    };
+    // SAFETY: the first `count` entries of `headers` name one `iov` and
+    // one `name` each, all alive and writable for their stated lengths
+    // until the call returns; each `iov` names a disjoint `stride` bytes
+    // of `slab`, which the exclusive borrow keeps alive; `fd` is an open
+    // borrowed descriptor and the timeout is null.
+    let received = unsafe {
+        libc::recvmmsg(
+            fd.as_raw_fd(),
+            headers.as_mut_ptr(),
+            vlen,
+            libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+            std::ptr::null_mut(),
+        )
+    };
+    let Ok(received) = usize::try_from(received) else {
+        return Err(io::Error::last_os_error().raw_os_error().unwrap_or(0));
+    };
+    let received = received.min(count);
+    for ((message, header), name) in out
+        .iter_mut()
+        .zip(headers.iter())
+        .zip(names.iter())
+        .take(received)
+    {
+        let namelen = usize::try_from(header.msg_hdr.msg_namelen).unwrap_or(0);
+        *message = RecvMessage {
+            bytes: usize::try_from(header.msg_len).unwrap_or(usize::MAX),
+            truncated: header.msg_hdr.msg_flags & libc::MSG_TRUNC != 0,
+            source: decode_name(name.get(..namelen.min(NAME)).unwrap_or_default()),
+        };
+    }
+    Ok(received)
+}
+
+/// Decodes the bytes of a `sockaddr_in` or `sockaddr_in6` the kernel
+/// wrote; `None` for any other family or a short length.
+fn decode_name(name: &[u8]) -> Option<SocketAddr> {
+    let family = u16::from_ne_bytes(name.get(..2)?.try_into().ok()?);
+    let port = u16::from_be_bytes(name.get(2..4)?.try_into().ok()?);
+    match libc::c_int::from(family) {
+        libc::AF_INET => {
+            let ip: [u8; 4] = name.get(4..8)?.try_into().ok()?;
+            Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), port)))
+        }
+        libc::AF_INET6 => {
+            let flowinfo = u32::from_ne_bytes(name.get(4..8)?.try_into().ok()?);
+            let ip: [u8; 16] = name.get(8..24)?.try_into().ok()?;
+            let scope = u32::from_ne_bytes(name.get(24..28)?.try_into().ok()?);
+            Some(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(ip),
+                port,
+                flowinfo,
+                scope,
+            )))
+        }
+        _ => None,
+    }
 }
 
 /// Sets `IP_MULTICAST_ALL` (IPv4) or `IPV6_MULTICAST_ALL` (IPv6) to 0 on

@@ -88,10 +88,10 @@ fn open_rejects_invalid_configuration_and_protection() {
     // Review P3-7: the pools against the memory cap (4.5). 8 slots of 256
     // bytes and a 257 byte RX buffer need 2,305 bytes.
     check(
-        |cfg| cfg.memory_cap = std::num::NonZeroU64::new(2304).unwrap(),
+        |cfg| cfg.memory_cap = std::num::NonZeroU64::new(18495).unwrap(),
         OpenError::InvalidConfig {
             field: "memory_cap",
-            value: 2305,
+            value: 18496,
         },
     );
     // The largest pool (32 MiB) exceeds the provisional default cap.
@@ -102,7 +102,7 @@ fn open_rejects_invalid_configuration_and_protection() {
         },
         OpenError::InvalidConfig {
             field: "memory_cap",
-            value: 4096 * 8192 + 8193,
+            value: 4096 * 8192 + 64 * 8193,
         },
     );
     // S3 review P3: a buffer request the C `int` of `SO_SNDBUF` or
@@ -152,7 +152,8 @@ fn buffer_requests_up_to_a_c_int_are_valid() {
 #[test]
 fn memory_cap_admits_pools_at_the_cap() {
     let mut cfg = config();
-    cfg.memory_cap = std::num::NonZeroU64::new(2305).unwrap();
+    // 8 TX slots of 256 bytes and 64 RX batch slots of 257.
+    cfg.memory_cap = std::num::NonZeroU64::new(18496).unwrap();
     assert_eq!(cfg.validate(), Ok(()), "the cap is inclusive");
     cfg.tx_slots = nz(MAX_TX_SLOTS);
     cfg.max_datagram = nz(MAX_DATAGRAM);

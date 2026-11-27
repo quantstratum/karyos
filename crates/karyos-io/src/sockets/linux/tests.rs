@@ -740,3 +740,172 @@ fn an_ipv6_join_survives_a_kernel_without_ipv6_multicast_all() {
     ));
     assert_eq!(multicast_all_off(Ok(()), true), Ok(()));
 }
+
+/// Receives a batch into `results`, retrying `EAGAIN` until [`PATIENCE`]
+/// runs out, like [`recv_one`].
+fn recv_batch_some(
+    socket: &mut LinuxSocket,
+    slab: &mut [u8],
+    stride: usize,
+    results: &mut [RecvResult],
+) -> usize {
+    let start = Instant::now();
+    loop {
+        let filled = socket.recv_batch(slab, stride, results);
+        match results.first() {
+            Some(RecvResult::Error(Errno::AGAIN)) if filled == 1 && start.elapsed() < PATIENCE => {
+                std::thread::yield_now();
+            }
+            _ => return filled,
+        }
+    }
+}
+
+/// Section 4.4 batched: one `recvmmsg` returns several datagrams in order,
+/// each with its own source, length and truncation exactly as `recv`
+/// reports them; a batch smaller than the queue leaves the rest for the
+/// next call, and an empty queue is `EAGAIN`.
+#[test]
+fn a_batched_receive_returns_each_datagram_with_its_source() {
+    let (mut first, from_first) = open_ipv4();
+    let (mut second, from_second) = open_ipv4();
+    let (mut receiver, to) = open_ipv4();
+    let route = RouteAddr::new(to);
+    let long = vec![7_u8; 9000];
+    let exact = vec![8_u8; 257];
+    let sends: [(bool, &[u8]); 5] = [
+        (true, b"one"),
+        (false, b"two"),
+        (true, &long),
+        (false, &exact),
+        (true, b"five"),
+    ];
+    for (from_first_socket, datagram) in sends {
+        let socket = if from_first_socket {
+            &mut first
+        } else {
+            &mut second
+        };
+        assert_eq!(
+            socket.send(&route, &[datagram]),
+            SendResult::Sent {
+                sent: 1,
+                error: None
+            }
+        );
+    }
+    let stride = 257;
+    let mut slab = vec![0_u8; stride * 8];
+    let mut results = [RecvResult::Error(Errno::INVAL); 8];
+    // A partial batch: two slots of the five queued.
+    assert_eq!(
+        recv_batch_some(&mut receiver, &mut slab, stride, &mut results[..2]),
+        2
+    );
+    assert_eq!(
+        results[..2],
+        [
+            RecvResult::Datagram {
+                len: 3,
+                truncated: None,
+                source: Some(from_first),
+            },
+            RecvResult::Datagram {
+                len: 3,
+                truncated: None,
+                source: Some(from_second),
+            },
+        ]
+    );
+    assert_eq!(
+        (&slab[..3], &slab[stride..stride + 3]),
+        (&b"one"[..], &b"two"[..])
+    );
+    // The rest: truncation by MSG_TRUNC, a datagram that fills the slot.
+    let filled = recv_batch_some(&mut receiver, &mut slab, stride, &mut results);
+    assert_eq!(filled, 3);
+    assert_eq!(
+        results[..3],
+        [
+            RecvResult::Datagram {
+                len: 257,
+                truncated: Some(9000),
+                source: Some(from_first),
+            },
+            RecvResult::Datagram {
+                len: 257,
+                truncated: Some(257),
+                source: Some(from_second),
+            },
+            RecvResult::Datagram {
+                len: 4,
+                truncated: None,
+                source: Some(from_first),
+            },
+        ]
+    );
+    assert_eq!(&slab[2 * stride..2 * stride + 4], b"five");
+    assert_eq!(receiver.recv_batch(&mut slab, stride, &mut results), 1);
+    assert_eq!(results[0], RecvResult::Error(Errno::AGAIN));
+    // Nothing to fill makes no call; a closed socket is EBADF.
+    assert_eq!(receiver.recv_batch(&mut slab, stride, &mut []), 0);
+    receiver.close();
+    assert_eq!(receiver.recv_batch(&mut slab, stride, &mut results), 1);
+    assert_eq!(results[0], RecvResult::Error(Errno::BADF));
+}
+
+/// The batched receive of an IPv6 socket reports the IPv6 source, as
+/// `recv` does.
+#[test]
+fn a_batched_receive_reports_an_ipv6_source() {
+    let mut receiver = LinuxSocket::new();
+    let Ok(probes) = receiver.open(&config(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)))) else {
+        skip("no IPv6 loopback");
+        return;
+    };
+    let mut sender = LinuxSocket::new();
+    let from = sender
+        .open(&config(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))))
+        .unwrap()
+        .local;
+    let route = RouteAddr::new(probes.local);
+    assert!(matches!(
+        sender.send(&route, &[b"six"]),
+        SendResult::Sent { sent: 1, .. }
+    ));
+    let mut slab = [0_u8; 64];
+    let mut results = [RecvResult::Error(Errno::INVAL); 1];
+    assert_eq!(
+        recv_batch_some(&mut receiver, &mut slab, 64, &mut results),
+        1
+    );
+    assert_eq!(
+        results[0],
+        RecvResult::Datagram {
+            len: 3,
+            truncated: None,
+            source: Some(from),
+        }
+    );
+}
+
+/// The batched receive does not allocate.
+#[test]
+fn a_batched_receive_does_not_allocate() {
+    let (mut sender, _) = open_ipv4();
+    let (mut receiver, to) = open_ipv4();
+    let route = RouteAddr::new(to);
+    let mut slab = vec![0_u8; 257 * 64];
+    let mut results = [RecvResult::Error(Errno::INVAL); 64];
+    for _ in 0..4 {
+        let _ = sender.send(&route, &[b"x"]);
+    }
+    let (filled, allocations) = karyos_sys::alloc_count::count_allocations(|| {
+        let mut filled = 0;
+        while filled < 4 {
+            filled += recv_batch_some(&mut receiver, &mut slab, 257, &mut results[filled..]);
+        }
+        filled
+    });
+    assert_eq!((filled, allocations), (4, 0));
+}

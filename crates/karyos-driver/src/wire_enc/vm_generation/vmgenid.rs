@@ -202,26 +202,77 @@ fn bound_device(driver: &Path) -> Option<bool> {
 mod tests {
     #![allow(clippy::unwrap_used, reason = "tests, as ADR-0007 allows")]
 
+    use std::ops::Deref;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
 
-    /// A fresh fake sysfs root under the target directory, with its `bus`
-    /// directory and no bus in it.
-    fn root(name: &str) -> PathBuf {
+    /// A fake sysfs directory under the system temp directory, removed
+    /// when dropped, also when the test fails: permissions a test took
+    /// away are restored first, so nothing is left behind (not even under
+    /// a root-owned run in a container).
+    struct FakeRoot(PathBuf);
+
+    impl Deref for FakeRoot {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for FakeRoot {
+        fn drop(&mut self) {
+            restore(&self.0);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Makes `path` and everything under it readable and writable again.
+    fn restore(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let Ok(meta) = std::fs::symlink_metadata(path) else {
+                return;
+            };
+            let mode = if meta.is_dir() { 0o755 } else { 0o644 };
+            if !meta.file_type().is_symlink() {
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+            }
+            if meta.is_dir()
+                && let Ok(entries) = std::fs::read_dir(path)
+            {
+                for entry in entries.flatten() {
+                    restore(&entry.path());
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+    }
+
+    /// A fresh fake sysfs root, with its `bus` directory and no bus in it.
+    fn root(name: &str) -> FakeRoot {
         let root = bare(name);
         std::fs::create_dir_all(root.join("bus")).unwrap();
         root
     }
 
-    /// A fresh empty directory under the target directory.
-    fn bare(name: &str) -> PathBuf {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/vmgenid-fake-sysfs")
-            .join(format!("{name}-{}", std::process::id()));
+    /// A fresh empty directory under the system temp directory, unique to
+    /// this process and call.
+    fn bare(name: &str) -> FakeRoot {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "karyos-vmgenid-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        root
+        FakeRoot(root)
     }
 
     /// A platform device `name` (its `of_node` and `modalias`, as Linux

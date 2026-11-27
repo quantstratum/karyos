@@ -3,16 +3,23 @@
 //! The RX state of one endpoint and `poll_rx` (`quantstratum-docs:
 //! karyos/design/sockets-backend.md` 3.7, 4.4 and 4.7).
 //!
-//! One buffer of `max_datagram + 1` bytes, owned by the half. The kernel
-//! writes it only during the receive call, while the half holds the only
-//! reference; the handler then gets a shared borrow that ends when it
-//! returns. No state of the half changes while the borrow is live, so a
-//! panicking handler leaves nothing to restore.
+//! One buffer of [`RX_BATCH`] slots of `max_datagram + 1` bytes, owned by
+//! the half. Each receive is one batched call ([`SocketOps::recv_batch`]:
+//! one `recvmmsg` on Linux) for up to as many datagrams as the rest of the
+//! budget admits; its results are then taken one at a time, in order, with
+//! exactly the checks and counts of one single receive each, so `Spent`
+//! counts one op per result as before. Results the poll did not take (the
+//! handler stopped) stay pending, in order, for the next poll; `reopen`
+//! discards them with the old socket. The kernel writes the buffer only
+//! during the receive call, while the half holds the only reference; the
+//! handler then gets a shared borrow that ends when it returns. No state of
+//! the half changes while the borrow is live, so a panicking handler leaves
+//! nothing to restore.
 
 use karyos_sys::host_clock::host_monotonic_ns;
 
 use super::State;
-use super::config::SocketsConfig;
+use super::config::{SOCKETS_MAX_BATCH_LEN, SocketsConfig};
 use crate::backend::{
     BackendEpoch, BackendFailure, Budget, ClockDomain, ClockEpoch, InstanceId, Observation,
     ObservationPoint, OpenError, PathId, RxDatagram, RxDrop, RxDropReason, RxHandler, RxOutcome,
@@ -28,6 +35,9 @@ const RECV: &str = "recv";
 /// the host clock's reading granularity.
 const OBSERVATION_UNCERTAINTY_NS: u64 = 1;
 
+/// Slots of one batched receive: [`SOCKETS_MAX_BATCH_LEN`] datagrams.
+pub(crate) const RX_BATCH: usize = SOCKETS_MAX_BATCH_LEN;
+
 /// The RX half's state; `SocketsRx` adds the duplicated socket.
 #[derive(Debug)]
 pub(super) struct RxCore {
@@ -38,7 +48,18 @@ pub(super) struct RxCore {
     path: PathId,
     observe: bool,
     clock_epoch: ClockEpoch,
+    /// [`RX_BATCH`] slots of `stride` bytes.
     buffer: Box<[u8]>,
+    /// `max_datagram + 1`: the bytes of one slot.
+    stride: usize,
+    /// The results of the last batched receive.
+    results: [RecvResult; RX_BATCH],
+    /// The next result to take.
+    next: usize,
+    /// Results the last batched receive wrote.
+    filled: usize,
+    /// The host clock read after the last batched receive, when observing.
+    batch_time_ns: Option<u64>,
     peer_errors: u64,
     /// Counter increments that would have overflowed and were not applied.
     counter_overflows: u64,
@@ -60,12 +81,12 @@ impl RxCore {
         epoch: BackendEpoch,
     ) -> Result<Self, OpenError> {
         let max_datagram = config.max_datagram.get();
-        let len = usize::from(max_datagram)
-            .checked_add(1)
-            .ok_or(OpenError::InvalidConfig {
-                field: "max_datagram",
-                value: u64::from(max_datagram),
-            })?;
+        let invalid = OpenError::InvalidConfig {
+            field: "max_datagram",
+            value: u64::from(max_datagram),
+        };
+        let stride = usize::from(max_datagram).checked_add(1).ok_or(invalid)?;
+        let len = stride.checked_mul(RX_BATCH).ok_or(invalid)?;
         Ok(Self {
             instance,
             epoch,
@@ -75,6 +96,11 @@ impl RxCore {
             observe: config.rx_observation,
             clock_epoch: config.clock_epoch,
             buffer: vec![0; len].into_boxed_slice(),
+            stride,
+            results: [RecvResult::Error(Errno::AGAIN); RX_BATCH],
+            next: 0,
+            filled: 0,
+            batch_time_ns: None,
             peer_errors: 0,
             counter_overflows: 0,
             failed: None,
@@ -90,6 +116,8 @@ impl RxCore {
         self.observe = config.rx_observation;
         self.clock_epoch = config.clock_epoch;
         self.failed = None;
+        self.next = 0;
+        self.filled = 0;
     }
 
     /// `ECONNREFUSED` results of receive calls (4.7).
@@ -111,6 +139,20 @@ impl RxCore {
                 .bytes()
                 .checked_sub(spent.bytes)
                 .is_some_and(|rest| rest >= u64::from(self.max_datagram))
+    }
+
+    /// Datagrams the rest of `budget` admits whole, up to [`RX_BATCH`];
+    /// at least 1 when [`admits`](Self::admits) holds.
+    fn room(&self, budget: Budget, spent: Spent) -> usize {
+        let ops = budget.ops().saturating_sub(spent.ops);
+        let datagrams = budget.datagrams().saturating_sub(spent.datagrams);
+        let bytes = budget
+            .bytes()
+            .saturating_sub(spent.bytes)
+            .checked_div(u64::from(self.max_datagram))
+            .unwrap_or(0);
+        let whole = u64::from(ops.min(datagrams)).min(bytes);
+        usize::try_from(whole).unwrap_or(RX_BATCH).min(RX_BATCH)
     }
 
     /// Stops the half with `failure` (3.10) and returns `outcome` with it.
@@ -158,8 +200,25 @@ impl RxCore {
                 outcome.stop = RxStop::Budget;
                 return outcome;
             };
-            let result = ops.recv(&mut self.buffer);
-            let time_ns = self.observe.then(host_monotonic_ns);
+            if self.next >= self.filled {
+                let room = self.room(budget, outcome.spent);
+                let Some(results) = self.results.get_mut(..room) else {
+                    return self.fail(outcome, invariant);
+                };
+                let filled = ops.recv_batch(&mut self.buffer, self.stride, results);
+                self.batch_time_ns = self.observe.then(host_monotonic_ns);
+                if filled == 0 || filled > room {
+                    return self.fail(outcome, invariant);
+                }
+                self.next = 0;
+                self.filled = filled;
+            }
+            let slot = self.next;
+            let Some(&result) = self.results.get(slot) else {
+                return self.fail(outcome, invariant);
+            };
+            self.next = slot.saturating_add(1);
+            let time_ns = self.batch_time_ns;
             outcome.spent.ops = next_ops;
             let (len, truncated, source) = match result {
                 RecvResult::Datagram {
@@ -176,7 +235,7 @@ impl RxCore {
                     None => continue,
                 },
             };
-            if len > self.buffer.len() {
+            if len > self.stride {
                 return self.fail(outcome, invariant);
             }
             outcome.spent.datagrams = next_datagrams;
@@ -207,7 +266,8 @@ impl RxCore {
             let (Some(bytes), Some(delivered), Some(datagram)) = (
                 bytes,
                 outcome.delivered.checked_add(1),
-                self.buffer.get(..len),
+                slot.checked_mul(self.stride)
+                    .and_then(|start| self.buffer.get(start..)?.get(..len)),
             ) else {
                 return self.fail(outcome, invariant);
             };

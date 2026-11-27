@@ -219,7 +219,7 @@ pub struct SocketsConfig {
     /// Datagrams of one exposure, 1..=[`SOCKETS_MAX_BATCH`].
     pub max_batch: NonZeroU16,
     /// Bytes the TX pool (`tx_slots * max_datagram`) and the RX buffer
-    /// (`max_datagram + 1`) may take together (4.5); provisional default
+    /// (64 batch slots of `max_datagram + 1`) may take together (4.5); provisional default
     /// [`DEFAULT_MEMORY_CAP`].
     pub memory_cap: NonZeroU64,
     /// The `SO_SNDBUF` request, if any, up to [`MAX_BUFFER_REQUEST`].
@@ -290,7 +290,9 @@ impl SocketsConfig {
     fn pool_bytes(&self) -> Option<u64> {
         let datagram = u64::from(self.max_datagram.get());
         let tx = u64::from(self.tx_slots.get()).checked_mul(datagram)?;
-        let rx = datagram.checked_add(1)?;
+        let rx = datagram
+            .checked_add(1)?
+            .checked_mul(u64::try_from(SOCKETS_MAX_BATCH_LEN).ok()?)?;
         tx.checked_add(rx)
     }
 
