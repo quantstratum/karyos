@@ -5527,11 +5527,20 @@ impl<T: StreamTerms> Intake<'_, T> {
         // Only a REPLY naming the probe whose send is still in its backend
         // call settles that send as submitted; any other collects only a
         // final report, as the duty would (H8-38 audit): a refused REPLY,
-        // never committed and so replayable, settles nothing.
+        // never committed and so replayable, settles nothing. Its timeout
+        // and duration are decided first, at the send's start, without
+        // changing anything (H8-41): a late or zero-duration REPLY leaves
+        // the send in its backend call.
         let generation = image.rtt.generation(path);
         if let Some(probe) = image.probes.get_mut(path) {
             let answers = probe.pending.is_some_and(|pending| {
-                pending.probe_id == rttm.probe_id && Some(pending.generation) == generation
+                pending.probe_id == rttm.probe_id
+                    && Some(pending.generation) == generation
+                    && probe.slot.sending_start().is_some_and(|start| {
+                        image
+                            .rtt
+                            .would_take(path, pending.generation, rttm.probe_id, start, seen)
+                    })
             });
             collect_probe(&mut image.rtt, probe, answers);
         }

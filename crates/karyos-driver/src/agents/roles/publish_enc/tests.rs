@@ -2425,3 +2425,144 @@ fn an_obsolete_challenge_never_rekeys_or_resets_the_binding() {
         assert_eq!(sender.bindings, held, "no runtime reset, {wait}");
     }
 }
+
+/// The rejections of reason `reason` of the sender's publication.
+fn rejected(sender: &super::super::SenderRole, reason: EncRejection) -> u64 {
+    sender.enc.publications[0].channel.rejections.get(reason)
+}
+
+/// H8-42 (sections 7 and 8): the receiver seals CHALLENGE X and never
+/// delivers it; X expires, and challenge A is answered and installed at
+/// the receiver, its first SM delayed. Delivered after the re-key
+/// holdoff, X is refused by its domain 6 position, below A's
+/// (`enc_duplicate`): no key, salt, epoch or runtime binding changes, and
+/// the delayed SM then opens under A.
+#[test]
+fn an_obsolete_challenge_after_the_holdoff_never_splits_an_installed_answer() {
+    let (mut sender, destination, _log) = answering();
+    sender.confirmed_timeout = u64::MAX;
+    sender.unconfirmed_timeout = u64::MAX;
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    let a = receiver.nonce;
+    receiver.nonce = [a[0] + 7, a[1] + 7];
+    let x = receiver.challenge();
+    receiver.nonce = a;
+    tick();
+    assert!(
+        establish(&mut sender, destination, &receiver.challenge()).is_some(),
+        "A is answered, and the receiver installs it"
+    );
+    let salt = session_salt(&mut sender);
+    let (mut sm_sealer, _) = receiver.data_keys();
+    let sm = seal_control(&mut sm_sealer, &receiver.sm());
+    let held = sender.bindings.clone();
+    let epochs = sender.enc.publications[0].bound_epochs();
+    for wait in [REKEY_HOLDOFF_NS, 10 * REKEY_HOLDOFF_NS] {
+        NOW.with(|now| now.set(now.get() + wait));
+        let before = rejected(&sender, EncRejection::Duplicate);
+        assert!(establish(&mut sender, destination, &x).is_none(), "{wait}");
+        assert_eq!(rejected(&sender, EncRejection::Duplicate), before + 1);
+        assert_eq!(session_salt(&mut sender), salt, "nothing re-keyed, {wait}");
+        let publication = &sender.enc.publications[0];
+        assert_eq!(publication.bound_receiver(), Some(receiver.receiver));
+        assert_eq!(publication.bound_epochs(), epochs);
+        assert_eq!(sender.bindings, held, "no runtime reset, {wait}");
+    }
+    assert_eq!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &sm)
+            .map(|(control, _)| control),
+        Some(receiver.sm()),
+        "the delayed SM opens under A"
+    );
+    let a_salt = Salt::Challenge {
+        receiver_boot_id: receiver.receiver.receiver_boot_id,
+        nonce: id128(a),
+    };
+    assert_eq!(
+        session_salt(&mut sender),
+        Some(a_salt),
+        "DATA seals under A"
+    );
+}
+
+/// H8-42 (sections 4 and 7): a genuine retry still re-keys. A is answered
+/// and its ANSWER lost; the receiver, unbound, seals challenge B, above
+/// A's domain 6 position. A later SOLICIT, refused on the unconfirmed
+/// binding, moves no floor: B, delivered after it and past the holdoff,
+/// re-keys the binding to B.
+#[test]
+fn a_lost_answers_retry_sealed_after_it_still_rekeys() {
+    let (mut sender, destination, _log) = answering();
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    let a = receiver.nonce;
+    assert!(
+        establish(&mut sender, destination, &receiver.challenge()).is_some(),
+        "A is answered; the ANSWER is lost"
+    );
+    let b = [a[0] + 1, a[1] + 1];
+    receiver.nonce = b;
+    let retry = receiver.challenge();
+    receiver.nonce = [a[0] + 2, a[1] + 2];
+    let before = rejected(&sender, EncRejection::ResyncRefused);
+    assert!(establish(&mut sender, destination, &receiver.solicit()).is_none());
+    assert_eq!(rejected(&sender, EncRejection::ResyncRefused), before + 1);
+    past_holdoff();
+    let Some(Control::SetupAnswer(answer)) = establish(&mut sender, destination, &retry) else {
+        panic!("B is answered")
+    };
+    assert_eq!(answer.challenge.nonce, b, "the ANSWER echoes B");
+    assert_eq!(
+        session_salt(&mut sender),
+        Some(Salt::Challenge {
+            receiver_boot_id: receiver.receiver.receiver_boot_id,
+            nonce: id128(b),
+        }),
+        "sealed under B"
+    );
+}
+
+/// H8-42 (sections 7 and 8): around a channel file activation both epochs
+/// bind. A CHALLENGE X sealed under the predecessor, delivered past the
+/// holdoff after challenge A of the same boot bound under the successor,
+/// sits below A's domain 6 position and is refused (`enc_duplicate`);
+/// the binding keeps A.
+#[test]
+fn an_obsolete_challenge_under_an_older_key_epoch_is_refused() {
+    let mut publication = PublicationEnc::new(
+        EndpointId(1),
+        ALIAS,
+        IDENTITY,
+        &[&channel(1, 0x11), &channel(2, 0x33)],
+        &[&pairwise(0x22)],
+        clock,
+    )
+    .unwrap();
+    publication.sign_with(1).unwrap();
+    publication.apply_keys(&activation(1, &[1, 2]));
+    let both = ChannelKeys::new(&[&channel(1, 0x11), &channel(2, 0x33)]).unwrap();
+    let mut old = peer(5, 0x22, 1, &both);
+    old.nonce = [old.nonce[0] + 7, old.nonce[1] + 7];
+    let x = old.challenge();
+    let mut current = peer(5, 0x22, 2, &both);
+    let Ok(EncOpened::RspSetup(_, establishing)) = open(&mut publication, &current.challenge())
+    else {
+        panic!("A binds under the successor")
+    };
+    assert!(establishing.bind);
+    assert_eq!(establishing.nonce, id128(current.nonce));
+    past_holdoff();
+    let before = publication.channel.rejections.get(EncRejection::Duplicate);
+    assert_eq!(open(&mut publication, &x), Err(EncRejection::Duplicate));
+    assert_eq!(
+        publication.channel.rejections.get(EncRejection::Duplicate),
+        before + 1
+    );
+    assert_eq!(publication.bound_receiver(), Some(current.receiver));
+    // The bound challenge, sealed again, is still answered unchanged.
+    let Ok(EncOpened::RspSetup(_, again)) = open(&mut publication, &current.challenge()) else {
+        panic!("A is answered again")
+    };
+    assert!(!again.bind);
+    assert_eq!(again.nonce, id128(current.nonce));
+}

@@ -12644,6 +12644,95 @@ fn a_refused_eos_heartbeat_records_no_terminal_bound() {
     assert_eq!(after.eos_refused, counters.eos_refused);
 }
 
+/// H8-41 (ADR-0114 sections 8 and 9): a REPLY naming the probe whose
+/// send is still in its backend call, but of no duration or at the
+/// probe's timeout, settles nothing. Under the next `party_epoch` each is
+/// refused, marks nothing, promotes nothing and leaves the send
+/// unsettled; a fresh probe's REPLY sealed at the same sequence then
+/// settles its send, takes a sample and promotes.
+#[test]
+fn a_late_or_zero_duration_reply_settles_no_probe_send() {
+    use karyos_protocol::network::{Control, Rttm, RttmKind};
+    use karyos_protocol::protection::aes_gcm_siv::EncRejection;
+
+    let (mut rig, b, slot, data, receiver, _subscriber) = quiet_encrypted_image(0);
+    let reply = |probe_id| {
+        control_frames(&Control::Rttm(Rttm {
+            alias: alias(),
+            identity: identity(),
+            receiver,
+            probe_id,
+            kind: RttmKind::Reply {
+                service_delay_ns: 0,
+            },
+        }))
+    };
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let refused = |rig: &Rig| {
+        rig.agents
+            .receiver
+            .role
+            .enc_rejections(b, alias().stream_id)
+            .unwrap()
+            .get(EncRejection::InnerRejected)
+    };
+    let epochs = rig.agents.receiver.role.enc_epochs(slot);
+    let samples = rig.agents.receiver.counters().rttm_samples;
+    let before = refused(&rig);
+    let timeout = crate::rtt::RttConfig::default().rtt_probe_timeout;
+    let mut sends = Vec::new();
+    for (late, wait) in [(false, 0), (true, timeout)] {
+        let (probe_id, send) = rig
+            .agents
+            .receiver
+            .role
+            .sending_probe(slot, rig.now, rig.now)
+            .unwrap();
+        sends.push(send);
+        rig.now += wait;
+        VIRTUAL_NOW.with(|now| now.set(rig.now));
+        let receiver = &mut rig.agents.receiver;
+        receiver.role.inject_datagram(
+            &receiver.sessions,
+            b,
+            source,
+            &next_epoch(&data, reply(probe_id), 0),
+            rig.now,
+        );
+        assert_eq!(rig.agents.receiver.role.enc_epochs(slot), epochs, "{late}");
+        assert!(
+            rig.agents.receiver.role.probe_unsettled(slot),
+            "a refused REPLY settles nothing ({late})"
+        );
+    }
+    assert_eq!(refused(&rig), before + 2);
+    assert_eq!(rig.agents.receiver.counters().rttm_samples, samples);
+    let (probe_id, send) = rig
+        .agents
+        .receiver
+        .role
+        .sending_probe(slot, rig.now, rig.now)
+        .unwrap();
+    sends.push(send);
+    rig.now += MS;
+    VIRTUAL_NOW.with(|now| now.set(rig.now));
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_datagram(
+        &receiver.sessions,
+        b,
+        source,
+        &next_epoch(&data, reply(probe_id), 0),
+        rig.now,
+    );
+    assert!(!rig.agents.receiver.role.probe_unsettled(slot), "settled");
+    assert_eq!(
+        rig.agents.receiver.role.enc_epochs(slot),
+        Some((data.context.key_epoch, data.context.party_epoch + 1)),
+        "its sequence was never marked"
+    );
+    assert_eq!(rig.agents.receiver.counters().rttm_samples, samples + 1);
+}
+
 /// H8-38 audit (ADR-0114 sections 8 and 9): a refused RTTM REPLY settles
 /// no probe send. With path 0's probe in its backend call, a REPLY naming
 /// another probe id is refused under the next `party_epoch` and leaves

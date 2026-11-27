@@ -468,6 +468,33 @@ impl<I: ProbeIds> RttProbes<I> {
             .unwrap_or(ReplyOutcome::Ignored)
     }
 
+    /// Whether [`Self::take_reply`] would take `path`'s outstanding probe
+    /// `probe_id` of binding `generation` at `now`, were its send started
+    /// at `start`: matched, inside `rtt_probe_timeout` and of positive
+    /// duration. Changes nothing (H8-41): a reply settles a send still in
+    /// its backend call only once this holds.
+    #[must_use]
+    pub fn would_take(
+        &self,
+        path: usize,
+        generation: u64,
+        probe_id: u64,
+        start: u64,
+        now: u64,
+    ) -> bool {
+        let timeout = self.config.rtt_probe_timeout;
+        self.paths
+            .get(path)
+            .and_then(|state| {
+                state.outstanding.filter(|outstanding| {
+                    state.generation == generation && outstanding.probe_id == probe_id
+                })
+            })
+            .is_some_and(|outstanding| {
+                age_ns(now, outstanding.issued_at) < timeout && age_ns(now, start) != 0
+            })
+    }
+
     /// [`Self::reply`], `None` when it takes no probe: no path, unmatched,
     /// a duplicate, one never submitted, one late (its probe past
     /// `rtt_probe_timeout` at `now`) or of no duration (H8-33). Such a

@@ -87,6 +87,15 @@ struct Bound {
     /// When `nonce` was first answered: no fresh CHALLENGE re-keys the
     /// binding until [`PublicationEnc::rekey_holdoff`] after it (H8-40).
     answered_at: u64,
+    /// The domain 6 position, `(key_epoch, envelope_seq)`, of the
+    /// RSP_SETUP that established the binding or of the last one of its
+    /// boot answered since (H8-42). The receiver seals every RSP_SETUP of
+    /// one boot to this publication with one counter, kept for the boot,
+    /// under file epochs that only rise (`receive_enc::RSP_SEALERS`): a
+    /// CHALLENGE or SOLICIT at or below it was sealed no later than that
+    /// datagram, so it is obsolete or a copy, and is refused. Moved only
+    /// by an RSP_SETUP that verified and was answered.
+    position: (u32, u64),
 }
 
 /// A new binding a verified RSP_SETUP staged: its domain 4 keys, made
@@ -109,6 +118,10 @@ pub(crate) struct EncEstablishing {
     /// binding: answered with no key change, its runtime binding keeps its
     /// receiver id, consumption and liveness (H8-36).
     pub(crate) resync: bool,
+    /// Its verified domain 6 position, `(key_epoch, envelope_seq)`: once
+    /// answered, the binding's new floor ([`PublicationEnc::answered`],
+    /// H8-42).
+    pub(crate) position: (u32, u64),
 }
 
 /// A control that verified.
@@ -296,6 +309,8 @@ impl PublicationEnc {
         let (opened, staged, pending) = self.open_staged(datagram, out)?;
         if let Some(staged) = staged {
             self.commit(staged)?;
+        } else if let EncOpened::RspSetup(_, establishing) = &opened {
+            self.answered(establishing);
         }
         if let Some(pending) = pending {
             self.commit_receiver(pending)?;
@@ -354,6 +369,21 @@ impl PublicationEnc {
             self.channel.rejections.bump(reason);
         }
         result
+    }
+
+    /// Records that the RSP_SETUP of `establishing`, which binds nothing,
+    /// was admitted and is answered: its domain 6 position becomes the
+    /// bound receiver's floor (H8-42). Only an answered one moves it; a
+    /// refused or unverified one never does.
+    pub(crate) fn answered(&mut self, establishing: &EncEstablishing) {
+        if let Some(bound) = self
+            .bound
+            .as_mut()
+            .filter(|bound| bound.receiver == establishing.receiver)
+            && establishing.position > bound.position
+        {
+            bound.position = establishing.position;
+        }
     }
 
     /// Commits a staged binding: the bound receiver's boot id is retired
@@ -450,6 +480,9 @@ impl PublicationEnc {
             return Err(EncRejection::RetiredBoot);
         }
         let nonce = id128(challenge.nonce);
+        // Its place in the receiver's one domain 6 sequence for this
+        // publication (H8-42): lexicographic, key epoch first.
+        let position = (opened.header.key_epoch, opened.header.seq);
         let mut superseded = [None; MAX_RECHALLENGES];
         if let Some(bound) = &self.bound {
             let same = bound.receiver == receiver;
@@ -469,11 +502,15 @@ impl PublicationEnc {
                             nonce: bound.nonce,
                             bind: false,
                             resync,
+                            position,
                         },
                     ),
                     None,
                 ))
             };
+            // Sealed no later than the datagram the binding last answered:
+            // obsolete or a copy, whatever its nonce (H8-42).
+            let stale = same && position <= bound.position;
             if same && bound.nonce == nonce {
                 // The bound challenge: before confirmation its answer was
                 // lost and the receiver, still challenging, gets it again,
@@ -481,7 +518,7 @@ impl PublicationEnc {
                 // binding the receiver installed it and never sends that
                 // challenge again: a copy is a replay, refused, and changes
                 // no key, binding or runtime state (H8-36).
-                if bound.confirmed {
+                if bound.confirmed || stale {
                     return Err(EncRejection::Duplicate);
                 }
                 return answer(false);
@@ -495,6 +532,7 @@ impl PublicationEnc {
                 // nonce. Refused, it re-keys nothing and resets no runtime
                 // binding (H8-40).
                 return match control {
+                    Control::Solicit(_) if stale => Err(EncRejection::Duplicate),
                     Control::Solicit(_) => answer(true),
                     _ => Err(EncRejection::ResyncRefused),
                 };
@@ -528,6 +566,15 @@ impl PublicationEnc {
                 if now.saturating_sub(bound.answered_at) < self.rekey_holdoff {
                     return Err(EncRejection::ResyncRefused);
                 }
+                // Elapsed time proves no freshness (H8-42): an obsolete
+                // CHALLENGE, captured and delivered late while the bound
+                // ANSWER is installed and its first control delayed, was
+                // sealed before the bound one and sits below its position.
+                // A receiver that lost its ANSWER challenges again only
+                // after sealing it, so above it.
+                if stale {
+                    return Err(EncRejection::Duplicate);
+                }
                 superseded = bound.superseded;
                 let free = superseded
                     .iter_mut()
@@ -554,6 +601,7 @@ impl PublicationEnc {
                     nonce,
                     bind: true,
                     resync: false,
+                    position,
                 },
             ),
             Some(Staged(Bound {
@@ -563,6 +611,7 @@ impl PublicationEnc {
                 confirmed: false,
                 superseded,
                 answered_at: now,
+                position,
             })),
         ))
     }
@@ -1163,6 +1212,9 @@ impl<T: StreamTerms> SenderRole<T> {
                         let _ = outbound.install_enc_sealer(sealer);
                         outbound.set_key_fence(fence);
                     }
+                } else {
+                    // Admitted: answered, so its position is the floor.
+                    self.enc.publications.get_mut(at)?.answered(&establishing);
                 }
                 if establishing.resync {
                     self.enc.keep_binding = Some((
