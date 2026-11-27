@@ -1075,7 +1075,7 @@ pub fn drive_metered<C: ConsensusCore, D: Disk + Clone>(
         core,
         log,
         &mut ReadyBuf::default(),
-        (budget, base, DriveFault::None),
+        (budget, base, DriveFault::None, Detail::Appended),
         send,
         apply,
         observe,
@@ -1102,11 +1102,22 @@ pub fn drive_into<C: ConsensusCore, D: Disk + Clone>(
         core,
         log,
         buf,
-        (budget, base, DriveFault::None),
+        (budget, base, DriveFault::None, Detail::Appended),
         send,
         apply,
         observe,
     )
+}
+
+/// What a [`Step::Persisted`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detail {
+    /// The entries appended, for a harness's checks: it allocates.
+    Appended,
+    /// None of them (`appended` empty): the shipped node, which observes
+    /// only [`Step::SnapshotTo`] and allocates nothing for it (C6,
+    /// karyos#681).
+    Lean,
 }
 
 /// [`drive_metered`]'s steps, with `fault` injected; only
@@ -1117,7 +1128,12 @@ pub fn drive_inner<C: ConsensusCore, D: Disk + Clone>(
     core: &mut C,
     log: &mut RaftLog<D>,
     buf: &mut ReadyBuf<C::Message>,
-    (budget, base, fault): (Option<&ReadBudget>, Option<SnapshotBase>, DriveFault),
+    (budget, base, fault, detail): (
+        Option<&ReadBudget>,
+        Option<SnapshotBase>,
+        DriveFault,
+        Detail,
+    ),
     send: &mut dyn FnMut(NodeId, C::Message, Option<Release>),
     apply: &mut dyn FnMut(&Entry, Applying),
     observe: &mut dyn FnMut(Step),
@@ -1135,7 +1151,7 @@ pub fn drive_inner<C: ConsensusCore, D: Disk + Clone>(
             core,
             log,
             buf,
-            (budget, base, fault),
+            (budget, base, fault, detail),
             (send, apply, observe),
         );
         core.recycle_ready(buf);
@@ -1151,7 +1167,12 @@ fn take<C: ConsensusCore, D: Disk + Clone>(
     core: &mut C,
     log: &mut RaftLog<D>,
     buf: &mut ReadyBuf<C::Message>,
-    (budget, base, fault): (Option<&ReadBudget>, Option<SnapshotBase>, DriveFault),
+    (budget, base, fault, detail): (
+        Option<&ReadBudget>,
+        Option<SnapshotBase>,
+        DriveFault,
+        Detail,
+    ),
     (send, apply, observe): (
         &mut dyn FnMut(NodeId, C::Message, Option<Release>),
         &mut dyn FnMut(&Entry, Applying),
@@ -1225,11 +1246,14 @@ fn take<C: ConsensusCore, D: Disk + Clone>(
         observe(Step::Persisted {
             persisted,
             truncated_from: ready.truncate_from,
-            appended: ready
-                .entries
-                .iter()
-                .map(|entry| (entry.index, entry.term))
-                .collect(),
+            appended: match detail {
+                Detail::Appended => ready
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.index, entry.term))
+                    .collect(),
+                Detail::Lean => Vec::new(),
+            },
         });
         // 4. What depends on it.
         for (to, message) in ready.after_persist.drain(..) {

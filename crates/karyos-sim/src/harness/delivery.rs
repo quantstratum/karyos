@@ -82,7 +82,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
             }
         };
         Ok(Self {
-            node: node.with_seal_interval(SEAL_TICKS),
+            node: node.with_seal_interval(SEAL_TICKS).with_records(),
             survives,
             survived: None,
             lost: None,

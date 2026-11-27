@@ -2,7 +2,7 @@
 
 //! The shipped Cluster node (C6, quantstratum/karyos#681): a consensus core
 //! behind [`ConsensusCore`] over C4's log on its own disk, driven with
-//! persist then send ([`drive`]), feeding its committed entries to a
+//! persist then send ([`crate::driver::drive`]), feeding its committed entries to a
 //! [`ServiceContainer`], whose C7a session table deduplicates. It was the
 //! simulator's `DeliveryServer` (C10, karyos#686); the simulator now runs
 //! this node behind its harness wrapper, so the delivery path's tests run
@@ -40,7 +40,7 @@
 //!   core, and rebuilds the container from the committed entries the core
 //!   hands out again.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use karyos_archive::control::HoldState;
@@ -49,8 +49,8 @@ use karyos_archive::segment::Geometry;
 
 use crate::dedup::{ConfigError, Outcome, Request};
 use crate::driver::{
-    Change, ConsensusCore, DriveFault, LogView, NodeId, ReadyBuf, Refused, Release, SnapshotBase,
-    Step, drive_inner,
+    Change, ConsensusCore, Detail, DriveFault, LogView, NodeId, ReadyBuf, Refused, Release,
+    SnapshotBase, Step, drive_inner,
 };
 use crate::log::HoldSource;
 use crate::service::{
@@ -194,10 +194,18 @@ impl Answer {
         }
     }
 
-    fn of(outcome: Outcome<'_>) -> Self {
+    /// The outcome, its reply copied into a buffer of `replies` when one
+    /// is free.
+    fn of(outcome: Outcome<'_>, replies: &mut Vec<Vec<u8>>) -> Self {
+        let mut copied = |reply: &[u8]| {
+            let mut buffer = replies.pop().unwrap_or_default();
+            buffer.clear();
+            buffer.extend_from_slice(reply);
+            buffer
+        };
         match outcome {
-            Outcome::Applied(reply) => Self::Applied(reply.to_vec()),
-            Outcome::Retained(reply) => Self::Retained(reply.to_vec()),
+            Outcome::Applied(reply) => Self::Applied(copied(reply)),
+            Outcome::Retained(reply) => Self::Retained(copied(reply)),
             Outcome::Duplicate => Self::Duplicate,
             Outcome::ReplyTooLarge => Self::ReplyTooLarge,
             Outcome::SessionExpired => Self::SessionExpired,
@@ -227,8 +235,12 @@ impl<C: ConsensusCore> Propose for Proposer<'_, '_, C> {
     }
 
     fn propose(&mut self, payload: Vec<u8>) -> Result<(), NotLeader> {
+        self.propose_slice(&payload)
+    }
+
+    fn propose_slice(&mut self, payload: &[u8]) -> Result<(), NotLeader> {
         self.core
-            .propose(payload, self.log)
+            .propose_slice(payload, self.log)
             .map_err(|refused| match refused {
                 Refused::NotLeader(refused) => NotLeader::new(refused.leader.map(u64::from)),
                 // The delivery cases declare no limits, so a core never
@@ -328,7 +340,8 @@ pub struct ClusterNode<C: ConsensusCore, S, D: Disk + Clone> {
     config: ContainerConfig,
     container: ServiceContainer<S>,
     /// Requests and registrations this server took, and who it answers.
-    pending: BTreeMap<Pending, Taker>,
+    /// Bounded by the session table: sessions times window.
+    pending: Vec<(Pending, Taker)>,
     /// Whether the core led, and its term, at the end of the last duty.
     led: Option<u64>,
     /// The timer firings this server proposed while leading, by timer
@@ -357,6 +370,18 @@ pub struct ClusterNode<C: ConsensusCore, S, D: Disk + Clone> {
     outcomes: Vec<(u64, Option<Answer>)>,
     /// Why the container stopped, if it did.
     halted: Option<ApplyError>,
+    /// Whether it records every applied entry's kind and outcome (a
+    /// harness's observation; off by default: it grows without bound).
+    records: bool,
+    /// The committed entries of a duty, and the pool their buffers go
+    /// back to.
+    committed: Vec<Entry>,
+    spare: Vec<Entry>,
+    /// Byte buffers for replies and commands: what the host gave back
+    /// ([`ClusterNode::recycle`]) and the commands proposed.
+    replies: Vec<Vec<u8>>,
+    /// The envelope a proposal is encoded into.
+    encoded: Vec<u8>,
     /// Its snapshot store, once it compacts.
     snapshots: Option<Snapshots<D>>,
     /// The snapshot its log stands on.
@@ -404,7 +429,13 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
             container,
             fresh: service,
             config,
-            pending: BTreeMap::new(),
+            pending: Vec::with_capacity(
+                usize::try_from(
+                    u64::from(config.dedup.sessions).saturating_mul(u64::from(config.dedup.window)),
+                )
+                .unwrap_or(usize::MAX)
+                .min(1 << 16),
+            ),
             led: None,
             fired: BTreeSet::new(),
             bounds_proposed: false,
@@ -422,6 +453,11 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
             ready: ReadyBuf::default(),
             fault: DriveFault::None,
             early: 0,
+            records: false,
+            committed: Vec::new(),
+            spare: Vec::new(),
+            replies: Vec::new(),
+            encoded: Vec::new(),
             snapshots: None,
             base: None,
             since: (0, 0),
@@ -456,6 +492,31 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
         Ok(self)
     }
 
+    /// Records every applied entry's kind and outcome
+    /// ([`ClusterNode::kinds`], [`ClusterNode::outcomes`]), for a test's
+    /// observation.
+    #[must_use]
+    pub fn with_records(mut self) -> Self {
+        self.records = true;
+        self
+    }
+
+    /// Takes back a message the host is done with (sent, or encoded for
+    /// the wire), so its buffers serve the next one: a node that gets its
+    /// answers back allocates nothing for them once warm.
+    pub fn recycle(&mut self, message: Delivery<C::Message>) {
+        match message {
+            Delivery::Answer {
+                answer: Answer::Applied(reply) | Answer::Retained(reply),
+                ..
+            } => self.give_buffer(reply),
+            Delivery::Relay { message, .. } | Delivery::Forward { message, .. } => {
+                self.recycle(*message);
+            }
+            _ => {}
+        }
+    }
+
     /// Reads the Archive's hold on the log from `hold` (A2's purge floor):
     /// while it holds, or cannot be read, nothing is purged.
     #[must_use]
@@ -482,6 +543,21 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
     #[must_use]
     pub fn first_index(&self) -> Option<u64> {
         self.running.as_ref().map(|(_, log)| log.first_index())
+    }
+
+    /// Room in its log's index for `additional` more entries, so a run of
+    /// that many grows nothing ([`RaftLog::reserve`]); without it the
+    /// index grows by doubling, an allocation now and then.
+    ///
+    /// # Errors
+    ///
+    /// [`LogError::IndexFull`], or [`LogError::Poisoned`] for a node that
+    /// is down.
+    pub fn reserve(&mut self, additional: usize) -> Result<(), LogError> {
+        match self.running.as_mut() {
+            Some((_, log)) => log.reserve(additional),
+            None => Err(LogError::Poisoned),
+        }
     }
 
     /// The prefix purges the Archive's hold refused.
@@ -603,8 +679,8 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
     #[must_use]
     pub fn pending_requests(&self) -> usize {
         self.pending
-            .keys()
-            .filter(|key| matches!(key, Pending::Request(..)))
+            .iter()
+            .filter(|(key, _)| matches!(key, Pending::Request(..)))
             .count()
     }
 
@@ -627,7 +703,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
         &mut self,
         taker: Taker,
         envelope: Envelope<'_>,
-        message: Delivery<C::Message>,
+        message: &Delivery<C::Message>,
         out: &mut Outbox<Delivery<C::Message>>,
     ) {
         let base = self.base;
@@ -635,13 +711,17 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
             return;
         };
         let mut view = LogView::new(log).with_base(base);
-        let refused = match self
-            .container
-            .propose(&envelope, &mut Proposer::new(core, &mut view))
-        {
+        let refused = match self.container.propose_with(
+            &envelope,
+            &mut Proposer::new(core, &mut view),
+            &mut self.encoded,
+        ) {
             Ok(()) => {
                 if let Some(key) = pending_of(&envelope) {
-                    let _ = self.pending.insert(key, taker);
+                    match self.pending.iter_mut().find(|(held, _)| *held == key) {
+                        Some(held) => held.1 = taker,
+                        None => self.pending.push((key, taker)),
+                    }
                 }
                 return;
             }
@@ -676,7 +756,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
                 leader,
                 Delivery::Forward {
                     client: taker.client,
-                    message: Box::new(message),
+                    message: Box::new(message.clone()),
                 },
             )),
             leader => out.push(taker.wrap(Delivery::NotLeader { leader })),
@@ -697,18 +777,37 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
                 let envelope = Envelope::Register {
                     client: u64::from(client),
                 };
-                self.propose(taker, envelope, message.clone(), out);
+                self.propose(taker, envelope, &message, out);
             }
             // A client speaks for itself only.
             Delivery::Request { request, command } if request.client == u64::from(client) => {
-                let command = command.clone();
                 let envelope = Envelope::Request {
                     request: *request,
-                    command: &command,
+                    command,
                 };
-                self.propose(taker, envelope, message.clone(), out);
+                self.propose(taker, envelope, &message, out);
             }
             _ => {}
+        }
+        // The command is in the log: its buffer serves the next message.
+        if let Delivery::Request { command, .. } = message {
+            self.give_buffer(command);
+        }
+    }
+
+    /// A byte buffer from the node's pool, empty: what a transport decodes
+    /// a client's command into, so the node takes it back once proposed
+    /// and allocates nothing for it once warm.
+    pub fn buffer(&mut self) -> Vec<u8> {
+        let mut buffer = self.replies.pop().unwrap_or_default();
+        buffer.clear();
+        buffer
+    }
+
+    /// Keeps `buffer` for a later message, up to the pool's bound.
+    fn give_buffer(&mut self, buffer: Vec<u8>) {
+        if self.replies.len() < self.pending.capacity().max(64) {
+            self.replies.push(buffer);
         }
     }
 
@@ -723,7 +822,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
             .as_ref()
             .and_then(|(core, _)| core.leads().then(|| core.term()));
         if self.led.is_some() && self.led != now {
-            for (key, taker) in std::mem::take(&mut self.pending) {
+            for (key, taker) in self.pending.drain(..) {
                 if let Pending::Request(client, epoch, sequence) = key {
                     let request = Request::new(client, epoch, sequence, sequence);
                     out.push(taker.wrap(Delivery::Answer {
@@ -745,7 +844,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
                     let envelope = Envelope::Register {
                         client: u64::from(taker.client),
                     };
-                    self.propose(taker, envelope, Delivery::Register, out);
+                    self.propose(taker, envelope, &Delivery::Register, out);
                 }
             }
         }
@@ -801,7 +900,8 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
         let Some((mut core, mut log)) = self.running.take() else {
             return;
         };
-        let mut committed = Vec::new();
+        let mut committed = std::mem::take(&mut self.committed);
+        let mut spare = std::mem::take(&mut self.spare);
         let mut snapshot_to = Vec::new();
         let mut ready = std::mem::take(&mut self.ready);
         let early = &mut self.early;
@@ -809,7 +909,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
             &mut core,
             &mut log,
             &mut ready,
-            (None, self.base, self.fault),
+            (None, self.base, self.fault, Detail::Lean),
             &mut |to, message, release| {
                 if release.is_some_and(|release| !durable(&release)) {
                     *early = early.saturating_add(1);
@@ -817,7 +917,20 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
                     out.push((to, Delivery::Core(message)));
                 }
             },
-            &mut |entry, _| committed.push(entry.clone()),
+            &mut |entry, _| {
+                let mut copy = spare.pop().unwrap_or_else(|| Entry {
+                    index: 0,
+                    term: 0,
+                    event_time: 0,
+                    payload: Vec::new(),
+                });
+                copy.index = entry.index;
+                copy.term = entry.term;
+                copy.event_time = entry.event_time;
+                copy.payload.clear();
+                copy.payload.extend_from_slice(&entry.payload);
+                committed.push(copy);
+            },
             &mut |step| {
                 if let Step::SnapshotTo(to) = step {
                     snapshot_to.push(to);
@@ -831,6 +944,9 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
         for entry in &committed {
             self.apply(entry, out);
         }
+        spare.append(&mut committed);
+        self.committed = committed;
+        self.spare = spare;
         if !failed {
             self.compact(&mut core, &mut log);
             self.running = Some((core, log));
@@ -1050,6 +1166,10 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
         let key = Envelope::decode(&entry.payload)
             .ok()
             .and_then(|envelope| pending_of(&envelope));
+        // An answer is built for a taker waiting here, or a record: a
+        // replica that took nothing answers nothing.
+        let waiting = key.and_then(|key| self.pending.iter().position(|(held, _)| *held == key));
+        let answers = waiting.is_some() || self.records;
         let answer = match self.container.apply(entry) {
             Ok(Applied::Registered(registered)) => Some(match registered {
                 Ok(registered) => Delivery::Registered {
@@ -1057,9 +1177,9 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
                 },
                 Err(_) => Delivery::RegisterRefused,
             }),
-            Ok(Applied::Answered { request, outcome }) => Some(Delivery::Answer {
+            Ok(Applied::Answered { request, outcome }) if answers => Some(Delivery::Answer {
                 request,
-                answer: Answer::of(outcome),
+                answer: Answer::of(outcome, &mut self.replies),
             }),
             Ok(_) => None,
             Err(error) => {
@@ -1068,14 +1188,16 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
             }
         };
         let outcome = match &answer {
+            _ if !self.records => None,
             Some(Delivery::Answer { answer, .. }) => Some(answer.clone()),
             _ => None,
         };
-        self.outcomes.push((entry.index, outcome));
-        self.kinds.push((entry.index, kind));
-        if let (Some(key), Some(answer)) = (key, answer)
-            && let Some(taker) = self.pending.remove(&key)
-        {
+        if self.records {
+            self.outcomes.push((entry.index, outcome));
+            self.kinds.push((entry.index, kind));
+        }
+        if let (Some(at), Some(answer)) = (waiting, answer) {
+            let (_, taker) = self.pending.swap_remove(at);
             out.push(taker.wrap(answer));
         }
     }
@@ -1196,7 +1318,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
                 let envelope = Envelope::Register {
                     client: u64::from(taker.client),
                 };
-                self.propose(taker, envelope, Delivery::Register, out);
+                self.propose(taker, envelope, &Delivery::Register, out);
             }
         }
         self.duty(out);

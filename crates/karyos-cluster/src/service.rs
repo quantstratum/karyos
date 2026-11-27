@@ -412,6 +412,18 @@ impl<'a> Envelope<'a> {
     ///
     /// As [`Envelope::encode`], but never `Truncated`.
     pub fn to_vec(&self) -> Result<Vec<u8>, CodecError> {
+        let mut out = Vec::new();
+        self.encode_into(&mut out)?;
+        Ok(out)
+    }
+
+    /// Encodes into `out`, which it replaces: no allocation once `out`
+    /// has held the template's longest message.
+    ///
+    /// # Errors
+    ///
+    /// As [`Envelope::encode`].
+    pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), CodecError> {
         let max = match self {
             Self::Register { .. } => REGISTER.max_length,
             Self::Close { .. } => CLOSE.max_length,
@@ -419,10 +431,11 @@ impl<'a> Envelope<'a> {
             Self::TimerFired { .. } => TIMER_FIRED.max_length,
             Self::Configuration(_) => CONFIGURATION.max_length,
         };
-        let mut out = vec![0; usize::try_from(max).unwrap_or(usize::MAX)];
-        let length = self.encode(&mut out)?;
+        out.clear();
+        out.resize(usize::try_from(max).unwrap_or(usize::MAX), 0);
+        let length = self.encode(out)?;
         out.truncate(length);
-        Ok(out)
+        Ok(())
     }
 
     /// Decodes exactly one schema 2 message from `bytes`, validated whole.
@@ -516,6 +529,16 @@ pub trait Propose {
     ///
     /// [`NotLeader`] when it does not, with the leader it knows of.
     fn propose(&mut self, payload: Vec<u8>) -> Result<(), NotLeader>;
+
+    /// [`Propose::propose`], borrowing `payload`, for a host that keeps
+    /// its buffer (C6, karyos#681). The default copies it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Propose::propose`].
+    fn propose_slice(&mut self, payload: &[u8]) -> Result<(), NotLeader> {
+        self.propose(payload.to_vec())
+    }
 
     /// Whether this node leads now, as far as it knows. The container's
     /// registration gate ([`ServiceContainer::propose`]) holds a
@@ -1220,6 +1243,22 @@ impl<S: ClusteredService> ServiceContainer<S> {
         envelope: &Envelope<'_>,
         core: &mut P,
     ) -> Result<(), ProposeRefused> {
+        self.propose_with(envelope, core, &mut Vec::new())
+    }
+
+    /// [`ServiceContainer::propose`], encoding into `buf`, which the host
+    /// keeps: no allocation once it has held the longest envelope (C6,
+    /// karyos#681).
+    ///
+    /// # Errors
+    ///
+    /// As [`ServiceContainer::propose`].
+    pub fn propose_with<P: Propose>(
+        &self,
+        envelope: &Envelope<'_>,
+        core: &mut P,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), ProposeRefused> {
         if self.stopping() {
             return Err(ProposeRefused::Stopping);
         }
@@ -1234,7 +1273,8 @@ impl<S: ClusteredService> ServiceContainer<S> {
         if matches!(envelope, Envelope::Register { .. }) && !self.bounds_logged && core.leads() {
             return Err(ProposeRefused::BoundsPending);
         }
-        core.propose(envelope.to_vec()?)?;
+        envelope.encode_into(buf)?;
+        core.propose_slice(buf)?;
         Ok(())
     }
 
