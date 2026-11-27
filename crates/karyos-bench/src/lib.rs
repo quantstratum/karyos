@@ -42,6 +42,7 @@ static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
 pub mod analyze;
 pub mod archive;
 pub mod decision;
+pub mod enc_cost;
 pub mod env;
 pub mod inventory;
 #[cfg(target_os = "linux")]
