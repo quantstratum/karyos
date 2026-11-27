@@ -11155,10 +11155,88 @@ fn a_repeated_record_retries_a_failed_commit() {
     assert!(record.record(identity()).is_err());
     assert!(record.terminal(&identity()), "terminal in memory");
     assert!(record.record(identity()).is_err(), "not durable yet");
-    assert!(!AbortedIncarnations::new(state.clone()).terminal(&identity()));
     state.fail_writes(&[]);
     assert!(record.record(identity()).is_ok());
+    drop(record);
     assert!(AbortedIncarnations::new(state).terminal(&identity()));
+}
+
+/// H8 review 6, R5-02 / MP-2 (RCV-6): both writes of an abort fail, then
+/// the receiver stops uncleanly (no `Drop`, the marker stays armed). The
+/// restart cannot know the abort, but its publisher's incarnation was
+/// recorded at install: every incarnation up to it is terminal, and a
+/// later one, never live here, is admitted.
+#[test]
+fn an_abort_lost_to_two_failed_writes_stays_terminal_after_an_unclean_stop() {
+    use crate::remote_guard::{ABORTED_FILE, ABORTED_REPLICA, AbortRecord, AbortedIncarnations};
+
+    let state = MemDir::initialised();
+    let mut record = AbortedIncarnations::new(state.clone());
+    record.admit(identity()).unwrap();
+    state.fail_writes(&[ABORTED_FILE, ABORTED_REPLICA]);
+    assert!(record.record(identity()).is_err(), "neither copy committed");
+    // Crash: no clean stop.
+    std::mem::forget(record);
+    state.fail_writes(&[]);
+    let mut restarted = AbortedIncarnations::new(state.clone());
+    assert!(restarted.terminal(&identity()), "the lost abort holds");
+    let earlier = Identity {
+        incarnation: identity().incarnation - 1,
+        ..identity()
+    };
+    assert!(restarted.terminal(&earlier));
+    assert!(restarted.admit(identity()).is_err(), "no install");
+    let later = Identity {
+        incarnation: identity().incarnation + 1,
+        ..identity()
+    };
+    assert!(!restarted.terminal(&later), "a new incarnation is admitted");
+    restarted.admit(later).unwrap();
+    let stranger = Identity {
+        registration_id: identity().registration_id + 1,
+        ..identity()
+    };
+    assert!(!restarted.terminal(&stranger), "never live here");
+}
+
+/// H8 review 6, R5-02: an unclean stop with no failed write refuses the
+/// incarnations that were live (their abort cannot be ruled out), never
+/// a later one; a clean stop with nothing uncommitted refuses nothing.
+#[test]
+fn the_marker_tells_a_clean_stop_from_an_unclean_one() {
+    use crate::remote_guard::{AbortRecord, AbortedIncarnations};
+
+    let state = MemDir::initialised();
+    let mut record = AbortedIncarnations::new(state.clone());
+    record.admit(identity()).unwrap();
+    drop(record);
+    let restarted = AbortedIncarnations::new(state.clone());
+    assert!(!restarted.terminal(&identity()), "clean: nothing refused");
+    std::mem::forget(restarted);
+    let after_crash = AbortedIncarnations::new(state.clone());
+    assert!(after_crash.terminal(&identity()), "unclean: the live one");
+    let later = Identity {
+        incarnation: identity().incarnation + 1,
+        ..identity()
+    };
+    assert!(!after_crash.terminal(&later));
+}
+
+/// H8 review 6, R5-02: the high-water is written before the install; when
+/// it cannot be committed the install is refused (fail closed).
+#[test]
+fn an_install_whose_high_water_cannot_be_committed_is_refused() {
+    use crate::remote_guard::{ABORTED_FILE, ABORTED_REPLICA, AbortRecord, AbortedIncarnations};
+
+    let state = MemDir::initialised();
+    let mut record = AbortedIncarnations::new(state.clone());
+    state.fail_writes(&[ABORTED_FILE, ABORTED_REPLICA]);
+    assert!(record.admit(identity()).is_err());
+    state.fail_writes(&[]);
+    assert!(
+        record.admit(identity()).is_ok(),
+        "retried once the disk works"
+    );
 }
 /// H8 round 4: insufficient evidence raised and missing properties (karyos#648).
 mod invariants_r4;
@@ -12113,6 +12191,16 @@ fn a_blocked_key_read_stops_live_agents_within_the_bound() {
     let late = genuine_envelope(&mut rig);
     let source = rig.endpoints.local_address(rig.publisher).unwrap();
     let (mut sent_while_blocked, mut last_send_start) = (false, 0u64);
+    // DATA has its own observer (H8 review 6, R5-05): the publication's
+    // backend submissions, not the controls counter.
+    let data_submitted = |rig: &Rig| {
+        rig.agents
+            .sender
+            .role
+            .outbound(0)
+            .map_or(0, |outbound| outbound.counters().submitted)
+    };
+    let (mut data_while_blocked, mut last_data_start) = (false, 0u64);
     let mut opened_while_blocked = false;
     let end = after + FRESH_NS + 1_000_000_000;
     let mut round = 0u64;
@@ -12125,10 +12213,15 @@ fn a_blocked_key_read_stops_live_agents_within_the_bound() {
         let blocked = keys.blocked();
         let started = monotonic_ns();
         let sent = rig.agents.sender.role.counters().sent;
+        let data = data_submitted(&rig);
         rig.round(true);
         if rig.agents.sender.role.counters().sent > sent {
             last_send_start = started;
             sent_while_blocked |= blocked;
+        }
+        if data_submitted(&rig) > data {
+            last_data_start = started;
+            data_while_blocked |= blocked;
         }
         if blocked && !opened_while_blocked {
             // Ingress inside the bound with the reload blocked: opened.
@@ -12152,6 +12245,14 @@ fn a_blocked_key_read_stops_live_agents_within_the_bound() {
     assert!(
         last_send_start <= after + FRESH_NS,
         "sent at {last_send_start}, bound {}",
+        after + FRESH_NS
+    );
+    // DATA, observed at the backend: it flowed inside the bound with the
+    // reload blocked, and none was submitted from a cycle past it.
+    assert!(data_while_blocked, "DATA flowed inside the bound");
+    assert!(
+        last_data_start <= after + FRESH_NS,
+        "DATA submitted at {last_data_start}, bound {}",
         after + FRESH_NS
     );
     // Ingress past the bound: a genuine envelope sealed inside it is

@@ -262,6 +262,20 @@ pub trait AbortRecord: core::fmt::Debug {
     /// failed; the identity is terminal in memory regardless, and the
     /// abort must not be acknowledged.
     fn record(&mut self, identity: Identity) -> Result<(), MarkError>;
+    /// Admits `identity` for an image install (H8 R5-02): records its
+    /// publisher's incarnation high-water durably first, so a restart
+    /// after an unclean stop knows which incarnations were live here.
+    ///
+    /// # Errors
+    ///
+    /// [`MarkError`] when `identity` is terminal or the high-water could
+    /// not be committed: the install is refused (fail closed).
+    fn admit(&mut self, identity: Identity) -> Result<(), MarkError> {
+        if self.terminal(&identity) {
+            return Err(MarkError::Unreadable);
+        }
+        Ok(())
+    }
 }
 
 /// The most incarnations [`AbortedIncarnations`] holds; past it every
@@ -273,9 +287,20 @@ pub const ABORTED_FILE: &str = "aborted-incarnations";
 /// Its replica, written first at each commit: a commit holds once either
 /// file holds it, and a load takes the union of both.
 pub const ABORTED_REPLICA: &str = "aborted-incarnations-replica";
-const ABORTED_FORMAT: &str = "karyos-aborted-incarnations-v1";
+const ABORTED_FORMAT: &str = "karyos-aborted-incarnations-v2";
+/// The format before the incarnation high-water (no `h` lines), still read.
+const ABORTED_FORMAT_V1: &str = "karyos-aborted-incarnations-v1";
+/// The most publishers whose incarnation high-water the record keeps; a
+/// new publisher past it is refused its install (fail closed).
+pub const MAX_PUBLISHERS: usize = 256;
 /// The largest record file: the header, the flag and every line.
-const ABORTED_MAX_LEN: usize = 64 + MAX_ABORTED * 88;
+const ABORTED_MAX_LEN: usize = 64 + MAX_ABORTED * 88 + MAX_PUBLISHERS * 90;
+/// The marker armed at every start and disarmed at a clean stop with
+/// nothing left uncommitted (H8 R5-02): found armed, the last run may have
+/// lost an abort it never committed.
+pub const ABORTED_MARKER: &str = "aborted-incarnations-armed";
+const MARKER_ARMED: &str = "karyos-aborted-marker-v1\narmed=1\n";
+const MARKER_CLEAN: &str = "karyos-aborted-marker-v1\narmed=0\n";
 
 /// [`AbortRecord`] in two files of a [`Files`] directory, each a header, a
 /// `full` flag and one `<driver0>-<driver1>-<registration>-<incarnation>`
@@ -292,6 +317,13 @@ pub struct AbortedIncarnations<F: Files> {
     full: bool,
     /// The file could not be read at start: every identity is terminal.
     unreadable: bool,
+    /// Per publisher (driver id, registration), the highest incarnation an
+    /// image was installed for here, durably (H8 R5-02).
+    high: Vec<([u64; 2], u64, u64)>,
+    /// The marker was found armed: the last run stopped uncleanly, so an
+    /// abort it applied may never have been committed. Every incarnation
+    /// at or below its publisher's high-water is terminal.
+    uncertain: bool,
 }
 
 impl<F: Files> core::fmt::Debug for AbortedIncarnations<F> {
@@ -300,6 +332,7 @@ impl<F: Files> core::fmt::Debug for AbortedIncarnations<F> {
             .field("held", &self.held.len())
             .field("full", &self.full)
             .field("unreadable", &self.unreadable)
+            .field("uncertain", &self.uncertain)
             .finish_non_exhaustive()
     }
 }
@@ -313,15 +346,55 @@ impl<F: Files> AbortedIncarnations<F> {
             dirty: false,
             full: false,
             unreadable: false,
+            high: Vec::with_capacity(MAX_PUBLISHERS),
+            uncertain: false,
         };
         let loaded = record
             .load(ABORTED_FILE, false)
             .and_then(|()| record.load(ABORTED_REPLICA, true));
         if loaded.is_err() {
             record.held.clear();
+            record.high.clear();
+            record.unreadable = true;
+        }
+        // The marker (H8 R5-02): armed, or unreadable, the last run did not
+        // stop cleanly. It is armed again now, while the disk works; a
+        // record that cannot arm it fails closed.
+        let mut buf = [0u8; 64];
+        record.uncertain = match record.files.read(ABORTED_MARKER, &mut buf) {
+            Ok(len) => buf.get(..len) != Some(MARKER_CLEAN.as_bytes()),
+            Err(FileError::NotFound) => false,
+            Err(FileError::Refused) => true,
+        };
+        if record
+            .files
+            .write_atomic(ABORTED_MARKER, MARKER_ARMED.as_bytes())
+            .is_err()
+        {
             record.unreadable = true;
         }
         record
+    }
+
+    /// Disarms the marker at a clean stop, only when nothing is left
+    /// uncommitted (H8 R5-02); `Drop` calls it.
+    pub fn close(&mut self) {
+        if !self.dirty && !self.unreadable {
+            let _ = self
+                .files
+                .write_atomic(ABORTED_MARKER, MARKER_CLEAN.as_bytes());
+        }
+    }
+
+    /// Whether `identity` is at or below its publisher's high-water.
+    fn was_live(&self, identity: &Identity) -> bool {
+        self.high
+            .iter()
+            .any(|&(driver, registration, incarnation)| {
+                driver == identity.driver_id
+                    && registration == identity.registration_id
+                    && identity.incarnation <= incarnation
+            })
     }
 
     /// Adds what `name` holds. A missing record was lost (it is created
@@ -339,9 +412,11 @@ impl<F: Files> AbortedIncarnations<F> {
             .and_then(|bytes| core::str::from_utf8(bytes).ok())
             .ok_or(MarkError::Unreadable)?;
         let mut lines = text.split('\n');
-        if lines.next() != Some(ABORTED_FORMAT) {
-            return Err(MarkError::Unreadable);
-        }
+        let v2 = match lines.next() {
+            Some(ABORTED_FORMAT) => true,
+            Some(ABORTED_FORMAT_V1) => false,
+            _ => return Err(MarkError::Unreadable),
+        };
         self.full |= match lines.next() {
             Some("full=0") => false,
             Some("full=1") => true,
@@ -351,6 +426,11 @@ impl<F: Files> AbortedIncarnations<F> {
             if line.is_empty() {
                 continue;
             }
+            let (high, line) = match line.strip_prefix("h ") {
+                Some(rest) if v2 => (true, rest),
+                Some(_) => return Err(MarkError::Unreadable),
+                None => (false, line),
+            };
             let mut parts = line.split('-').map(|part| {
                 part.bytes()
                     .all(|byte| byte.is_ascii_digit())
@@ -371,6 +451,20 @@ impl<F: Files> AbortedIncarnations<F> {
                 registration_id: registration,
                 incarnation: inc,
             };
+            if high {
+                // The union of both copies: the higher high-water.
+                let at = self
+                    .high
+                    .iter()
+                    .position(|(driver, held, _)| *driver == [d0, d1] && *held == registration);
+                let full = self.high.len() >= MAX_PUBLISHERS;
+                match at.and_then(|at| self.high.get_mut(at)) {
+                    Some(entry) => entry.2 = entry.2.max(inc),
+                    None if !full => self.high.push(([d0, d1], registration, inc)),
+                    None => return Err(MarkError::Unreadable),
+                }
+                continue;
+            }
             if self.held.contains(&identity) {
                 continue;
             }
@@ -386,7 +480,7 @@ impl<F: Files> AbortedIncarnations<F> {
     /// either write does, since a load takes the union. It stays dirty
     /// until the record itself is written.
     fn write(&mut self) -> Result<(), MarkError> {
-        let text = encode_aborted(self.full, &self.held);
+        let text = encode_aborted(self.full, &self.held, &self.high);
         let replica = self.files.write_atomic(ABORTED_REPLICA, text.as_bytes());
         let record = self.files.write_atomic(ABORTED_FILE, text.as_bytes());
         self.dirty = record.is_err();
@@ -397,7 +491,7 @@ impl<F: Files> AbortedIncarnations<F> {
     }
 }
 
-fn encode_aborted(full: bool, held: &[Identity]) -> String {
+fn encode_aborted(full: bool, held: &[Identity], high: &[([u64; 2], u64, u64)]) -> String {
     use core::fmt::Write as _;
 
     let mut text = String::with_capacity(ABORTED_MAX_LEN);
@@ -412,7 +506,20 @@ fn encode_aborted(full: bool, held: &[Identity]) -> String {
             identity.incarnation
         );
     }
+    for (driver, registration, incarnation) in high {
+        let _ = writeln!(
+            text,
+            "h {}-{}-{registration}-{incarnation}",
+            driver[0], driver[1]
+        );
+    }
     text
+}
+
+impl<F: Files> Drop for AbortedIncarnations<F> {
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 /// Creates the empty abort record in a new state directory, with the key
@@ -423,13 +530,40 @@ fn encode_aborted(full: bool, held: &[Identity]) -> String {
 /// [`MarkError::Commit`] when the write fails.
 pub fn initialise_aborted<F: Files + ?Sized>(files: &F) -> Result<(), MarkError> {
     files
-        .write_atomic(ABORTED_FILE, encode_aborted(false, &[]).as_bytes())
+        .write_atomic(ABORTED_FILE, encode_aborted(false, &[], &[]).as_bytes())
         .map_err(|_| MarkError::Commit)
 }
 
 impl<F: Files> AbortRecord for AbortedIncarnations<F> {
     fn terminal(&self, identity: &Identity) -> bool {
-        self.full || self.unreadable || self.held.contains(identity)
+        self.full
+            || self.unreadable
+            || self.held.contains(identity)
+            || (self.uncertain && self.was_live(identity))
+    }
+
+    fn admit(&mut self, identity: Identity) -> Result<(), MarkError> {
+        if self.terminal(&identity) {
+            return Err(MarkError::Unreadable);
+        }
+        let key = (identity.driver_id, identity.registration_id);
+        let at = self
+            .high
+            .iter()
+            .position(|(driver, registration, _)| (*driver, *registration) == key);
+        let full = self.high.len() >= MAX_PUBLISHERS;
+        match at.and_then(|at| self.high.get_mut(at)) {
+            Some(entry) if entry.2 >= identity.incarnation => return Ok(()),
+            Some(entry) => entry.2 = identity.incarnation,
+            None if !full => self.high.push((key.0, key.1, identity.incarnation)),
+            None => return Err(MarkError::Commit),
+        }
+        // Raised in memory whatever the commit does: the install waits for
+        // it, so an uncommitted high-water admits nothing here.
+        match self.write() {
+            Ok(()) if !self.dirty => Ok(()),
+            _ => Err(MarkError::Commit),
+        }
     }
 
     fn record(&mut self, identity: Identity) -> Result<(), MarkError> {
