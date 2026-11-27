@@ -318,3 +318,249 @@ fn a_recycled_ready_buf_reuses_its_buffers() {
     .unwrap();
     assert_eq!(counts, SetCounts::default());
 }
+
+/// A core that is past the warm-up from its first call, leads, and readies
+/// one prepared entry, filling the Ready without allocating.
+#[derive(Debug)]
+struct Prepared(Option<karyos_cluster::Entry>);
+
+impl ConsensusCore for Prepared {
+    type Message = ();
+
+    fn recover(_id: NodeId, _peers: &[NodeId], _log: &mut LogView<'_>) -> Self {
+        Self(Some(karyos_cluster::Entry {
+            index: 1,
+            term: 1,
+            event_time: 0,
+            payload: vec![7; 64],
+        }))
+    }
+
+    fn propose(&mut self, _command: Vec<u8>, _log: &mut LogView<'_>) -> Result<(), Refused> {
+        Ok(())
+    }
+
+    fn step(&mut self, _from: NodeId, _message: (), _log: &mut LogView<'_>) {}
+
+    fn tick(&mut self, _now: u64, _log: &mut LogView<'_>) {}
+
+    fn ready(&mut self, _log: &mut LogView<'_>) -> Option<Ready<()>> {
+        None
+    }
+
+    fn ready_into(&mut self, out: &mut ReadyBuf<()>, _log: &mut LogView<'_>) -> bool {
+        match self.0.take() {
+            Some(entry) => {
+                out.ready.entries.push(entry);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn advance(&mut self, _persisted: Persisted, _log: &mut LogView<'_>) {}
+
+    fn term(&self) -> u64 {
+        1
+    }
+
+    fn leads(&self) -> bool {
+        true
+    }
+
+    fn received(&self) -> Option<u64> {
+        None
+    }
+
+    fn committed(&self) -> Option<u64> {
+        Some(WARMUP)
+    }
+}
+
+/// Codex review of docs#1080 (C5 v3 coverage): the driver's recycling of
+/// a Ready, which grows the pool its entries go back to, is counted in
+/// the probed core's Ready stage, not left outside every stage.
+#[test]
+fn a_probed_cores_ready_recycling_is_counted_in_its_ready_stage() {
+    use std::path::Path;
+
+    use karyos_cluster::RaftLog;
+    use karyos_sim::disk::SimDisk;
+    use karyos_sim::harness::core::drive_into;
+    use karyos_sim::harness::node::LOG_DIR;
+    use karyos_sim::harness::probe::{Probed, measure_with};
+    use karyos_sim::harness::workloads::geometry;
+
+    let _serial = serial();
+    let mut log =
+        RaftLog::create(SimDisk::new(), Path::new(LOG_DIR), geometry().unwrap(), 1).unwrap();
+    let mut core = Probed::<Prepared>::recover(1, &[1], &mut LogView::new(&mut log));
+    // Room for the Ready's one entry: filling it allocates nothing, and the
+    // pool it goes back to starts empty.
+    let mut buf: ReadyBuf<()> = ReadyBuf::default();
+    buf.ready.entries.reserve(4);
+    let ((), measured) = measure_with(|| {
+        // Past the warm-up from this first call.
+        core.tick(0, &mut LogView::new(&mut log));
+        drive_into(
+            &mut core,
+            &mut log,
+            &mut buf,
+            (None, None),
+            &mut |_, (), _| {},
+            &mut |_, _| {},
+            &mut |_| {},
+        )
+        .unwrap();
+    })
+    .unwrap();
+    let ready = measured
+        .stages
+        .iter()
+        .find(|(stage, _)| *stage == Stage::ReadyLeader)
+        .map(|(_, counts)| *counts)
+        .unwrap();
+    assert!(ready.allocations >= 1, "{:?}", measured.stages);
+}
+
+/// Codex review of docs#1080 (C5 v3 coverage): the driver's persistence
+/// of a Ready (the log's append and sync) is counted in the probed core's
+/// Advance stage, not left outside every stage.
+#[test]
+fn a_probed_cores_persistence_is_counted_in_its_advance_stage() {
+    use std::path::Path;
+
+    use karyos_cluster::RaftLog;
+    use karyos_sim::disk::SimDisk;
+    use karyos_sim::harness::core::drive_into;
+    use karyos_sim::harness::node::LOG_DIR;
+    use karyos_sim::harness::probe::{Probed, measure_with};
+    use karyos_sim::harness::workloads::geometry;
+
+    let _serial = serial();
+    let mut log =
+        RaftLog::create(SimDisk::new(), Path::new(LOG_DIR), geometry().unwrap(), 1).unwrap();
+    let mut core = Probed::<Prepared>::recover(1, &[1], &mut LogView::new(&mut log));
+    let mut buf: ReadyBuf<()> = ReadyBuf::default();
+    buf.ready.entries.reserve(4);
+    buf.reserve_spare(4);
+    let ((), measured) = measure_with(|| {
+        core.tick(0, &mut LogView::new(&mut log));
+        drive_into(
+            &mut core,
+            &mut log,
+            &mut buf,
+            (None, None),
+            &mut |_, (), _| {},
+            &mut |_, _| {},
+            &mut |_| {},
+        )
+        .unwrap();
+    })
+    .unwrap();
+    // Prepared's own advance does nothing: what the stage counts is the
+    // log's.
+    let advance = measured
+        .stages
+        .iter()
+        .find(|(stage, _)| *stage == Stage::AdvanceLeader)
+        .map(|(_, counts)| *counts)
+        .unwrap();
+    assert!(
+        advance.allocations + advance.frees >= 1,
+        "{:?}",
+        measured.stages
+    );
+    assert_eq!(log.durable_index(), Some(1));
+}
+
+/// Codex review of docs#1092 (C5 v3 coverage): a simulated server applies
+/// each committed entry inside the apply window, over the borrowed entry
+/// and through `TestService::apply_into`, as a real process does. A
+/// service left to grow on every application is counted in the probed
+/// core's apply stage, not left outside every window; the same server
+/// prefilled from the case's bounds applies, answers and queues every
+/// reply at 0 allocations and 0 frees.
+#[test]
+fn a_simulated_servers_application_is_counted_in_its_apply_stage() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use karyos_sim::cluster::ClusterSim;
+    use karyos_sim::disk::{SimDisk, Survives};
+    use karyos_sim::harness::custom::Custom;
+    use karyos_sim::harness::node::{
+        ClientNode, Member, Op, Recorder, ServerNode, ServiceBounds, Shared, Wire,
+    };
+    use karyos_sim::harness::probe::{Probed, measure_with};
+    use karyos_sim::harness::workloads::geometry;
+    use karyos_sim::net::LinkConfig;
+
+    type Core = Probed<Custom>;
+    /// Appends: well past the warm-up.
+    const OPERATIONS: usize = 64;
+    const PAYLOAD: usize = 8;
+    const SERVERS: u32 = 3;
+
+    let _serial = serial();
+    let applied = |prefilled: bool| {
+        let recorder: Shared = Rc::new(RefCell::new(Recorder::default()));
+        let mut sim: ClusterSim<Member<Core>, Wire<<Core as ConsensusCore>::Message>> =
+            ClusterSim::new("apply", 1, LinkConfig::default()).unwrap();
+        for id in 0..SERVERS {
+            let mut server = ServerNode::<Core>::new(
+                id,
+                (0..SERVERS).collect(),
+                SimDisk::new(),
+                Survives::Synced,
+                geometry().unwrap(),
+                Rc::clone(&recorder),
+            )
+            .unwrap();
+            if prefilled {
+                server = server.with_service_bounds(ServiceBounds {
+                    clients: vec![SERVERS],
+                    values: OPERATIONS,
+                    payload: PAYLOAD,
+                    answers: OPERATIONS,
+                });
+            }
+            assert_eq!(
+                sim.add_node(Member::Server(Box::new(server)), 0, 0)
+                    .unwrap(),
+                id
+            );
+        }
+        let script = (0..OPERATIONS)
+            .map(|value| Op::Append(vec![u8::try_from(value).unwrap(); PAYLOAD]))
+            .collect();
+        let client =
+            ClientNode::new(SERVERS, 0, script, Rc::clone(&recorder)).with_servers(SERVERS);
+        assert_eq!(sim.add_node(Member::Client(client), 0, 0).unwrap(), SERVERS);
+        let ((), measured) = measure_with(|| sim.run_for(5_000).unwrap()).unwrap();
+        let client = sim.node(SERVERS).and_then(Member::client).unwrap();
+        assert!(
+            client.done(),
+            "every append answered: {:?}",
+            recorder
+                .borrow()
+                .observations
+                .iter()
+                .rev()
+                .take(12)
+                .collect::<Vec<_>>()
+        );
+        assert!(measured.entries > 0, "nothing past the warm-up");
+        measured
+            .stages
+            .iter()
+            .find(|(stage, _)| *stage == Stage::Apply)
+            .map(|(_, counts)| *counts)
+            .unwrap()
+    };
+    // The service's tables grow as it applies: counted as the application.
+    let growing = applied(false);
+    assert!(growing.allocations >= 1, "{growing:?}");
+    // Prefilled, the application allocates and frees nothing.
+    assert_eq!(applied(true), SetCounts::default());
+}

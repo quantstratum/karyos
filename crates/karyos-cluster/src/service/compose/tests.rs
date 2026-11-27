@@ -553,6 +553,40 @@ fn logged_session_bounds_restore_within_the_budget() {
     }
 }
 
+/// karyos#1019: a snapshot taken after a registration, with a live
+/// session, restores into a fresh container as no longer fresh, so a
+/// `SessionBounds` entry that differs from the restored table stops the
+/// container with `BoundsDiffer` and keeps the restored sessions; the same
+/// entry on a container never restored rebuilds its table instead.
+#[test]
+fn different_bounds_after_a_restore_with_a_session_stop_the_container() {
+    use crate::service::{ApplyError, SessionBounds};
+
+    let mut source = ServiceContainer::new(Sequencer::new(), config()).unwrap();
+    apply_range(&mut source, 1, 1);
+    assert_eq!(source.sessions().live_sessions(), 1);
+    let mut parts = ServiceSnapshot::new(4096, 8);
+    let sections = reads(&source.snapshot(&mut parts).unwrap());
+    let mut restored = ServiceContainer::new(Sequencer::new(), config()).unwrap();
+    restored.restore(1, &sections).unwrap();
+    assert_eq!(restored.sessions(), source.sessions());
+    let table = restored.sessions().config();
+    let logged = table.with_sessions(2).with_ttl(500);
+    assert_ne!(logged, table);
+    assert_eq!(
+        restored.apply(&raw(2, 2, SessionBounds::new(logged).to_vec().unwrap())),
+        Err(ApplyError::BoundsDiffer { logged, table })
+    );
+    assert_eq!(restored.sessions(), source.sessions(), "the sessions kept");
+    // A container with nothing applied is fresh: the same bounds rebuild
+    // its table.
+    let mut fresh = ServiceContainer::new(Sequencer::new(), config()).unwrap();
+    fresh
+        .apply(&raw(1, 1, SessionBounds::new(logged).to_vec().unwrap()))
+        .unwrap();
+    assert_eq!(fresh.sessions().config(), logged);
+}
+
 /// Different logged bounds after a snapshot install with a live session
 /// are a typed stop, never a rebuild: the restored container is not fresh
 /// (karyos#1019).

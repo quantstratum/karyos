@@ -33,16 +33,19 @@ const REJECTED: u8 = 1;
 /// payload's length does not fit its `u32`.
 #[must_use]
 pub fn encode(message: &Message) -> Option<Vec<u8>> {
-    let payloads: usize = message
-        .entries
-        .iter()
-        .map(|entry| entry.payload.len())
-        .sum();
-    let mut out = Vec::with_capacity(
-        64_usize
-            .saturating_add(message.entries.len().saturating_mul(28))
-            .saturating_add(payloads),
-    );
+    let mut out = Vec::new();
+    encode_into(message, &mut out).then_some(out)
+}
+
+/// [`encode`] into `out`, cleared first: a runner that keeps `out` encodes
+/// without allocating once it has grown (C5 v3); `false` when a count or
+/// a length does not fit its `u32`.
+pub fn encode_into(message: &Message, out: &mut Vec<u8>) -> bool {
+    out.clear();
+    write(message, out).is_some()
+}
+
+fn write(message: &Message, out: &mut Vec<u8>) -> Option<()> {
     let words = |out: &mut Vec<u8>, words: &[u64]| {
         for word in words {
             out.extend_from_slice(&word.to_le_bytes());
@@ -56,7 +59,7 @@ pub fn encode(message: &Message) -> Option<Vec<u8>> {
             round,
         } => {
             out.push(PRE_VOTE);
-            words(&mut out, &[term, last_index, last_term, round]);
+            words(out, &[term, last_index, last_term, round]);
         }
         CoreMessage::PreVoteReply {
             term,
@@ -64,9 +67,9 @@ pub fn encode(message: &Message) -> Option<Vec<u8>> {
             round,
         } => {
             out.push(PRE_VOTE_REPLY);
-            words(&mut out, &[term]);
+            words(out, &[term]);
             out.push(u8::from(granted));
-            words(&mut out, &[round]);
+            words(out, &[round]);
         }
         CoreMessage::Vote {
             term,
@@ -74,11 +77,11 @@ pub fn encode(message: &Message) -> Option<Vec<u8>> {
             last_term,
         } => {
             out.push(VOTE);
-            words(&mut out, &[term, last_index, last_term]);
+            words(out, &[term, last_index, last_term]);
         }
         CoreMessage::VoteReply { term, granted } => {
             out.push(VOTE_REPLY);
-            words(&mut out, &[term]);
+            words(out, &[term]);
             out.push(u8::from(granted));
         }
         CoreMessage::Append {
@@ -90,10 +93,7 @@ pub fn encode(message: &Message) -> Option<Vec<u8>> {
             epoch,
         } => {
             out.push(APPEND);
-            words(
-                &mut out,
-                &[term, prev_index, prev_term, entries, commit, epoch],
-            );
+            words(out, &[term, prev_index, prev_term, entries, commit, epoch]);
         }
         CoreMessage::AppendReply {
             term,
@@ -101,26 +101,26 @@ pub fn encode(message: &Message) -> Option<Vec<u8>> {
             epoch,
         } => {
             out.push(APPEND_REPLY);
-            words(&mut out, &[term, epoch]);
+            words(out, &[term, epoch]);
             match outcome {
                 AppendOutcome::Accepted { index } => {
                     out.push(ACCEPTED);
-                    words(&mut out, &[index]);
+                    words(out, &[index]);
                 }
                 AppendOutcome::Rejected { probe, hint } => {
                     out.push(REJECTED);
-                    words(&mut out, &[probe, hint]);
+                    words(out, &[probe, hint]);
                 }
             }
         }
     }
     out.extend_from_slice(&u32::try_from(message.entries.len()).ok()?.to_le_bytes());
     for entry in &message.entries {
-        words(&mut out, &[entry.index, entry.term, entry.event_time]);
+        words(out, &[entry.index, entry.term, entry.event_time]);
         out.extend_from_slice(&u32::try_from(entry.payload.len()).ok()?.to_le_bytes());
         out.extend_from_slice(&entry.payload);
     }
-    Some(out)
+    Some(())
 }
 
 /// A reader over a datagram that fails on the first short read.
@@ -159,11 +159,9 @@ impl Reader<'_> {
     }
 }
 
-/// The message in `bytes`; `None` when they are not exactly one.
-#[must_use]
-pub fn decode(bytes: &[u8]) -> Option<Message> {
-    let mut reader = Reader(bytes);
-    let core = match reader.byte()? {
+/// The core's message at the head of `reader`.
+fn core_of(reader: &mut Reader<'_>) -> Option<CoreMessage> {
+    Some(match reader.byte()? {
         PRE_VOTE => CoreMessage::PreVote {
             term: reader.word()?,
             last_index: reader.word()?,
@@ -212,7 +210,14 @@ pub fn decode(bytes: &[u8]) -> Option<Message> {
             }
         }
         _ => return None,
-    };
+    })
+}
+
+/// The message in `bytes`; `None` when they are not exactly one.
+#[must_use]
+pub fn decode(bytes: &[u8]) -> Option<Message> {
+    let mut reader = Reader(bytes);
+    let core = core_of(&mut reader)?;
     let count = reader.length()?;
     // Each entry takes at least 28 bytes: a count past what the datagram
     // can hold is refused before anything is reserved for it.
@@ -236,13 +241,130 @@ pub fn decode(bytes: &[u8]) -> Option<Message> {
     reader.0.is_empty().then_some(Message { core, entries })
 }
 
+/// Entries a [`Decoder`] holds before it grows: an append's batch
+/// several times over.
+pub const DECODER_ENTRIES: usize = 64;
+
+/// Payload bytes each of a [`Decoder`]'s entries is prefilled with: the
+/// custom adapter's per-entry share of its default limits (W2's 1 MiB
+/// over 64 entries), which W1's and W2's largest command fits.
+pub const DECODER_PAYLOAD: usize = 16 * 1024;
+
+/// The runner's own pool of decoded messages (C5 v3): one message, lent to
+/// the core's `step` and taken back, and the entries and payload buffers
+/// it decodes into, prefilled at initialisation with
+/// [`DECODER_ENTRIES`] entries of [`DECODER_PAYLOAD`] bytes, so a decode
+/// past the warm-up allocates nothing.
+#[derive(Debug)]
+pub struct Decoder {
+    message: Message,
+    spare: Vec<Entry>,
+}
+
+impl Default for Decoder {
+    fn default() -> Self {
+        let spare = (0..DECODER_ENTRIES)
+            .map(|_| Entry {
+                index: 0,
+                term: 0,
+                event_time: 0,
+                payload: Vec::with_capacity(DECODER_PAYLOAD),
+            })
+            .collect();
+        Self {
+            message: Message {
+                core: CoreMessage::VoteReply {
+                    term: 0,
+                    granted: false,
+                },
+                entries: Vec::with_capacity(DECODER_ENTRIES),
+            },
+            spare,
+        }
+    }
+}
+
+/// The message in `bytes`, decoded into `decoder`'s message and buffers:
+/// the entries of the last one go back to its pool first, so none is
+/// freed; `None` when they are not exactly one.
+pub fn decode_lent<'a>(decoder: &'a mut Decoder, bytes: &[u8]) -> Option<&'a mut Message> {
+    let Decoder { message, spare } = decoder;
+    spare.append(&mut message.entries);
+    let mut reader = Reader(bytes);
+    message.core = core_of(&mut reader)?;
+    let count = reader.length()?;
+    if count > reader.0.len() / 28 {
+        return None;
+    }
+    for _ in 0..count {
+        let index = reader.word()?;
+        let term = reader.word()?;
+        let event_time = reader.word()?;
+        let length = reader.length()?;
+        let payload = reader.bytes(length)?;
+        let mut entry = spare.pop().unwrap_or(Entry {
+            index,
+            term,
+            event_time,
+            payload: Vec::new(),
+        });
+        entry.index = index;
+        entry.term = term;
+        entry.event_time = event_time;
+        entry.payload.clear();
+        entry.payload.extend_from_slice(payload);
+        message.entries.push(entry);
+    }
+    reader.0.is_empty().then_some(message)
+}
+
 impl Wire for Custom {
-    fn encode(message: &Message) -> Option<Vec<u8>> {
-        encode(message)
+    fn encode_into(message: &Message, out: &mut Vec<u8>) -> bool {
+        encode_into(message, out)
+    }
+
+    type Decoder = Decoder;
+
+    fn decoder() -> Decoder {
+        Decoder::default()
+    }
+
+    fn decode_lent<'a>(decoder: &'a mut Decoder, bytes: &[u8]) -> Option<&'a mut Message> {
+        decode_lent(decoder, bytes)
     }
 
     fn decode(bytes: &[u8]) -> Option<Message> {
         decode(bytes)
+    }
+
+    fn appended(message: &Message) -> Option<(u64, Vec<(u64, u64)>)> {
+        let CoreMessage::Append { term, .. } = message.core else {
+            return None;
+        };
+        Some((
+            term,
+            message
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.index,
+                        u64::try_from(entry.payload.len()).unwrap_or(u64::MAX),
+                    )
+                })
+                .collect(),
+        ))
+    }
+
+    fn acknowledged(message: &Message) -> Option<(u64, u64)> {
+        match message.core {
+            CoreMessage::AppendReply {
+                term,
+                outcome: AppendOutcome::Accepted { index },
+                ..
+            } => Some((term, index)),
+            _ => None,
+        }
     }
 }
 
@@ -304,6 +426,26 @@ mod tests {
                 epoch: 7,
             }),
         ]
+    }
+
+    /// The reused buffers give what the owned forms give, message after
+    /// message through one encoding buffer and one decoder, longer and
+    /// shorter appends in turn, and a refused datagram leaves the next
+    /// decode whole (C5 v3).
+    #[test]
+    fn the_reused_buffers_round_trip_every_message() {
+        let mut out = Vec::new();
+        let mut decoder = Decoder::default();
+        let messages = every_message();
+        for message in messages.iter().chain(messages.iter().rev()) {
+            assert!(encode_into(message, &mut out));
+            assert_eq!(Some(out.clone()), encode(message));
+            assert_eq!(
+                decode_lent(&mut decoder, &out).cloned(),
+                Some(message.clone())
+            );
+            assert_eq!(decode_lent(&mut decoder, &out[..out.len() - 1]), None);
+        }
     }
 
     #[test]

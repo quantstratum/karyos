@@ -648,8 +648,9 @@ impl Custom {
         // A batch never larger than the entries a follower may have in
         // flight.
         let batch = limits.map_or(BATCH, |limits| BATCH.min(limits.in_flight_entries));
-        // Seeded by the node: the same run reproduces the same timeouts. A
-        // server that is not a bootstrap voter joins.
+        // Seeded by the run and the node: the same run reproduces the same
+        // timeouts, and another seed draws others (`core::run_seed`).
+        // A server that is not a bootstrap voter joins.
         let config = Config::joining(
             core_id(id),
             &voters,
@@ -657,7 +658,7 @@ impl Custom {
             ELECTION_MAX,
             HEARTBEAT,
             batch,
-            u64::from(id),
+            super::core::node_seed(super::core::run_seed(), u64::from(id)),
         )
         .map_err(|_| Unsupported)?;
         let config = match limits {
@@ -1062,6 +1063,29 @@ impl ConsensusCore for Custom {
         recycle(entries);
     }
 
+    /// The lent append's entries copied into entries of the thread's pool,
+    /// which the core keeps; the node takes the lent message back whole
+    /// (C5 v3): nothing of it is freed here.
+    fn step_lent(&mut self, from: NodeId, message: &mut Message, log: &mut LogView<'_>) {
+        let mut entries = vector(message.entries.len());
+        for entry in &message.entries {
+            entries.push(pooled(
+                entry.index,
+                entry.term,
+                entry.event_time,
+                &entry.payload,
+            ));
+        }
+        self.step(
+            from,
+            Message {
+                core: message.core,
+                entries,
+            },
+            log,
+        );
+    }
+
     fn tick(&mut self, now: u64, log: &mut LogView<'_>) {
         self.now = self.now.max(now);
         let Some(ticked) = self.ticked else {
@@ -1087,6 +1111,13 @@ impl ConsensusCore for Custom {
         // What the node is done with goes back to the thread's pool.
         out.take_spare(&mut self.spare);
         release(&mut self.spare);
+        // Room for a Ready's entries going back once it is done, at the
+        // first call: the recycling is the Ready stage's (C5 v3 coverage).
+        out.reserve_spare(
+            self.bounds
+                .ready_entries
+                .saturating_add(self.bounds.committed),
+        );
         // The node's vectors, grown to the reserved ones' size once.
         let (ready, reserved) = (&mut out.ready, &mut self.reserved);
         if ready.messages.capacity() < reserved.messages.capacity() {

@@ -229,9 +229,19 @@ fn s4_a_promotion_before_fencing_is_refused_on_the_core() {
     }
 }
 
+/// The seeds on which S6's damaged feed sends reach no standby leader: the
+/// standby group has not elected yet when the primary feeds indices 3, 5
+/// and 7, so the damaged sends are dropped unread and the resends arrive
+/// intact. Their safety is still checked; that nothing is refused is
+/// asserted, so the list stays exact. 0x1e: since karyos 4014992f the
+/// election timeouts are drawn from the run seed, and on it the standby
+/// elects after the primary fed index 7, over the feed (over the
+/// replication it is refused).
+const S6_UNREACHED: [(u64, bool); 1] = [(0x1e, false)];
+
 #[test]
 fn s6_damaged_sends_are_refused_before_they_apply_on_the_core() {
-    for case in both(standby::s6()) {
+    for (replicated, case) in both(standby::s6()).into_iter().enumerate() {
         for seed in corpus() {
             let outcome = passing(&case, seed);
             let refused = outcome.observations.iter().any(|observation| {
@@ -240,7 +250,12 @@ fn s6_damaged_sends_are_refused_before_they_apply_on_the_core() {
                     Observation::FeedRefused { .. } | Observation::ReplicationRefused { .. }
                 )
             });
-            assert!(refused, "{} seed {seed:#x}: nothing refused", case.name);
+            let reached = !S6_UNREACHED.contains(&(seed, replicated == 1));
+            assert_eq!(
+                refused, reached,
+                "{} seed {seed:#x}: refused {refused}, the scenario reached {reached}",
+                case.name
+            );
             // Nothing damaged applied (the standby checks compare every
             // applied entry with the primary's), and the resends got
             // through.

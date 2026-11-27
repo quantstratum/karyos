@@ -868,6 +868,109 @@ pub struct Outcome {
     pub deduplicated: u64,
     /// Whether a standby was promoted: the states are the standby's.
     pub promoted: bool,
+    /// Each fault the run applied, in order, and where it fell against the
+    /// run's leader commits (C5's per-fault coverage; karyos#691).
+    pub faults: Vec<FaultPhase>,
+    /// The server each client still waiting at the end sends to, in
+    /// client order.
+    pub waiting_on: Vec<NodeId>,
+}
+
+/// Where a fault fell against a run's leader commits (quantstratum-docs:
+/// karyos/evaluations/c5-raft-comparison-v1.md, Seed corpora: "how many
+/// seeds reached it before the first commit, during replication and
+/// after the last commit").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Phase {
+    /// No leader had committed anything when it acted.
+    BeforeFirstCommit,
+    /// Some leader commits came before it, and some after.
+    DuringReplication,
+    /// Every leader commit of the run came before it.
+    AfterLastCommit,
+}
+
+impl Phase {
+    /// Its name in a line.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::BeforeFirstCommit => "before_first_commit",
+            Self::DuringReplication => "during_replication",
+            Self::AfterLastCommit => "after_last_commit",
+        }
+    }
+}
+
+/// One fault of a run: the step it acted at, what it was, and its phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultPhase {
+    /// The step.
+    pub step: u64,
+    /// The fault: a scheduled action as `Debug` prints it, or a lost
+    /// reply's trigger (`Triggered:cut`, `Triggered:crash`, ...).
+    pub fault: String,
+    /// Where it fell.
+    pub phase: Phase,
+}
+
+impl FaultPhase {
+    /// The fault's kind, without its arguments: `Crash`, `Isolate`,
+    /// `Triggered:cut`.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        self.fault
+            .split(['(', ' ', '{'])
+            .next()
+            .unwrap_or(&self.fault)
+    }
+}
+
+/// The [`Observation::Triggered`] of an [`Action::Leader`]: the action's
+/// own mark, taken when it acted, covers it ([`phases`]).
+const LEADER_TRIGGERS: [&str; 7] = [
+    "leader crash",
+    "leader isolate",
+    "leader mute",
+    "leader split",
+    "leader remove",
+    "follower remove",
+    "leader restart",
+];
+
+/// Each fault's phase: `marks` are the faults with the number of
+/// observations recorded when each acted.
+fn phases(observations: &[Observation], marks: &[(u64, String, usize)]) -> Vec<FaultPhase> {
+    let commits: Vec<usize> = observations
+        .iter()
+        .enumerate()
+        .filter(|(_, observation)| matches!(observation, Observation::Commit { leader: true, .. }))
+        .map(|(at, _)| at)
+        .collect();
+    let mut faults: Vec<(u64, String, usize)> = marks.to_vec();
+    for (at, observation) in observations.iter().enumerate() {
+        if let Observation::Triggered { what, at: step, .. } = observation
+            && *what != "deadline"
+            && !LEADER_TRIGGERS.contains(what)
+        {
+            faults.push((*step, format!("Triggered:{what}"), at));
+        }
+    }
+    faults.sort_by_key(|(step, _, at)| (*step, *at));
+    faults
+        .into_iter()
+        .map(|(step, fault, at)| {
+            let before = commits.iter().filter(|commit| **commit < at).count();
+            let phase = if before == 0 {
+                Phase::BeforeFirstCommit
+            } else if before == commits.len() {
+                Phase::AfterLastCommit
+            } else {
+                Phase::DuringReplication
+            };
+            FaultPhase { step, fault, phase }
+        })
+        .collect()
 }
 
 /// A case its run did not pass.
@@ -960,8 +1063,33 @@ fn creation_syncs<C: ConsensusCore>(geometry: Geometry) -> Option<u64> {
     })
 }
 
-/// The script of the `index`th client of `case`.
-fn script(case: &Case, index: usize) -> Vec<Op> {
+/// What a server's test service is prefilled for in `case` (C5 v3), the
+/// same policy for every variant: every client session's id (as [`run`]
+/// numbers them), room for every append of every session, the case's
+/// payload, and each session's answers. `None` past a count's type.
+#[must_use]
+pub fn service_bounds(case: &Case) -> Option<super::node::ServiceBounds> {
+    let first = case
+        .servers
+        .checked_add(case.spares)?
+        .checked_add(case.standby)?;
+    let sessions = case.sessions()?;
+    let clients = (0..sessions)
+        .map(|session| NodeId::try_from(first.checked_add(session)?).ok())
+        .collect::<Option<Vec<_>>>()?;
+    Some(super::node::ServiceBounds {
+        clients,
+        values: sessions.checked_mul(case.operations)?,
+        payload: case.payload,
+        answers: case.operations,
+    })
+}
+
+/// The script of the `index`th client session of `case`: the operations
+/// [`run`] gives that session's client, which a client in a real process
+/// runs too (C5 v2, "Processes"; karyos#691).
+#[must_use]
+pub fn script(case: &Case, index: usize) -> Vec<Op> {
     (0..case.operations)
         .map(|operation| {
             if index == 0 && case.operations > 1 && operation + 1 == case.operations {
@@ -1044,6 +1172,35 @@ struct Stepping<'a> {
     recorder: &'a Shared,
     ensuring: Ensuring,
     done: u64,
+    /// The servers whose flushes fail ([`Case::failing_flushes`]), each
+    /// with the failures already recorded.
+    flushing: Vec<(NodeId, usize)>,
+}
+
+/// Records each planned flush failure of a failing server since the last
+/// look, at step `at`, as `Triggered:failed_flush`: a fault the coverage
+/// counts by its phase, as a scheduled action's.
+fn note_failed_flushes<C: ConsensusCore>(sim: &Sim<C>, stepping: &mut Stepping<'_>, at: u64) {
+    for (id, seen) in &mut stepping.flushing {
+        let failed = sim
+            .node(*id)
+            .and_then(Member::server)
+            .map_or(*seen, |server| server.disk().failed_syncs());
+        while *seen < failed {
+            *seen = seen.saturating_add(1);
+            stepping
+                .recorder
+                .borrow_mut()
+                .observations
+                .push(Observation::Triggered {
+                    what: "failed_flush",
+                    node: *id,
+                    client: 0,
+                    at,
+                    request: None,
+                });
+        }
+    }
 }
 
 /// Sends `change` from the operator to every server that is up.
@@ -1133,6 +1290,7 @@ fn advance<C: ConsensusCore>(
         }
         sim.run_for(1).map_err(RunError::Sim)?;
         stepping.done = step;
+        note_failed_flushes(sim, stepping, step);
     }
     Ok(())
 }
@@ -1143,6 +1301,9 @@ fn advance<C: ConsensusCore>(
 ///
 /// [`RunError`] when the run cannot be set up or stepped.
 pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError> {
+    // Every node of the run, and every restart of one, draws its election
+    // timeouts from the run's seed and its id (`core::run_seed`).
+    let _seed = super::core::RunSeed::set(seed);
     if let Some(limits) = case.limits {
         // The largest entry the case writes: a client's append, framed.
         let command = super::node::Command {
@@ -1229,6 +1390,11 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                 ServerError::Unsupported(unsupported) => RunError::Unsupported(unsupported),
             })?,
         };
+        // Its service prefilled from the case's bounds, by the policy a
+        // real process uses (C5 v3).
+        if let Some(bounds) = service_bounds(case) {
+            server = server.with_service_bounds(bounds);
+        }
         if in_standby {
             server = server.as_standby(primary.clone());
             if case.replication {
@@ -1281,7 +1447,8 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             .and_then(|index| standby_end.checked_add(index))
             .ok_or(RunError::Count)?;
         let mut client = ClientNode::new(id, leader, script(case, index), Rc::clone(&recorder))
-            .with_retry_after(case.retry_after);
+            .with_retry_after(case.retry_after)
+            .with_servers(servers);
         if case.cluster_clients {
             client = client.with_cluster_client();
         }
@@ -1348,13 +1515,25 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         recorder: &recorder,
         ensuring: Ensuring::default(),
         done: 0,
+        flushing: case.failing_flushes.iter().map(|id| (*id, 0)).collect(),
     };
     // What the last leader-relative action acted on, and whom it crashed.
     let mut acted: Option<(NodeId, u64)> = None;
+    let mut marks: Vec<(u64, String, usize)> = Vec::new();
     let mut crashed: Option<NodeId> = None;
     for (step, action) in schedule {
         if let Some(steps) = step.checked_sub(stepping.done).filter(|steps| *steps > 0) {
             advance(&mut sim, steps, &mut stepping, &joined)?;
+        }
+        // A leader-relative action may wait for a leader: it is marked
+        // where it acts, below, not where it was scheduled.
+        let mut label = Some(format!("{action:?}"));
+        if !matches!(action, Action::Leader(act) if act != LeaderAction::RestartCrashed) {
+            marks.push((
+                step,
+                label.take().unwrap_or_default(),
+                recorder.borrow().observations.len(),
+            ));
         }
         match action {
             Action::Ensure(change) => stepping.ensuring.queue.push_back(change),
@@ -1440,6 +1619,11 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                     }
                     LeaderAction::RestartCrashed => "leader restart",
                 };
+                marks.push((
+                    stepping.done,
+                    label.take().unwrap_or_default(),
+                    recorder.borrow().observations.len(),
+                ));
                 recorder
                     .borrow_mut()
                     .observations
@@ -1715,6 +1899,12 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         advance(&mut sim, steps, &mut stepping, &joined)?;
     }
 
+    let waiting_on: Vec<NodeId> = clients
+        .iter()
+        .filter_map(|id| sim.node(*id).and_then(Member::client))
+        .filter(|client| !client.done())
+        .map(ClientNode::server)
+        .collect();
     let waiting = clients
         .iter()
         .filter(|id| {
@@ -1774,6 +1964,9 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         sim.restart(id).map_err(RunError::Node)?;
     }
     sim.run_for(case.quiet).map_err(RunError::Sim)?;
+    // A flush that failed in the quiet period, stamped at its end.
+    let quiet_end = stepping.done.max(done).saturating_add(case.quiet);
+    note_failed_flushes(&sim, &mut stepping, quiet_end);
     let recorded = recorder.borrow();
     // A core that lacks a capability the case needs: not demonstrated.
     if recorded
@@ -1793,6 +1986,8 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         states,
         deduplicated,
         promoted,
+        faults: phases(&recorded.observations, &marks),
+        waiting_on,
     })
 }
 
@@ -1926,6 +2121,59 @@ fn lost_reply_shown(observations: &[Observation]) -> Result<(), Failed> {
     Ok(())
 }
 
+/// The [`Outcome`] of `case` run outside the simulator, by real processes
+/// (C5 v2, "Processes"; karyos#691): `recorded` holds every server's and
+/// client's observations and the clients' history, merged in real-time
+/// order; `liveness`, `states` and `deduplicated` are as [`run`] takes
+/// them from its servers and clients. Safety is [`run`]'s own checks, so
+/// [`pass`] judges the run as it judges a simulated one. Such a run has
+/// no cluster trace and applies no fault: `trace` and `faults` are empty
+/// and `digest` 0.
+///
+/// # Errors
+///
+/// [`RunError::Unsupported`] when a server reported a capability its core
+/// lacks, as [`run`] does; [`RunError::Count`] for a case with a standby,
+/// which no process run takes, or a count beyond the node id range.
+pub fn outcome(
+    case: &Case,
+    recorded: &Recorder,
+    liveness: Result<(), Liveness>,
+    states: Vec<(NodeId, Option<u64>, u64)>,
+    deduplicated: u64,
+) -> Result<Outcome, RunError> {
+    if case.standby != 0 {
+        return Err(RunError::Count);
+    }
+    if recorded
+        .observations
+        .iter()
+        .any(|observation| matches!(observation, Observation::Unsupported { .. }))
+    {
+        return Err(RunError::Unsupported(Unsupported));
+    }
+    let primary = case
+        .servers
+        .checked_add(case.spares)
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or(RunError::Count)?;
+    let primary: Vec<NodeId> = (0..primary).collect();
+    Ok(Outcome {
+        safety: safety(case, recorded, &primary, &[]),
+        liveness,
+        observations: recorded.observations.clone(),
+        history: recorded.history.clone(),
+        trace: Vec::new(),
+        digest: 0,
+        states,
+        deduplicated,
+        promoted: false,
+        // A process run of W1 applies no fault.
+        faults: Vec::new(),
+        waiting_on: Vec::new(),
+    })
+}
+
 /// The safety checks of a run: every check over all of it, or with a
 /// standby, each group's on its own observations, the history across the
 /// promotion, and the standby's checks.
@@ -1970,6 +2218,20 @@ pub fn pass(case: &Case, outcome: &Outcome) -> Result<Option<Liveness>, Failed> 
     let gap = match (outcome.liveness, case.progress) {
         (Ok(()), _) => None,
         (Err(gap), Progress::MayStop) => Some(gap),
+        // Every waiting client sends to a server whose flushes failed,
+        // which answers nothing from then on: as for a leader crashed and
+        // not restarted, the run's bound ends before a client's second
+        // silent retry moves it on, so the stall is a gap, not a failure
+        // (karyos#691). One waiting client on a healthy server fails.
+        (Err(gap @ Liveness::Stalled { .. }), Progress::Expected)
+            if !outcome.waiting_on.is_empty()
+                && outcome
+                    .waiting_on
+                    .iter()
+                    .all(|server| case.failing_flushes.contains(server)) =>
+        {
+            Some(gap)
+        }
         (Err(gap), Progress::Expected) => return Err(Failed::Liveness(gap)),
     };
     if let Some(to) = case.handover {

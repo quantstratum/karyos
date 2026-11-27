@@ -95,21 +95,27 @@ pub const VARIANT: Variant = Variant::Baseline;
 /// Polls one core call pumps at most: the work budget of a call.
 pub const PUMP_BUDGET: usize = 4096;
 
-/// Milliseconds (harness ticks) between heartbeats.
-pub const HEARTBEAT_MS: u64 = 2;
+/// Milliseconds (harness ticks) between heartbeats: one harness step is
+/// one OpenRaft millisecond (C5 v2 manifest, Timing).
+pub const HEARTBEAT_MS: u64 = 5;
 
-/// The election timeout's range, in milliseconds (harness ticks).
-pub const ELECTION_MS: (u64, u64) = (10, 20);
+/// The election timeout's range, in milliseconds (harness ticks),
+/// `[15, 30)` (C5 v2 manifest, Timing). OpenRaft draws it again at every
+/// reset with `RT::thread_rng()`, which this adapter's runtime seeds from
+/// the node's executor (`executor::SimRuntime::thread_rng`), so the draw
+/// is the manifest's, from a seeded source.
+pub const ELECTION_MS: (u64, u64) = (15, 30);
 
 /// The retry delays after a failed RPC, on the harness's clock. OpenRaft's
-/// default, 200 ms then up to 1 s, is 100 heartbeats here, which on a lossy
+/// default, 200 ms then up to 1 s, is 40 heartbeats here, which on a lossy
 /// link stalls a follower for most of a run; raft-rs retries at its next
-/// heartbeat. The adapter scales it to its own heartbeat instead: an
-/// adapter setting, the same for every workload, not a workload parameter.
-pub const BACKOFF: &str = "2ms, 4ms, 8ms ..20ms";
+/// heartbeat. The adapter scales it to its own heartbeat instead, from
+/// one heartbeat up to the longest election timeout: an adapter setting,
+/// the same for every workload, not a workload parameter.
+pub const BACKOFF: &str = "5ms, 10ms, 20ms ..30ms";
 
 /// The shortest an RPC waits for its answer: OpenRaft's replication asks
-/// for its heartbeat interval, 2 ticks, which is shorter than a reply's
+/// for its heartbeat interval, 5 ticks, which is shorter than a reply's
 /// round trip on the workloads' slower links; this is the election
 /// timeout's upper bound instead. An adapter setting, the same for every
 /// workload.
@@ -175,6 +181,29 @@ fn to_harness(entry: &OEntry) -> Option<Entry> {
         // place in the log, which the test service ignores.
         event_time: 0,
         payload,
+    })
+}
+
+/// OpenRaft's `entries` as [`crate::raft_rs::Sent`], borrowed: a normal
+/// entry's command in place; a membership entry, which OpenRaft holds as
+/// a configuration, encoded (C5 v3). An index past `u64::MAX` saturates:
+/// the caller refuses such an append first.
+pub fn sent_entries(entries: &[OEntry]) -> impl Iterator<Item = crate::raft_rs::Sent<'_>> + Clone {
+    entries.iter().map(|entry| crate::raft_rs::Sent {
+        index: entry.log_id.index.saturating_add(1),
+        term: entry.log_id.leader_id.term,
+        event_time: 0,
+        payload: match &entry.payload {
+            EntryPayload::Blank => std::borrow::Cow::Borrowed(&[]),
+            EntryPayload::Normal(command) => std::borrow::Cow::Borrowed(command.0.as_slice()),
+            EntryPayload::Membership(membership) => {
+                let voters: Vec<NodeId> = membership
+                    .voter_ids()
+                    .filter_map(|id| NodeId::try_from(id).ok())
+                    .collect();
+                std::borrow::Cow::Owned(encode_configuration(&voters, &[]))
+            }
+        },
     })
 }
 
@@ -775,6 +804,9 @@ pub struct OpenRaftCore<const PRE_VOTE: bool, const BATCH: u64 = 0> {
     overruns: u64,
     /// The declared limits (W2), when started with them.
     limits: Option<Limits>,
+    /// The kept buffers of the metered read back
+    /// ([`crate::raft_rs::read_back`]).
+    reads: crate::raft_rs::ReadBack,
 }
 
 /// `openraft` with pre-vote on: the evaluated core.
@@ -874,10 +906,15 @@ impl<const PRE_VOTE: bool, const BATCH: u64> fmt::Debug for OpenRaftCore<PRE_VOT
     }
 }
 
-/// The node's executor seed: fixed per node, so a run is a function of
-/// the harness's seed and calls.
+/// The node's executor seed, which also seeds OpenRaft's election
+/// timeout draws (`RT::thread_rng`): from the run's seed and the node's
+/// id (`harness::core::run_seed`), so a run is a function of the
+/// harness's seed and calls, and each seed draws other timeouts.
 fn seed_of(id: NodeId) -> u64 {
-    crate::executor::splitmix64(u64::from(id) ^ 0x0000_43C5)
+    crate::executor::splitmix64(
+        karyos_sim::harness::core::node_seed(karyos_sim::harness::core::run_seed(), u64::from(id))
+            ^ 0x0000_43C5,
+    )
 }
 
 impl<const PRE_VOTE: bool, const BATCH: u64> OpenRaftCore<PRE_VOTE, BATCH> {
@@ -936,6 +973,7 @@ impl<const PRE_VOTE: bool, const BATCH: u64> OpenRaftCore<PRE_VOTE, BATCH> {
             out: false,
             overruns: 0,
             limits: limits.copied(),
+            reads: crate::raft_rs::ReadBack::default(),
         };
         let Some(config) = Self::config(limits).filter(|_| readable) else {
             return core;
@@ -1190,13 +1228,17 @@ impl<const PRE_VOTE: bool, const BATCH: u64> ConsensusCore for OpenRaftCore<PRE_
         // one held back is lost to its peer, and its RPC times out and is
         // retried, as after a loss on the network.
         if self.limits.is_some() {
+            let reads = &mut self.reads;
             out.ready.messages.retain(|(_, message)| match message {
                 Message::Request {
                     request: Request::Append(rpc),
                     ..
                 } => {
-                    let sent: Option<Vec<Entry>> = rpc.entries.iter().map(to_harness).collect();
-                    sent.is_some_and(|sent| crate::raft_rs::read_back(&sent, log))
+                    // Compared in place, no entry copied (C5 v3).
+                    rpc.entries
+                        .iter()
+                        .all(|entry| entry.log_id.index.checked_add(1).is_some())
+                        && crate::raft_rs::read_back(sent_entries(&rpc.entries), log, reads)
                 }
                 _ => true,
             });
@@ -1314,18 +1356,66 @@ impl<const PRE_VOTE: bool, const BATCH: u64> ConsensusCore for OpenRaftCore<PRE_
 impl<const PRE_VOTE: bool, const BATCH: u64> crate::process::Wire
     for OpenRaftCore<PRE_VOTE, BATCH>
 {
-    fn encode(message: &Message) -> Option<Vec<u8>> {
-        crate::openraft_wire::encode(message)
+    fn encode_into(message: &Message, out: &mut Vec<u8>) -> bool {
+        crate::openraft_wire::encode_into(message, out)
     }
 
     fn decode(bytes: &[u8]) -> Option<Message> {
         crate::openraft_wire::decode(bytes)
+    }
+
+    /// OpenRaft's RPCs are its own types behind `Arc`s; the lent message
+    /// is stepped as a clone of those `Arc`s. An append is decoded into the
+    /// slot's own request once no clone of it is left, its entries and
+    /// command buffers kept ([`crate::openraft_wire::decode_into`]); what
+    /// OpenRaft still forces is listed there (C5 v3).
+    type Decoder = Option<Message>;
+
+    fn decoder() -> Self::Decoder {
+        None
+    }
+
+    fn decode_lent<'a>(decoder: &'a mut Self::Decoder, bytes: &[u8]) -> Option<&'a mut Message> {
+        crate::openraft_wire::decode_into(decoder, bytes).then_some(())?;
+        decoder.as_mut()
+    }
+
+    fn appended(message: &Message) -> Option<(u64, Vec<(u64, u64)>)> {
+        append_entries(message)
+    }
+
+    fn acknowledged(message: &Message) -> Option<(u64, u64)> {
+        append_ack(message)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each run seed seeds each node's executor, and so OpenRaft's
+    /// election timeout draws, differently; outside a run the seed is
+    /// the node's alone, as before.
+    #[test]
+    fn the_run_seed_reseeds_each_node() {
+        let base: Vec<u64> = (0..5_u32).map(seed_of).collect();
+        assert_eq!(
+            base,
+            (0..5_u32)
+                .map(|id| crate::executor::splitmix64(u64::from(id) ^ 0x0000_43C5))
+                .collect::<Vec<_>>()
+        );
+        let one: Vec<u64> = {
+            let _seed = karyos_sim::harness::core::RunSeed::set(1);
+            (0..5_u32).map(seed_of).collect()
+        };
+        let two: Vec<u64> = {
+            let _seed = karyos_sim::harness::core::RunSeed::set(2);
+            (0..5_u32).map(seed_of).collect()
+        };
+        assert_ne!(one, base);
+        assert_ne!(one, two);
+    }
 
     fn append_rpc(term: u64, prev: Option<(u64, u64)>, entries: &[(u64, &[u8])]) -> Request {
         Request::Append(Arc::new(AppendEntriesRequest {

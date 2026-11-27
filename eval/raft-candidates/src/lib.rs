@@ -19,7 +19,11 @@
 //! - [`raft_rs`]: `raft` 0.7.0 (TiKV's raft-rs), its `RawNode` driven by
 //!   the harness's node.
 //! - [`process`]: the same cores in real processes: C4's log on real
-//!   files, UDP between processes, the monotonic clock.
+//!   files, UDP between processes, the monotonic clock, serving the
+//!   harness test service to client processes.
+//! - [`record`]: what those processes report, stamped from the host
+//!   monotonic clock, and its merge for the harness checks.
+//! - [`v2`]: C5 version 2's frozen W2 in-flight byte case.
 //! - [`variant`]: which build of a candidate ran, baseline or patched,
 //!   with its patch record.
 
@@ -29,4 +33,6 @@ pub mod openraft_core;
 pub mod openraft_wire;
 pub mod process;
 pub mod raft_rs;
+pub mod record;
+pub mod v2;
 pub mod variant;

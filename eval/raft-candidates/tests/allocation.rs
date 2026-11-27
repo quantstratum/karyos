@@ -18,11 +18,19 @@
 use std::io::Write as _;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use karyos_cluster::RaftLog;
 use karyos_raft_eval::openraft_core::{OpenRaftBatch16, VARIANT as OPENRAFT_VARIANT};
+use karyos_raft_eval::process;
 use karyos_raft_eval::raft_rs::{RaftRsBatch16, VARIANT};
+use karyos_sim::disk::SimDisk;
+use karyos_sim::harness::core::{ConsensusCore, LogView, Persisted, Ready, Refused};
+use karyos_sim::harness::node::LOG_DIR;
 use karyos_sim::harness::probe::{AllocationReport, WARMUP, measure};
+use karyos_sim::harness::probe::{Measured, Probed, Stage, measure_with};
+use karyos_sim::harness::workloads::geometry;
 use karyos_sim::harness::workloads::{self, Case, W1};
-use karyos_sys::alloc_count::CountingAllocator;
+use karyos_sim::net::NodeId;
+use karyos_sys::alloc_count::{CountingAllocator, SetCounts, enroll, window};
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -103,4 +111,409 @@ fn openraft_replication_path_allocates_and_the_gate_reports_it() {
     );
     let (allocations, frees) = measured.per_entry().unwrap();
     assert!(allocations > 0 && frees > 0, "{measured:?}");
+}
+
+/// C5 version 2's allocation gate in the simulator, for every variant at
+/// one commit (quantstratum-docs: karyos/evaluations/c5-raft-comparison-v2.md,
+/// "One probe, one revision"; version 1's gate counts W1 and W2): each
+/// variant measured with `harness::probe` on W1's allocation case (version
+/// 1's, `W1 n=3 payload=32 clients=32`, batch limit 16) and on W2's
+/// nominal case under the manifest's declared limits, seed 1, one line per
+/// measurement on stdout for the run record. W2's declared limits set each
+/// core's batching, so it runs the evaluated builds, not the batch-16 ones.
+/// The counts are the gate's evidence, scored by the report: this asserts
+/// only that each run passes its case and the probe measured entries.
+/// Ignored by default: the run record runs it at its run commit.
+#[test]
+#[ignore = "C5 v3's allocation measurement; the run record runs it at its commit"]
+fn the_c5_v3_allocation_lines() {
+    use karyos_raft_eval::openraft_core::OpenRaft;
+    use karyos_raft_eval::raft_rs::RaftRs;
+    use karyos_sim::harness::custom::Custom;
+    use karyos_sim::harness::workloads::W2;
+
+    let _serial = serial();
+    let w1 = W1::skeleton().cases().into_iter().nth(1).unwrap();
+    let w2 = W2::manifest()
+        .cases()
+        .unwrap()
+        .into_iter()
+        .find(|case| case.name.ends_with("nominal"))
+        .unwrap();
+    let raft = ("raft 0.7.0", VARIANT.label());
+    let openraft = ("openraft 0.10.0-alpha.37", OPENRAFT_VARIANT.label());
+    let custom = ("custom core (karyos_cluster::consensus)", "not applicable");
+    let runs: [(&str, &str, &Case, AllocationReport); 6] = [
+        (
+            raft.0,
+            raft.1,
+            &w1,
+            measure::<RaftRsBatch16>(&w1, 1).unwrap(),
+        ),
+        (
+            openraft.0,
+            openraft.1,
+            &w1,
+            measure::<OpenRaftBatch16>(&w1, 1).unwrap(),
+        ),
+        (custom.0, custom.1, &w1, measure::<Custom>(&w1, 1).unwrap()),
+        (raft.0, raft.1, &w2, measure::<RaftRs>(&w2, 1).unwrap()),
+        (
+            openraft.0,
+            openraft.1,
+            &w2,
+            measure::<OpenRaft>(&w2, 1).unwrap(),
+        ),
+        (custom.0, custom.1, &w2, measure::<Custom>(&w2, 1).unwrap()),
+    ];
+    for (core, variant, case, measured) in &runs {
+        assert_eq!(
+            workloads::pass(case, &measured.outcome),
+            Ok(None),
+            "{core} {}",
+            case.name
+        );
+        assert!(
+            measured.entries > 0,
+            "{core} {}: nothing measured",
+            case.name
+        );
+        let stages: Vec<String> = measured
+            .stages
+            .iter()
+            .map(|(stage, counts)| {
+                format!(
+                    "\"{}\":[{},{}]",
+                    stage.name(),
+                    counts.allocations,
+                    counts.frees
+                )
+            })
+            .collect();
+        let _ = writeln!(
+            std::io::stdout(),
+            "{{\"evidence\":\"C5 v3 simulator\",\"core\":\"{core}\",\"variant\":\"{variant}\",\
+             \"forms\":\"borrowed: propose_slice, ready_into, entries_into\",\
+             \"case\":\"{}\",\"servers\":{},\"clients\":{},\"operations\":{},\
+             \"payload\":{},\"limits\":{},\"seed\":1,\"warmup\":{WARMUP},\"entries\":{},\
+             \"allocations\":{},\"frees\":{},\"stages\":{{{}}}}}",
+            case.name,
+            case.servers,
+            case.clients,
+            case.operations,
+            case.payload,
+            case.limits.is_some(),
+            measured.entries,
+            measured.counts.allocations,
+            measured.counts.frees,
+            stages.join(","),
+        );
+    }
+}
+
+/// A core past the warm-up from its first call: driving it once opens the
+/// probe's between-calls stages ([`probe::encoding`], [`probe::application`]).
+#[derive(Debug)]
+struct Past;
+
+impl ConsensusCore for Past {
+    type Message = ();
+
+    fn recover(_id: NodeId, _peers: &[NodeId], _log: &mut LogView<'_>) -> Self {
+        Self
+    }
+
+    fn propose(&mut self, _command: Vec<u8>, _log: &mut LogView<'_>) -> Result<(), Refused> {
+        Ok(())
+    }
+
+    fn step(&mut self, _from: NodeId, _message: (), _log: &mut LogView<'_>) {}
+
+    fn tick(&mut self, _now: u64, _log: &mut LogView<'_>) {}
+
+    fn ready(&mut self, _log: &mut LogView<'_>) -> Option<Ready<()>> {
+        None
+    }
+
+    fn advance(&mut self, _persisted: Persisted, _log: &mut LogView<'_>) {}
+
+    fn term(&self) -> u64 {
+        1
+    }
+
+    fn leads(&self) -> bool {
+        true
+    }
+
+    fn received(&self) -> Option<u64> {
+        None
+    }
+
+    fn committed(&self) -> Option<u64> {
+        Some(WARMUP)
+    }
+}
+
+/// `stage`'s counts in `measured`.
+fn staged(measured: &Measured, stage: Stage) -> SetCounts {
+    measured
+        .stages
+        .iter()
+        .find(|(name, _)| *name == stage)
+        .map(|(_, counts)| *counts)
+        .unwrap()
+}
+
+/// Runs `run` in a measurement, past a probed core's warm-up.
+fn past_warmup(run: impl FnOnce()) -> Measured {
+    let mut log = RaftLog::create(
+        SimDisk::new(),
+        std::path::Path::new(LOG_DIR),
+        geometry().unwrap(),
+        1,
+    )
+    .unwrap();
+    let mut core = Probed::<Past>::recover(1, &[1], &mut LogView::new(&mut log));
+    let ((), measured) = measure_with(|| {
+        core.tick(0, &mut LogView::new(&mut log));
+        run();
+    })
+    .unwrap();
+    measured
+}
+
+/// Codex review of docs#1080 (C5 v3 coverage): what grows the runner's
+/// send outbox is counted as the encoding.
+#[test]
+fn the_runners_send_outbox_is_counted_as_the_encoding() {
+    let _serial = serial();
+    let mut outbox: Vec<(NodeId, u8)> = Vec::new();
+    let measured = past_warmup(|| process::outbox_push(&mut outbox, 2, 7));
+    assert_eq!(outbox, [(2, 7)]);
+    assert!(
+        staged(&measured, Stage::Encoding).allocations >= 1,
+        "{:?}",
+        measured.stages
+    );
+}
+
+/// Codex review of docs#1080 (C5 v3): a reply framed into the server's
+/// kept frame, prefilled for the largest answer, allocates nothing.
+#[test]
+fn a_reply_framed_into_the_kept_frame_allocates_nothing() {
+    use karyos_sim::harness::node::Wire as Harness;
+    let _serial = serial();
+    let message: Harness<()> = Harness::Response {
+        cluster: karyos_sim::harness::node::HARNESS_CLUSTER,
+        sequence: 1,
+        bytes: vec![7; 9],
+        index: 4,
+        generation: 1,
+    };
+    let mut framed = Vec::with_capacity(256);
+    let (ok, counts) = window(|| {
+        let _enrolled = enroll();
+        process::frame_into(3, &message, &mut framed)
+    })
+    .unwrap();
+    assert!(ok);
+    assert_eq!(counts, SetCounts::default());
+    assert_eq!(Some(framed), process::frame(3, &message));
+}
+
+/// Docs#1080 review (C5 v3): an append's read back under declared limits
+/// compares the library's entries in place, for both library adapters:
+/// once its kept buffers fit, it allocates and frees nothing.
+#[test]
+fn the_read_back_compares_in_place_and_allocates_nothing() {
+    use karyos_cluster::Entry;
+    use karyos_raft_eval::openraft_core::{Command, TypeConfig, sent_entries as open_sent};
+    use karyos_raft_eval::raft_rs::{ReadBack, read_back, sent_entries, to_raft};
+
+    type Clid =
+        <<TypeConfig as openraft::RaftTypeConfig>::LeaderId as openraft::vote::RaftLeaderId>::Committed;
+
+    let _serial = serial();
+    let mut log = RaftLog::create(
+        SimDisk::new(),
+        std::path::Path::new(LOG_DIR),
+        geometry().unwrap(),
+        1,
+    )
+    .unwrap();
+    let entries: Vec<Entry> = (1..=2)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            event_time: 0,
+            payload: vec![7; 32],
+        })
+        .collect();
+    let _ = log.append(&entries).unwrap();
+    let _ = log.sync().unwrap();
+    let raft: Vec<raft::eraftpb::Entry> = entries.iter().map(to_raft).collect();
+    let open: Vec<<TypeConfig as openraft::RaftTypeConfig>::Entry> = entries
+        .iter()
+        .map(|entry| openraft::Entry {
+            log_id: openraft::LogId::new(Clid::new(1), entry.index - 1),
+            payload: openraft::EntryPayload::Normal(Command(entry.payload.clone())),
+        })
+        .collect();
+    let mut reads = ReadBack::default();
+    // The kept buffers grow once.
+    assert!(read_back(
+        sent_entries(&raft),
+        &mut LogView::new(&mut log),
+        &mut reads
+    ));
+    let (both, counts) = window(|| {
+        let _enrolled = enroll();
+        read_back(sent_entries(&raft), &mut LogView::new(&mut log), &mut reads)
+            && read_back(open_sent(&open), &mut LogView::new(&mut log), &mut reads)
+    })
+    .unwrap();
+    assert!(both);
+    assert_eq!(counts, SetCounts::default());
+    // A mismatch is still caught in place.
+    let mut other = raft.clone();
+    other[1].data = vec![8; 32].into();
+    assert!(!read_back(
+        sent_entries(&other),
+        &mut LogView::new(&mut log),
+        &mut reads
+    ));
+}
+
+/// Codex re-review of docs#1080 (C5 v3): a server's pending requests,
+/// prefilled from the case's bounds, take a request and give it back once
+/// answered, over and over, with no allocation and no free.
+#[test]
+fn the_pending_requests_neither_allocate_nor_free_past_their_prefill() {
+    let _serial = serial();
+    let bounds = karyos_sim::harness::node::ServiceBounds {
+        clients: vec![1, 2, 3, 4],
+        values: 16,
+        payload: 32,
+        answers: 2,
+    };
+    let mut pending = process::Pending::prefilled(process::pending_room(&bounds));
+    let ((), counts) = window(|| {
+        let _enrolled = enroll();
+        for round in 0..8u64 {
+            for client in 1..=4u32 {
+                for sequence in [2 * round, 2 * round + 1] {
+                    pending.insert((client, sequence));
+                    // A retry of a pending request is not added again.
+                    pending.insert((client, sequence));
+                }
+            }
+            assert_eq!(pending.len(), 8);
+            for client in 1..=4u32 {
+                for sequence in [2 * round, 2 * round + 1] {
+                    assert!(pending.remove((client, sequence)));
+                }
+            }
+            assert!(!pending.remove((1, 2 * round)));
+        }
+    })
+    .unwrap();
+    assert!(pending.is_empty());
+    assert_eq!(counts, SetCounts::default());
+}
+
+/// Codex re-review of docs#1080 (C5 v3): the reply queue, prefilled from
+/// the case's bounds, queues an answer for every pending request and a
+/// refusal for every client with no allocation and no free.
+#[test]
+fn the_reply_queue_takes_its_bound_without_allocating() {
+    use karyos_sim::harness::node::Wire as Harness;
+    let _serial = serial();
+    let bounds = karyos_sim::harness::node::ServiceBounds {
+        clients: vec![1, 2, 3, 4],
+        values: 16,
+        payload: 32,
+        answers: 2,
+    };
+    let room = process::reply_room(&bounds);
+    let mut replies: Vec<(NodeId, Harness<()>)> = Vec::with_capacity(room);
+    let ((), counts) = window(|| {
+        let _enrolled = enroll();
+        for _ in 0..4 {
+            for sequence in 0..u64::try_from(room).unwrap() {
+                replies.push((
+                    1,
+                    Harness::Refused {
+                        cluster: karyos_sim::harness::node::HARNESS_CLUSTER,
+                        sequence,
+                    },
+                ));
+            }
+            replies.clear();
+        }
+    })
+    .unwrap();
+    assert_eq!(counts, SetCounts::default());
+}
+
+/// Docs#1080 (C5 v3): a request encoded into the node's command buffer,
+/// prefilled from the case's bounds, allocates nothing at the case's
+/// largest payload.
+#[test]
+fn a_request_encodes_into_the_prefilled_command_buffer() {
+    use karyos_sim::harness::node::{Command, Op, ServiceBounds};
+    let _serial = serial();
+    let bounds = ServiceBounds {
+        clients: vec![1, 2],
+        values: 4,
+        payload: 256,
+        answers: 1,
+    };
+    let command = Command {
+        client: u32::MAX,
+        sequence: u64::MAX,
+        op: Op::Append(vec![7; 256]),
+    };
+    let mut buffer = Vec::with_capacity(process::command_room(&bounds));
+    let ((), counts) = window(|| {
+        let _enrolled = enroll();
+        command.encode_into(&mut buffer);
+    })
+    .unwrap();
+    assert_eq!(counts, SetCounts::default());
+    assert_eq!(buffer, command.encode());
+}
+
+/// Docs#1080 (C5 v3 coverage): the decoder's last message, dropped as the
+/// node stops, is counted as the encoding.
+#[test]
+fn the_decoders_last_message_is_counted_as_the_encoding() {
+    use karyos_raft_eval::process::Wire;
+    use karyos_raft_eval::raft_rs::to_raft;
+    let _serial = serial();
+    let mut message = raft::eraftpb::Message::default();
+    message.set_msg_type(raft::eraftpb::MessageType::MsgAppend);
+    message.entries = (1..=4)
+        .map(|index| {
+            to_raft(&karyos_cluster::Entry {
+                index,
+                term: 1,
+                event_time: 0,
+                payload: vec![7; 64],
+            })
+        })
+        .collect();
+    let bytes = protobuf::Message::write_to_bytes(&message).unwrap();
+    let mut decoder = <RaftRsBatch16 as Wire>::decoder();
+    assert!(<RaftRsBatch16 as Wire>::decode_lent(&mut decoder, &bytes).is_some());
+    let mut kept = Some(decoder);
+    let measured = past_warmup(|| {
+        if let Some(decoder) = kept.take() {
+            process::drop_decoder::<RaftRsBatch16>(decoder);
+        }
+    });
+    assert!(
+        staged(&measured, Stage::Encoding).frees >= 1,
+        "{:?}",
+        measured.stages
+    );
 }

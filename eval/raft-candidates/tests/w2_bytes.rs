@@ -41,7 +41,6 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 
 use karyos_raft_eval::openraft_core::{self, OpenRaft};
 use karyos_raft_eval::raft_rs::{self, RaftRs};
@@ -56,6 +55,12 @@ use karyos_sim::net::NodeId;
 const SEEDS: [u64; 4] = [1, 0xC5, 0x0043, 0xDEAD_BEEF];
 
 mod v2;
+
+// The oracle, shared with the real-process runs (`tests/real_processes.rs`).
+#[path = "v2/oracle.rs"]
+mod oracle;
+
+use oracle::Trace;
 
 use v2::CAP;
 
@@ -77,70 +82,6 @@ fn case() -> Case {
     );
     assert_eq!((case.clients, case.window, case.operations), (32, 4, 32));
     case
-}
-
-/// One leader's view of one follower within a term.
-#[derive(Debug, Default)]
-struct Window {
-    term: u64,
-    /// The highest index the follower acknowledged in `term`.
-    acked: u64,
-    /// The indices sent above `acked`, with their payload bytes.
-    unacked: BTreeMap<u64, u64>,
-}
-
-/// What the oracle saw of one run.
-#[derive(Debug, Default)]
-struct Trace {
-    windows: BTreeMap<(NodeId, NodeId), Window>,
-    /// The most payload bytes ever unacknowledged to one follower.
-    most: u64,
-    /// The largest entry payload seen in any append.
-    largest: u64,
-    /// Entries with a payload seen in appends.
-    commands: u64,
-}
-
-impl Trace {
-    fn sent(&mut self, leader: NodeId, to: NodeId, term: u64, entries: &[(u64, u64)]) {
-        let window = self.windows.entry((leader, to)).or_default();
-        if term < window.term {
-            return;
-        }
-        if term > window.term {
-            *window = Window {
-                term,
-                ..Window::default()
-            };
-        }
-        for &(index, bytes) in entries {
-            self.largest = self.largest.max(bytes);
-            if bytes > 0 {
-                self.commands += 1;
-            }
-            if index > window.acked {
-                window.unacked.insert(index, bytes);
-            }
-        }
-        let total: u64 = window.unacked.values().sum();
-        self.most = self.most.max(total);
-    }
-
-    fn acked(&mut self, leader: NodeId, from: NodeId, term: u64, index: u64) {
-        if let Some(window) = self.windows.get_mut(&(leader, from))
-            && window.term == term
-            && index > window.acked
-        {
-            window.acked = index;
-            window.unacked.retain(|&at, _| at > index);
-        }
-    }
-
-    fn unacked(&self, leader: NodeId, to: NodeId) -> u64 {
-        self.windows
-            .get(&(leader, to))
-            .map_or(0, |window| window.unacked.values().sum())
-    }
 }
 
 thread_local! {
@@ -416,4 +357,87 @@ fn the_oracle_counts_each_unacknowledged_index_once() {
     // The ignored earlier-term append counts for nothing, not even the
     // largest payload seen.
     assert_eq!((trace.largest, trace.commands), (100, 9));
+}
+
+/// The byte case's oracle over the corpus seeds, for the run record (C5
+/// v2 run record, "W2 in-flight byte case"): one JSON line per core and
+/// seed into `KARYOS_C5_OUT/c5-v3-w2-bytes-<core>-<first>-<last>.jsonl`,
+/// with the most bytes unacknowledged to one follower, the largest entry,
+/// the commands replicated, the refusals by kind, safety and the harness
+/// verdict, and whether the seed meets the frozen pass (bound held,
+/// reached once, typed refusals only, W1's pass after the load). A result
+/// is a line, never a failed test. Ignored by default; `KARYOS_C5_SEEDS`
+/// as the corpus runner's (default 1..=1000), `KARYOS_C5_CORES` a subset
+/// of `raft,openraft,custom`.
+#[test]
+#[ignore = "the corpus seeds take long; run on request"]
+#[allow(clippy::print_stdout, reason = "each core's count, for the report")]
+fn the_byte_case_over_the_corpus_seeds() {
+    use std::io::Write as _;
+    fn over<C: Read>(name: &str, seeds: std::ops::RangeInclusive<u64>, dir: &std::path::Path) {
+        let case = case();
+        let path = dir.join(format!(
+            "c5-v3-w2-bytes-{name}-{}-{}.jsonl",
+            seeds.start(),
+            seeds.end()
+        ));
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        let mut passed = 0u64;
+        let mut runs = 0u64;
+        for seed in seeds {
+            let (outcome, trace, refused) = run::<C>(&case, seed);
+            let bytes = refused
+                .iter()
+                .filter(|limit| **limit == Limit::InFlightBytes)
+                .count();
+            let queue = refused
+                .iter()
+                .filter(|limit| **limit == Limit::Queue)
+                .count();
+            let typed = refused
+                .iter()
+                .all(|limit| matches!(limit, Limit::InFlightBytes | Limit::Queue));
+            let verdict = workloads::pass(&case, &outcome);
+            let pass = outcome.safety.is_ok()
+                && trace.most <= CAP
+                && trace.most >= REACHED
+                && typed
+                && verdict == Ok(None);
+            runs += 1;
+            passed += u64::from(pass);
+            writeln!(
+                out,
+                "{{\"core\":\"{name}\",\"seed\":{seed},\"most\":{},\"largest\":{},\"commands\":{},\"refused_in_flight_bytes\":{bytes},\"refused_queue\":{queue},\"refusals_typed\":{typed},\"safety\":{},\"verdict\":\"{verdict:?}\",\"pass\":{pass}}}",
+                trace.most,
+                trace.largest,
+                trace.commands,
+                outcome.safety.is_ok(),
+            )
+            .unwrap();
+        }
+        out.into_inner().unwrap().sync_all().unwrap();
+        println!(
+            "c5 v2 W2 bytes: {name}, runs {runs}, pass {passed}, {}",
+            path.display()
+        );
+    }
+    let seeds = std::env::var("KARYOS_C5_SEEDS")
+        .ok()
+        .map_or(1..=1_000, |range| {
+            let (first, last) = range.split_once("..=").unwrap();
+            first.parse().unwrap()..=last.parse().unwrap()
+        });
+    let dir = std::env::var_os("KARYOS_C5_OUT").map_or_else(
+        || std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")),
+        std::path::PathBuf::from,
+    );
+    let cores = std::env::var("KARYOS_C5_CORES").unwrap_or_else(|_| "raft,openraft,custom".into());
+    for name in cores.split(',') {
+        match name {
+            "raft" => over::<RaftRs>(name, seeds.clone(), &dir),
+            "openraft" => over::<OpenRaft>(name, seeds.clone(), &dir),
+            "custom" => over::<Custom>(name, seeds.clone(), &dir),
+            _ => panic!("unknown core {name}: raft, openraft or custom"),
+        }
+    }
 }

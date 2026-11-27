@@ -553,12 +553,38 @@ fn caught<C: ConsensusCore>(case: &Case, caught: impl Fn(&Violation) -> bool) ->
     })
 }
 
+/// The seed of the learners-as-voters check: its scenario needs node 0,
+/// which M1's split puts with the learner, to lead, and the check is
+/// caught exactly on the seeds where it does. Was any of [`CORPUS`]: since
+/// karyos 4014992f the election timeouts are drawn from the run seed, and
+/// none of the corpus seeds elects node 0 any more; 0x04, the first seed
+/// from 1 that does.
+const AS_VOTERS_SEED: u64 = 0x04;
+
 #[test]
 fn quorum_of_voters_catches_learners_reported_as_voters() {
-    assert!(caught::<Mutant<AS_VOTERS>>(
-        &warmed(membership::m1()),
-        |violation| { matches!(violation, Violation::QuorumOfVoters { .. }) }
-    ));
+    let case = warmed(membership::m1());
+    let outcome = workloads::run::<Mutant<AS_VOTERS>>(&case, AS_VOTERS_SEED).unwrap();
+    // The scenario is reached: node 0 leads, on the learner's side.
+    let leader = outcome
+        .observations
+        .iter()
+        .find_map(|observation| match observation {
+            Observation::Leading { node, .. } => Some(*node),
+            _ => None,
+        });
+    assert_eq!(
+        leader,
+        Some(0),
+        "seed {AS_VOTERS_SEED:#x}: node 0 did not lead"
+    );
+    assert!(
+        matches!(
+            workloads::pass(&case, &outcome),
+            Err(Failed::Safety(violation)) if matches!(*violation, Violation::QuorumOfVoters { .. })
+        ),
+        "seed {AS_VOTERS_SEED:#x}: the learners counted as voters were not caught"
+    );
 }
 
 #[test]

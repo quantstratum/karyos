@@ -502,6 +502,18 @@ impl SimDisk {
         self.0.borrow().crashed
     }
 
+    /// The planned flush failures so far, across the restarts its trace
+    /// continues through ([`Decision::FailedSync`]).
+    #[must_use]
+    pub fn failed_syncs(&self) -> usize {
+        self.0
+            .borrow()
+            .trace
+            .iter()
+            .filter(|decision| matches!(decision, Decision::FailedSync { .. }))
+            .count()
+    }
+
     /// The fault decisions so far.
     #[must_use]
     pub fn trace(&self) -> Vec<Decision> {

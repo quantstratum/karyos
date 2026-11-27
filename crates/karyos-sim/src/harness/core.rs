@@ -588,6 +588,14 @@ impl<M> ReadyBuf<M> {
         into.append(&mut self.spare);
     }
 
+    /// Room in the pool for `count` entries, so that recycling a Ready of
+    /// up to `count` entries does not grow it (C5 v3 coverage: the
+    /// recycling counts in a probed core's Ready stage). A core reserves it
+    /// to its bounds; past that, reserving again allocates nothing.
+    pub fn reserve_spare(&mut self, count: usize) {
+        self.spare.reserve(count.saturating_sub(self.spare.len()));
+    }
+
     /// Drops the pool: for a core that never draws from it.
     pub fn release_spare(&mut self) {
         self.spare = Vec::new();
@@ -695,11 +703,44 @@ pub trait ConsensusCore: Sized {
     /// `message` from `from` arrives.
     fn step(&mut self, from: NodeId, message: Self::Message, log: &mut LogView<'_>);
 
+    /// [`ConsensusCore::step`] with `message` lent (C5 v3, "the harness and
+    /// the adapters"): the node owns it and its buffers, and takes it back
+    /// after the call, so a core that copies what it keeps frees nothing
+    /// of it. The default steps an owned clone; a core whose library takes
+    /// its messages by value moves it out instead (its library's types
+    /// then free it inside the call).
+    fn step_lent(&mut self, from: NodeId, message: &mut Self::Message, log: &mut LogView<'_>) {
+        self.step(from, message.clone(), log);
+    }
+
     /// Time passes: the node's clock reads `now`.
     fn tick(&mut self, now: u64, log: &mut LogView<'_>);
 
     /// What the node should do now, if anything.
     fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Self::Message>>;
+
+    /// Runs `persist`, the driver's persistence of this core's Ready (the
+    /// log's truncation, append, sync and hard state), just before
+    /// [`ConsensusCore::advance`] reports it. The work is the Advance's, so
+    /// a probed core counts it in its Advance stage
+    /// (`harness::probe::Probed`; C5 v3 coverage). The default
+    /// only runs it; no core overrides it.
+    fn persisting<R>(&mut self, persist: impl FnOnce() -> R) -> R
+    where
+        Self: Sized,
+    {
+        persist()
+    }
+
+    /// Empties `out` for the next [`ConsensusCore::ready_into`]
+    /// ([`ReadyBuf::recycle`]): [`drive`] calls it before each Ready and
+    /// after it is done with one. Its work (the entries going back to the
+    /// pool, which can grow it) is the Ready's, so a probed core counts it
+    /// in its Ready stage (`harness::probe::Probed`; C5 v3
+    /// coverage). The default only recycles; no core overrides it.
+    fn recycle_ready(&mut self, out: &mut ReadyBuf<Self::Message>) {
+        out.recycle();
+    }
 
     /// [`ConsensusCore::ready`], filled into the node's `out`, which
     /// [`drive`] hands over empty ([`ReadyBuf::recycle`]) (plan issue 073,
@@ -1049,10 +1090,10 @@ pub(crate) fn drive_inner<C: ConsensusCore, D: Disk + Clone>(
     observe: &mut dyn FnMut(Step),
 ) -> Result<(), DriveError> {
     let mut readies = 0usize;
-    buf.recycle();
+    core.recycle_ready(buf);
     while core.ready_into(buf, &mut LogView::metered(log, budget).with_base(base)) {
         if readies == MAX_READIES {
-            buf.recycle();
+            core.recycle_ready(buf);
             return Err(DriveError::WorkBudget { readies });
         }
         // Below MAX_READIES, so it does not overflow.
@@ -1064,7 +1105,7 @@ pub(crate) fn drive_inner<C: ConsensusCore, D: Disk + Clone>(
             (budget, base, fault),
             (send, apply, observe),
         );
-        buf.recycle();
+        core.recycle_ready(buf);
         result?;
     }
     Ok(())
@@ -1121,21 +1162,24 @@ fn take<C: ConsensusCore, D: Disk + Clone>(
             }
             DriveFault::None => {}
         }
-        // 2. Persistence.
-        if let Some(from) = ready.truncate_from {
-            log.truncate_suffix(from)?;
-        }
-        let durable = if ready.entries.is_empty() && ready.truncate_from.is_none() {
-            log.durable_index()
-        } else {
-            if !ready.entries.is_empty() {
-                let _ = log.append(&ready.entries)?;
+        // 2. Persistence, counted with the Advance that reports it.
+        let durable = core.persisting(|| -> Result<_, DriveError> {
+            if let Some(from) = ready.truncate_from {
+                log.truncate_suffix(from)?;
             }
-            log.sync()?
-        };
-        if let Some(state) = ready.hard_state {
-            log.save_hard_state(state)?;
-        }
+            let durable = if ready.entries.is_empty() && ready.truncate_from.is_none() {
+                log.durable_index()
+            } else {
+                if !ready.entries.is_empty() {
+                    let _ = log.append(&ready.entries)?;
+                }
+                log.sync()?
+            };
+            if let Some(state) = ready.hard_state {
+                log.save_hard_state(state)?;
+            }
+            Ok(durable)
+        })?;
         // 3. Reported to the core.
         let persisted = Persisted {
             durable,
@@ -1174,4 +1218,83 @@ fn take<C: ConsensusCore, D: Disk + Clone>(
         }
     }
     Ok(())
+}
+
+thread_local! {
+    /// The seed of the workload run on this thread, 0 outside one.
+    static RUN_SEED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The seed of the workload run this thread is in ([`super::workloads::run`]),
+/// or 0 outside one: an adapter seeds each node's election timeout draw
+/// from it and the node's id, so the timing differs from seed to seed
+/// and stays a function of the seed (C5 v2 manifest, Timing; karyos#691).
+#[must_use]
+pub fn run_seed() -> u64 {
+    RUN_SEED.with(Cell::get)
+}
+
+/// Sets [`run_seed`] for the life of the guard, and puts the previous
+/// value back when it drops.
+#[must_use = "the seed is set only while the guard lives"]
+pub struct RunSeed(u64);
+
+impl RunSeed {
+    /// Sets the thread's run seed to `seed`.
+    pub fn set(seed: u64) -> Self {
+        Self(RUN_SEED.with(|cell| cell.replace(seed)))
+    }
+}
+
+impl Drop for RunSeed {
+    fn drop(&mut self) {
+        RUN_SEED.with(|cell| cell.set(self.0));
+    }
+}
+
+/// The seed of node `id`'s election timeout draw in the run seeded
+/// `seed`: the id alone outside a run (`seed` 0), so a path with no run
+/// seed keeps its old draw.
+#[must_use]
+pub const fn node_seed(seed: u64, id: u64) -> u64 {
+    // The multiplication wraps by design: a spread of the seed's bits.
+    id ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03)
+}
+
+#[cfg(test)]
+mod run_seed_tests {
+    use super::{RunSeed, node_seed, run_seed};
+
+    /// The guard sets the seed for its life and puts the previous one
+    /// back, nested or not; outside a run it is 0.
+    #[test]
+    fn a_run_seed_lives_as_long_as_its_guard() {
+        assert_eq!(run_seed(), 0);
+        {
+            let _outer = RunSeed::set(7);
+            assert_eq!(run_seed(), 7);
+            {
+                let _inner = RunSeed::set(9);
+                assert_eq!(run_seed(), 9);
+            }
+            assert_eq!(run_seed(), 7);
+        }
+        assert_eq!(run_seed(), 0);
+    }
+
+    /// Outside a run a node keeps its id as its seed; under a run every
+    /// seed of the corpus gives each node another draw, and no two nodes
+    /// of a run share one.
+    #[test]
+    fn each_run_seed_gives_each_node_its_own_draw() {
+        for id in 0..5 {
+            assert_eq!(node_seed(0, id), id);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for seed in 1..=1_000 {
+            for id in 0..5 {
+                assert!(seen.insert(node_seed(seed, id)), "seed {seed} node {id}");
+            }
+        }
+    }
 }

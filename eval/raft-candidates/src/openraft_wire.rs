@@ -26,12 +26,29 @@ type OEntry = <C as openraft::RaftTypeConfig>::Entry;
 type OVote = <C as openraft::RaftTypeConfig>::Vote;
 type Clid = <<C as openraft::RaftTypeConfig>::LeaderId as openraft::vote::RaftLeaderId>::Committed;
 type OLogId = openraft::LogId<Clid>;
+type OPayload = EntryPayload<
+    <C as openraft::RaftTypeConfig>::D,
+    <C as openraft::RaftTypeConfig>::NodeId,
+    <C as openraft::RaftTypeConfig>::Node,
+>;
 
 /// Encodes `message`; `None` for what the adapter never sends (a joint
 /// membership).
 #[must_use]
 pub fn encode(message: &Message) -> Option<Vec<u8>> {
     let mut out = Vec::new();
+    encode_into(message, &mut out).then_some(out)
+}
+
+/// [`encode`] into `out`, cleared first: a runner that keeps `out` encodes
+/// without allocating once it has grown (C5 v3); `false` for what the
+/// adapter never sends.
+pub fn encode_into(message: &Message, out: &mut Vec<u8>) -> bool {
+    out.clear();
+    write(message, out).is_some()
+}
+
+fn write(message: &Message, out: &mut Vec<u8>) -> Option<()> {
     match message {
         Message::Request {
             id,
@@ -39,9 +56,9 @@ pub fn encode(message: &Message) -> Option<Vec<u8>> {
             request,
         } => {
             out.push(0);
-            u64_to(&mut out, *id);
-            u64_to(&mut out, *incarnation);
-            request_to(&mut out, request)?;
+            u64_to(out, *id);
+            u64_to(out, *incarnation);
+            request_to(out, request)?;
         }
         Message::Response {
             id,
@@ -50,44 +67,80 @@ pub fn encode(message: &Message) -> Option<Vec<u8>> {
             response,
         } => {
             out.push(1);
-            u64_to(&mut out, *id);
-            u64_to(&mut out, *incarnation);
-            request_to(&mut out, request)?;
+            u64_to(out, *id);
+            u64_to(out, *incarnation);
+            request_to(out, request)?;
             match response {
                 None => out.push(0),
                 Some(response) => {
                     out.push(1);
-                    response_to(&mut out, response);
+                    response_to(out, response);
                 }
             }
         }
     }
-    Some(out)
+    Some(())
 }
 
 /// Decodes a message; `None` for bytes that are not exactly one.
 #[must_use]
 pub fn decode(bytes: &[u8]) -> Option<Message> {
-    let mut input = Reader { bytes };
-    let message = match input.u8()? {
-        0 => Message::Request {
-            id: input.u64()?,
-            incarnation: input.u64()?,
-            request: input.request()?,
-        },
-        1 => Message::Response {
-            id: input.u64()?,
-            incarnation: input.u64()?,
-            request: input.request()?,
-            response: match input.u8()? {
-                0 => None,
-                1 => Some(input.response()?),
-                _ => return None,
+    let mut slot = None;
+    decode_into(&mut slot, bytes).then_some(())?;
+    slot
+}
+
+/// The message in `bytes`, decoded into `slot` (C5 v3): an append whose
+/// request the slot alone still holds (OpenRaft and the sent answer have
+/// dropped their clones of its `Arc`) is refilled in place, its entries'
+/// vector and its normal entries' command buffers kept; any other message
+/// is built new, as OpenRaft's types are. `false`, the slot emptied, when
+/// they are not one.
+pub fn decode_into(slot: &mut Option<Message>, bytes: &[u8]) -> bool {
+    let reuse = match slot.take() {
+        Some(
+            Message::Request {
+                request: Request::Append(rpc),
+                ..
+            }
+            | Message::Response {
+                request: Request::Append(rpc),
+                ..
             },
-        },
-        _ => return None,
+        ) => Some(rpc),
+        _ => None,
     };
-    input.bytes.is_empty().then_some(message)
+    *slot = Reader { bytes }.message(reuse);
+    slot.is_some()
+}
+
+impl Reader<'_> {
+    fn message(&mut self, reuse: Option<Arc<AppendEntriesRequest<C>>>) -> Option<Message> {
+        let message = self.message_body(reuse)?;
+        self.bytes.is_empty().then_some(message)
+    }
+
+    fn message_body(&mut self, reuse: Option<Arc<AppendEntriesRequest<C>>>) -> Option<Message> {
+        let input = self;
+        Some(match input.u8()? {
+            0 => Message::Request {
+                id: input.u64()?,
+                incarnation: input.u64()?,
+                request: input.request(reuse)?,
+            },
+            1 => Message::Response {
+                id: input.u64()?,
+                incarnation: input.u64()?,
+                request: input.request(reuse)?,
+                response: match input.u8()? {
+                    0 => None,
+                    1 => Some(input.response()?),
+                    _ => return None,
+                },
+            },
+            _ => return None,
+        })
+    }
 }
 
 /// The request's bytes: equal bytes are an equal request.
@@ -289,7 +342,32 @@ impl Reader<'_> {
 
     fn entry(&mut self) -> Option<OEntry> {
         let log_id = self.log_id()??;
-        let payload = match self.u8()? {
+        let tag = self.u8()?;
+        let payload = self.payload(tag)?;
+        Some(OEntry { log_id, payload })
+    }
+
+    /// The next entry decoded into `entry`: a normal entry's command into
+    /// the command buffer `entry` already holds, if it holds one.
+    fn entry_into(&mut self, entry: &mut OEntry) -> Option<()> {
+        let log_id = self.log_id()??;
+        let tag = self.u8()?;
+        if tag == 1
+            && let EntryPayload::Normal(command) = &mut entry.payload
+        {
+            let len = self.len()?;
+            let bytes = self.take(len)?;
+            command.0.clear();
+            command.0.extend_from_slice(bytes);
+        } else {
+            entry.payload = self.payload(tag)?;
+        }
+        entry.log_id = log_id;
+        Some(())
+    }
+
+    fn payload(&mut self, tag: u8) -> Option<OPayload> {
+        Some(match tag {
             0 => EntryPayload::Blank,
             1 => {
                 let len = self.len()?;
@@ -309,11 +387,10 @@ impl Reader<'_> {
                 EntryPayload::Membership(Membership::new_with_defaults(vec![voters], []))
             }
             _ => return None,
-        };
-        Some(OEntry { log_id, payload })
+        })
     }
 
-    fn request(&mut self) -> Option<Request> {
+    fn request(&mut self, reuse: Option<Arc<AppendEntriesRequest<C>>>) -> Option<Request> {
         Some(match self.u8()? {
             0 => {
                 let vote = self.vote()?;
@@ -322,6 +399,23 @@ impl Reader<'_> {
                 // An entry is at least 18 bytes.
                 if count > self.bytes.len() / 18 {
                     return None;
+                }
+                // The slot's own request, no clone of it left: refilled.
+                if let Some(mut rpc) = reuse
+                    && let Some(kept) = Arc::get_mut(&mut rpc)
+                {
+                    kept.vote = vote;
+                    kept.prev_log_id = prev_log_id;
+                    kept.entries.truncate(count);
+                    let refilled = kept.entries.len();
+                    for entry in &mut kept.entries {
+                        self.entry_into(entry)?;
+                    }
+                    for _ in refilled..count {
+                        kept.entries.push(self.entry()?);
+                    }
+                    kept.leader_commit = self.log_id()?;
+                    return Some(Request::Append(rpc));
                 }
                 let mut entries = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -426,8 +520,65 @@ mod tests {
         }))
     }
 
+    /// An append's command buffer in `message`, by entry.
+    fn command_ptr(message: &Message, at: usize) -> *const u8 {
+        let Message::Request {
+            request: Request::Append(rpc),
+            ..
+        } = message
+        else {
+            panic!("not an append");
+        };
+        match &rpc.entries[at].payload {
+            EntryPayload::Normal(command) => command.0.as_ptr(),
+            _ => panic!("not a normal entry"),
+        }
+    }
+
+    /// C5 v3: an append decoded into a slot whose request no clone holds
+    /// any more is refilled in place (the same `Arc`, the same command
+    /// buffer); while a clone is held it is decoded new; either way the
+    /// message is the one encoded.
+    #[test]
+    fn an_append_decodes_into_the_slots_own_request() {
+        let message = |id| Message::Request {
+            id,
+            incarnation: 1,
+            request: append(),
+        };
+        let first = encode(&message(1)).unwrap();
+        let second = encode(&message(2)).unwrap();
+        let mut slot = None;
+        assert!(decode_into(&mut slot, &first));
+        let held = slot.as_ref().map(|kept| command_ptr(kept, 1)).unwrap();
+        let rpc = |slot: &Option<Message>| match slot {
+            Some(Message::Request {
+                request: Request::Append(rpc),
+                ..
+            }) => Arc::clone(rpc),
+            _ => panic!("not an append"),
+        };
+        let before = Arc::as_ptr(&rpc(&slot));
+        assert!(decode_into(&mut slot, &second));
+        assert_eq!(Arc::as_ptr(&rpc(&slot)), before);
+        assert_eq!(slot.as_ref().map(|kept| command_ptr(kept, 1)), Some(held));
+        assert_eq!(encode(slot.as_ref().unwrap()).unwrap(), second);
+        // A clone still held (OpenRaft's, or the answer's echo): new.
+        let clone = rpc(&slot);
+        assert!(decode_into(&mut slot, &first));
+        assert_ne!(Arc::as_ptr(&rpc(&slot)), Arc::as_ptr(&clone));
+        assert_eq!(encode(slot.as_ref().unwrap()).unwrap(), first);
+        // Not a message: the slot is emptied.
+        assert!(!decode_into(&mut slot, &[9]));
+        assert!(slot.is_none());
+    }
+
     fn round_trip(message: &Message) {
         let bytes = encode(message).unwrap();
+        // Into a reused buffer, longer before: the same bytes (C5 v3).
+        let mut reused = vec![0xAA; bytes.len() + 64];
+        assert!(encode_into(message, &mut reused));
+        assert_eq!(reused, bytes);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(encode(&decoded).unwrap(), bytes);
         // The values too, not only their bytes (karyos#959 review).

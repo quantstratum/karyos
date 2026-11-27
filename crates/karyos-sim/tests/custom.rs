@@ -60,6 +60,24 @@ fn w4_passes_and_a_lost_majority_is_a_gap() {
                     "{} seed {seed}",
                     case.name
                 );
+            } else if let Ok(Some(gap)) = result {
+                // Only a stall on the failed-flush servers alone is a gap
+                // (see `a_stall_on_the_failed_flush_server_alone_is_a_gap`).
+                assert!(
+                    matches!(gap, Liveness::Stalled { .. }),
+                    "{} seed {seed}",
+                    case.name
+                );
+                assert!(
+                    !outcome.waiting_on.is_empty()
+                        && outcome
+                            .waiting_on
+                            .iter()
+                            .all(|server| case.failing_flushes.contains(server)),
+                    "{} seed {seed}: {:?}",
+                    case.name,
+                    outcome.waiting_on
+                );
             } else {
                 assert_eq!(result, Ok(None), "{} seed {seed}", case.name);
             }
@@ -647,5 +665,53 @@ fn the_harness_histories_keep_the_model_invariants() {
             }
         })
         .contains("sent before")
+    );
+}
+
+/// The leader is the server whose flushes fail (W4 `FailedFlush`, seed
+/// 67, where the run seed draws node 2 the shortest timeout): it stops
+/// answering and another server takes over, but the clients redirected
+/// to it wait out the run's bound before a second silent retry would
+/// move them on. Every waiting client sits on the failed server, so the
+/// stall is a liveness gap, as for a leader crashed and not restarted
+/// (karyos#691); the same stall with a client on a healthy server fails.
+#[test]
+fn a_stall_on_the_failed_flush_server_alone_is_a_gap() {
+    let seed = 67;
+    let case = W4::skeleton(seed)
+        .cases()
+        .into_iter()
+        .find(|case| case.name == "W4 FailedFlush { after: 7 } Synced")
+        .expect("the case");
+    assert_eq!(case.failing_flushes, vec![2]);
+    let outcome = workloads::run::<Custom>(&case, seed).unwrap();
+    assert!(
+        outcome.trace.iter().any(|line| line.contains("sent 0->3")
+            && line.contains("Redirect {")
+            && line.contains("server: 2 }")),
+        "node 2 led and the clients were sent to it"
+    );
+    assert_eq!(outcome.waiting_on, vec![2, 2]);
+    assert_eq!(
+        workloads::pass(&case, &outcome),
+        Ok(Some(Liveness::Stalled { waiting: 2 }))
+    );
+    // A waiting client on a healthy server: a failure.
+    let mut healthy = outcome.clone();
+    healthy.waiting_on = vec![2, 1];
+    assert_eq!(
+        workloads::pass(&case, &healthy),
+        Err(workloads::Failed::Liveness(Liveness::Stalled {
+            waiting: 2
+        }))
+    );
+    // No failing flush in the case: a failure.
+    let mut unfaulted = case.clone();
+    unfaulted.failing_flushes.clear();
+    assert_eq!(
+        workloads::pass(&unfaulted, &outcome),
+        Err(workloads::Failed::Liveness(Liveness::Stalled {
+            waiting: 2
+        }))
     );
 }
