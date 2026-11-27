@@ -692,7 +692,10 @@ fn a_same_generation_answer_keeps_the_identity_requests_name() {
     assert!(events(|sink| client.registered(session, live(1), sink).unwrap()).is_empty());
     // The operator moves the client to the standby; its registration
     // carries no higher generation yet.
-    let standby = SessionTable::new(config(4)).unwrap().register(9, 3, 0).unwrap();
+    let standby = SessionTable::new(config(4))
+        .unwrap()
+        .register(9, 3, 0)
+        .unwrap();
     let at_standby = Stamp {
         cluster: STANDBY,
         generation: 1,
@@ -701,14 +704,11 @@ fn a_same_generation_answer_keeps_the_identity_requests_name() {
     // An answer stamped by the old primary, generation 1, for a request
     // of this session.
     let request = client.submit().unwrap();
-    let _ = events(|sink| {
-        client.replied(
-            request.key,
-            live(1),
-            Reply::Outcome(Answer::Applied),
-            sink,
-        )
-    });
+    let _ =
+        events(|sink| client.replied(request.key, live(1), Reply::Outcome(Answer::Applied), sink));
     let sent = client.submit().unwrap();
-    assert_eq!(sent.cluster, STANDBY, "still the standby it registered with");
+    assert_eq!(
+        sent.cluster, STANDBY,
+        "still the standby it registered with"
+    );
 }
