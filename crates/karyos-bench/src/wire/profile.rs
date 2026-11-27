@@ -130,12 +130,15 @@ impl Profile {
     /// As [`Profile::of`], or keys that do not derive.
     pub fn for_run(
         configuration: &str,
-        load: crate::wire::stage::StageLoad,
+        run: &crate::wire::stage::StageRun,
     ) -> Result<Self, BenchError> {
         if configuration == ENCRYPTED
-            && matches!(load, crate::wire::stage::StageLoad::Rotation { .. })
+            && matches!(run.load, crate::wire::stage::StageLoad::Rotation { .. })
         {
-            return Ok(Self::Rotating(Box::new(crate::enc_cost::Rotation::new()?)));
+            return Ok(Self::Rotating(Box::new(crate::enc_cost::Rotation::new(
+                run.warmup,
+                run.messages,
+            )?)));
         }
         Self::of(configuration)
     }

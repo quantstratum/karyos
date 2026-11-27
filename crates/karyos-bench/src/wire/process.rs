@@ -650,7 +650,7 @@ pub fn child() -> Option<Result<(), BenchError>> {
 
 fn run_child(role: &str) -> Result<(), BenchError> {
     let context = ChildContext::from_env()?;
-    let profile = Profile::for_run(&context.profile, context.run.load)?;
+    let profile = Profile::for_run(&context.profile, &context.run)?;
     let prepared = Prepared::new(&context.run, &profile)?;
     match role {
         "rx" => receive_child(&context, &prepared, &profile),
@@ -1279,7 +1279,7 @@ pub fn run_processes(
     options: &ProcessOptions,
 ) -> Result<StageSamples, BenchError> {
     faults_allowed(&options.faults)?;
-    let prepared = Prepared::new(run, &Profile::for_run(&options.profile, run.load)?)?;
+    let prepared = Prepared::new(run, &Profile::for_run(&options.profile, run)?)?;
     let expected =
         usize::try_from(run.messages).map_err(|_| BenchError("too many messages".into()))?;
     let count = usize::from(run.receivers);

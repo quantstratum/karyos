@@ -527,31 +527,42 @@ mod tests {
     }
 }
 
-/// The seals the R5 sender makes under the starting key before its
-/// in-band epoch change, and under that key before the file epoch change:
-/// a third and two thirds of a decision run with its warmup (karyos#650).
-pub const ROTATION_AT: [u64; 2] = [366_667, 733_334];
-
 /// The keys of an R5 run (karyos#650, manifest 6.1 R5): the starting key
 /// (file epoch 1, in-band epoch 1), its in-band successor (in-band epoch
 /// 2) and the next file epoch's key (file epoch 2, in-band epoch 1), each
 /// derived before the run, as the driver derives a successor ahead of its
-/// cutover. The sender seals under each in turn at [`ROTATION_AT`]; the
-/// receiver opens under the key the datagram's header names. The
+/// cutover. The sender seals under each in turn at its cutovers, a third
+/// and two thirds into the measured messages (after the warmup), so both
+/// transitions fall inside what is recorded (#1294 review); the receiver
+/// opens under the key the datagram's header names. The
 /// derivation's own cost is the `rekey` point of this module.
 #[derive(Debug)]
 pub struct Rotation {
     keys: [AesGcmSiv; 3],
+    /// The seals before the in-band change and before the file change.
+    at: [u64; 2],
     sealed: std::sync::atomic::AtomicU64,
 }
 
 impl Rotation {
-    /// The three keys.
+    /// The keys of a run of `warmup` then `messages` one-datagram messages:
+    /// the cutovers at `warmup + messages / 3` and `warmup + 2 messages / 3`
+    /// seals.
     ///
     /// # Errors
     ///
-    /// A key that does not derive.
-    pub fn new() -> Result<Self, BenchError> {
+    /// Fewer than three measured messages, which cannot place both
+    /// transitions inside the measurement; or a key that does not derive.
+    pub fn new(warmup: u64, messages: u64) -> Result<Self, BenchError> {
+        if messages < 3 {
+            return Err(BenchError(format!(
+                "R5 needs at least 3 measured messages to place both epoch changes, not {messages}"
+            )));
+        }
+        let at = [
+            warmup.saturating_add(messages / 3),
+            warmup.saturating_add(messages / 3 * 2),
+        ];
         let derive = |key_epoch: u32, party_epoch: u16| {
             let context = KeyContext {
                 key_epoch,
@@ -561,6 +572,7 @@ impl Rotation {
         };
         Ok(Self {
             keys: [derive(1, 1)?, derive(1, 2)?, derive(2, 1)?],
+            at,
             sealed: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -576,7 +588,7 @@ impl Rotation {
         let n = self
             .sealed
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let index = ROTATION_AT.iter().filter(|&&at| n >= at).count();
+        let index = self.at.iter().filter(|&&at| n >= at).count();
         let [first, second, third] = &self.keys;
         match index {
             0 => first,
@@ -627,15 +639,18 @@ mod rotation_tests {
     use super::*;
 
     /// R5 (karyos#650): the sender's seals cross one in-band and one file
-    /// epoch change at [`ROTATION_AT`]; the receiver opens each datagram
+    /// epoch change inside the measured messages; the receiver opens each datagram
     /// under the key its header names, and a datagram of an unknown epoch
     /// is refused.
     #[test]
     fn a_rotation_crosses_an_in_band_and_a_file_epoch_and_every_datagram_opens() {
-        let sender = Rotation::new().unwrap();
-        let receiver = Rotation::new().unwrap();
+        // 100 warmup and 300 measured: the cutovers at 200 and 300 seals.
+        let sender = Rotation::new(100, 300).unwrap();
+        let receiver = Rotation::new(100, 300).unwrap();
+        assert_eq!(sender.at, [200, 300], "both inside the measured messages");
+        assert!(Rotation::new(100, 2).is_err(), "too short to place both");
         let mut epochs = Vec::new();
-        for at in [0, ROTATION_AT[0], ROTATION_AT[1]] {
+        for at in [0, 200, 300] {
             sender.skip_to(at);
             let mut datagram = vec![0_u8; 1408];
             datagram[..64].fill(3);
