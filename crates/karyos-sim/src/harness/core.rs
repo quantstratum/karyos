@@ -723,7 +723,7 @@ pub trait ConsensusCore: Sized {
     /// log's truncation, append, sync and hard state), just before
     /// [`ConsensusCore::advance`] reports it. The work is the Advance's, so
     /// a probed core counts it in its Advance stage
-    /// ([`crate::harness::probe::Probed`]; C5 v3 coverage). The default
+    /// (`harness::probe::Probed`; C5 v3 coverage). The default
     /// only runs it; no core overrides it.
     fn persisting<R>(&mut self, persist: impl FnOnce() -> R) -> R
     where
@@ -736,7 +736,7 @@ pub trait ConsensusCore: Sized {
     /// ([`ReadyBuf::recycle`]): [`drive`] calls it before each Ready and
     /// after it is done with one. Its work (the entries going back to the
     /// pool, which can grow it) is the Ready's, so a probed core counts it
-    /// in its Ready stage ([`crate::harness::probe::Probed`]; C5 v3
+    /// in its Ready stage (`harness::probe::Probed`; C5 v3
     /// coverage). The default only recycles; no core overrides it.
     fn recycle_ready(&mut self, out: &mut ReadyBuf<Self::Message>) {
         out.recycle();
