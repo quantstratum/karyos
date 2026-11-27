@@ -1905,3 +1905,333 @@ fn a_datagram_verified_before_a_generation_change_still_commits() {
         Err(EncRejection::VmGeneration)
     );
 }
+
+/// A DATA frame of `payload` bytes on `lane` at `term_offset`, BEGIN and
+/// END set, with the 64-byte `EXT` when `traced`; every field nonzero so
+/// that each mutation below changes a meaningful value.
+fn data_frame(payload: usize, lane: u8, traced: bool, term_offset: i32) -> Vec<u8> {
+    let header = if traced { 96 } else { 32 };
+    let length = header + payload;
+    let mut out = vec![0_u8; length.next_multiple_of(32)];
+    out[..4].copy_from_slice(&i32::try_from(length).unwrap().to_le_bytes());
+    out[4] = 1;
+    out[5] = 0x03 | (lane << 4) | if traced { 0x08 } else { 0 };
+    out[6..8].copy_from_slice(&DATA.to_le_bytes());
+    out[8..12].copy_from_slice(&term_offset.to_le_bytes());
+    out[12..16].copy_from_slice(&9_i32.to_le_bytes());
+    out[16..20].copy_from_slice(&6_i32.to_le_bytes());
+    out[20..24].copy_from_slice(&3_i32.to_le_bytes());
+    out[24..32].copy_from_slice(&0x0102_0304_0506_0708_i64.to_le_bytes());
+    for (at, byte) in out[32..length].iter_mut().enumerate() {
+        *byte = u8::try_from((at * 7 + 1) % 251).unwrap();
+    }
+    out
+}
+
+/// Gate H1 (manifest section 7; ADR-0114 sections 2, 3 and 8): the tag
+/// covers every inner field and every header field of a sealed domain 1
+/// datagram. One datagram holds a traced DATA frame (lane 1, `EXT`, 128
+/// bytes) and an untraced one (lane 0, 64 bytes). Each case alters one
+/// location of the received ciphertext (plaintext byte `k` is at
+/// `HEADER_LEN + k`, AES-GCM-SIV encrypts in place), or one header field,
+/// or swaps the two frames' ciphertext blocks; no key is used to re-seal.
+/// Every variant is refused, the inner ones by the tag, nothing is marked
+/// or promoted and no plaintext is released; the untouched datagram is
+/// accepted afterwards.
+#[test]
+fn h1_every_covered_field_and_the_frame_order_are_under_the_tag() {
+    let mut sealer = sender();
+    let mut opener = opener();
+    let mut channel = EncChannel::default();
+    let first = data_frame(32, 1, true, 0);
+    let second = data_frame(32, 0, false, 128);
+    assert_eq!((first.len(), second.len()), (128, 64));
+    let valid = seal(&mut sealer, &[first.clone(), second.clone()].concat());
+    let at = HEADER_LEN;
+    let flip = |offset: usize, mask: u8| {
+        let mut datagram = valid.clone();
+        datagram[offset] ^= mask;
+        datagram
+    };
+    let mut swapped = valid[..at].to_vec();
+    swapped.extend_from_slice(&valid[at + 128..at + 192]);
+    swapped.extend_from_slice(&valid[at..at + 128]);
+    swapped.extend_from_slice(&valid[at + 192..]);
+    assert_eq!(swapped.len(), valid.len());
+    let inner: Vec<(&str, Vec<u8>)> = vec![
+        ("payload, frame 1", flip(at + 96 + 5, 0x01)),
+        ("payload, frame 2", flip(at + 128 + 63, 0x80)),
+        ("frame_length, frame 1", flip(at, 0x01)),
+        ("frame_length, frame 2", flip(at + 128, 0x08)),
+        ("frame boundary (frame 1 length 128 to 160)", flip(at, 0x20)),
+        ("version, frame 1", flip(at + 4, 0x01)),
+        ("flags BEGIN", flip(at + 5, 0x01)),
+        ("flags END", flip(at + 5, 0x02)),
+        ("flags EOS", flip(at + 5, 0x04)),
+        ("flags EXT", flip(at + 5, 0x08)),
+        ("lane, frame 1", flip(at + 5, 0x10)),
+        ("lane, frame 2", flip(at + 128 + 5, 0x20)),
+        ("frame type, frame 1", flip(at + 6, 0x01)),
+        ("frame type, frame 2", flip(at + 128 + 7, 0x01)),
+        ("term_offset (position), frame 1", flip(at + 8, 0x20)),
+        ("term_offset (position), frame 2", flip(at + 128 + 8, 0x80)),
+        ("term_id (position)", flip(at + 20, 0x01)),
+        ("inner session_id", flip(at + 12, 0x01)),
+        ("inner stream_id", flip(at + 16, 0x01)),
+        ("reserved_value", flip(at + 24, 0x01)),
+        ("reserved_value, high byte", flip(at + 31, 0x80)),
+        ("EXT byte 0", flip(at + 32, 0x01)),
+        ("EXT byte 8", flip(at + 40, 0x01)),
+        ("EXT byte 63", flip(at + 95, 0x01)),
+        ("AEAD tag", flip(valid.len() - 1, 0x01)),
+        ("frames reordered (ciphertext blocks swapped)", swapped),
+    ];
+    let header_cases: Vec<(&str, Vec<u8>, EncRejection)> = vec![
+        ("datagram length", flip(0, 0x01), EncRejection::Length),
+        ("envelope version", flip(4, 0x01), EncRejection::Version),
+        ("envelope flags", flip(5, 0x01), EncRejection::Flags),
+        ("outer frame type", flip(6, 0x01), EncRejection::WrongClass),
+        (
+            "profile_id (algorithm)",
+            flip(8, 0x01),
+            EncRejection::Profile,
+        ),
+        ("tag_len", flip(9, 0x01), EncRejection::TagLength),
+        ("domain", flip(10, 0x03), EncRejection::Domain),
+        ("reserved byte 11", flip(11, 0x01), EncRejection::Reserved),
+        ("key_epoch", flip(12, 0x01), EncRejection::Epoch),
+        ("key_epoch, high byte", flip(15, 0x80), EncRejection::Epoch),
+        (
+            "party_epoch, the next one",
+            flip(16, 0x01),
+            EncRejection::Tag,
+        ),
+        (
+            "reserved bytes 18 to 19",
+            flip(19, 0x01),
+            EncRejection::Reserved,
+        ),
+        ("session_id", flip(20, 0x01), EncRejection::Binding),
+        ("stream_id", flip(24, 0x01), EncRejection::Binding),
+        ("envelope_seq", flip(28, 0x10), EncRejection::Tag),
+        ("party driver_id", flip(36, 0x01), EncRejection::Party),
+        ("party registration_id", flip(52, 0x01), EncRejection::Party),
+        ("party incarnation", flip(60, 0x01), EncRejection::Party),
+    ];
+    let window = opener.current_window();
+    for (name, datagram) in &inner {
+        assert_eq!(
+            open(&mut opener, &mut channel, datagram),
+            Err(EncRejection::Tag),
+            "{name}"
+        );
+        assert_eq!(opener.current_window(), window, "{name}: nothing marked");
+        assert_eq!(opener.epochs(), (1, 0), "{name}: nothing promoted");
+    }
+    for (name, datagram, reason) in &header_cases {
+        assert_eq!(
+            open(&mut opener, &mut channel, datagram),
+            Err(*reason),
+            "{name}"
+        );
+        assert_eq!(opener.current_window(), window, "{name}: nothing marked");
+        assert_eq!(opener.epochs(), (1, 0), "{name}: nothing promoted");
+    }
+    let tagged = inner.len()
+        + header_cases
+            .iter()
+            .filter(|(_, _, reason)| *reason == EncRejection::Tag)
+            .count();
+    assert_eq!(
+        channel.rejections.get(EncRejection::Tag),
+        u64::try_from(tagged).unwrap()
+    );
+    assert_eq!(open(&mut opener, &mut channel, &valid).unwrap().frames, 192);
+}
+
+/// Gate H1 in domain 4: the pairwise trailer (its epoch and its tag) is
+/// inside the plaintext, so altering either in the ciphertext fails the
+/// outer tag; nothing is marked.
+#[test]
+fn h1_the_pairwise_trailer_is_under_the_outer_tag() {
+    let files = pairs(0x22);
+    let (mut sealer, mut opener) = data_pair(Domain::Receiver, &files);
+    let mut channel = EncChannel::default();
+    let valid = seal(&mut sealer, &frame(0x03));
+    let window = opener.current_window();
+    // The plaintext is the 32-byte SM, the 4-byte epoch, the 16-byte tag.
+    for (name, offset) in [
+        ("SM body", HEADER_LEN + 9),
+        ("trailer epoch", HEADER_LEN + 32),
+        ("trailer tag", HEADER_LEN + 36 + 15),
+    ] {
+        let mut datagram = valid.clone();
+        datagram[offset] ^= 0x01;
+        assert_eq!(
+            open(&mut opener, &mut channel, &datagram),
+            Err(EncRejection::Tag),
+            "{name}"
+        );
+        assert_eq!(opener.current_window(), window, "{name}");
+    }
+    assert!(open(&mut opener, &mut channel, &valid).is_ok());
+}
+
+/// Gate H3 (manifest section 7 and table 2.2; ADR-0114 sections 4 and 9):
+/// receiver 67 holds the channel key, so it can derive receiver 66's
+/// domain 4 key, but not 66's pairwise key. Each receiver control it
+/// forges as 66 (SM, NAK, ERR, RTTM and SESSION_ABORT_ACK, the ACK)
+/// under the channel key, with its own secret relabelled as 66's or with a
+/// pairwise epoch the publisher does not hold, is refused `enc_pairwise`;
+/// sent under its own identity it is refused `enc_party`. Nothing is marked
+/// or promoted; 66's own SM is then accepted, and 66's own
+/// SESSION_ABORT_ACK stays refused by the matrix.
+#[test]
+fn h3_a_receiver_cannot_forge_another_receivers_controls() {
+    let keys = keys();
+    let victim = pairs(0x22);
+    let mut publisher =
+        EncOpener::new(&keys, Some(&victim), context(Domain::Receiver), clock()).unwrap();
+    let mut genuine =
+        EncSealer::new(&keys, Some(&victim), context(Domain::Receiver), clock).unwrap();
+    let relabelled = PairwiseFiles::new(&[&pairwise_file(66, 1, 0x67)]).unwrap();
+    let mut relabel =
+        EncSealer::new(&keys, Some(&relabelled), context(Domain::Receiver), clock).unwrap();
+    let unheld = PairwiseFiles::new(&[&pairwise_file(66, 2, 0x67)]).unwrap();
+    let mut other_epoch =
+        EncSealer::new(&keys, Some(&unheld), context(Domain::Receiver), clock).unwrap();
+    let own = PairwiseFiles::new(&[&pairwise_file(67, 1, 0x67)]).unwrap();
+    let mut itself = context(Domain::Receiver);
+    itself.receiver = Some(ReceiverIdentity {
+        receiver_boot_id: [4; 16],
+        receiver_id: 67,
+    });
+    let mut as_itself = EncSealer::new(&keys, Some(&own), itself, clock).unwrap();
+    let mut channel = EncChannel::default();
+    let window = publisher.current_window();
+    let controls = [
+        ("SM", 0x03),
+        ("NAK", 0x02),
+        ("ERR", 0x04),
+        ("RTTM", 0x06),
+        ("SESSION_ABORT_ACK", 0x13),
+    ];
+    for (name, code) in controls {
+        for (forger, sealer, reason) in [
+            ("relabelled secret", &mut relabel, EncRejection::Pairwise),
+            (
+                "unheld pairwise epoch",
+                &mut other_epoch,
+                EncRejection::Pairwise,
+            ),
+            ("its own identity", &mut as_itself, EncRejection::Party),
+        ] {
+            let forged = seal(sealer, &frame(code));
+            assert_eq!(
+                open(&mut publisher, &mut channel, &forged),
+                Err(reason),
+                "{name} by {forger}"
+            );
+            assert_eq!(publisher.current_window(), window, "{name} by {forger}");
+            assert_eq!(publisher.epochs(), (1, 0), "{name} by {forger}");
+        }
+    }
+    assert_eq!(channel.rejections.get(EncRejection::Pairwise), 10);
+    assert_eq!(channel.rejections.get(EncRejection::Party), 5);
+    assert_eq!(
+        open(
+            &mut publisher,
+            &mut channel,
+            &seal(&mut genuine, &frame(0x13))
+        ),
+        Err(EncRejection::InnerRejected),
+        "SESSION_ABORT_ACK stays refused until ADR-0086 open point 5"
+    );
+    assert!(
+        open(
+            &mut publisher,
+            &mut channel,
+            &seal(&mut genuine, &frame(0x03))
+        )
+        .is_ok()
+    );
+}
+
+/// An ADR-0086 signed message of `domain` (2 GUARD, 3 SESSION_ABORT): an
+/// inner `0x20` of 128 bytes, its 32-byte header, a body and a 64-byte
+/// signature, as a group key holder would place it.
+fn signed(domain: u8) -> Vec<u8> {
+    let mut out = vec![0x5a_u8; 128];
+    out[..4].copy_from_slice(&128_i32.to_le_bytes());
+    out[4] = 1;
+    out[5] = 0;
+    out[6..8].copy_from_slice(&0x20_u16.to_le_bytes());
+    out[8] = 4;
+    out[9] = 64;
+    out[10] = domain;
+    out[11] = 0;
+    out
+}
+
+/// Gate H3 (manifest section 7; ADR-0114 section 9, "GUARD and
+/// SESSION_ABORT", and "Assigned to the implementation" item 2): a group
+/// key holder seals GUARD and SESSION_ABORT alone in a domain 1 datagram
+/// under the valid channel key, bare or as the ADR-0086 signed message.
+/// The outer tag verifies (the profile alone opens each datagram), yet
+/// the opener refuses every one before it takes effect: the bare frames
+/// `enc_inner_rejected`, the signed ones `enc_mixed_class`, with nothing
+/// marked. The matrix refuses GUARD, SESSION_ABORT and SESSION_ABORT_ACK
+/// in every domain.
+#[test]
+fn h3_a_group_key_holder_cannot_forge_guard_or_session_abort() {
+    let mut forger = sender();
+    let mut opener = opener();
+    let mut channel = EncChannel::default();
+    let window = opener.current_window();
+    for (name, inner, reason) in [
+        ("GUARD", frame(0x11).to_vec(), EncRejection::InnerRejected),
+        (
+            "SESSION_ABORT",
+            frame(0x12).to_vec(),
+            EncRejection::InnerRejected,
+        ),
+        ("signed GUARD", signed(2), EncRejection::MixedClass),
+        ("signed SESSION_ABORT", signed(3), EncRejection::MixedClass),
+    ] {
+        let datagram = seal(&mut forger, &inner);
+        let mut out = [0_u8; MAX_PLAINTEXT];
+        let opened = forger.key().open_into(&datagram, &mut out).unwrap();
+        assert_eq!(
+            &out[..opened.frames],
+            &inner[..],
+            "{name}: the outer tag verifies"
+        );
+        assert_eq!(
+            open(&mut opener, &mut channel, &datagram),
+            Err(reason),
+            "{name}"
+        );
+        assert_eq!(opener.current_window(), window, "{name}: nothing marked");
+    }
+    assert_eq!(channel.rejections.get(EncRejection::InnerRejected), 2);
+    assert_eq!(channel.rejections.get(EncRejection::MixedClass), 2);
+    for domain in [
+        Domain::Sender,
+        Domain::Receiver,
+        Domain::Setup,
+        Domain::RspSetup,
+    ] {
+        for code in [0x11, 0x12, 0x13] {
+            assert_eq!(
+                check_matrix(domain, &frame(code)),
+                Err(EncRejection::InnerRejected),
+                "{domain:?} {code:#x}"
+            );
+        }
+        assert_eq!(
+            check_matrix(domain, &signed(2)),
+            Err(EncRejection::MixedClass),
+            "{domain:?}"
+        );
+    }
+}

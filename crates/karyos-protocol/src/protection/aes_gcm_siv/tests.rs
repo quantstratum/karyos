@@ -1426,3 +1426,141 @@ fn set_pairwise_keeps_the_sequence_and_the_window() {
     );
     assert_eq!(sealer.set_pairwise(&[]), Err(ContextError::Pairwise));
 }
+
+// Gate H5, part 2 (ADR-0114 "Hard gates", H5). Every expected value below
+// was printed by `enc_vectors2.py`, a second implementation written from
+// the frozen encodings only (Python `cryptography` and `hmac`), and is
+// copied from its output `enc_vectors2-output.txt`; none comes from this
+// implementation's output.
+
+/// One epoch transition vector: name, domain, `(key_epoch, party_epoch,
+/// salted, pairwise file epoch, envelope_seq)`, the frames `(len, mul,
+/// add)` as in [`envelope_vectors`], then `info`, key and datagram.
+type EpochVector = (
+    &'static str,
+    Domain,
+    (u32, u16, bool, u32, u64),
+    (usize, usize, usize),
+    &'static str,
+    &'static str,
+    &'static str,
+);
+
+/// The next `party_epoch` (5, 3) and the next `key_epoch` (6, 0) of every
+/// domain, from the inputs of the first vectors (`key_epoch` 5); the
+/// receiver domains at the next `key_epoch` also use the next pairwise
+/// file epoch, 10.
+const EPOCH_VECTORS: [EpochVector; 6] = [
+    (
+        "snd next party",
+        Domain::Sender,
+        (5, 3, true, 0, 0),
+        (64, 3, 1),
+        "6b6172796f732d776972652d656e632d76303100736e640000000000050000000300080706050403020118171615141312110700000000000000030000000000000010",
+        "af6a165458206f3a4341b517b8d6061118943cc431117227abb371e29ebf6718",
+        "9400000001002100101001000500000003000000feffffffe903000000000000000000000807060504030201181716151413121107000000000000000300000000000000a471eb078a23aa45a7bc794b3e30fca6a510e3f9e6d379205508147cc1f2292070cdd61c0389662fb22c695faaaf70a2ef38e0a72b249b3d41fd7beb770b4271dd65b6f3287a8d80693264948f7dfe9d",
+    ),
+    (
+        "snd next key",
+        Domain::Sender,
+        (6, 0, true, 0, 1),
+        (64, 5, 2),
+        "6b6172796f732d776972652d656e632d76303100736e640000000000060000000000080706050403020118171615141312110700000000000000030000000000000010",
+        "c785a1d4db14426524e105737daa6ae62b826dc8f234088736857740177c7738",
+        "9400000001002100101001000600000000000000feffffffe9030000010000000000000008070605040302011817161514131211070000000000000003000000000000008121296174e8d4f0c4c689bb3f011760b679722fa315e4e99962308059e16083ce9a554c47747c6939cd46875ce7b3af22a49cea3f9027fcd0f3efaa5e579cf85b43b884337903acd7992489c27e8469",
+    ),
+    (
+        "rcv next party",
+        Domain::Receiver,
+        (5, 3, true, 9, 0),
+        (32, 7, 3),
+        "6b6172796f732d776972652d656e632d763031007263760000000000050000000300282726252423222138373635343332312a00000000000000080706050403020118171615141312110700000000000000030000000000000010",
+        "0e7300a66ee010f6cd494f156bf87b4b47a40d2b7e4cb9df91066a3eb80296cb",
+        "8800000001002100101004000500000003000000feffffffe90300000000000000000000282726252423222138373635343332312a000000000000000000000000000000d0013773abbb4b9e55ffa1cc437c006951daa16f0e2cfa3c8f4ac854c8eb2b00e220adfc9677e6a020f65c98a051dd3acd65d568c931c0556adf52a0848ef4deb1ac71a4",
+    ),
+    (
+        "rcv next key",
+        Domain::Receiver,
+        (6, 0, true, 10, 2),
+        (32, 9, 4),
+        "6b6172796f732d776972652d656e632d763031007263760000000000060000000000282726252423222138373635343332312a00000000000000080706050403020118171615141312110700000000000000030000000000000010",
+        "ed9115bb7ec3b6c2cf5a10302ada63e920cecdf75bc27591e37a7fa4b90212f6",
+        "8800000001002100101004000600000000000000feffffffe90300000200000000000000282726252423222138373635343332312a000000000000000000000000000000e70f181794da34e17952369f00d10964e33e2c796a7a747900705d6ba0b8a5d52bf39375165c68ac3157d543797ea06381cd569520007eaac7cbff62c0b180bca0d0bd53",
+    ),
+    (
+        "setup next key",
+        Domain::Setup,
+        (6, 0, false, 0, 0),
+        (72, 11, 5),
+        "6b6172796f732d776972652d656e632d763031007365747570000000060000000000080706050403020118171615141312110700000000000000030000000000000010",
+        "8128f05d56818bc6f8cec7a96b6b3514038464b20c039b4aef7aecf2e2eed961",
+        "9c00000001002100101005000600000000000000feffffffe90300000000000000000000080706050403020118171615141312110700000000000000030000000000000039094e462a51d4b2af1c868497a84dcf5ca6b0f4867f12d3876a55e56cbb1acdb3a7d84e8e9c277c6b63a030ce11c8223f4b5bdd2530bf539f97cca8e7775d1c922904a947f63ad15f1feccb9fe8aab9616a96364c10e62b",
+    ),
+    (
+        "rsp next key",
+        Domain::RspSetup,
+        (6, 0, false, 10, 0),
+        (88, 13, 6),
+        "6b6172796f732d776972652d656e632d763031007273700000000000060000000000282726252423222138373635343332312a00000000000000080706050403020118171615141312110700000000000000030000000000000010",
+        "b408b7387371c9f38c3f4e24082e67778679b534724c06612d57cdc5241bab07",
+        "c000000001002100101006000600000000000000feffffffe90300000000000000000000282726252423222138373635343332312a000000000000000000000000000000d56ae681497a0c664644124079b73c7fd141f6e22a818f53c1cf5b8eeb6b37ae1df753e25099baf62d66dedf753c43a794c86e75849c1e711fabe17b3b33f72a49d6626861e49ead2900e28226da53810c6951d9cd3b0eb86b77be5b2009bf9b513cf0d012c0d3dab644c727a83c42f437828a2c06bac1615c5f0500",
+    ),
+];
+
+/// Gate H5 (ADR-0114 sections 4, 5 and 6): the KDF `info`, the derived key
+/// and one sealed datagram of every domain at the next epoch match the
+/// independent script byte for byte, and each datagram opens under the
+/// profile of its epoch.
+#[test]
+fn h5_the_epoch_transition_vectors_match_the_independent_script() {
+    for (
+        name,
+        domain,
+        (key_epoch, party_epoch, salted, pairwise_epoch, seq),
+        shape,
+        info,
+        key,
+        datagram,
+    ) in EPOCH_VECTORS
+    {
+        let mut context = context(domain, party_epoch, salted);
+        context.key_epoch = key_epoch;
+        let (got, len) = context.info();
+        assert_eq!(got[..len].to_vec(), hex(info), "{name} info");
+        assert_eq!(context.derive(&IKM).to_vec(), hex(key), "{name} key");
+        let keys = if domain.is_receiver() {
+            vec![pairwise(pairwise_epoch, &PAIRWISE_SECRET)]
+        } else {
+            Vec::new()
+        };
+        let profile = AesGcmSiv::new(&IKM, context, &keys).unwrap();
+        let (len, mul, add) = shape;
+        let frames: Vec<u8> = (0..len).map(|i| ((i * mul + add) % 256) as u8).collect();
+        let expected = hex(datagram);
+        assert_eq!(sealed(&profile, &frames, seq), expected, "{name} seal");
+        let mut opened = expected.clone();
+        let result = profile.open_in_place(&mut opened).unwrap();
+        assert_eq!(result.seq, seq, "{name}");
+        assert_eq!(
+            &opened[HEADER_LEN..HEADER_LEN + result.frames],
+            &frames[..],
+            "{name}"
+        );
+        assert_eq!(
+            result.pairwise_epoch,
+            domain.is_receiver().then_some(pairwise_epoch),
+            "{name}"
+        );
+    }
+    // The pairwise key of the next pairwise file epoch.
+    assert_eq!(
+        pairwise_info(10, &receiver(), &publication()).to_vec(),
+        hex(
+            "6b6172796f732d776972652d656e632d7630310070617574680000000a000000282726252423222138373635343332312a00000000000000080706050403020118171615141312110700000000000000030000000000000010"
+        )
+    );
+    assert_eq!(
+        derive_pairwise(&PAIRWISE_SECRET, 10, &receiver(), &publication()).to_vec(),
+        hex("001dbe035764ae11e22ed5f6aada8a96f4a273a1cb0f763fb9023ea73260410b")
+    );
+}
