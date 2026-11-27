@@ -1937,6 +1937,16 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         })
     }
 
+    /// A duplicate of its TX half's socket on `endpoint` (tests): what is
+    /// sent from it leaves from the endpoint's own address and port.
+    #[cfg(test)]
+    pub(crate) fn tx_socket(&self, endpoint: EndpointId) -> Option<O> {
+        self.core.halves.iter().find_map(|(held, half)| match half {
+            Half::Tx(tx) if *held == endpoint => tx.try_clone_socket().ok(),
+            _ => None,
+        })
+    }
+
     /// Its control routes open and closing on `endpoint` (tests,
     /// karyos#859).
     #[cfg(test)]

@@ -5,25 +5,35 @@
 //! load, since the bench harness has no `encrypted` profile. A real
 //! encrypted publication and subscription over loopback carry valid W1
 //! traffic (`L` = 32, one message per append) at R2's two rates (100 000
-//! and 1 000 000 messages/s) for a fixed time in wall-clock time, while datagrams forged under a wrong key (the
-//! genuine context and frames, invalid tag) reach the receiver's real
-//! intake at 10% or 100% of the valid rate. Each run states the
-//! allocations of the forged intake and of each agent's duties, the
-//! percentiles of the receiver's complete intake interval (the forged
-//! datagrams of the iteration verified and refused, then the receiver's
-//! duty cycle) and of its duty cycle alone, what was delivered and in
-//! which order, the rejection counters and the state the flood left.
-//! A run that does not sustain its load is refused: at least
-//! [`MIN_LOAD_PERCENT`] of the scheduled valid and forged datagrams,
-//! a schedule lag within [`MAX_LAG_NS`] and [`MIN_SAMPLES_PER_SECOND`]
-//! intake samples per second. Ignored:
+//! and 1 000 000 messages/s) for a fixed time in wall-clock time, while
+//! datagrams forged under a wrong key (the genuine context, an invalid
+//! tag) are sent at 10% or 100% of the valid rate from up to
+//! [`FORGERS`] other threads, each over a real UDP socket that shares the publisher's address and port
+//! (a duplicate of its descriptor: the source a spoofing attacker
+//! names), to the receiver's bound endpoint. They reach the receiver
+//! through its polled transport, as an attacker's datagrams would. Each
+//! run states the allocations of each agent's duties, the percentiles of
+//! the receiver's complete intake interval (its duty cycle: the socket
+//! read, the forged datagrams verified and refused, the valid ones
+//! delivered), what was delivered and in which order, the forged
+//! datagrams sent, received and dropped by UDP, the rejection counters
+//! and the state the flood left. A run that does not sustain its load is
+//! refused: at least [`MIN_LOAD_PERCENT`] of the scheduled valid and
+//! forged datagrams sent, at most [`MAX_DROP_PERCENT`] of the forged
+//! ones lost before the receiver read them, a schedule lag within
+//! [`MAX_LAG_NS`] and [`MIN_SAMPLES_PER_SECOND`] intake samples per
+//! second. Ignored:
 //! run explicitly in release (`cargo test --release -p karyos-driver
 //! --lib r4_ -- --ignored --nocapture`); each run prints its report, and
 //! writes it to `r4-<rate>-<p>.txt` in the directory `KARYOS_R4_OUT` names, when
 //! set.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
+use karyos_io::sockets::ops::{RouteAddr, SendResult, SocketOps};
 
 use karyos_protocol::protection::aes_gcm_siv::{Domain, EncRejection};
 use karyos_sys::alloc_count::count_allocations;
@@ -38,12 +48,27 @@ const RATE_LOW: u64 = 100_000;
 const RATE_HIGH: u64 = 1_000_000;
 /// Seconds each run lasts.
 const SECONDS: u64 = 10;
-/// Distinct forged datagrams, injected in a cycle.
+/// Distinct forged datagrams, sent in a cycle.
 const POOL: u64 = 4_096;
+/// Bytes added to the forged plaintext: the forged datagrams take a
+/// length the valid ones do not, so the receiver's intake counts them
+/// as it reads them.
+const FORGED_PAD: usize = 3;
+/// Forged datagrams per send call at most.
+const SEND_BATCH: usize = 32;
+/// Threads sending the flood, each on its own duplicate of the
+/// publisher's socket and its share of the schedule: one loopback sender
+/// alone tops out near 450 000 datagrams/s on xaskar.
+const FORGERS: u64 = 4;
+/// Forged datagrams per second one sending thread is given at most.
+const PER_FORGER: u64 = 300_000;
+/// The share of the forged datagrams sent that UDP may lose before the
+/// receiver reads them, or the run is refused as underloaded.
+const MAX_DROP_PERCENT: u64 = 5;
 /// Receiver duties timed at most.
 const MAX_SAMPLES: usize = 1 << 24;
 /// The share of the scheduled valid and forged datagrams a run must
-/// inject, or it is refused as underloaded.
+/// send, or it is refused as underloaded.
 const MIN_LOAD_PERCENT: u64 = 95;
 /// The longest the valid load may fall behind its schedule: 10 ms, 1 000
 /// messages at [`RATE_LOW`], 10 000 at [`RATE_HIGH`].
@@ -82,24 +107,52 @@ fn percentiles(label: &str, samples: &mut [u64], report: &mut String) {
     );
 }
 
-/// Whether a run at `rate` valid messages/s and `invalid_percent` sustained its load: at least
-/// [`MIN_LOAD_PERCENT`] of the scheduled valid and forged datagrams, a
-/// schedule lag within [`MAX_LAG_NS`] and enough intake samples.
-fn sustained(
-    rate: u64,
+/// What a run carried: valid messages appended, forged datagrams sent and
+/// received, the largest schedule lag of the valid load (the flood's
+/// is reported: its shortfall is the forged load rule) and the intake
+/// samples timed.
+#[derive(Debug, Clone, Copy)]
+struct Load {
     appended: u64,
-    forged: u64,
-    invalid_percent: u64,
+    forged_sent: u64,
+    forged_received: u64,
     late_ns: u64,
     samples: usize,
-) -> Result<(), String> {
+}
+
+/// Whether a run at `rate` valid messages/s and `invalid_percent` sustained
+/// its load: at least [`MIN_LOAD_PERCENT`] of the scheduled valid and
+/// forged datagrams, at most [`MAX_DROP_PERCENT`] of the forged ones sent
+/// lost by UDP, a schedule lag within [`MAX_LAG_NS`] and enough intake
+/// samples.
+fn sustained(rate: u64, invalid_percent: u64, load: Load) -> Result<(), String> {
+    let Load {
+        appended,
+        forged_sent,
+        forged_received,
+        late_ns,
+        samples,
+    } = load;
     let valid_target = rate * SECONDS;
     let forged_target = valid_target * invalid_percent / 100;
     if appended * 100 < valid_target * MIN_LOAD_PERCENT {
         return Err(format!("underloaded: {appended} valid of {valid_target}"));
     }
-    if forged * 100 < forged_target * MIN_LOAD_PERCENT {
-        return Err(format!("underloaded: {forged} forged of {forged_target}"));
+    if forged_sent * 100 < forged_target * MIN_LOAD_PERCENT {
+        return Err(format!(
+            "underloaded: {forged_sent} forged sent of {forged_target}"
+        ));
+    }
+    if forged_received > forged_sent {
+        return Err(format!(
+            "{forged_received} forged received of {forged_sent} sent"
+        ));
+    }
+    let drops = forged_sent - forged_received;
+    if drops * 100 > forged_sent * MAX_DROP_PERCENT {
+        return Err(format!(
+            "underloaded: {drops} of {forged_sent} forged dropped by UDP"
+        ));
     }
     if late_ns > MAX_LAG_NS {
         return Err(format!("schedule lag {late_ns}ns over {MAX_LAG_NS}ns"));
@@ -142,16 +195,23 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     // Sequences ahead of every genuine one of the run: each forged datagram
     // passes the replay precheck and is refused for its tag.
     sealer.key().set_next_seq(last.seq + 10 * rate * SECONDS);
-    let pool: Vec<Vec<u8>> = (0..POOL)
+    let pool: Arc<Vec<Vec<u8>>> = (0..POOL)
         .map(|_| {
             let mut bytes = vec![0_u8; MAX_SEALED];
             bytes[..last.frames.len()].copy_from_slice(&last.frames);
-            let length = sealer.seal(&mut bytes, last.frames.len()).unwrap();
+            let length = sealer
+                .seal(&mut bytes, last.frames.len() + FORGED_PAD)
+                .unwrap();
             bytes.truncate(length);
             bytes
         })
-        .collect();
-    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+        .collect::<Vec<_>>()
+        .into();
+    let forged_length = pool[0].len();
+    // The forger: a duplicate of the publisher's own socket, so its
+    // datagrams name the bound publication's source, sending to the
+    // receiver's bound endpoint.
+    let receiver_address = rig.endpoints.local_address(b).unwrap();
     let refusals = |rig: &Rig| {
         rig.agents
             .receiver
@@ -164,23 +224,72 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     let challenges = rig.agents.receiver.role.posted_challenges().len();
     let committed_before = rig.agents.receiver.counters().data_committed;
 
-    let mut duties: Vec<u64> = Vec::with_capacity(MAX_SAMPLES);
     let mut intakes: Vec<u64> = Vec::with_capacity(MAX_SAMPLES);
     let mut busy: Vec<u64> = Vec::with_capacity(MAX_SAMPLES);
     let mut out = vec![0_u8; 65_536];
     let mut allocating: Vec<(u64, u64, String)> = Vec::with_capacity(32);
     let counters_of = |rig: &Rig| format!("{:?}", rig.agents.receiver.counters());
     let mut message = [0_u8; 32];
-    let (mut appended, mut back_pressured, mut forged) = (0_u64, 0_u64, 0_u64);
+    let (mut appended, mut back_pressured) = (0_u64, 0_u64);
     let (mut delivered, mut out_of_order, mut next_expected) = (0_u64, 0_u64, 0_u64);
-    let (mut forged_allocs, mut receiver_allocs, mut sender_allocs) = (0_u64, 0_u64, 0_u64);
+    let (mut receiver_allocs, mut sender_allocs) = (0_u64, 0_u64);
     let (mut iterations, mut late_ns) = (0_u64, 0_u64);
     // The test-only logs reserved to their caps: what is counted is the
     // production path alone.
     rig.agents.receiver.role.reserve_test_logs();
+    rig.agents.receiver.role.watch_length(forged_length);
     let base = rig.now;
-    let start = Instant::now();
     let total_ns = SECONDS * 1_000_000_000;
+    let forged_rate = rate * invalid_percent / 100;
+    let go = Arc::new(AtomicBool::new(false));
+    // The flood, on its own thread, on its own schedule from the start
+    // both loads share: forged sent, send calls refused, largest lag.
+    let forgers = forged_rate.div_ceil(PER_FORGER).clamp(1, FORGERS);
+    let floods: Vec<_> = (0..forgers)
+        .map(|share| {
+            let go = Arc::clone(&go);
+            let pool = Arc::clone(&pool);
+            let route = RouteAddr::new(receiver_address);
+            let mut forger = rig.agents.sender.tx_socket(rig.publisher).unwrap();
+            std::thread::spawn(move || {
+                while !go.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                let start = Instant::now();
+                let (mut sent, mut refused, mut late_ns) = (0_u64, 0_u64, 0_u64);
+                let mut batch: [&[u8]; SEND_BATCH] = [&[]; SEND_BATCH];
+                loop {
+                    let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap();
+                    if elapsed >= total_ns {
+                        break;
+                    }
+                    // This thread's share of the datagrams due by now.
+                    let due =
+                        (elapsed * forged_rate / 1_000_000_000 + forgers - 1 - share) / forgers;
+                    let behind = due.saturating_sub(sent);
+                    late_ns = late_ns.max(behind * forgers * 1_000_000_000 / forged_rate.max(1));
+                    if behind == 0 {
+                        // Nothing due: the core goes back to the agents.
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    let count = usize::try_from(behind.min(SEND_BATCH as u64)).unwrap();
+                    for (at, slot) in batch[..count].iter_mut().enumerate() {
+                        #[allow(clippy::cast_possible_truncation, reason = "below POOL")]
+                        let index = ((share + forgers * (sent + at as u64)) % POOL) as usize;
+                        *slot = &pool[index];
+                    }
+                    match forger.send(&route, &batch[..count]) {
+                        SendResult::Sent { sent: more, .. } if more > 0 => sent += more as u64,
+                        _ => refused += 1,
+                    }
+                }
+                (sent, refused, late_ns)
+            })
+        })
+        .collect();
+    go.store(true, Ordering::Release);
+    let start = Instant::now();
     loop {
         let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap();
         if elapsed >= total_ns {
@@ -217,37 +326,22 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
         let (result, allocations) = count_allocations(|| sender.do_work(now));
         result.unwrap();
         sender_allocs += allocations;
-        // The receiver's intake: the flood at its share of the scheduled
-        // valid rate, verified and refused, then the receiver's duty cycle.
-        // The interval times both; the duty is also timed alone.
-        let forged_due = due * invalid_percent / 100;
+        // The receiver's complete intake: its duty cycle reads the socket,
+        // where the flood and the valid load arrive, verifies and refuses
+        // the forged datagrams and delivers the valid ones.
         let receiver = &mut rig.agents.receiver;
-        let intake = Instant::now();
-        let ((), allocations) = count_allocations(|| {
-            while forged < forged_due {
-                #[allow(clippy::cast_possible_truncation, reason = "below POOL")]
-                let bytes = &pool[(forged % POOL) as usize];
-                receiver
-                    .role
-                    .inject_datagram(&receiver.sessions, b, source, bytes, now);
-                forged += 1;
-            }
-        });
-        forged_allocs += allocations;
         let timed = Instant::now();
         let (work, allocations) = count_allocations(|| receiver.do_work(now));
-        let duty = u64::try_from(timed.elapsed().as_nanos()).unwrap();
-        let interval = u64::try_from(intake.elapsed().as_nanos()).unwrap();
+        let interval = u64::try_from(timed.elapsed().as_nanos()).unwrap();
         receiver_allocs += allocations;
         if allocations > 0 && allocating.len() < allocating.capacity() {
             allocating.push((elapsed, allocations, counters_of(&rig)));
         }
-        if duties.len() < MAX_SAMPLES {
-            duties.push(duty);
+        if intakes.len() < MAX_SAMPLES {
             intakes.push(interval);
         }
         if work.unwrap() > 0 && busy.len() < MAX_SAMPLES {
-            busy.push(duty);
+            busy.push(interval);
         }
         rig.endpoints.poll(&rig.links, now, |_| {}, |_| {});
         rig.images
@@ -262,9 +356,22 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
             delivered += 1;
         }
     }
-    // Drain what is in flight, without load and without flood.
+    let (mut forged_sent, mut send_refused, mut forged_late_ns) = (0_u64, 0_u64, 0_u64);
+    for flood in floods {
+        let (sent, refused, late) = flood.join().unwrap();
+        forged_sent += sent;
+        send_refused += refused;
+        forged_late_ns = forged_late_ns.max(late);
+    }
+    let elapsed_s = start.elapsed().as_secs_f64();
+    // Drain what is in flight, without load and without flood: the
+    // forged datagrams still queued at the receiver's socket included.
+    let (mut quiet, mut read) = (0_u32, rig.agents.receiver.role.watched_in());
     for _ in 0..2_000 {
-        if delivered == appended {
+        let now_read = rig.agents.receiver.role.watched_in();
+        quiet = if now_read == read { quiet + 1 } else { 0 };
+        read = now_read;
+        if delivered == appended && quiet >= 10 {
             break;
         }
         rig.round(true);
@@ -280,6 +387,8 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
         }
     }
     let after = refusals(&rig);
+    let forged = rig.agents.receiver.role.watched_in();
+    let drops = forged_sent.saturating_sub(forged);
     let new_challenges = rig.agents.receiver.role.posted_challenges().len() - challenges;
     let counters = rig.agents.receiver.counters();
     let mut report = String::new();
@@ -289,15 +398,17 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
          invalid tags at {invalid_percent}% ({} /s)",
         rate * invalid_percent / 100
     );
-    let elapsed_s = start.elapsed().as_secs_f64();
     #[allow(clippy::cast_precision_loss, reason = "a reported rate")]
-    let achieved = (appended as f64 / elapsed_s, forged as f64 / elapsed_s);
+    let achieved = (
+        appended as f64 / elapsed_s,
+        forged_sent as f64 / elapsed_s,
+        forged as f64 / elapsed_s,
+    );
     let _ = writeln!(
         report,
-        "achieved: valid {:.0}/s forged {:.0}/s over {elapsed_s:.3} s (scheduled {rate}/s and {}/s)",
-        achieved.0,
-        achieved.1,
-        rate * invalid_percent / 100
+        "achieved: valid {:.0}/s forged sent {:.0}/s received {:.0}/s over {elapsed_s:.3} s \
+         (scheduled {rate}/s and {forged_rate}/s)",
+        achieved.0, achieved.1, achieved.2,
     );
     let _ = writeln!(
         report,
@@ -308,7 +419,9 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     );
     let _ = writeln!(
         report,
-        "forged injected={forged} enc_tag={} enc_total={} (before: tag={} total={})",
+        "forged sent={forged_sent} received={forged} udp_drops={drops} \
+         (refused send calls={send_refused} max_flood_lag={forged_late_ns}ns, length {forged_length}) \
+         enc_tag={} enc_total={} (before: tag={} total={})",
         after.get(EncRejection::Tag) - before.get(EncRejection::Tag),
         after.total() - before.total(),
         before.get(EncRejection::Tag),
@@ -317,8 +430,7 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     let _ = writeln!(report, "rejections after: {after:?}");
     let _ = writeln!(
         report,
-        "allocations: forged intake={forged_allocs} receiver duties={receiver_allocs} \
-         sender duties={sender_allocs}"
+        "allocations: receiver duties={receiver_allocs} sender duties={sender_allocs}"
     );
     let _ = writeln!(
         report,
@@ -338,12 +450,15 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     }
     let samples = intakes.len();
     percentiles(
-        "receiver intake (forged verification + duty), every poll",
+        "receiver intake (socket read, forged verification, delivery), every poll",
         &mut intakes,
         &mut report,
     );
-    percentiles("receiver duty, every poll", &mut duties, &mut report);
-    percentiles("receiver duty, polls that did work", &mut busy, &mut report);
+    percentiles(
+        "receiver intake, polls that did work",
+        &mut busy,
+        &mut report,
+    );
     // The report goes to stdout (run with --nocapture), and to a file in
     // the directory KARYOS_R4_OUT names, when set.
     let _ = std::io::Write::write_all(&mut std::io::stdout(), report.as_bytes());
@@ -358,13 +473,19 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     }
 
     // The load was sustained: an underloaded run measures nothing.
-    if let Err(why) = sustained(rate, appended, forged, invalid_percent, late_ns, samples) {
+    let load = Load {
+        appended,
+        forged_sent,
+        forged_received: forged,
+        late_ns,
+        samples,
+    };
+    if let Err(why) = sustained(rate, invalid_percent, load) {
         panic!(
             "{why}
 {report}"
         );
     }
-    assert_eq!(forged_allocs, 0, "{report}");
     assert_eq!(receiver_allocs, 0, "{report}");
     assert_eq!(sender_allocs, 0, "{report}");
     assert_eq!(
@@ -410,27 +531,49 @@ fn r4_encrypted_1m_invalid_tags_at_100_percent() {
 
 #[test]
 fn an_underloaded_r4_run_is_refused() {
+    let samples = usize::try_from(MIN_SAMPLES_PER_SECOND * SECONDS).unwrap();
+    let load = |appended, forged_sent, forged_received, late_ns, samples| Load {
+        appended,
+        forged_sent,
+        forged_received,
+        late_ns,
+        samples,
+    };
     for rate in [RATE_LOW, RATE_HIGH] {
         let full = rate * SECONDS;
-        let samples = usize::try_from(MIN_SAMPLES_PER_SECOND * SECONDS).unwrap();
-        assert_eq!(sustained(rate, full, full / 10, 10, 0, samples), Ok(()));
+        let ok = |p, l| sustained(rate, p, l);
+        assert_eq!(ok(10, load(full, full / 10, full / 10, 0, samples)), Ok(()));
+        let least = full * 95 / 100;
         assert_eq!(
-            sustained(
-                rate,
-                full * 95 / 100,
-                full * 95 / 100,
+            ok(
                 100,
-                MAX_LAG_NS,
-                samples
+                load(least, least, least * 95 / 100 + 1, MAX_LAG_NS, samples)
             ),
             Ok(())
         );
-        // A stall before the first iteration: nothing injected at all.
-        assert!(sustained(rate, 0, 0, 10, 0, 0).is_err());
-        assert!(sustained(rate, full * 94 / 100, full, 100, 0, samples).is_err());
-        assert!(sustained(rate, full, full * 94 / 100, 100, 0, samples).is_err());
-        assert!(sustained(rate, full, full / 10 * 94 / 100, 10, 0, samples).is_err());
-        assert!(sustained(rate, full, full, 100, MAX_LAG_NS + 1, samples).is_err());
-        assert!(sustained(rate, full, full, 100, 0, samples - 1).is_err());
+        // A stall before the first iteration: nothing sent at all.
+        assert!(ok(10, load(0, 0, 0, 0, 0)).is_err());
+        assert!(ok(100, load(full * 94 / 100, full, full, 0, samples)).is_err());
+        assert!(
+            ok(
+                100,
+                load(full, full * 94 / 100, full * 94 / 100, 0, samples)
+            )
+            .is_err()
+        );
+        assert!(
+            ok(
+                10,
+                load(full, full / 10 * 94 / 100, full / 10 * 94 / 100, 0, samples)
+            )
+            .is_err()
+        );
+        // More than 5% of the forged datagrams sent lost by UDP.
+        assert!(ok(100, load(full, full, full * 94 / 100, 0, samples)).is_err());
+        assert!(ok(10, load(full, full / 10, full / 10 * 94 / 100, 0, samples)).is_err());
+        // Received more than was sent: the count is not of the flood.
+        assert!(ok(100, load(full, full, full + 1, 0, samples)).is_err());
+        assert!(ok(100, load(full, full, full, MAX_LAG_NS + 1, samples)).is_err());
+        assert!(ok(100, load(full, full, full, 0, samples - 1)).is_err());
     }
 }

@@ -516,6 +516,17 @@ impl<O: SocketOps> SocketsTx<O> {
         self.core.commitment()
     }
 
+    /// A duplicate of its socket (tests): what is sent from it leaves
+    /// from the endpoint's own address and port.
+    ///
+    /// # Errors
+    ///
+    /// The OS error of the duplication.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn try_clone_socket(&self) -> Result<O, super::ops::Errno> {
+        self.ops.try_clone()
+    }
+
     /// Adds a route to `destination`, measuring its MTU (3.8, 4.5).
     ///
     /// # Errors
