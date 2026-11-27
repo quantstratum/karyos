@@ -57,11 +57,13 @@ use super::{BindingKey, Intake, ReceiverRole, SessionEnd, SlotRef, sender_frame_
 use crate::agents::EndpointId;
 use crate::embedded::StreamTerms;
 use crate::sessions::NonceSource;
+use crate::wire_enc::verify_pool::{Done, Outcome, VerifyPool};
 use crate::wire_enc::vm_generation;
 use crate::wire_enc::{
-    ChannelKeys, EncChannel, EncKeyError, EncOpener, EncRejections, EncSealer, PairwiseFiles,
-    Pending, VmGenerationWatch, check_resync, header, id128, identity_of, is_envelope,
-    monotonic_ns, open_bootstrap_in, publication_of, quiesced,
+    ChannelKeys, EncChannel, EncKeyError, EncOpener, EncRejections, EncSealer, EncVerifyConfig,
+    Header, Lease, PairwiseFiles, Pending, Prepared, Ticket, VmGenerationWatch, check_matrix,
+    check_resync, header, id128, identity_of, is_envelope, monotonic_ns, open_bootstrap_in,
+    publication_of, quiesced,
 };
 use crate::wire_keys::KeyFile;
 
@@ -296,9 +298,65 @@ struct ImageEnc {
     resync: Option<([u64; 2], u64)>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The verifier pool the next encrypted subscription of a role on
+    /// this thread makes, and whether its verifiers run on threads
+    /// (tests: [`with_enc_verifiers`]).
+    static TEST_VERIFY: core::cell::Cell<Option<(EncVerifyConfig, bool)>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// Runs `run` with every role made on this thread verifying through a
+/// pool of `config`, its verifiers on threads when `spawn`, or run only by
+/// the role when it waits (tests: the encrypted suite with a pool).
+#[cfg(test)]
+pub(crate) fn with_enc_verifiers<R>(
+    config: EncVerifyConfig,
+    spawn: bool,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Reset(Option<(EncVerifyConfig, bool)>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_VERIFY.with(|cell| cell.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_VERIFY.with(|cell| cell.replace(Some((config, spawn)))));
+    run()
+}
+
+/// The context a receiver role records for one domain 1 job at dispatch
+/// (ADR-0126 decision 2): where it came from, the binding it was
+/// dispatched for, the header's publication, the role's withdrawal fence
+/// and the opener's [`Ticket`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct EncJob {
+    endpoint: EndpointId,
+    source: SocketAddr,
+    alias: Alias,
+    slot: SlotRef,
+    publication: Option<PublicationIdentity>,
+    fence: u64,
+    ticket: Ticket,
+}
+
 /// The encrypted class of a receiver role.
 #[derive(Debug, Default)]
 pub(crate) struct ReceiverEnc {
+    /// The verifier pool (ADR-0126), made at the first encrypted
+    /// subscription when `verify` names verifiers. First, so that it is
+    /// dropped first: its verifiers are joined and every lease returned
+    /// before the role leaves the VM generation fence.
+    pool: Option<VerifyPool<EncJob>>,
+    /// The pool's configuration.
+    verify: EncVerifyConfig,
+    /// Moves when every job in flight is withdrawn ([`Self::quiesce`]): a
+    /// job dispatched under an earlier value is refused.
+    fence: u64,
+    /// Results are not consumed while set (tests: jobs held in flight).
+    #[cfg(test)]
+    pub(super) hold: bool,
     subscriptions: Vec<SubscriptionEnc>,
     images: Vec<ImageEnc>,
     /// The local encrypted publications, by endpoint and alias: their
@@ -344,6 +402,47 @@ pub(crate) struct ReceiverEnc {
 }
 
 impl ReceiverEnc {
+    /// The encrypted class of a role whose verifier pool is `verify`.
+    pub(crate) fn new(verify: EncVerifyConfig) -> Self {
+        Self {
+            verify,
+            ..Self::default()
+        }
+    }
+
+    /// ADR-0126 decision 5, for a key replacement or a VM generation
+    /// change: every job in flight is withdrawn. Queued jobs are
+    /// cancelled, running ones finish, and every result is consumed and
+    /// refused (`enc_withdrawn`), so every lease is back, and no key a job
+    /// held is changed or erased, before this returns. Allocates nothing.
+    fn quiesce(&mut self) {
+        let Some(pool) = self.pool.as_mut() else {
+            return;
+        };
+        if pool.in_flight() == 0 {
+            return;
+        }
+        self.fence = self.fence.wrapping_add(1);
+        let _ = pool.cancel_where(|_| true);
+        let mut plain = [0_u8; MAX_PLAINTEXT];
+        while let Some(done) = pool.take_waiting(&mut plain) {
+            let job = done.context;
+            match self.subscriptions.iter_mut().find(|subscription| {
+                (subscription.endpoint, subscription.stream_id)
+                    == (job.endpoint, job.alias.stream_id)
+            }) {
+                Some(subscription) => subscription
+                    .channel
+                    .rejections
+                    .bump(EncRejection::Withdrawn),
+                None => self.unattributed.bump(EncRejection::Withdrawn),
+            }
+            // Its lease returns here.
+            drop(done);
+        }
+        zeroize::Zeroize::zeroize(&mut plain);
+    }
+
     /// The resynchronisation of section 6b for an ENC ANSWER of the bound
     /// identity, from subscription `index`, at `now`: the answer must echo
     /// the binding's outstanding challenge (`boot` and its nonce) before
@@ -417,6 +516,9 @@ impl ReceiverEnc {
     /// expired; each image's domain 1 opener is withdrawn once its key
     /// epoch is revoked or expired.
     pub(crate) fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        // A key replacement withdraws every job in flight first (ADR-0126
+        // decision 5): no key a lease holds changes under a verifier.
+        self.quiesce();
         for subscription in &mut self.subscriptions {
             // Rotation: a newly admitted epoch serves the next bindings,
             // admitted before its predecessor goes.
@@ -522,6 +624,18 @@ impl ReceiverEnc {
     /// key.
     pub(crate) fn subscribe(&mut self, mut subscription: SubscriptionEnc) {
         self.unsubscribe(subscription.endpoint, subscription.stream_id);
+        // The verifier pool (ADR-0126), made once on the control path.
+        if self.pool.is_none() {
+            #[cfg(not(test))]
+            let (config, spawn) = (self.verify, true);
+            #[cfg(test)]
+            let (config, spawn) = TEST_VERIFY
+                .with(core::cell::Cell::get)
+                .unwrap_or((self.verify, true));
+            if config.verifiers > 0 || !spawn {
+                self.pool = Some(VerifyPool::new(config, spawn));
+            }
+        }
         // It starts at the role's activation floor, not 0 (H8-17).
         self.activation.hold(&mut subscription.keys);
         // The fixed tables, made once on the control path: the receive
@@ -687,7 +801,15 @@ impl ReceiverEnc {
 
     /// The image at `slot` was retired: its domain 1 keys are dropped,
     /// which erases them (H8-09).
+    ///
+    /// Its jobs still queued are cancelled (ADR-0126 decision 5) and its
+    /// opener is withdrawn for its verifiers; every result is consumed in
+    /// order and refused, and a key a lease still holds is erased once
+    /// the last returns.
     pub(crate) fn retire_image(&mut self, slot: SlotRef) {
+        if let Some(pool) = self.pool.as_mut() {
+            let _ = pool.cancel_where(|job| job.slot == slot);
+        }
         self.images.retain(|image| image.slot != slot);
     }
 
@@ -811,6 +933,28 @@ impl ReceiverEnc {
 pub(super) struct EncQueued {
     slot: SlotRef,
     pending: Pending,
+}
+
+/// What the inner frames of a verified domain 1 datagram of the binding
+/// on `alias`, of incarnation `identity`, are: `Some(true)` a DATA batch
+/// or heartbeat of that binding while it is `live`, `Some(false)` a sender
+/// control naming it, `None` anything else. Structural only: no handler
+/// state is read.
+fn sender_datagram(frames: &[u8], alias: Alias, live: bool, identity: Identity) -> Option<bool> {
+    match classify(frames) {
+        Ok(Datagram::DataBatch(batch) | Datagram::Heartbeat(batch))
+            if batch.alias() == alias && live =>
+        {
+            Some(true)
+        }
+        Ok(Datagram::Control(control))
+            if sender_frame_alias(&control) == Some(alias)
+                && sender_control_names(&control, identity) =>
+        {
+            Some(false)
+        }
+        _ => None,
+    }
 }
 
 /// Whether a domain 1 sender control names the bound image's incarnation
@@ -984,6 +1128,9 @@ impl<T: StreamTerms> Intake<'_, T> {
                 Err(EncRejection::RetiredParty)
             }
             Ok(head) if head.domain == Domain::Setup => {
+                // Opened inline: the jobs dispatched before it are decided
+                // first, in arrival order (ADR-0126 decision 4).
+                self.role.enc_settle(self.sessions, self.now);
                 self.enc_setup(source, alias, index, bytes, &mut out)
             }
             Ok(head) if head.domain == Domain::Sender => {
@@ -1024,6 +1171,14 @@ impl<T: StreamTerms> Intake<'_, T> {
         out: &mut [u8; MAX_PLAINTEXT],
     ) -> Result<(), EncRejection> {
         let head = header(bytes)?;
+        if self.role.enc.pool.is_some() {
+            if self.enc_dispatch(source, alias, index, bytes, &head)? {
+                return Ok(());
+            }
+            // Opened inline: the jobs dispatched before it are decided
+            // first, in arrival order (ADR-0126 decision 4).
+            self.role.enc_settle(self.sessions, self.now);
+        }
         let bound = self.bound_image(source, alias);
         let Some((slot, identity, aborted)) = bound
             .and_then(|image| self.role.images.get(image))
@@ -1068,20 +1223,7 @@ impl<T: StreamTerms> Intake<'_, T> {
             // The frames name this live binding (alias, and a control's
             // incarnation): no handler state is read. Whether they take
             // effect is their handler's decision, below.
-            data = match classify(frames) {
-                Ok(Datagram::DataBatch(batch) | Datagram::Heartbeat(batch))
-                    if batch.alias() == alias && live =>
-                {
-                    Some(true)
-                }
-                Ok(Datagram::Control(control))
-                    if sender_frame_alias(&control) == Some(alias)
-                        && sender_control_names(&control, identity) =>
-                {
-                    Some(false)
-                }
-                _ => None,
-            };
+            data = sender_datagram(frames, alias, live, identity);
             data.map(|_| ()).ok_or(EncRejection::InnerRejected)
         });
         let pending = match verified {
@@ -1095,15 +1237,231 @@ impl<T: StreamTerms> Intake<'_, T> {
             Err(reason) => return Err(reason),
         };
         let frames = out.get(..pending.frames).ok_or(EncRejection::Short)?;
-        let queued = EncQueued { slot, pending };
+        let data = data.ok_or(EncRejection::InnerRejected)?;
+        self.enc_handle(source, alias, frames, EncQueued { slot, pending }, data)
+    }
+
+    /// ADR-0126 decision 2: a domain 1 datagram of a bound image, with a
+    /// verifier pool. Every check before the open runs here, on the role
+    /// thread, the open rate charged to the channel's one count
+    /// ([`EncOpener::prepare`]); then a slot is reserved, the job's context
+    /// recorded and its lease taken, and the job queued for a verifier.
+    /// `Ok(true)` once queued; `Ok(false)` for a datagram to open here,
+    /// inline: no binding, or the next epoch (a scratch derivation).
+    ///
+    /// # Errors
+    ///
+    /// The refusal of a check before the open, or
+    /// [`EncRejection::VerifyBusy`] when no slot is free: dropped before
+    /// dispatch.
+    fn enc_dispatch(
+        &mut self,
+        source: SocketAddr,
+        alias: Alias,
+        index: usize,
+        bytes: &[u8],
+        head: &Header,
+    ) -> Result<bool, EncRejection> {
+        // A full table first gives back what is done (decision 4).
+        if self
+            .role
+            .enc
+            .pool
+            .as_ref()
+            .is_some_and(|pool| !pool.has_free())
+        {
+            self.role.enc_collect(self.sessions, self.now);
+        }
+        let Some(slot) = self
+            .bound_image(source, alias)
+            .and_then(|image| self.role.images.get(image))
+            .map(|image| image.slot)
+        else {
+            return Ok(false);
+        };
+        let (now, endpoint) = (self.now, self.endpoint);
+        let enc = &mut self.role.enc;
+        let fence = enc.fence;
+        let image = enc
+            .images
+            .iter_mut()
+            .find(|image| image.slot == slot)
+            .ok_or(EncRejection::Binding)?;
+        let rate = &mut enc
+            .subscriptions
+            .get_mut(index)
+            .ok_or(EncRejection::Binding)?
+            .channel
+            .rate;
+        let (ticket, lease) = match image.opener.prepare(bytes, rate, now) {
+            Ok(Prepared::Dispatch(ticket, lease)) => (ticket, lease),
+            Ok(Prepared::Inline) => return Ok(false),
+            Err(EncRejection::Epoch)
+                if (head.key_epoch, head.party_epoch) > image.opener.epochs() =>
+            {
+                self.enc_start_resync(source, slot);
+                return Err(EncRejection::Epoch);
+            }
+            Err(reason) => return Err(reason),
+        };
+        let job = EncJob {
+            endpoint,
+            source,
+            alias,
+            slot,
+            publication: head.publication,
+            fence,
+            ticket,
+        };
+        match enc.pool.as_mut() {
+            // A refused dispatch hands the lease back, and it returns here.
+            Some(pool) => pool
+                .dispatch(bytes, lease, job)
+                .map(|()| true)
+                .map_err(|_| EncRejection::VerifyBusy),
+            None => Err(EncRejection::VerifyBusy),
+        }
+    }
+
+    /// ADR-0126 decision 3: a verifier's result, consumed in arrival order.
+    /// A refusal is counted on its subscription and changes nothing else.
+    fn enc_verified(&mut self, done: Done<EncJob>, plain: &mut [u8; MAX_PLAINTEXT]) {
+        let job = done.context;
+        if let Err(reason) = self.enc_recheck(done, plain) {
+            let index = self
+                .role
+                .enc
+                .subscription(job.endpoint, job.alias.stream_id);
+            self.enc_reject(index, reason);
+        }
+    }
+
+    /// The outcome of `done`: a refused open or a cancelled job is refused
+    /// as such; a verified one is re-checked, decided and committed
+    /// ([`Self::enc_decide`]), its plaintext erased when refused.
+    fn enc_recheck(
+        &mut self,
+        done: Done<EncJob>,
+        plain: &mut [u8; MAX_PLAINTEXT],
+    ) -> Result<(), EncRejection> {
+        let Done {
+            context: job,
+            outcome,
+            lease,
+            header,
+            len,
+        } = done;
+        let opened = match outcome {
+            Outcome::Verified(opened) => opened,
+            Outcome::Failed(reason) => return Err(reason),
+            Outcome::Cancelled => return Err(EncRejection::Withdrawn),
+        };
+        let lease = lease.ok_or(EncRejection::Withdrawn)?;
+        let decided = self.enc_decide(&job, &opened, lease, (&header, len), plain);
+        if decided.is_err()
+            && let Some(frames) = plain.get_mut(..opened.frames)
+        {
+            zeroize::Zeroize::zeroize(frames);
+        }
+        decided
+    }
+
+    /// ADR-0126 decision 3 for a verified job: every predicate checked at
+    /// dispatch is evaluated again, changing nothing: the role's
+    /// withdrawal fence, the VM generation fence, the key fence, the
+    /// retired identities, the binding (the same image, by the admission
+    /// rule) and its liveness, and the opener's own
+    /// ([`EncOpener::complete`]: instance, withdrawal, generation, key
+    /// slot, age and replay window); its lease returns then. The inner
+    /// frames are validated as on the inline path; the handler decides and
+    /// the commit marks, as in ADR-0124. No second open.
+    fn enc_decide(
+        &mut self,
+        job: &EncJob,
+        opened: &karyos_protocol::protection::aes_gcm_siv::Opened,
+        lease: Lease,
+        authenticated: (
+            &[u8; karyos_protocol::protection::aes_gcm_siv::HEADER_LEN],
+            usize,
+        ),
+        plain: &[u8; MAX_PLAINTEXT],
+    ) -> Result<(), EncRejection> {
+        if job.fence != self.role.enc.fence {
+            return Err(EncRejection::Withdrawn);
+        }
+        if quiesced() {
+            return Err(EncRejection::VmGeneration);
+        }
+        if !self
+            .role
+            .key_generation
+            .admits_now(crate::wire_auth::Side::Receiver)
+        {
+            self.role.count(|c| &mut c.auth_rejected);
+            return Ok(());
+        }
+        if job.publication.is_some_and(|publication| {
+            self.role
+                .sessions
+                .is_quarantined(&identity_of(&publication), self.now)
+        }) {
+            return Err(EncRejection::RetiredParty);
+        }
+        let (slot, identity, aborted) = self
+            .bound_image(job.source, job.alias)
+            .and_then(|image| self.role.images.get(image))
+            .map(|image| (image.slot, image.identity, image.aborted.is_some()))
+            .filter(|(slot, _, _)| *slot == job.slot)
+            .ok_or(EncRejection::Binding)?;
+        let live = self.role.sessions.is_active(slot) && !aborted;
+        let now = self.now;
+        let pending = self
+            .role
+            .enc
+            .images
+            .iter()
+            .find(|image| image.slot == slot)
+            .ok_or(EncRejection::Binding)
+            .and_then(|image| {
+                image
+                    .opener
+                    .complete(&job.ticket, &lease, opened, authenticated, now)
+            })?;
+        // Consumed: the lease returns.
+        drop(lease);
+        let frames = plain.get(..opened.frames).ok_or(EncRejection::Short)?;
+        check_matrix(Domain::Sender, frames)?;
+        let data = sender_datagram(frames, job.alias, live, identity)
+            .ok_or(EncRejection::InnerRejected)?;
+        self.enc_handle(
+            job.source,
+            job.alias,
+            frames,
+            EncQueued { slot, pending },
+            data,
+        )
+    }
+
+    /// The handler of a verified domain 1 datagram decides, and only an
+    /// accepted one is committed (ADR-0124): `data` a DATA batch or
+    /// heartbeat, delivered now or queued in its path's order, otherwise a
+    /// sender control, checked again after the queue it drains first.
+    fn enc_handle(
+        &mut self,
+        source: SocketAddr,
+        alias: Alias,
+        frames: &[u8],
+        queued: EncQueued,
+        data: bool,
+    ) -> Result<(), EncRejection> {
         let accepted = match (data, classify(frames)) {
-            (Some(true), _) => match self.deliver_enc(source, alias, frames, queued) {
+            (true, _) => match self.deliver_enc(source, alias, frames, queued) {
                 // Queued in its path's order, or dropped by a full queue:
                 // nothing is committed now.
                 None => return Ok(()),
                 Some(accepted) => accepted,
             },
-            (Some(false), Ok(Datagram::Control(control))) => {
+            (false, Ok(Datagram::Control(control))) => {
                 self.drain_own_queue();
                 // The drain hands its queued datagrams to their handlers
                 // and commits them: this one is checked again after it.
@@ -1447,6 +1805,10 @@ impl<T: StreamTerms> ReceiverRole<T> {
         if current == self.enc.seen {
             return;
         }
+        // ADR-0126 decision 5: every job in flight is withdrawn and every
+        // lease is back before anything is closed, and so before the role
+        // reports itself redrawn.
+        self.enc.quiesce();
         // Step 2. Each encrypted image's domain 4 sealer is withdrawn
         // through its shared object first, which erases its key for every
         // holder, a clone in a queued control included (H8-09).
@@ -1506,6 +1868,102 @@ impl<T: StreamTerms> ReceiverRole<T> {
         if let Some(registration) = self.enc.registration.as_mut() {
             registration.redrawn(current);
         }
+    }
+
+    /// ADR-0126 decision 4: consumes every job in flight in arrival order,
+    /// each at `now` with its own endpoint, waiting for the ones not yet
+    /// done (running queued ones itself meanwhile). Called before any
+    /// encrypted datagram is opened inline, so that a binding's datagrams
+    /// are decided in the order they arrived, and by a duty that read
+    /// nothing. Allocates nothing.
+    pub(in crate::agents) fn enc_settle(&mut self, sessions: &SessionEnd<T>, now: u64) {
+        self.enc_consume(sessions, now, true);
+    }
+
+    /// ADR-0126 decision 4: consumes the jobs already done, in arrival
+    /// order, up to the first that is not: after each endpoint's receive
+    /// poll, so that the verifiers work on one poll's datagrams while the
+    /// role reads the next. Allocates nothing.
+    pub(in crate::agents) fn enc_collect(&mut self, sessions: &SessionEnd<T>, now: u64) {
+        self.enc_consume(sessions, now, false);
+    }
+
+    /// Consumes jobs in arrival order; with `wait`, every one in flight.
+    fn enc_consume(&mut self, sessions: &SessionEnd<T>, now: u64, wait: bool) {
+        #[cfg(test)]
+        if self.enc.hold {
+            return;
+        }
+        if self
+            .enc
+            .pool
+            .as_ref()
+            .is_none_or(|pool| pool.in_flight() == 0)
+        {
+            return;
+        }
+        let mut plain = [0_u8; MAX_PLAINTEXT];
+        while let Some(done) = self.enc.pool.as_mut().and_then(|pool| {
+            if wait {
+                pool.take_waiting(&mut plain)
+            } else {
+                pool.take(&mut plain)
+            }
+        }) {
+            let mut intake = Intake {
+                endpoint: done.context.endpoint,
+                now,
+                role: self,
+                sessions,
+                work: 0,
+            };
+            intake.enc_verified(done, &mut plain);
+        }
+    }
+
+    /// Holds results in flight while `hold` (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_hold(&mut self, hold: bool) {
+        self.enc.hold = hold;
+    }
+
+    /// Jobs in flight (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_in_flight(&self) -> usize {
+        self.enc.pool.as_ref().map_or(0, VerifyPool::in_flight)
+    }
+
+    /// Verifier threads running (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_verifiers(&self) -> Option<usize> {
+        self.enc.pool.as_ref().map(VerifyPool::verifiers)
+    }
+
+    /// Runs one queued job on this thread, as a verifier (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_verify_one(&self) -> bool {
+        self.enc.pool.as_ref().is_some_and(VerifyPool::verify_one)
+    }
+
+    /// The leases out on the image at `slot`'s opener, and its current
+    /// key, weakly (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_leases(
+        &self,
+        slot: SlotRef,
+    ) -> Option<(u32, std::sync::Weak<crate::wire_enc::KeyCell>)> {
+        self.enc
+            .images
+            .iter()
+            .find(|image| image.slot == slot)
+            .map(|image| (image.opener.leases(), image.opener.current_key()))
+    }
+
+    /// Removes the domain 1 binding of the image at `slot` from the
+    /// encrypted class, as a retirement does (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_remove_binding(&mut self, slot: SlotRef) {
+        self.enc.retire_image(slot);
     }
 
     /// Reads the signal with `watch` instead of the platform's (tests).

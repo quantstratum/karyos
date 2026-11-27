@@ -577,6 +577,10 @@ pub enum EncRejection {
     /// `enc_withdrawn`: the opener's keys were withdrawn by a key reload
     /// (revoked, expired, or the store disabled). Raised by the driver.
     Withdrawn,
+    /// `enc_verify_busy`: no verification slot was free, so the datagram
+    /// was dropped before its open (ADR-0126 decision 4). Raised by the
+    /// driver.
+    VerifyBusy,
 }
 
 impl From<Replay> for EncRejection {
@@ -619,7 +623,8 @@ impl From<EncRejection> for Rejection {
             EncRejection::Tag
             | EncRejection::Pairwise
             | EncRejection::InnerRejected
-            | EncRejection::OpenRate => Self::Tag,
+            | EncRejection::OpenRate
+            | EncRejection::VerifyBusy => Self::Tag,
         }
     }
 }
@@ -1043,6 +1048,14 @@ impl AesGcmSiv {
     /// steps 1 to 3 and 5. Changes nothing. Returns the sequence and the
     /// plaintext length.
     fn precheck(&self, datagram: &[u8]) -> Result<(u64, usize), EncRejection> {
+        let (seq, plaintext) = self.precheck_fields(datagram)?;
+        self.lock().check(seq)?;
+        Ok((seq, plaintext))
+    }
+
+    /// [`Self::precheck`] without the replay window: section 8 steps 1 to
+    /// 3. Changes nothing.
+    fn precheck_fields(&self, datagram: &[u8]) -> Result<(u64, usize), EncRejection> {
         let field = |at: usize, width: usize| -> &[u8] {
             datagram
                 .get(at..at.saturating_add(width))
@@ -1123,7 +1136,6 @@ impl AesGcmSiv {
         if seq >= self.context.domain.seq_cap() {
             return Err(EncRejection::SequenceCap);
         }
-        self.lock().check(seq)?;
         let plaintext = datagram
             .len()
             .checked_sub(ENVELOPE_LEN)
@@ -1219,6 +1231,49 @@ impl AesGcmSiv {
     /// when `out` cannot hold the plaintext.
     pub fn open_into(&self, datagram: &[u8], out: &mut [u8]) -> Result<Opened, EncRejection> {
         let (seq, plaintext) = self.precheck(datagram)?;
+        self.open_after_precheck(datagram, out, seq, plaintext)
+    }
+
+    /// Every check [`Self::open_into`] runs before the AEAD, the replay
+    /// precheck included, changing nothing: what a caller that hands the
+    /// open to another thread runs first (ADR-0126 decision 2). Returns
+    /// the sequence.
+    ///
+    /// # Errors
+    ///
+    /// The first [`EncRejection`] that applies.
+    pub fn check_before_open(&self, datagram: &[u8]) -> Result<u64, EncRejection> {
+        self.precheck(datagram).map(|(seq, _)| seq)
+    }
+
+    /// [`Self::open_into`] without the replay precheck: the fixed fields,
+    /// the AEAD and the pairwise trailer only, the pure step a verifier
+    /// thread runs (ADR-0126 decision 1). Its caller ran
+    /// [`Self::check_before_open`] first and checks the window again before
+    /// it marks. Reads no window, so it never takes the window's lock.
+    /// Allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_into`], but never a replay refusal.
+    pub fn open_verified_into(
+        &self,
+        datagram: &[u8],
+        out: &mut [u8],
+    ) -> Result<Opened, EncRejection> {
+        let (seq, plaintext) = self.precheck_fields(datagram)?;
+        self.open_after_precheck(datagram, out, seq, plaintext)
+    }
+
+    /// The AEAD and the pairwise trailer of [`Self::open_into`], after its
+    /// precheck gave `seq` and the `plaintext` length.
+    fn open_after_precheck(
+        &self,
+        datagram: &[u8],
+        out: &mut [u8],
+        seq: u64,
+        plaintext: usize,
+    ) -> Result<Opened, EncRejection> {
         let header = datagram.get(..HEADER_LEN).ok_or(EncRejection::Short)?;
         let (body, tag) = datagram
             .get(HEADER_LEN..)

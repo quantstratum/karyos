@@ -160,6 +160,7 @@ fn every_rejection_reason_has_its_own_counter() {
         R::BeforeJoin,
         R::VmGeneration,
         R::Withdrawn,
+        R::VerifyBusy,
     ];
     assert_eq!(all.len(), ENC_REASONS);
     let mut seen = [false; ENC_REASONS];

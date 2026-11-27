@@ -354,6 +354,18 @@ pub struct AgentConfig {
     /// least this often while a conflated network view is open, or its
     /// views can close at `barrier_ack_timeout` without a loss.
     pub conductor_duty_period: u64,
+    /// The receiver's encrypted verifier pool (ADR-0126):
+    /// `enc_verify.verifiers` threads (0 to [`crate::wire_enc::MAX_ENC_VERIFIERS`];
+    /// default 0, every encrypted datagram opened on the receiver's own
+    /// thread) run the AEAD open and pairwise trailer of an encrypted
+    /// subscription's domain 1 datagrams, through `enc_verify.slots`
+    /// in-flight job slots (1 to [`crate::wire_enc::MAX_ENC_VERIFY_SLOTS`],
+    /// default [`crate::wire_enc::DEFAULT_ENC_VERIFY_SLOTS`]; each about
+    /// 2.7 KiB, allocated at the first encrypted subscription). A datagram
+    /// that finds no free slot is dropped before its open and counted
+    /// (`enc_verify_busy`); at least `rx_datagrams` slots keep one poll's
+    /// datagrams from ever finding none.
+    pub enc_verify: crate::wire_enc::EncVerifyConfig,
 }
 
 impl Default for AgentConfig {
@@ -395,6 +407,7 @@ impl Default for AgentConfig {
             stop_timeout: Duration::from_secs(1),
             barrier_ack_timeout: conflated_gate::DEFAULT_BARRIER_ACK_TIMEOUT_NS,
             conductor_duty_period: conflated_gate::DEFAULT_CONDUCTOR_DUTY_PERIOD_NS,
+            enc_verify: crate::wire_enc::EncVerifyConfig::default(),
         }
     }
 }
@@ -462,6 +475,9 @@ impl AgentConfig {
                 "sessions.max_paths × path_queue_datagrams × MAX_DATAGRAM must be at most 64 MiB",
             ));
         }
+        self.enc_verify
+            .validate()
+            .map_err(AgentError::InvalidConfig)?;
         if self.max_endpoints == 0 {
             return Err(AgentError::InvalidConfig(
                 "max_endpoints must be at least 1",

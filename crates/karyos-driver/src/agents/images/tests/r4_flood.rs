@@ -40,7 +40,30 @@ use karyos_sys::alloc_count::count_allocations;
 use karyos_sys::log_buffer::{AppendOptions, AppendOutcome, PollOutcome, Role};
 
 use super::*;
-use crate::wire_enc::{ChannelKeys, EncSealer, MAX_SEALED};
+use crate::wire_enc::{
+    ChannelKeys, DEFAULT_ENC_VERIFY_SLOTS, EncSealer, EncVerifyConfig, MAX_SEALED,
+};
+
+/// Verifier threads of the receiver's pool (ADR-0126) by default;
+/// `KARYOS_R4_VERIFIERS` overrides it, 0 running every open on the
+/// receiver's own thread.
+const VERIFIERS: u16 = 3;
+
+/// The receiver's verifier pool of a run: [`VERIFIERS`] threads and
+/// [`DEFAULT_ENC_VERIFY_SLOTS`] slots, or `KARYOS_R4_VERIFIERS` and
+/// `KARYOS_R4_SLOTS`.
+fn r4_pool() -> EncVerifyConfig {
+    let read = |name: &str, default: u16| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    EncVerifyConfig {
+        verifiers: read("KARYOS_R4_VERIFIERS", VERIFIERS),
+        slots: read("KARYOS_R4_SLOTS", DEFAULT_ENC_VERIFY_SLOTS),
+    }
+}
 
 /// R2's lower valid rate (manifest 6.1), messages/s.
 const RATE_LOW: u64 = 100_000;
@@ -181,7 +204,14 @@ fn sustained(rate: u64, invalid_percent: u64, load: Load) -> Result<(), String> 
 /// forged; returns the report and asserts the H10 properties.
 #[allow(clippy::too_many_lines, reason = "one measured run, read top down")]
 fn r4(rate: u64, invalid_percent: u64) -> String {
-    let (mut rig, b) = encrypted_rig();
+    let verify = r4_pool();
+    let (mut rig, b) =
+        crate::agents::roles::receive_enc::with_enc_verifiers(verify, true, encrypted_rig);
+    assert_eq!(
+        rig.agents.receiver.role.enc_verifiers(),
+        (verify.verifiers > 0).then_some(usize::from(verify.verifiers)),
+        "the pool runs"
+    );
     crate::wire_enc::record_seals();
     let slot = established(&mut rig);
     let (mut image_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
@@ -470,6 +500,14 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     let _ = writeln!(report, "rejections after: {after:?}");
     let _ = writeln!(
         report,
+        "verifier pool (ADR-0126): verifiers={} slots={} enc_verify_busy={} in_flight_after={}",
+        verify.verifiers,
+        verify.slots,
+        after.get(EncRejection::VerifyBusy) - before.get(EncRejection::VerifyBusy),
+        rig.agents.receiver.role.enc_in_flight()
+    );
+    let _ = writeln!(
+        report,
         "allocations: receiver duties={receiver_allocs} sender duties={sender_allocs}"
     );
     let _ = writeln!(
@@ -536,12 +574,13 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     }
     assert_eq!(receiver_allocs, 0, "{report}");
     assert_eq!(sender_allocs, 0, "{report}");
-    assert_eq!(
-        after.get(EncRejection::Tag) - before.get(EncRejection::Tag),
-        forged,
-        "{report}"
-    );
-    assert_eq!(after.total() - before.total(), forged, "{report}");
+    // Every forged datagram read is refused for its tag, or dropped before
+    // its open when no verification slot was free (ADR-0126 decision 4,
+    // which drops valid datagrams too: those are repaired).
+    let tags = after.get(EncRejection::Tag) - before.get(EncRejection::Tag);
+    let busy = after.get(EncRejection::VerifyBusy) - before.get(EncRejection::VerifyBusy);
+    assert!(tags <= forged && tags + busy >= forged, "{report}");
+    assert_eq!(after.total() - before.total(), tags + busy, "{report}");
     assert_eq!(delivered, appended, "{report}");
     assert_eq!(out_of_order, 0, "{report}");
     assert!(new_challenges <= 1, "{report}");

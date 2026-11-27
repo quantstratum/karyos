@@ -2473,7 +2473,7 @@ pub(super) fn roles<T: StreamTerms>(
             auth_unattributed: AuthRejections::default(),
             published_auth: Vec::new(),
             subscription_auth: Vec::new(),
-            enc: receive_enc::ReceiverEnc::default(),
+            enc: receive_enc::ReceiverEnc::new(config.enc_verify),
             verified_setup: false,
             signed: None,
             authority_keys: Vec::new(),
@@ -3209,6 +3209,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             work: 0,
         };
         intake.bytes_in(source, bytes);
+        self.enc_settle(sessions, now);
     }
 
     /// Marks the local publication `alias` on `endpoint` authenticated
@@ -5099,6 +5100,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 self.rx_epoch(*endpoint, rx.capabilities().epoch);
             }
         }
+        let mut read = 0_u32;
         for (endpoint, half) in halves.iter_mut() {
             let Half::Rx(rx) = half else {
                 continue;
@@ -5116,6 +5118,14 @@ impl<T: StreamTerms> ReceiverRole<T> {
             };
             let _ = rx.poll_rx(budget, &mut intake);
             work = work.checked_add(intake.work).ok_or(overflow.clone())?;
+            read = read.saturating_add(intake.work);
+            // The encrypted jobs already verified are decided, in arrival
+            // order, while the rest are verified (ADR-0126 decision 4).
+            self.enc_collect(sessions, now);
+        }
+        // A duty that read nothing waits for every job still in flight.
+        if read == 0 {
+            self.enc_settle(sessions, now);
         }
         work = work
             .checked_add(self.drain_path_queues(sessions))
