@@ -422,6 +422,7 @@ mod tests {
     /// The derivation's vector (ADR-0123 decision 2): SHA-256 over the
     /// 25-byte domain, the source, the index and term little endian, and
     /// the nonce, 105 bytes in all; computed independently.
+    #[cfg(feature = "backup")]
     #[test]
     fn the_rebuild_identity_matches_its_vector() {
         let identity = rebuild_identity(ClusterId([7; 32]), 290, 3, [1; 32]);
