@@ -205,6 +205,35 @@ fn a_node_is_exported_verified_and_rebuilt_end_to_end() {
         out.starts_with("rebuild base=1000:2 top=2400:2 entries=1400 objects=4\n"),
         "{out}"
     );
+    // ADR-0123 decision 2: the report records the rebuild's identity, its
+    // source and its nonce, from which the identity is recomputed.
+    let line = out
+        .lines()
+        .find(|line| line.starts_with("identity="))
+        .unwrap_or_else(|| panic!("{out}"));
+    let field = |name: &str| -> [u8; 32] {
+        let value = line
+            .split(' ')
+            .find_map(|part| part.strip_prefix(name))
+            .unwrap();
+        let bytes: Vec<u8> = (0..32)
+            .map(|at| u8::from_str_radix(&value[at * 2..at * 2 + 2], 16).unwrap())
+            .collect();
+        bytes.try_into().unwrap()
+    };
+    let (identity, source, nonce) = (field("identity="), field("isolated_from="), field("nonce="));
+    let source_hex: String = source.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(source_hex, cluster, "the source is the export's identity");
+    assert_eq!(
+        karyos_cluster::cluster_identity::rebuild_identity(
+            karyos_cluster::cluster_identity::ClusterId(source),
+            2400,
+            2,
+            nonce
+        )
+        .0,
+        identity
+    );
     // The rebuilt node opens with the source's committed log after the
     // snapshot, and the snapshot itself.
     let store = SnapshotStore::open(

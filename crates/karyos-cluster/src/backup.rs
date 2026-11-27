@@ -52,6 +52,12 @@
 //!   service's, checked by the hook [`verify_with`] and [`rebuild_with`]
 //!   take, run on every section before anything is written. Without one,
 //!   a snapshot whose service bytes the service cannot open passes.
+//! - **Identity.** A rebuild writes its node's cluster identity last
+//!   ([`crate::cluster_identity`], quantstratum-docs:
+//!   karyos/adr/0123-cluster-identity.md, decision 2): a new one, derived
+//!   from the export's identity, its top and the caller's random nonce,
+//!   marked isolated from the source. A partly written target has none, so
+//!   it does not start.
 //! - **Report**: an export and a rebuild each report the index and term
 //!   their state reaches and what they do not include ([`NOT_INCLUDED`]).
 //!
@@ -77,6 +83,7 @@ use karyos_archive::integrity::copies::Enforcement;
 use karyos_archive::integrity::tiering::{ObjectKey, ObjectKind, ObjectStore};
 use karyos_archive::segment::Geometry;
 
+use crate::cluster_identity::{ClusterId, IdentityError, IdentityRecord, rebuild_identity};
 use crate::log::{LogError, RaftLog};
 use crate::snapshot::{SectionKind, SnapshotConfig, SnapshotError, SnapshotStore, WRITE_CHUNK};
 use crate::{Entry, HardState};
@@ -100,7 +107,7 @@ pub const NOT_INCLUDED: &[&str] = &[
     "the node's term and vote (the rebuilt log takes the top entry's term, no vote)",
     "snapshots older than the latest",
     "the Archive's own recordings, holds and journals",
-    "a separate identity or membership: the rebuild is restored storage, to be started only under isolation its operator enforces",
+    "the source's cluster identity: the rebuild takes its own, derived from the source's and marked isolated, so the live cluster's peers and clients refuse it and it never enables external effects (ADR-0123)",
 ];
 
 const MANIFEST_MAGIC: [u8; 4] = *b"KYBK";
@@ -183,12 +190,26 @@ pub struct Report {
     /// An export's: the weakest retention the store enforced for its
     /// objects. A rebuild's: [`Enforcement::Unsupported`].
     pub retention: Enforcement,
+    /// A rebuild's: the identity record it wrote. An export's: none.
+    pub identity: Option<IdentityRecord>,
+    /// A rebuild's: the nonce its identity was derived with, so an auditor
+    /// recomputes the identity from the source, the top and it (ADR-0123
+    /// decision 2). An export's: none.
+    pub nonce: Option<[u8; 32]>,
 }
 
 /// Why an export or a rebuild did not complete.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BackupError {
+    /// The export's cluster identity is all zero, which no identity record
+    /// names as a source (ADR-0123 decision 1): refused before anything is
+    /// written.
+    #[error("the export's cluster identity is all zero: no rebuild can name it as its source")]
+    ZeroIdentity,
+    /// The rebuild's identity record could not be written.
+    #[error("the rebuild's cluster identity: {0}")]
+    Identity(IdentityError),
     /// The node has no snapshot to export.
     #[error("the node has no snapshot to export")]
     NoSnapshot,
@@ -463,6 +484,8 @@ pub fn export<D: Disk + Clone, E: Disk + Clone>(
         objects: manifest.objects.len() as u64 + 1,
         not_included: NOT_INCLUDED,
         retention: enforced,
+        identity: None,
+        nonce: None,
     })
 }
 
@@ -761,6 +784,9 @@ pub struct Target<'a, D> {
     pub snapshots: &'a Path,
     /// Their geometry.
     pub geometry: Geometry,
+    /// The rebuild identity's random nonce, drawn by the caller from the
+    /// operating system (ADR-0123 decision 2).
+    pub nonce: [u8; 32],
 }
 
 /// Rebuilds a node from the export under `cluster` into `target`, whose
@@ -797,6 +823,9 @@ pub fn rebuild_with<D: Disk + Clone>(
     target: &Target<'_, D>,
     check: &mut SectionCheck<'_>,
 ) -> Result<Report, BackupError> {
+    if cluster == [0; 32] {
+        return Err(BackupError::ZeroIdentity);
+    }
     for dir in [target.log, target.snapshots] {
         let names = target
             .disk
@@ -849,7 +878,21 @@ pub fn rebuild_with<D: Disk + Clone>(
         voted_for: None,
         commit: Some(manifest.top.0),
     })?;
+    let identity = IdentityRecord {
+        identity: rebuild_identity(
+            ClusterId(cluster),
+            manifest.top.0,
+            manifest.top.1,
+            target.nonce,
+        ),
+        isolated_from: Some(ClusterId(cluster)),
+    };
+    identity
+        .create(&mut target.disk.clone(), target.log)
+        .map_err(BackupError::Identity)?;
     Ok(Report {
+        identity: Some(identity),
+        nonce: Some(target.nonce),
         base: manifest.base,
         top: manifest.top,
         entries,

@@ -30,8 +30,8 @@ use karyos_sim::cluster::{Node, Outbox};
 use karyos_sim::disk::{SimDisk, Survives};
 use karyos_sim::harness::core::SnapshotBase;
 use karyos_sim::harness::node::{
-    Command, Compaction, Observation, Op, Recorder, SERVICE_SECTION_VERSION, SNAPSHOT_STALL,
-    ServerNode, Shared, TestService, Wire,
+    Command, Compaction, HARNESS_CLUSTER, Observation, Op, Recorder, SERVICE_SECTION_VERSION,
+    SNAPSHOT_STALL, ServerNode, Shared, TestService, Wire,
 };
 use karyos_sim::harness::reference::Reference;
 use karyos_sim::harness::workloads::{geometry, w5_frame};
@@ -125,6 +125,7 @@ fn pieces_in(
         .chunks(PIECE)
         .enumerate()
         .map(|(at, chunk)| Wire::Snapshot {
+            cluster: HARNESS_CLUSTER,
             base,
             term,
             transfer,
@@ -258,6 +259,7 @@ fn a_piece_whose_metadata_differs_drops_the_transfer() {
         let all = pieces(at(40), 4, &bytes, good);
         let _ = deliver(&mut server, all[0].clone(), 1);
         let Wire::Snapshot {
+            cluster,
             base,
             term,
             transfer,
@@ -271,6 +273,7 @@ fn a_piece_whose_metadata_differs_drops_the_transfer() {
         };
         let altered = match change {
             0 => Wire::Snapshot {
+                cluster,
                 base,
                 term,
                 transfer,
@@ -280,6 +283,7 @@ fn a_piece_whose_metadata_differs_drops_the_transfer() {
                 bytes,
             },
             1 => Wire::Snapshot {
+                cluster,
                 base,
                 term,
                 transfer,
@@ -289,6 +293,7 @@ fn a_piece_whose_metadata_differs_drops_the_transfer() {
                 bytes,
             },
             _ => Wire::Snapshot {
+                cluster,
                 base,
                 term,
                 transfer,

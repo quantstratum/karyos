@@ -54,6 +54,9 @@ use std::rc::Rc;
 
 use karyos_archive::integrity::SealRecord;
 use karyos_archive::segment::Geometry;
+use karyos_cluster::client::Accepted;
+use karyos_cluster::cluster_identity::{ClusterId, IdentityRecord};
+use karyos_cluster::peer_frame::{Admission, PeerGate};
 use karyos_cluster::snapshot::{
     PendingSnapshot, Section, SectionKind, SnapshotConfig, SnapshotError, SnapshotReader,
     SnapshotStore, WRITE_CHUNK,
@@ -1081,6 +1084,29 @@ pub enum Observation {
         /// The answering server's generation.
         generation: u64,
     },
+    /// A server dropped a peer frame of another cluster identity before
+    /// its core saw it (ADR-0123 decision 3), or refused a request for
+    /// another identity unjournalled (decision 4).
+    ForeignDropped {
+        /// The server.
+        node: NodeId,
+        /// The sender.
+        from: NodeId,
+        /// The identity it carried.
+        cluster: ClusterId,
+    },
+    /// A client refused an answer of a cluster identity it does not accept.
+    ForeignCluster {
+        /// The client.
+        client: NodeId,
+        /// The identity it carried.
+        cluster: ClusterId,
+    },
+    /// An isolated rebuild refused a promotion (ADR-0123 decision 5).
+    IsolatedPromotion {
+        /// The server.
+        node: NodeId,
+    },
     /// A client rejected an answer of a generation below one it has seen.
     StaleGeneration {
         /// The client.
@@ -1435,15 +1461,28 @@ pub struct Recorder {
 /// A recorder the nodes of one run share.
 pub type Shared = Rc<RefCell<Recorder>>;
 
+/// The cluster identity of a run's servers (ADR-0123 decision 1).
+pub const HARNESS_CLUSTER: ClusterId = ClusterId([0x4b; 32]);
+/// The cluster identity of a run's standby group (decision 6).
+pub const HARNESS_STANDBY: ClusterId = ClusterId([0x53; 32]);
+const HARNESS_IDENTITY: IdentityRecord = IdentityRecord {
+    identity: HARNESS_CLUSTER,
+    isolated_from: None,
+};
+
 /// The one message type of a harness run.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Wire<M> {
-    /// Between cores.
-    Core(M),
-    /// A client's request.
-    Request(Command),
+    /// Between cores, in a peer frame of the sender's cluster identity
+    /// (ADR-0123 decision 3).
+    Core(ClusterId, M),
+    /// A client's request, for the cluster identity it names (ADR-0123
+    /// decision 4).
+    Request(ClusterId, Command),
     /// A server's answer: `ret` for the command at `index`.
     Response {
+        /// The server's cluster identity.
+        cluster: ClusterId,
         /// The client's sequence number.
         sequence: u64,
         /// The answer, in canonical response bytes ([`Ret::canonical`]).
@@ -1455,6 +1494,8 @@ pub enum Wire<M> {
     },
     /// A server cannot take the request.
     Refused {
+        /// The server's cluster identity.
+        cluster: ClusterId,
         /// The client's sequence number.
         sequence: u64,
     },
@@ -1462,6 +1503,8 @@ pub enum Wire<M> {
     /// the client sends it again after its retry interval, not at once,
     /// so a full queue is not flooded.
     Busy {
+        /// The server's cluster identity.
+        cluster: ClusterId,
         /// The client's sequence number.
         sequence: u64,
     },
@@ -1479,6 +1522,8 @@ pub enum Wire<M> {
     /// [`SNAPSHOT_WINDOW`] pieces of `WRITE_CHUNK` unacknowledged, and the
     /// follower writes each into its own store as it arrives.
     Snapshot {
+        /// The sender's cluster identity, as its peer frame carries it.
+        cluster: ClusterId,
         /// The snapshot's base.
         base: SnapshotBase,
         /// The sender's term when it started the transfer: with the base
@@ -1500,6 +1545,8 @@ pub enum Wire<M> {
     /// installed the snapshot (or holds state past it), and only that ends
     /// the sender's transfer.
     SnapshotAck {
+        /// The sender's cluster identity, as its peer frame carries it.
+        cluster: ClusterId,
         /// The snapshot's base.
         base: SnapshotBase,
         /// The transfer.
@@ -1574,6 +1621,9 @@ pub enum Wire<M> {
     },
     /// The harness sends a client to another server.
     Redirect {
+        /// The cluster identity of the server or operator that sends it
+        /// (ADR-0123 decision 4): a client follows only an accepted one.
+        cluster: ClusterId,
         /// The server.
         server: NodeId,
     },
@@ -1706,6 +1756,10 @@ pub struct ServerNode<C: ConsensusCore> {
     ready: ReadyBuf<C::Message>,
     /// The bytes of the request it proposes, kept across requests.
     command: Vec<u8>,
+    /// Its cluster identity record (ADR-0123 decision 1).
+    identity: IdentityRecord,
+    /// The check of its peers' frames (decision 3).
+    gate: PeerGate,
 }
 
 /// Why a server could not be created.
@@ -1848,6 +1902,8 @@ impl<C: ConsensusCore> ServerNode<C> {
             standby: None,
             limits,
             budget: ReadBudget::new(),
+            identity: HARNESS_IDENTITY,
+            gate: PeerGate::new(HARNESS_CLUSTER),
             compaction: None,
             snapshots: None,
             incoming: None,
@@ -1905,6 +1961,8 @@ impl<C: ConsensusCore> ServerNode<C> {
             standby: None,
             limits: None,
             budget: ReadBudget::new(),
+            identity: HARNESS_IDENTITY,
+            gate: PeerGate::new(HARNESS_CLUSTER),
             compaction: None,
             snapshots: None,
             incoming: None,
@@ -2167,6 +2225,7 @@ impl<C: ConsensusCore> ServerNode<C> {
     /// last is sent only once the reader has checked the snapshot's end:
     /// a snapshot that does not verify is not sent whole.
     fn pump_snapshot(&mut self, to: NodeId, out: &mut Outbox<Wire<C::Message>>) {
+        let cluster = self.identity.identity;
         let Some(outgoing) = self.outgoing.get_mut(&to) else {
             return;
         };
@@ -2209,6 +2268,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             out.push((
                 to,
                 Wire::Snapshot {
+                    cluster,
                     base: outgoing.base,
                     term: outgoing.term,
                     transfer: outgoing.transfer,
@@ -2320,11 +2380,13 @@ impl<C: ConsensusCore> ServerNode<C> {
         out: &mut Outbox<Wire<C::Message>>,
     ) {
         let node = self.id;
+        let cluster = self.identity.identity;
         self.expire_incoming();
         let ack = |out: &mut Outbox<Wire<C::Message>>, next: u64, installed: bool| {
             out.push((
                 from,
                 Wire::SnapshotAck {
+                    cluster,
                     base: piece.base,
                     transfer: piece.transfer,
                     next,
@@ -2652,14 +2714,74 @@ impl<C: ConsensusCore> ServerNode<C> {
         self
     }
 
-    /// A standby server, fed by the servers `primary`.
+    /// A standby server, fed by the servers `primary`. Its group has its
+    /// own cluster identity (ADR-0123 decision 6), [`HARNESS_STANDBY`].
     #[must_use]
     pub fn as_standby(mut self, primary: Vec<NodeId>) -> Self {
         self.standby = Some(StandbyIn {
             primary,
             ..StandbyIn::default()
         });
+        self.with_identity(IdentityRecord {
+            identity: HARNESS_STANDBY,
+            isolated_from: None,
+        })
+    }
+
+    /// The server under `identity` (ADR-0123): its frames carry it, its
+    /// gate admits only it, and an isolated record keeps it from taking
+    /// requests, replying or being promoted.
+    #[must_use]
+    pub fn with_identity(mut self, identity: IdentityRecord) -> Self {
+        self.identity = identity;
+        self.gate = PeerGate::new(identity.identity);
+        if identity.isolated()
+            && let Some(follower) = self.standby.as_mut().and_then(|s| s.follower.as_mut())
+        {
+            follower.isolate();
+        }
         self
+    }
+
+    /// Its cluster identity record.
+    #[must_use]
+    pub fn identity(&self) -> IdentityRecord {
+        self.identity
+    }
+
+    /// The peer frames and requests it dropped for another identity.
+    #[must_use]
+    pub fn foreign_dropped(&self) -> u64 {
+        self.gate.dropped()
+    }
+
+    /// Whether `message` from `from` passes the identity checks (ADR-0123
+    /// decisions 3 and 4): a peer frame or a request of another identity is
+    /// dropped before the core sees it, counted and observed.
+    fn admitted(
+        &mut self,
+        from: NodeId,
+        message: &Wire<C::Message>,
+        _out: &mut Outbox<Wire<C::Message>>,
+    ) -> bool {
+        let cluster = match message {
+            Wire::Core(cluster, _)
+            | Wire::Request(cluster, _)
+            | Wire::Snapshot { cluster, .. }
+            | Wire::SnapshotAck { cluster, .. } => *cluster,
+            _ => return true,
+        };
+        match self.gate.admit(u64::from(from), cluster) {
+            Admission::Admit => true,
+            Admission::DroppedFirst | Admission::Dropped => {
+                self.observe(Observation::ForeignDropped {
+                    node: self.id,
+                    from,
+                    cluster,
+                });
+                false
+            }
+        }
     }
 
     /// Its core over `log`, under `limits` when it has them.
@@ -2700,10 +2822,12 @@ impl<C: ConsensusCore> ServerNode<C> {
         self.generation
     }
 
-    /// Whether it takes requests: not a standby that waits for its
-    /// promotion, and not a lease holder past its lease.
+    /// Whether it takes requests: not an isolated rebuild (ADR-0123
+    /// decision 5), not a standby that waits for its promotion, and not a
+    /// lease holder past its lease.
     fn acts(&self) -> bool {
-        self.standby.as_ref().is_none_or(|standby| standby.promoted)
+        !self.identity.isolated()
+            && self.standby.as_ref().is_none_or(|standby| standby.promoted)
             && self
                 .lease
                 .as_ref()
@@ -2763,6 +2887,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             return;
         };
         let node = self.id;
+        let cluster = self.identity.identity;
         let recorder = Rc::clone(&self.recorder);
         let mut applied = Vec::new();
         let mut snapshot_to = Vec::new();
@@ -2779,7 +2904,7 @@ impl<C: ConsensusCore> ServerNode<C> {
                         .observations
                         .push(Observation::Released { node, to, release });
                 }
-                out.push((to, Wire::Core(message)));
+                out.push((to, Wire::Core(cluster, message)));
             },
             &mut |entry, applying| applied.push((entry.clone(), applying)),
             &mut |step| {
@@ -2900,6 +3025,7 @@ impl<C: ConsensusCore> ServerNode<C> {
                 out.push((
                     command.client,
                     Wire::Response {
+                        cluster: self.identity.identity,
                         sequence: command.sequence,
                         bytes: ret.canonical(),
                         index: entry.index,
@@ -3184,7 +3310,11 @@ impl<C: ConsensusCore> ServerNode<C> {
         out: &mut Outbox<Wire<C::Message>>,
     ) {
         self.now = now;
+        if !self.admitted(from, &message, out) {
+            return;
+        }
         if let Wire::SnapshotAck {
+            cluster: _,
             base,
             transfer,
             next,
@@ -3195,6 +3325,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             return;
         }
         if let Wire::Snapshot {
+            cluster: _,
             base,
             term,
             transfer,
@@ -3229,14 +3360,15 @@ impl<C: ConsensusCore> ServerNode<C> {
         };
         let mut view = LogView::metered(log, budget.as_ref()).with_base(self.base);
         match message {
-            Wire::Core(message) => core.step(from, message, &mut view),
-            Wire::Request(command) if !acts => out.push((
+            Wire::Core(_, message) => core.step(from, message, &mut view),
+            Wire::Request(_, command) if !acts => out.push((
                 command.client,
                 Wire::Refused {
+                    cluster: self.identity.identity,
                     sequence: command.sequence,
                 },
             )),
-            Wire::Request(command) => {
+            Wire::Request(_, command) => {
                 let key = (command.client, command.sequence);
                 command.encode_into(&mut self.command);
                 match core.propose_slice(&self.command, &mut view) {
@@ -3256,7 +3388,10 @@ impl<C: ConsensusCore> ServerNode<C> {
                         }
                         let sequence = command.sequence;
                         let answer = match refused {
-                            Refused::Backpressure(_) => Wire::Busy { sequence },
+                            Refused::Backpressure(_) => Wire::Busy {
+                                cluster: self.identity.identity,
+                                sequence,
+                            },
                             // It names another leader (a handover, W5):
                             // the client goes there.
                             Refused::NotLeader(NotLeader {
@@ -3270,9 +3405,15 @@ impl<C: ConsensusCore> ServerNode<C> {
                                         to: leader,
                                     },
                                 );
-                                Wire::Redirect { server: leader }
+                                Wire::Redirect {
+                                    cluster: self.identity.identity,
+                                    server: leader,
+                                }
                             }
-                            Refused::NotLeader(_) => Wire::Refused { sequence },
+                            Refused::NotLeader(_) => Wire::Refused {
+                                cluster: self.identity.identity,
+                                sequence,
+                            },
                         };
                         out.push((command.client, answer));
                     }
@@ -3467,6 +3608,13 @@ impl<C: ConsensusCore> ServerNode<C> {
                 if let Some(feed) = self.feed.as_mut() {
                     feed.acked = feed.acked.max(verified);
                 }
+            }
+            Wire::Promote { .. }
+                if karyos_cluster::standby::refuse_isolated(self.identity.isolated()).is_err() =>
+            {
+                // ADR-0123 decision 5, by the standby's own rule: an
+                // isolated rebuild is never promoted.
+                self.observe(Observation::IsolatedPromotion { node: self.id });
             }
             Wire::Promote { fencing, unknown } => {
                 if let Some(standby) = self.standby.as_mut()
@@ -3844,6 +3992,12 @@ pub struct ClientNode {
     recorder: Shared,
     /// The highest generation it has seen, 0 before the first answer.
     generation: u64,
+    /// The cluster identities it accepts (ADR-0123 decision 4), boxed to
+    /// keep the node small.
+    accepted: Box<Accepted>,
+    /// Its requests name the standby's identity, not the primary's: the
+    /// latest accepted answer was the standby's.
+    to_standby: bool,
     /// It records each read with a value no one wrote (karyos#1038,
     /// tests): a faulty client.
     #[cfg(feature = "test-hooks")]
@@ -3864,8 +4018,30 @@ impl ClientNode {
             refused: false,
             recorder,
             generation: 0,
+            accepted: Box::new(Accepted {
+                primary: HARNESS_CLUSTER,
+                standby: Some(HARNESS_STANDBY),
+            }),
+            to_standby: false,
             #[cfg(feature = "test-hooks")]
             corrupts_reads: false,
+        }
+    }
+
+    /// The client accepting only `accepted` (ADR-0123 decision 4): by
+    /// default the run's cluster and its standby.
+    #[must_use]
+    pub fn accepting(mut self, accepted: Accepted) -> Self {
+        self.accepted = Box::new(accepted);
+        self.to_standby = false;
+        self
+    }
+
+    /// The identity its requests name.
+    fn cluster(&self) -> ClusterId {
+        match self.accepted.standby {
+            Some(standby) if self.to_standby => standby,
+            _ => self.accepted.primary,
         }
     }
 
@@ -3900,6 +4076,7 @@ impl ClientNode {
 
 impl<M> Node<Wire<M>> for ClientNode {
     fn tick(&mut self, now: u64, out: &mut Outbox<Wire<M>>) {
+        let cluster = self.cluster();
         if let Some((command, sent)) = self.open.as_mut() {
             let due = now
                 .checked_sub(*sent)
@@ -3907,7 +4084,7 @@ impl<M> Node<Wire<M>> for ClientNode {
             if self.refused || due {
                 self.refused = false;
                 *sent = now;
-                out.push((self.server, Wire::Request(command.clone())));
+                out.push((self.server, Wire::Request(cluster, command.clone())));
             }
             return;
         }
@@ -3932,12 +4109,33 @@ impl<M> Node<Wire<M>> for ClientNode {
             sequence,
             op,
         };
-        out.push((self.server, Wire::Request(command.clone())));
+        out.push((self.server, Wire::Request(cluster, command.clone())));
         self.open = Some((command, now));
     }
 
     fn deliver(&mut self, _from: NodeId, message: Wire<M>, _now: u64, _out: &mut Outbox<Wire<M>>) {
         let open = self.open.as_ref().map(|(command, _)| command.sequence);
+        if let Wire::Response { cluster, .. }
+        | Wire::Refused { cluster, .. }
+        | Wire::Busy { cluster, .. }
+        | Wire::Redirect { cluster, .. } = &message
+            && !self.accepted.accepts(*cluster)
+        {
+            self.recorder
+                .borrow_mut()
+                .observations
+                .push(Observation::ForeignCluster {
+                    client: self.id,
+                    cluster: *cluster,
+                });
+            return;
+        }
+        let standby = match &message {
+            Wire::Response { cluster, .. } | Wire::Redirect { cluster, .. } => {
+                Some(*cluster != self.accepted.primary)
+            }
+            _ => None,
+        };
         match message {
             Wire::Response { generation, .. } if generation < self.generation => {
                 self.recorder
@@ -3949,11 +4147,14 @@ impl<M> Node<Wire<M>> for ClientNode {
                     });
             }
             Wire::Response {
+                cluster: _,
                 sequence,
                 bytes,
                 index,
                 generation,
             } if open == Some(sequence) => {
+                // Accepted: later requests name this answer's cluster.
+                self.to_standby = standby.unwrap_or(self.to_standby);
                 // Bytes that do not decode are no answer: the retry asks
                 // again.
                 let Some(ret) = Ret::decode(&bytes) else {
@@ -3990,9 +4191,10 @@ impl<M> Node<Wire<M>> for ClientNode {
                     generation,
                 });
             }
-            Wire::Refused { sequence } if open == Some(sequence) => self.refused = true,
-            Wire::Redirect { server } => {
+            Wire::Refused { sequence, .. } if open == Some(sequence) => self.refused = true,
+            Wire::Redirect { server, .. } => {
                 self.server = server;
+                self.to_standby = standby.unwrap_or(self.to_standby);
                 // An open request goes to the new server at once.
                 self.refused = self.open.is_some();
             }
