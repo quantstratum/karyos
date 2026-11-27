@@ -1204,14 +1204,11 @@ impl<K: crate::wire_keys::store::Files, S: crate::wire_keys::store::Files> KeySe
     }
 
     fn current_epoch(&self, key_id: u32) -> Option<u32> {
-        if self.store.is_disabled() {
-            return None;
-        }
-        self.store
-            .state()
-            .lineages
-            .get(&key_id)
-            .map(|lineage| lineage.highest)
+        // The active epoch, not the highest admitted one (H8 review 6,
+        // follow-on): a rotation admitted ahead of its `not_before` must
+        // not make every establishment under the still-signing epoch a
+        // `PreviousEpoch` refusal. Both sides read this one definition.
+        self.store.current_epoch(key_id, self.now)
     }
 
     fn fingerprint(&self) -> u64 {

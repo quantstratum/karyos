@@ -2240,6 +2240,48 @@ fn retained_sealed_data_never_leaves_after_a_withdrawal() {
     assert!(path.needs_reset());
 }
 
+/// H8 R6-01: sealed DATA retained under file epoch 1, then a routine
+/// rotation to epoch 2 (the sealer re-keyed, still live), then a view
+/// revoking epoch 1 while epoch 2 stays: no datagram sealed under epoch 1
+/// reaches the socket once it unblocks. The re-key made the retained heads
+/// obsolete, so they are returned unsent and the lane rewinds for the new
+/// file.
+#[test]
+fn retained_sealed_data_never_leaves_after_a_rekey_and_its_predecessor_s_withdrawal() {
+    use crate::wire_auth::FixedKeys;
+    let (mut tx, observer, mut path, _log) = blocked_path(1360);
+    let first = seal_auth(&mut path);
+    let offered = retain_sealed(&mut tx, &observer, &mut path);
+    let pending = path.sender.pending(0).unwrap();
+    assert!(pending > 0);
+    let text = "format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=2\npurpose=channel\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=3333333333333333333333333333333333333333333333333333333333333333\nchannel_id=7\nstream_id=6\n";
+    let second = || crate::wire_keys::parse("3-2.key", text.as_bytes()).unwrap();
+    // Routine rotation: epoch 2 signs, epoch 1 still verifies.
+    path.follow_keys(&FixedKeys {
+        files: vec![first, second()],
+    });
+    assert!(path.sealer_live(), "re-keyed, not withdrawn");
+    assert_eq!(path.sealer_keys().map(|(_, key)| key), Some((3, 2)));
+    // Epoch 1 revoked; the re-keyed sealer stays live.
+    path.follow_keys(&FixedKeys {
+        files: vec![second()],
+    });
+    assert!(path.sealer_live());
+    unblock_and_serve(&mut tx, &observer, &mut path, 4);
+    assert_eq!(
+        observer.datagrams_offered(),
+        offered,
+        "no epoch 1 datagram reached the socket"
+    );
+    assert_eq!(path.counters().submitted, 0);
+    assert_eq!(path.sender.pending(0), Some(0), "returned from the queue");
+    assert_eq!(
+        path.counters().seal_obsolete,
+        u64::try_from(pending).unwrap()
+    );
+    assert!(path.needs_reset());
+}
+
 /// H8 R5-03 (RLD-1, RLD-4, REV-2): the conductor publishes a withdrawing
 /// key view while the role's command ring is blocked, so the role has not
 /// applied it. The key fence, read at exposure, keeps the retained sealed

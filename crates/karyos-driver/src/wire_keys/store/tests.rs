@@ -661,6 +661,28 @@ fn the_state_directory_lock_is_never_refused_by_a_spawn() {
 }
 
 #[test]
+fn a_pairwise_file_reusing_a_channel_secret_is_refused() {
+    // wire-key-files.md 2.7: a pairwise file with the same `secret` as the
+    // channel file, refused at admission as a reused secret.
+    let (keys, state) = fresh();
+    keys.put(
+        "3-3.key",
+        channel(3, 3, "2026-11-01", "2027-01-30", 0x11).as_bytes(),
+    );
+    let secret: String = (0..KEY_LEN).map(|_| "11").collect();
+    keys.put(
+        "16909060-3.key",
+        format!(
+            "format=karyos-wire-key-v1\nkey_id=16909060\nfile_epoch=3\npurpose=pairwise\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret={secret}\nreceiver_id=66\npublisher_id=5\n"
+        )
+        .as_bytes(),
+    );
+    let (store, report) = Store::start(keys, state, DEC_01).unwrap();
+    assert_eq!(reasons(&report), [(16_909_060, 3, Reason::ReusedSecret)]);
+    assert_eq!(epochs(&store), [(3, 3)]);
+}
+
+#[test]
 fn a_secret_reused_across_classes_is_refused() {
     // wire-key-files.md 2.7: the `profile_id=1` channel file and the same
     // secret as a `profile_id=16` file, presented as `4-3.key`.
@@ -677,4 +699,31 @@ fn a_secret_reused_across_classes_is_refused() {
     let (store, report) = Store::start(keys, state, DEC_01).unwrap();
     assert_eq!(reasons(&report), [(4, 3, Reason::ReusedSecret)]);
     assert_eq!(epochs(&store), [(3, 3)]);
+}
+
+/// The current epoch is the newest active one (H8 review 6 follow-on), and
+/// it respects the durable cutover (#1288 review): before epoch 2's
+/// `not_before` epoch 1 is current; from it epoch 2 is, and stays so even
+/// when its file is removed during the overlap, where epoch 1 only
+/// verifies and never becomes current again.
+#[test]
+fn the_current_epoch_is_the_newest_active_one_and_keeps_its_cutover() {
+    let (keys, state) = fresh();
+    keys.put("3-1.key", first().as_bytes());
+    let (mut store, _) = Store::start(keys.clone(), state, DEC_01).unwrap();
+    keys.put("3-2.key", second().as_bytes());
+    assert!(!store.reload(DEC_01).alarm());
+    assert_eq!(
+        store.current_epoch(3, JAN_01 - 1),
+        Some(1),
+        "admitted ahead"
+    );
+    assert_eq!(store.current_epoch(3, JAN_01), Some(2), "at its not_before");
+    keys.remove("3-2.key");
+    store.reload(JAN_01);
+    assert_eq!(
+        store.current_epoch(3, JAN_01 + 1),
+        Some(2),
+        "the retiring epoch never becomes current again"
+    );
 }

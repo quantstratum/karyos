@@ -378,7 +378,22 @@ mod tests {
         let held = lock(&dir).unwrap();
         assert!(lock(&dir).unwrap_err().contains("in use"));
         drop(held);
-        drop(lock(&dir).unwrap());
+        // Another test in this process may spawn a child while the lock is
+        // held: between its fork and its exec the child holds a copy of the
+        // directory's descriptor, and with it the lock, for a moment after
+        // `drop(held)`. The release is shown by a relock within 2 s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let relocked = loop {
+            match lock(&dir) {
+                Ok(file) => break file,
+                Err(error) if std::time::Instant::now() < deadline => {
+                    assert!(error.contains("in use"), "{error}");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("still locked 2 s after release: {error}"),
+            }
+        };
+        drop(relocked);
         fs::remove_dir_all(&dir).unwrap();
     }
 

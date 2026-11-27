@@ -552,6 +552,9 @@ pub struct SenderCounters {
     pub repairs_cancelled: u64,
     /// Due abort attempts the duty's control budget deferred.
     pub aborts_deferred: u64,
+    /// SESSION_ABORT sends held by the publication guard's control reserve
+    /// until its bucket refills (karyos#1021).
+    pub aborts_held: u64,
     /// SETUP ANNOUNCEs or ANSWERs of an authenticated publication not sent:
     /// the fence held, admission pending, or its incarnation aborting.
     pub setup_blocked: u64,
@@ -937,6 +940,10 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// (MTU accounting, H8 SS-11).
     #[cfg(test)]
     largest_in: Vec<(EndpointId, usize)>,
+    /// Test only: the datagrams of one watched length the intake read, of
+    /// any endpoint (`(length, count)`; the R4 flood counts its forgeries).
+    #[cfg(test)]
+    watched_in: (usize, u64),
     /// Test only: the positions and lengths of the DATA `drop_data` lost,
     /// shared with a sender that holds back only the NAKs for them
     /// (karyos#1067). First term positions: the term offset.
@@ -2403,6 +2410,8 @@ pub(super) fn roles<T: StreamTerms>(
             #[cfg(test)]
             largest_in: Vec::new(),
             #[cfg(test)]
+            watched_in: (0, 0),
+            #[cfg(test)]
             data_seen: 0,
             #[cfg(test)]
             dropped: None,
@@ -3565,6 +3574,9 @@ impl<T: StreamTerms> ReceiverRole<T> {
     /// intake, as a lossy path would (tests).
     #[cfg(test)]
     fn note_in(&mut self, endpoint: EndpointId, length: usize) {
+        if length == self.watched_in.0 {
+            self.watched_in.1 += 1;
+        }
         match self.largest_in.iter_mut().find(|(at, _)| *at == endpoint) {
             Some((_, largest)) => *largest = (*largest).max(length),
             None => self.largest_in.push((endpoint, length)),
@@ -3586,6 +3598,20 @@ impl<T: StreamTerms> ReceiverRole<T> {
     #[cfg(test)]
     pub(super) fn signed_cached(&self) -> usize {
         self.signed.as_deref().map_or(0, SignedIntake::cached)
+    }
+
+    /// Counts from now on the datagrams of `length` the intake reads, from
+    /// 0 (tests).
+    #[cfg(test)]
+    pub(super) fn watch_length(&mut self, length: usize) {
+        self.watched_in = (length, 0);
+    }
+
+    /// The datagrams of the watched length read since
+    /// [`Self::watch_length`] (tests).
+    #[cfg(test)]
+    pub(super) fn watched_in(&self) -> u64 {
+        self.watched_in.1
     }
 
     /// The largest datagram `endpoint`'s intake has read (tests).
@@ -6432,10 +6458,32 @@ impl<T: StreamTerms> Intake<'_, T> {
                 // challenge stays pending.
                 let mut reserved = None;
                 let sessions = self.sessions;
+                // The image is installed only once its publisher's
+                // incarnation high-water is durable (H8 R5-02): after an
+                // unclean stop, the record refuses every incarnation that
+                // was live here, whose abort may have been lost. It is
+                // admitted here, once the answer passed every check and
+                // matched its challenge, so a refused answer consumes no
+                // publisher entry (#1288 review).
+                let mut record = if self.subscription_authenticated(answer.alias.stream_id) {
+                    self.role.abort_record.as_deref_mut()
+                } else {
+                    None
+                };
+                let mut admit_failed = false;
                 let outcome = self.role.sessions.answer(key, &answer, now, || {
+                    if let Some(record) = record.as_mut()
+                        && record.admit(answer.identity).is_err()
+                    {
+                        admit_failed = true;
+                        return false;
+                    }
                     reserved = reserve_chain(sessions);
                     reserved.is_some()
                 });
+                if admit_failed {
+                    self.role.count(|c| &mut c.abort_records_failed);
+                }
                 #[cfg(test)]
                 self.role.note(format!(
                     "{now} answer ep{} from {source} {outcome:?}",
@@ -6767,6 +6815,11 @@ struct PendingAbort {
     /// The per-lane ranges of the first valid ACK, which completed it.
     acked:
         Option<karyos_protocol::network::Lanes<karyos_protocol::network::authenticated::AckLane>>,
+    /// The binding a send round the control reserve held resumes at, so
+    /// every receiver gets its turn across refills (#1288 review).
+    cursor: usize,
+    /// Whether the current round submitted to some receiver already.
+    round_submitted: bool,
 }
 
 /// The alias of a frame a sender authenticates in domain 1 that names an
@@ -7673,6 +7726,8 @@ impl<T: StreamTerms> SenderRole<T> {
                 generation: self.key_generation.current(),
                 ended: None,
                 acked: None,
+                cursor: 0,
+                round_submitted: false,
             });
         }
     }
@@ -8831,6 +8886,8 @@ impl<T: StreamTerms> SenderRole<T> {
             generation: self.keys_applied,
             ended: None,
             acked: None,
+            cursor: 0,
+            round_submitted: false,
         });
         true
     }
@@ -9022,8 +9079,9 @@ impl<T: StreamTerms> SenderRole<T> {
                 pending.bytes,
                 pending.first.is_some(),
             );
-            let mut submitted = false;
-            for index in 0..self.bindings.len() {
+            let mut submitted = pending.round_submitted;
+            let mut held = None;
+            for index in pending.cursor..self.bindings.len() {
                 let Some(binding) = self.bindings.get(index) else {
                     break;
                 };
@@ -9031,6 +9089,25 @@ impl<T: StreamTerms> SenderRole<T> {
                     continue;
                 }
                 let destination = binding.source();
+                // Each frame pays from its guard's control budget, never
+                // the publication's (karyos#1021, R-CORE-21); past the
+                // reserve it waits for the control bucket's refill.
+                let length = u64::try_from(bytes.get().len()).unwrap_or(u64::MAX);
+                let admission = self
+                    .publications
+                    .iter_mut()
+                    .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+                    .map(|outbound| {
+                        outbound.admit_control(
+                            karyos_sys::frame::FrameType::SessionAbort,
+                            length,
+                            now,
+                        )
+                    });
+                if admission == Some(crate::guard_gate::ControlAdmission::Held) {
+                    held = Some(index);
+                    break;
+                }
                 if self
                     .send_raw(halves, endpoint, destination, bytes.get())
                     .submitted()
@@ -9041,6 +9118,23 @@ impl<T: StreamTerms> SenderRole<T> {
                 {
                     self.last_abort = Some((endpoint, destination, bytes));
                 }
+            }
+            if let Some(index) = held {
+                // Held by the control reserve: the round resumes at this
+                // receiver at a later duty, never dropped, keeping its
+                // schedule; a held record takes no attempt slot from other
+                // publications' aborts (#1288 review).
+                if let Some(pending) = self.aborts.get_mut(at) {
+                    pending.cursor = index;
+                    pending.round_submitted = submitted;
+                }
+                attempts -= 1;
+                self.count(|c| &mut c.aborts_held);
+                continue;
+            }
+            if let Some(pending) = self.aborts.get_mut(at) {
+                pending.cursor = 0;
+                pending.round_submitted = false;
             }
             if submitted {
                 if resend {

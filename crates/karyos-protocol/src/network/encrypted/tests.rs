@@ -189,3 +189,125 @@ fn an_announce_decodes_through_the_encrypted_decoder() {
         Ok(EncSetup::Announce(announce))
     );
 }
+
+// Gate H5, part 2 (ADR-0114 "Hard gates", H5). Every expected value below
+// was printed by `enc_vectors2.py`, a second implementation written from
+// the frozen encodings only (Python `cryptography` and `hmac`), and is
+// copied from its output `enc_vectors2-output.txt`; none comes from this
+// implementation's output.
+//
+// The script encodes the ENC ANSWER from network-control-schemas.md 4.1
+// with the field values of section 5.1 and V-SETUP-2 (`key_epoch` 3,
+// `party_epoch` 0x0102) and seals it in domain 5 at `envelope_seq` 4,
+// `IKM` = 00..1f, under the answer's own identity, alias and `key_epoch`.
+
+/// The ENC ANSWER of [`expected`], as the script encodes it.
+const PY_ENC_ANSWER: &str = "80000000010005000302000078563412e903000000000000efcdab89674523011032547698badcfe0700000000000000010000000000000000000100feffffff8005000000000000a8a7a6a5a4a3a2a1b8b7b6b5b4b3b2b1c8c7c6c5c4c3c2c1d8d7d6d5d4d3d2d1030000000201000000100300000000000000000000000000";
+/// The domain 5 `info` of the answer's identity at `key_epoch` 3.
+const PY_SETUP_INFO: &str = "6b6172796f732d776972652d656e632d763031007365747570000000030000000000efcdab89674523011032547698badcfe0700000000000000010000000000000010";
+/// The domain 5 key.
+const PY_SETUP_KEY: &str = "0314ad0ea1e27adae56ecdc1f494c477197f1b3854352f0b4866bb0c16156e8b";
+/// The sealed datagram, 212 bytes.
+const PY_ENC_ANSWER_SEALED: &str = "d40000000100210010100500030000000000000078563412e90300000400000000000000efcdab89674523011032547698badcfe07000000000000000100000000000000f8607b9e1082fb4bd01791dfe521533680e89ff389b2f269baf7eb24d47b7ee40c7718ab581f44ead2ad13326c21e2fb35af1c39216699f06ef1091f98ebc1d5417ac3a04ae11774f41549d6e071446f13363ef8f2a5a8509c0eba324b15e809a6bd4823e4f5171de37f5c78241440a052246b752a9e4e9703f50bfc7e45011bf79748f70ba247120ae75aaa7fda1d2d";
+
+fn unhex(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+        .collect()
+}
+
+/// Gate H5, SETUP variant 3 (ADR-0114 sections 6a and 9; manifest
+/// section 7): the ENC ANSWER transcript of the independent script. The
+/// encoder gives its plaintext byte for byte, the domain 5 profile seals
+/// it to the script's datagram, and opening that datagram gives back an
+/// ENC ANSWER whose `key_epoch` equals the envelope's.
+#[test]
+fn h5_the_enc_answer_transcript_in_domain_5_matches_the_independent_script() {
+    use crate::protection::aes_gcm_siv::{
+        AesGcmSiv, Domain, ENVELOPE_LEN, HEADER_LEN, KeyContext, PublicationIdentity, Salt,
+    };
+    let answer = expected();
+    let mut plaintext = [0_u8; MAX_ENC_ANSWER_LENGTH];
+    let length = answer.encode(&mut plaintext).unwrap();
+    assert_eq!(plaintext[..length].to_vec(), unhex(PY_ENC_ANSWER));
+    let mut driver_id = [0_u8; 16];
+    driver_id[..8].copy_from_slice(&answer.answer.identity.driver_id[0].to_le_bytes());
+    driver_id[8..].copy_from_slice(&answer.answer.identity.driver_id[1].to_le_bytes());
+    let context = KeyContext {
+        domain: Domain::Setup,
+        key_epoch: answer.key_epoch,
+        party_epoch: 0,
+        session_id: answer.answer.alias.session_id,
+        stream_id: answer.answer.alias.stream_id,
+        publication: PublicationIdentity {
+            driver_id,
+            registration_id: answer.answer.identity.registration_id,
+            incarnation: answer.answer.identity.incarnation,
+        },
+        receiver: None,
+        salt: Salt::Empty,
+    };
+    let (info, info_len) = context.info();
+    assert_eq!(info[..info_len].to_vec(), unhex(PY_SETUP_INFO));
+    let ikm: Vec<u8> = (0_u8..32).collect();
+    assert_eq!(context.derive(&ikm).to_vec(), unhex(PY_SETUP_KEY));
+    let profile = AesGcmSiv::new(&ikm, context, &[]).unwrap();
+    let mut datagram = vec![0_u8; length + ENVELOPE_LEN];
+    datagram[..length].copy_from_slice(&plaintext[..length]);
+    profile.set_next_seq(4);
+    let total = profile.seal_next(&mut datagram, length).unwrap();
+    assert_eq!(total, 212);
+    assert_eq!(datagram, unhex(PY_ENC_ANSWER_SEALED));
+    let mut received = unhex(PY_ENC_ANSWER_SEALED);
+    let opened = profile.open_in_place(&mut received).unwrap();
+    let frames = &received[HEADER_LEN..HEADER_LEN + opened.frames];
+    assert_eq!(decode_setup(frames), Ok(EncSetup::Answer(answer)));
+    assert_eq!(
+        u32::from_le_bytes(received[12..16].try_into().unwrap()),
+        answer.key_epoch,
+        "the answer's key_epoch is the envelope's"
+    );
+}
+
+/// The tracked output of the independent script (`tests/vectors`).
+const PY2: &str = include_str!("../../../tests/vectors/enc_vectors2-output.txt");
+
+/// Asserts that a line of `output` starting with `prefix` carries `value`
+/// as one of its words, and returns how many lines start with `prefix`.
+fn tracked(output: &str, prefix: &str, value: &str) -> usize {
+    let lines: Vec<&str> = output
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .collect();
+    assert!(
+        !lines.is_empty(),
+        "no line {prefix:?} in the tracked output"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.split_whitespace().any(|word| word == value)),
+        "{prefix:?}: {value} is not the tracked output"
+    );
+    lines.len()
+}
+
+/// How many lines of `output` start with `prefix`.
+fn lines_of(output: &str, prefix: &str) -> usize {
+    output
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .count()
+}
+
+/// Gate H5 provenance: the ENC ANSWER values embedded above are the
+/// values the tracked output of `enc_vectors2.py` prints.
+#[test]
+fn h5_the_embedded_enc_answer_is_the_tracked_output() {
+    tracked(PY2, "enc answer plaintext (128): ", PY_ENC_ANSWER);
+    tracked(PY2, "enc answer setup info: ", PY_SETUP_INFO);
+    tracked(PY2, "enc answer setup key: ", PY_SETUP_KEY);
+    tracked(PY2, "enc answer sealed seq 4 (212): ", PY_ENC_ANSWER_SEALED);
+    assert_eq!(lines_of(PY2, "enc answer "), 4);
+}
