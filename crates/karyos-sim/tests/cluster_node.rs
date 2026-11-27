@@ -10,15 +10,20 @@
 //! - pre-vote is active: a partitioned follower that rejoins disrupts no
 //!   leader and moves no term;
 //! - a driver that releases messages before they are durable is caught:
-//!   the node refuses every such message.
+//!   the node refuses every such message;
+//! - the log compacts through the snapshot store, a restart stands on the
+//!   latest snapshot, a follower behind the purge installs the leader's,
+//!   and no prefix purge crosses the Archive's hold (A2's purge floor).
 
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+use karyos_archive::control::HoldState;
 use karyos_archive::segment::Geometry;
 use karyos_cluster::DedupConfig;
 use karyos_cluster::custom::Custom;
 use karyos_cluster::driver::ConsensusCore;
-use karyos_cluster::service::ContainerConfig;
+use karyos_cluster::service::{ContainerConfig, ServiceSnapshot};
+use karyos_cluster::snapshot::SnapshotConfig;
 use karyos_sim::cluster::ClusterSim;
 use karyos_sim::disk::{SimDisk, Survives};
 use karyos_sim::harness::delivery::{
@@ -253,5 +258,124 @@ fn test_cluster_node_refuses_what_a_driver_releases_before_it_is_durable() {
         run_until(&mut sim, "an early release refused", |sim| {
             (0..servers).any(|id| server(sim, id).early_sends() > 0)
         });
+    }
+}
+
+/// Compacts after every 4 applied entries, keeping no log bytes below the
+/// oldest kept snapshot.
+fn compacting(
+    server: DeliveryServer<Custom, AppendService>,
+) -> DeliveryServer<Custom, AppendService> {
+    server
+        .with_snapshots(
+            SnapshotConfig::default()
+                .with_every_entries(4)
+                .with_allowance(0),
+            ServiceSnapshot::new(4096, 4),
+        )
+        .unwrap()
+}
+
+/// `count` values, from 1.
+fn many(count: u64) -> Vec<Vec<u8>> {
+    values(&(1..=count).collect::<Vec<_>>())
+}
+
+fn applied_all(sim: &Sim, servers: u32, count: usize) -> bool {
+    (0..servers).all(|id| server(sim, id).container().service().values.len() == count)
+}
+
+#[test]
+fn test_cluster_node_compacts_through_the_snapshot_store_and_restarts_from_it() {
+    for servers in [3, 5] {
+        for seed in scenarios::seeds() {
+            let (mut sim, clients) = cluster(seed, servers, vec![many(24)], compacting);
+            run_until(&mut sim, "every client answered", |sim| {
+                all_done(sim, &clients)
+            });
+            run_until(&mut sim, "every replica applied", |sim| {
+                applied_all(sim, servers, 24)
+            });
+            for id in 0..servers {
+                let node = server(&sim, id);
+                assert!(!node.snapshots().is_empty(), "{id}, seed {seed}");
+                let base = node.base().unwrap();
+                assert_eq!(node.snapshots().last().unwrap().index, base.index);
+                // Purged below the oldest kept snapshot: the allowance is 0.
+                let oldest = node.snapshots().first().unwrap().index;
+                assert_eq!(node.first_index(), Some(oldest + 1), "{id}, seed {seed}");
+                assert_eq!(node.held_purges(), 0);
+            }
+            replicas_agree(&sim, servers);
+            // A restarted server stands on its latest snapshot and the log
+            // after it.
+            let restarted = servers - 1;
+            sim.crash(restarted).unwrap();
+            sim.restart(restarted).unwrap();
+            sim.run_for(2_000).unwrap();
+            let node = server(&sim, restarted);
+            assert!(node.base().is_some(), "seed {seed}");
+            assert_eq!(
+                node.container().service().values,
+                (1..=24).collect::<Vec<_>>()
+            );
+            replicas_agree(&sim, servers);
+        }
+    }
+}
+
+#[test]
+fn test_cluster_node_never_purges_across_the_archive_hold() {
+    for hold in [HoldState::Held, HoldState::Pending, HoldState::Unknown] {
+        let (mut sim, clients) = cluster(0xC6, 3, vec![many(16)], |server| {
+            compacting(server).with_hold(Box::new(hold))
+        });
+        run_until(&mut sim, "every client answered", |sim| {
+            all_done(sim, &clients)
+        });
+        run_until(&mut sim, "every replica applied", |sim| {
+            applied_all(sim, 3, 16)
+        });
+        for id in 0..3 {
+            let node = server(&sim, id);
+            // Snapshots are taken, and the log keeps everything.
+            assert!(!node.snapshots().is_empty(), "{hold:?} {id}");
+            assert_eq!(node.first_index(), Some(1), "{hold:?} {id}");
+            assert!(node.held_purges() > 0, "{hold:?} {id}");
+        }
+        replicas_agree(&sim, 3);
+    }
+}
+
+#[test]
+fn test_cluster_node_a_follower_behind_the_purge_installs_the_leaders_snapshot() {
+    for servers in [3, 5] {
+        for seed in scenarios::seeds() {
+            let (mut sim, clients) = cluster(seed, servers, vec![values(&[1])], compacting);
+            run_until(&mut sim, "the first answer", |sim| all_done(sim, &clients));
+            let (leader_id, _) = leader(&sim, servers).unwrap();
+            let lagging = (leader_id + 1) % servers;
+            sim.crash(lagging).unwrap();
+            // The rest commit, compact and purge what the lagging server
+            // needs next.
+            let client = sim
+                .add_node(
+                    Member::Client(DeliveryClient::new(servers + 1, leader_id, many(20))),
+                    0,
+                    0,
+                )
+                .unwrap();
+            run_until(&mut sim, "the second client answered", |sim| {
+                all_done(sim, &[client])
+            });
+            let first = server(&sim, leader_id).first_index().unwrap();
+            assert!(first > 2, "seed {seed}: the leader purged to {first}");
+            sim.restart(lagging).unwrap();
+            run_until(&mut sim, "the lagging server installed", |sim| {
+                server(sim, lagging).base().is_some()
+                    && server(sim, lagging).container().service().values.len() == 21
+            });
+            replicas_agree(&sim, servers);
+        }
     }
 }

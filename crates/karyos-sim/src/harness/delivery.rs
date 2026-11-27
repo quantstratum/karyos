@@ -16,11 +16,16 @@ use std::path::Path;
 use karyos_archive::segment::Geometry;
 use karyos_cluster::LogError;
 use karyos_cluster::dedup::Request;
+use karyos_cluster::log::HoldSource;
 use karyos_cluster::node::{ClusterNode, NodeError};
-use karyos_cluster::service::{ClusteredService, ContainerConfig, Context};
+use karyos_cluster::service::{
+    ClusteredService, ContainerConfig, Context, RestoreRefused, ServicePart, ServiceSnapshot,
+    SnapshotFull,
+};
+use karyos_cluster::snapshot::SnapshotConfig;
 
 use super::core::ConsensusCore;
-use super::node::{LOG_DIR, SEAL_TICKS};
+use super::node::{LOG_DIR, SEAL_TICKS, SNAPSHOT_DIR};
 use crate::cluster::{Node, Outbox};
 use crate::disk::{SimDisk, Survives};
 use crate::net::NodeId;
@@ -72,7 +77,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         ) {
             Ok(node) => node,
             Err(NodeError::Log(error)) => return Err(error),
-            Err(NodeError::Config(error)) => {
+            Err(error @ (NodeError::Config(_) | NodeError::Snapshot(_))) => {
                 panic!("a session table the harness can hold: {error:?}")
             }
         };
@@ -110,6 +115,30 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
     #[must_use]
     pub fn with_drive_fault(mut self, fault: karyos_cluster::driver::DriveFault) -> Self {
         self.node = self.node.with_drive_fault(fault);
+        self
+    }
+
+    /// As [`ClusterNode::with_snapshots`], in the harness's snapshot
+    /// directory.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClusterNode::with_snapshots`].
+    pub fn with_snapshots(
+        mut self,
+        config: SnapshotConfig,
+        parts: ServiceSnapshot,
+    ) -> Result<Self, NodeError> {
+        self.node = self
+            .node
+            .with_snapshots(Path::new(SNAPSHOT_DIR), config, parts)?;
+        Ok(self)
+    }
+
+    /// As [`ClusterNode::with_hold`].
+    #[must_use]
+    pub fn with_hold(mut self, hold: Box<dyn HoldSource>) -> Self {
+        self.node = self.node.with_hold(hold);
         self
     }
 
@@ -460,6 +489,38 @@ pub fn schedule(timer: u64, after: u64) -> Vec<u8> {
     command
 }
 
+/// [`AppendService`]'s snapshot part of its values.
+const VALUES_PART: u16 = 1;
+/// [`AppendService`]'s snapshot part of its events.
+const EVENTS_PART: u16 = 2;
+
+impl AppendService {
+    /// Its events as one part: each index, length and text.
+    fn encode_events(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (index, event) in &self.events {
+            out.extend_from_slice(&index.to_le_bytes());
+            out.extend_from_slice(&u32::try_from(event.len()).unwrap_or(u32::MAX).to_le_bytes());
+            out.extend_from_slice(event.as_bytes());
+        }
+        out
+    }
+
+    /// The events [`AppendService::encode_events`] wrote.
+    fn decode_events(mut bytes: &[u8]) -> Option<Vec<(u64, String)>> {
+        let mut events = Vec::new();
+        while !bytes.is_empty() {
+            let index = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);
+            let length = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?);
+            let end = usize::try_from(length).ok()?.checked_add(12)?;
+            let text = String::from_utf8(bytes.get(12..end)?.to_vec()).ok()?;
+            events.push((index, text));
+            bytes = bytes.get(end..)?;
+        }
+        Some(events)
+    }
+}
+
 impl ClusteredService for AppendService {
     fn on_command(
         &mut self,
@@ -487,6 +548,40 @@ impl ClusteredService for AppendService {
     fn on_timer(&mut self, context: &mut Context<'_>, timer: u64) {
         self.events
             .push((context.index(), format!("timer {timer}")));
+    }
+
+    fn snapshot(&self, parts: &mut ServiceSnapshot) -> Result<(), SnapshotFull> {
+        let values: Vec<u8> = self
+            .values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        parts.part(VALUES_PART, 1, &values)?;
+        parts.part(EVENTS_PART, 1, &self.encode_events())
+    }
+
+    fn restore(&mut self, parts: &[ServicePart<'_>]) -> Result<(), RestoreRefused> {
+        let mut values = Vec::new();
+        let mut events = Vec::new();
+        for part in parts {
+            match part.id {
+                VALUES_PART => {
+                    let (words, rest) = part.bytes.as_chunks::<8>();
+                    if !rest.is_empty() {
+                        return Err(RestoreRefused::Malformed { id: part.id });
+                    }
+                    values = words.iter().map(|word| u64::from_le_bytes(*word)).collect();
+                }
+                EVENTS_PART => {
+                    events = Self::decode_events(part.bytes)
+                        .ok_or(RestoreRefused::Malformed { id: part.id })?;
+                }
+                id => return Err(RestoreRefused::UnknownPart { id }),
+            }
+        }
+        self.values = values;
+        self.events = events;
+        Ok(())
     }
 
     fn on_configuration(&mut self, context: &mut Context<'_>, configuration: &[u8]) {
