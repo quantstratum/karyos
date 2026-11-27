@@ -26,6 +26,7 @@ pub mod client;
 pub mod cluster_identity;
 pub mod consensus;
 pub mod dedup;
+pub mod driver;
 mod file;
 pub mod guards;
 pub mod hard_state;

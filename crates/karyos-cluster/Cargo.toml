@@ -26,6 +26,11 @@ sha2 = { workspace = true, optional = true }
 # scripts/check-cluster-backup-graph.sh keeps it out of every data-path
 # graph.
 backup = ["dep:sha2"]
+# The driver's injected faults (driver::DriveFault), so the harness checks
+# are shown to catch a faulty driver with a real core behind it
+# (karyos#1038). Tests only: karyos-sim's test-hooks enables it, never a
+# shipped build.
+test-hooks = []
 
 [[test]]
 name = "backup"
