@@ -349,6 +349,29 @@ impl<K: Files, S: Files> KeyStore<K, S> {
             })
     }
 
+    /// The current file epoch of `key_id` at `now`: the highest loaded
+    /// epoch already active (`not_before <= now <= not_after`). A successor
+    /// admitted ahead of its `not_before` is not current before it, so the
+    /// epoch it rotates from stays current until the cutover. With a
+    /// lineage but no active file, its highest epoch, so nothing loaded
+    /// counts as current (fail closed); `None` with no lineage or when
+    /// disabled.
+    #[must_use]
+    pub fn current_epoch(&self, key_id: u32, now: i64) -> Option<u32> {
+        if self.disabled {
+            return None;
+        }
+        let lineage = self.state.lineages.get(&key_id)?;
+        let active = self
+            .loaded
+            .range((key_id, 0)..=(key_id, lineage.highest))
+            .rev()
+            .map(|(_, file)| file)
+            .find(|file| file.not_before <= now && now <= file.not_after)
+            .map(|file| file.file_epoch);
+        Some(active.unwrap_or(lineage.highest))
+    }
+
     /// The keys that verify for `key_id` at `now`, at most two: each loaded
     /// epoch within its validity widened by [`SKEW_S`], and a predecessor
     /// only until its retirement deadline (design section 2.3).

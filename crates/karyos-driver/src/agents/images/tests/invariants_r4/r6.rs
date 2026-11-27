@@ -926,13 +926,13 @@ fn inv_r6_a_file_epoch_verifies_for_at_most_its_24_hour_overlap() {
     assert!(send_one(&mut rig, 200) >= 1, "epoch 2 flows");
 }
 
-/// INV-ROT-4 (WK 2.3) at the agents with a verify-only side (H8 review 6,
-/// R5-07), through the real key store: receiver 77's pairwise epoch 2 is
-/// admitted while its `not_before` is still ahead, so the lineage's
-/// current epoch is 2 while only the retiring epoch 1 verifies, and there
-/// is no current key to verify under. Applied to the publication, a
-/// CHALLENGE verified under epoch 1 is refused as `PreviousEpoch`: no
-/// sealer is installed under the retiring key and nothing binds.
+/// INV-ROT-4 (WK 2.3) at the agents through the real key store, and the
+/// regression of H8 review 6's follow-on finding: receiver 77's pairwise
+/// epoch 2 is admitted ahead of its `not_before`. Before it, epoch 1 is
+/// still current: the receiver's own CHALLENGEs under epoch 1 bind, with
+/// no `PreviousEpoch` refusal. From the cutover at epoch 2's `not_before`,
+/// epoch 1 only verifies (the retiring key): a CHALLENGE under it is
+/// refused as `PreviousEpoch` and installs no sealer.
 #[test]
 fn inv_r6_a_verify_only_publication_never_binds_under_the_retiring_key() {
     use crate::agents::roles::publish_auth::PublicationAuth;
@@ -940,6 +940,8 @@ fn inv_r6_a_verify_only_publication_never_binds_under_the_retiring_key() {
     use crate::wire_auth::KeySet as _;
 
     const P2_AHEAD: &str = "format=karyos-wire-key-v1\nkey_id=9\nfile_epoch=2\npurpose=pairwise\nprofile_id=1\nnot_before=2026-12-01T00:00:00Z\nnot_after=2027-02-17T00:00:00Z\nsecret=4444444444444444444444444444444444444444444444444444444444444444\nreceiver_id=77\npublisher_id=5\n";
+    // 2026-12-01T00:00:00Z.
+    const P2_NOT_BEFORE: i64 = 1_796_083_200;
     let (mut wire, keys_dir) = store_at(&[("3-1.key", C1), ("9-1.key", P1)], rotation_wall());
     let (mut rig, b) = Rig::new(Setup {
         auth: true,
@@ -960,8 +962,21 @@ fn inv_r6_a_verify_only_publication_never_binds_under_the_retiring_key() {
     keys_dir.put("9-2.key", P2_AHEAD);
     let reload_s = u64::try_from(crate::wire_keys::store::RELOAD_INTERVAL_S).unwrap();
     reload_and_apply(&mut rig, &mut wire, reload_s);
-    assert_eq!(wire.view().current_epoch(9), Some(2), "epoch 2 admitted");
-    assert_eq!(verifying(&wire, 9), [1], "only the retiring epoch verifies");
+    assert_eq!(
+        wire.view().current_epoch(9),
+        Some(1),
+        "epoch 2 is admitted but not yet current"
+    );
+    // Before the cutover the receiver's own CHALLENGEs bind.
+    let _slot = established(&mut rig);
+    assert!(bound_party(&rig).is_some(), "established under epoch 1");
+    assert_eq!(refused_for(&rig, AuthReason::PreviousEpoch), 0);
+
+    // The cutover: epoch 2 is current, epoch 1 only verifies.
+    WALL.with(|clock| clock.set(P2_NOT_BEFORE));
+    reload_and_apply(&mut rig, &mut wire, reload_s);
+    assert_eq!(wire.view().current_epoch(9), Some(2));
+    assert_eq!(verifying(&wire, 9), [1, 2]);
     let b_at = rig.endpoints.local_address(b).unwrap();
     let installed = rig.agents.sender.role.counters().auth_sealers_installed;
     let before = refused_for(&rig, AuthReason::PreviousEpoch);
@@ -971,14 +986,12 @@ fn inv_r6_a_verify_only_publication_never_binds_under_the_retiring_key() {
         &rsp_challenge(&previous, 77, [0xE0, 1], [1, 1]),
         20,
     );
-    // The injected CHALLENGE, and the receiver's own, sealed under its
-    // epoch 1 signing key, are each refused.
-    assert!(
-        refused_for(&rig, AuthReason::PreviousEpoch) > before,
+    assert_eq!(
+        refused_for(&rig, AuthReason::PreviousEpoch),
+        before + 1,
         "{:?}",
         rig.agents.sender.role.publication_rejections(a, alias())
     );
-    assert_eq!(bound_party(&rig), None, "nothing bound");
     assert_eq!(
         rig.agents.sender.role.counters().auth_sealers_installed,
         installed,
