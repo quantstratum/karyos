@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicU32;
 use super::*;
 use crate::manifest::{ExtBase, ILLUSTRATIVE_E_MAX};
 use crate::samples::SATURATED;
-use karyos_protocol::protection::{Rejection, SealError, Trusted};
+use karyos_protocol::protection::{Rejection, SealError, Trusted, Verdict};
 
 fn stage_run(shape: Shape, load: StageLoad, messages: u64, warmup: u64) -> StageRun {
     StageRun {
@@ -79,6 +79,8 @@ struct AllocatesOnce {
     opens: AtomicU32,
     in_open: bool,
 }
+
+impl crate::wire::profile::WireOpen for AllocatesOnce {}
 
 impl Protection for AllocatesOnce {
     fn envelope_len(&self) -> usize {
@@ -293,7 +295,10 @@ fn the_receive_stage_starts_at_the_first_callback_of_the_batch() {
     assert!((1_000_000..10_000_000).contains(&from_own), "{from_own}");
 }
 
-fn fault_of(receiver: &mut Receiver<'_, impl Protection>, datagram: &[u8]) -> String {
+fn fault_of(
+    receiver: &mut Receiver<'_, impl crate::wire::profile::WireOpen>,
+    datagram: &[u8],
+) -> String {
     let now = Instant::now();
     assert!(receiver.accept(datagram, now, now).is_break());
     receiver
@@ -414,6 +419,8 @@ fn a_sequence_never_sent_is_an_orphan() {
 /// A protection that rejects every datagram on open.
 struct RejectAll;
 
+impl crate::wire::profile::WireOpen for RejectAll {}
+
 impl Protection for RejectAll {
     fn envelope_len(&self) -> usize {
         0
@@ -462,6 +469,8 @@ fn a_saturated_receive_sample_invalidates_the_run() {
 #[derive(Default)]
 struct SlowFirst(AtomicBool);
 
+impl crate::wire::profile::WireOpen for SlowFirst {}
+
 impl Protection for SlowFirst {
     fn envelope_len(&self) -> usize {
         0
@@ -495,6 +504,8 @@ fn a_late_open_loop_send_keeps_its_delay() {
 /// A protection whose third seal panics.
 #[derive(Default)]
 struct PanicAtThird(AtomicU32);
+
+impl crate::wire::profile::WireOpen for PanicAtThird {}
 
 impl Protection for PanicAtThird {
     fn envelope_len(&self) -> usize {

@@ -430,6 +430,7 @@ pub fn encode_run(run: &StageRun) -> String {
     let load = match run.load {
         StageLoad::Closed => "closed".to_string(),
         StageLoad::Open { rate } => format!("open:{rate}"),
+        StageLoad::Rotation { rate } => format!("rotation:{rate}"),
     };
     format!(
         "{},{},{rule},{load},{},{},{}",
@@ -454,6 +455,12 @@ pub fn decode_run(text: &str) -> Result<StageRun, BenchError> {
         _ => return Err(bad()),
     };
     let load = match next()? {
+        rotation if rotation.starts_with("rotation:") => StageLoad::Rotation {
+            rate: rotation
+                .strip_prefix("rotation:")
+                .and_then(|rate| rate.parse().ok())
+                .ok_or_else(|| BenchError(format!("bad load {rotation}")))?,
+        },
         "closed" => StageLoad::Closed,
         open => StageLoad::Open {
             rate: open
@@ -493,6 +500,10 @@ fn point(run: &StageRun) -> Result<Point, BenchError> {
             StageLoad::Open { rate } => Load::R2 {
                 rate: u32::try_from(rate)
                     .map_err(|_| BenchError(format!("R2 rate {rate} outside the manifest")))?,
+            },
+            StageLoad::Rotation { rate } => Load::R5 {
+                rate: u32::try_from(rate)
+                    .map_err(|_| BenchError(format!("R5 rate {rate} outside the manifest")))?,
             },
         },
         fanout: fanout(run)?,
@@ -639,7 +650,7 @@ pub fn child() -> Option<Result<(), BenchError>> {
 
 fn run_child(role: &str) -> Result<(), BenchError> {
     let context = ChildContext::from_env()?;
-    let profile = Profile::of(&context.profile)?;
+    let profile = Profile::for_run(&context.profile, &context.run)?;
     let prepared = Prepared::new(&context.run, &profile)?;
     match role {
         "rx" => receive_child(&context, &prepared, &profile),
@@ -1268,7 +1279,7 @@ pub fn run_processes(
     options: &ProcessOptions,
 ) -> Result<StageSamples, BenchError> {
     faults_allowed(&options.faults)?;
-    let prepared = Prepared::new(run, &Profile::of(&options.profile)?)?;
+    let prepared = Prepared::new(run, &Profile::for_run(&options.profile, run)?)?;
     let expected =
         usize::try_from(run.messages).map_err(|_| BenchError("too many messages".into()))?;
     let count = usize::from(run.receivers);

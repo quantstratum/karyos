@@ -29,7 +29,7 @@
 //! the host has no record and is ineligible.
 //!
 //! ```text
-//! karyos-bench measure --out <dir> [--plan primary] [--plan-only]
+//! karyos-bench measure --out <dir> [--plan primary|synthetic|encrypted] [--plan-only]
 //!              [--runs <n>] [--messages <N>] [--warmup <n>]
 //!              [--e-max <bytes>] [--rule counts|excludes]
 //! ```
@@ -242,6 +242,7 @@ fn measure_command(args: &[String], out: &mut dyn Write) -> Result<usize, String
     let mut plan_only = false;
     // The last --plan wins.
     let mut synthetic = false;
+    let mut encrypted = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} needs a value"));
@@ -252,10 +253,16 @@ fn measure_command(args: &[String], out: &mut dyn Write) -> Result<usize, String
         match arg.as_str() {
             "--out" => dir = Some(PathBuf::from(value()?)),
             "--plan" => match value()?.as_str() {
-                "primary" => synthetic = false,
+                "primary" => (synthetic, encrypted) = (false, false),
                 // The B3e check: report-only, in a synthetic build.
-                "synthetic" => synthetic = true,
-                set => return Err(format!("unknown plan {set}: primary or synthetic")),
+                "synthetic" => (synthetic, encrypted) = (true, false),
+                // The encrypted class's cost (karyos#650).
+                "encrypted" => (synthetic, encrypted) = (false, true),
+                set => {
+                    return Err(format!(
+                        "unknown plan {set}: primary, synthetic or encrypted"
+                    ));
+                }
             },
             "--plan-only" => plan_only = true,
             "--runs" => {
@@ -280,6 +287,9 @@ fn measure_command(args: &[String], out: &mut dyn Write) -> Result<usize, String
     }
     if synthetic {
         options = options.with_synthetic_check();
+    }
+    if encrypted {
+        options = options.with_encrypted();
     }
     if karyos_bench::wire::process::faults_requested() {
         return Err(format!(
