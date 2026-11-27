@@ -997,4 +997,26 @@ fn inv_r6_a_verify_only_publication_never_binds_under_the_retiring_key() {
         installed,
         "no sealer under the retiring key"
     );
+
+    // H8 round 7: the successor's file is removed during the overlap. The
+    // publication is verify-only, with no current key at all: epoch 2
+    // stays current past its durable cutover, epoch 1 only verifies, and a
+    // CHALLENGE under it still binds nothing.
+    keys_dir.remove("9-2.key");
+    reload_and_apply(&mut rig, &mut wire, reload_s);
+    assert_eq!(wire.view().current_epoch(9), Some(2));
+    assert_eq!(verifying(&wire, 9), [1], "only the retiring epoch verifies");
+    let before = refused_for(&rig, AuthReason::PreviousEpoch);
+    challenge_a(
+        &mut rig,
+        b_at,
+        &rsp_challenge(&previous, 77, [0xE2, 1], [3, 3]),
+        20,
+    );
+    assert!(refused_for(&rig, AuthReason::PreviousEpoch) > before);
+    assert_eq!(
+        rig.agents.sender.role.counters().auth_sealers_installed,
+        installed,
+        "still no sealer under the retiring key"
+    );
 }

@@ -11143,6 +11143,100 @@ fn a_failed_record_write_with_the_ack_lost_stays_terminal_across_a_restart() {
     assert!(lost.terminal(&other), "a missing record fails closed");
 }
 
+/// H8 round 7 (R5-02 / MP-2 at the agents): an abort the receiver applies
+/// while both durable writes fail, then a crash. The restarted receiver,
+/// through its real SETUP path, refuses the aborted incarnation; a clean
+/// stop and another restart still refuse it; a later incarnation of the
+/// same publisher establishes.
+#[test]
+fn an_abort_lost_to_two_failed_writes_is_refused_at_the_agents_after_a_crash() {
+    use crate::remote_guard::{ABORTED_FILE, ABORTED_REPLICA};
+    use karyos_protocol::network::authenticated::GUARD_CLOSED;
+
+    let state = MemDir::initialised();
+    let (mut rig, b) = abort_record_rig(&state, 1);
+    let _slot = established(&mut rig);
+    rig.sender_stopped = true;
+    state.fail_writes(&[ABORTED_FILE, ABORTED_REPLICA]);
+    let after = inject_abort(&mut rig, b, &signed_abort(10, 11, GUARD_CLOSED));
+    assert_eq!(after.abort_acks_sent, 0, "not durable, not acknowledged");
+    // A crash: no clean stop.
+    std::mem::forget(rig);
+    state.fail_writes(&[]);
+    let installed = |rig: &Rig| {
+        rig.events
+            .iter()
+            .any(|event| matches!(event, ImageEvent::Installed { .. }))
+    };
+    for _ in 0..2 {
+        // The restart after the crash, then one after a clean stop.
+        let (mut rig, _b) = abort_record_rig(&state, 1);
+        resend_rounds(&mut rig);
+        assert!(!installed(&rig), "{:?}", rig.events);
+        assert!(rig.agents.receiver.counters().setup_after_abort >= 1);
+        drop(rig);
+    }
+    let (mut rig, _b) = abort_record_rig(&state, 2);
+    let _slot = established(&mut rig);
+    assert_eq!(rig.agents.receiver.counters().setup_after_abort, 0);
+}
+
+/// H8 round 7, R7-01: a record at its every capacity and widest line
+/// (every terminal identity, every publisher's high-water and floor, each
+/// value `u64::MAX`) round-trips through its bounded read: a restart reads
+/// it whole, never fails closed for size.
+#[test]
+fn a_full_width_abort_record_round_trips() {
+    use crate::remote_guard::{
+        ABORTED_FILE, ABORTED_MAX_LEN, AbortRecord, AbortedIncarnations, MAX_ABORTED,
+        MAX_PUBLISHERS,
+    };
+
+    let state = MemDir::initialised();
+    let wide = |n: u64| Identity {
+        driver_id: [u64::MAX - n, u64::MAX],
+        registration_id: u64::MAX,
+        incarnation: u64::MAX - 1,
+    };
+    let mut record = AbortedIncarnations::new(state.clone());
+    for n in 0..MAX_PUBLISHERS as u64 {
+        record.admit(wide(n)).unwrap();
+    }
+    // Crash and restart: every publisher's floor is raised and committed.
+    std::mem::forget(record);
+    let mut record = AbortedIncarnations::new(state.clone());
+    let later = |n: u64| Identity {
+        incarnation: u64::MAX,
+        ..wide(n)
+    };
+    for n in 0..MAX_PUBLISHERS as u64 {
+        record.admit(later(n)).unwrap();
+    }
+    for n in 0..MAX_ABORTED as u64 {
+        record
+            .record(Identity {
+                driver_id: [u64::MAX - n, u64::MAX - 1],
+                registration_id: u64::MAX,
+                incarnation: u64::MAX,
+            })
+            .unwrap();
+    }
+    drop(record);
+    let mut buf = vec![0u8; 2 * ABORTED_MAX_LEN];
+    let length = crate::wire_keys::store::Files::read(&state, ABORTED_FILE, &mut buf).unwrap();
+    assert!(length <= ABORTED_MAX_LEN, "{length} > {ABORTED_MAX_LEN}");
+    let restarted = AbortedIncarnations::new(state);
+    assert!(restarted.terminal(&wide(3)), "the floor holds");
+    assert!(
+        !restarted.terminal(&Identity {
+            driver_id: [1, 1],
+            registration_id: 1,
+            incarnation: 1,
+        }),
+        "read whole, not failed closed"
+    );
+}
+
 /// H8 R5-02: a repeated record of an identity whose commit failed retries
 /// the commit rather than reporting the in-memory entry as durable.
 #[test]
@@ -11203,7 +11297,10 @@ fn an_abort_lost_to_two_failed_writes_stays_terminal_after_an_unclean_stop() {
     // A clean stop now does not forget the recovered floor (#1288 review).
     drop(restarted);
     let again = AbortedIncarnations::new(state);
-    assert!(again.terminal(&identity()), "still terminal after a clean stop");
+    assert!(
+        again.terminal(&identity()),
+        "still terminal after a clean stop"
+    );
     assert!(!again.terminal(&later));
 }
 

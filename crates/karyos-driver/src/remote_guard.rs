@@ -293,8 +293,13 @@ const ABORTED_FORMAT_V1: &str = "karyos-aborted-incarnations-v1";
 /// The most publishers whose incarnation high-water the record keeps; a
 /// new publisher past it is refused its install (fail closed).
 pub const MAX_PUBLISHERS: usize = 256;
-/// The largest record file: the header, the flag and every line.
-const ABORTED_MAX_LEN: usize = 64 + MAX_ABORTED * 88 + MAX_PUBLISHERS * 90;
+/// The longest line: a prefix (`h ` or `f `), four `u64` of 20 digits,
+/// three dashes and the newline.
+const ABORTED_LINE_MAX: usize = 2 + 4 * 20 + 3 + 1;
+/// The largest record file: the header and flag, every terminal identity,
+/// and both publisher tables, the high-water and the floor (H8 round 7,
+/// R7-01).
+pub const ABORTED_MAX_LEN: usize = 64 + (MAX_ABORTED + 2 * MAX_PUBLISHERS) * ABORTED_LINE_MAX;
 /// The marker armed at every start and disarmed at a clean stop with
 /// nothing left uncommitted (H8 R5-02): found armed, the last run may have
 /// lost an abort it never committed.
@@ -377,8 +382,8 @@ impl<F: Files> AbortedIncarnations<F> {
             // fails closed.
             let mut raised = false;
             for (driver, registration, incarnation) in record.high.clone() {
-                raised |= raise(&mut record.floor, (driver, registration), incarnation)
-                    .unwrap_or(true);
+                raised |=
+                    raise(&mut record.floor, (driver, registration), incarnation).unwrap_or(true);
             }
             if raised && (record.write().is_err() || record.dirty) {
                 record.unreadable = true;
@@ -579,16 +584,16 @@ impl<F: Files> Drop for AbortedIncarnations<F> {
 /// [`MarkError::Commit`] when the write fails.
 pub fn initialise_aborted<F: Files + ?Sized>(files: &F) -> Result<(), MarkError> {
     files
-        .write_atomic(ABORTED_FILE, encode_aborted(false, &[], &[], &[]).as_bytes())
+        .write_atomic(
+            ABORTED_FILE,
+            encode_aborted(false, &[], &[], &[]).as_bytes(),
+        )
         .map_err(|_| MarkError::Commit)
 }
 
 impl<F: Files> AbortRecord for AbortedIncarnations<F> {
     fn terminal(&self, identity: &Identity) -> bool {
-        self.full
-            || self.unreadable
-            || self.held.contains(identity)
-            || self.below_floor(identity)
+        self.full || self.unreadable || self.held.contains(identity) || self.below_floor(identity)
     }
 
     fn admit(&mut self, identity: Identity) -> Result<(), MarkError> {
@@ -596,7 +601,8 @@ impl<F: Files> AbortRecord for AbortedIncarnations<F> {
             return Err(MarkError::Unreadable);
         }
         let key = (identity.driver_id, identity.registration_id);
-        let rose = raise(&mut self.high, key, identity.incarnation).map_err(|()| MarkError::Commit)?;
+        let rose =
+            raise(&mut self.high, key, identity.incarnation).map_err(|()| MarkError::Commit)?;
         // Already covered and durable: nothing to commit. Covered only in
         // memory (an earlier commit failed): the commit is retried, never
         // skipped (#1288 review).
