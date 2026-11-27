@@ -732,3 +732,26 @@ fn an_unmapped_v_reports_the_sealed_loss_unknown() {
     assert_eq!(report.verified, Some(at(100, 3)));
     assert_eq!(report.gap.sealed_unverified, None);
 }
+
+/// ADR-0123 decision 5: an isolated rebuild refuses every promotion, even
+/// fenced, and its external effects stay off.
+#[test]
+fn an_isolated_standby_is_never_promoted() {
+    let mut standby = fresh();
+    standby.isolate();
+    assert!(standby.isolated());
+    for fencing in [
+        Fencing::Lease { expired: true },
+        Fencing::OperatorStop {
+            members: vec![0],
+            confirmed: vec![0],
+        },
+    ] {
+        assert_eq!(
+            standby.promote(&fencing, Vec::new()),
+            Err(PromotionRefused::Isolated)
+        );
+    }
+    assert!(!standby.effects_enabled());
+    assert_eq!(standby.generation(), 1);
+}

@@ -20,8 +20,12 @@
 //!   its server: [`Reply::Redirect`] to that server. Backpressure is
 //!   [`Answer::WindowFull`]. A server's redirect is [`Reply::Redirect`]; the
 //!   operator's, a promotion's, is a leader change learnt otherwise
-//!   ([`ClusterClient::leader_changed`]), in the generation the client has
-//!   seen: the redirect carries none.
+//!   ([`ClusterClient::leader_changed`]). The redirect carries no
+//!   generation: one under the standby's identity is the promotion, so the
+//!   promoted generation ([`FIRST_GENERATION`] + 1), and a late answer of
+//!   the old primary's generation is then stale rather than steering the
+//!   client back to the old identity (ADR-0123); any other is in the
+//!   generation the client has seen.
 //! - **The caller.** The node is its [`ClusterClient`]'s caller: once its
 //!   request is unknown (a leader change, or no answer within its retry
 //!   interval, [`ClusterClient::timed_out`]) it retries it at its next tick
@@ -32,10 +36,10 @@
 //!   lower generation as the harness client records it
 //!   ([`Observation::StaleGeneration`]).
 
-use karyos_cluster::client::{Answer, ClusterClient, Event, Key, Reply, Send};
+use karyos_cluster::client::{Accepted, Answer, ClusterClient, Event, Key, Reply, Send, Stamp};
 use karyos_cluster::dedup::{DedupConfig, SessionTable};
 
-use super::node::{Command, Observation, Op, Ret, Shared, Wire};
+use super::node::{Command, HARNESS_CLUSTER, HARNESS_STANDBY, Observation, Op, Ret, Shared, Wire};
 use super::standby::FIRST_GENERATION;
 use crate::cluster::Outbox;
 use crate::net::NodeId;
@@ -90,7 +94,13 @@ impl FailoverClient {
         recorder: Shared,
         retry_after: u64,
     ) -> Self {
-        let mut client = ClusterClient::new(u64::from(id), Some(u64::from(server)));
+        // It accepts the run's cluster and its standby (ADR-0123 decision
+        // 4): the promoted standby answers under its own identity.
+        let accepted = Accepted {
+            primary: HARNESS_CLUSTER,
+            standby: Some(HARNESS_STANDBY),
+        };
+        let mut client = ClusterClient::new(u64::from(id), Some(u64::from(server)), accepted);
         let bounds = DedupConfig::default()
             .with_sessions(1)
             .with_window(1)
@@ -101,7 +111,11 @@ impl FailoverClient {
         if let Ok(mut table) = SessionTable::new(bounds)
             && let Ok(registered) = table.register(u64::from(id), EPOCH, 0)
         {
-            let _ = client.registered(registered, FIRST_GENERATION, &mut |_| {});
+            let from = Stamp {
+                cluster: HARNESS_CLUSTER,
+                generation: FIRST_GENERATION,
+            };
+            let _ = client.registered(registered, from, &mut |_| {});
         }
         Self {
             id,
@@ -153,7 +167,7 @@ impl FailoverClient {
         open.key = send.key;
         open.sent = now;
         open.sends.push((to, send.key, self.client.generation()));
-        out.push((to, Wire::Request(open.command.clone())));
+        out.push((to, Wire::Request(send.cluster, open.command.clone())));
     }
 
     /// The key and generation of the last attempt of the open request sent
@@ -235,6 +249,12 @@ impl FailoverClient {
                         open.sent = now;
                     }
                 }
+                Event::ForeignCluster { received } => {
+                    self.observe(Observation::ForeignCluster {
+                        client: self.id,
+                        cluster: received,
+                    });
+                }
                 Event::Expired { .. } => {
                     self.open = None;
                     self.next = self.script.len();
@@ -246,7 +266,7 @@ impl FailoverClient {
     fn replied<M>(
         &mut self,
         key: Key,
-        generation: u64,
+        from: Stamp,
         reply: Reply,
         settled: Option<(Ret, u64, u64)>,
         now: u64,
@@ -254,7 +274,7 @@ impl FailoverClient {
     ) {
         let mut events = Vec::new();
         self.client
-            .replied(key, generation, reply, &mut |event| events.push(event));
+            .replied(key, from, reply, &mut |event| events.push(event));
         self.handle(events, settled, now, out);
     }
 
@@ -328,6 +348,7 @@ impl FailoverClient {
     ) {
         match message {
             Wire::Response {
+                cluster,
                 sequence,
                 bytes,
                 index,
@@ -356,39 +377,63 @@ impl FailoverClient {
                 };
                 self.replied(
                     key,
-                    answered,
+                    Stamp {
+                        cluster,
+                        generation: answered,
+                    },
                     Reply::Outcome(answer),
                     Some((ret, index, answered)),
                     now,
                     out,
                 );
             }
-            Wire::Refused { sequence } => {
+            Wire::Refused { cluster, sequence } => {
                 if let Some((key, generation)) = self.exchange(from, sequence) {
                     let leader = Some(u64::from(from));
-                    self.replied(key, generation, Reply::Redirect { leader }, None, now, out);
+                    let stamp = Stamp {
+                        cluster,
+                        generation,
+                    };
+                    self.replied(key, stamp, Reply::Redirect { leader }, None, now, out);
                 }
             }
-            Wire::Busy { sequence } => {
+            Wire::Busy { cluster, sequence } => {
                 if let Some((key, generation)) = self.exchange(from, sequence) {
                     let reply = Reply::Outcome(Answer::WindowFull);
-                    self.replied(key, generation, reply, None, now, out);
+                    let stamp = Stamp {
+                        cluster,
+                        generation,
+                    };
+                    self.replied(key, stamp, reply, None, now, out);
                 }
             }
-            Wire::Redirect { server } => {
+            Wire::Redirect { cluster, server } => {
                 let leader = Some(u64::from(server));
                 let sequence = self.open.as_ref().map(|open| open.command.sequence);
                 // A server's redirect answers the last attempt sent to it;
                 // the operator's is a leader change.
                 match sequence.and_then(|sequence| self.exchange(from, sequence)) {
                     Some((key, generation)) => {
-                        self.replied(key, generation, Reply::Redirect { leader }, None, now, out);
+                        let stamp = Stamp {
+                            cluster,
+                            generation,
+                        };
+                        self.replied(key, stamp, Reply::Redirect { leader }, None, now, out);
                     }
                     None => {
-                        let generation = self.client.generation();
+                        let seen = self.client.generation();
+                        let generation = if cluster == HARNESS_STANDBY {
+                            seen.max(FIRST_GENERATION.saturating_add(1))
+                        } else {
+                            seen
+                        };
+                        let stamp = Stamp {
+                            cluster,
+                            generation,
+                        };
                         let mut events = Vec::new();
                         self.client
-                            .leader_changed(leader, generation, &mut |event| events.push(event));
+                            .leader_changed(leader, stamp, &mut |event| events.push(event));
                         self.handle(events, None, now, out);
                     }
                 }

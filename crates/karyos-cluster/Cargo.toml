@@ -17,13 +17,15 @@ categories = ["network-programming", "concurrency"]
 karyos-archive.workspace = true
 karyos-codec.workspace = true
 thiserror.workspace = true
+# The rebuild identity's derivation (ADR-0123 decision 2), with backups only.
+sha2 = { workspace = true, optional = true }
 
 [features]
 # Backups to remote storage and a rebuild from them (`backup`): control
 # path only. Off by default; karyos-tools enables it, and
 # scripts/check-cluster-backup-graph.sh keeps it out of every data-path
 # graph.
-backup = []
+backup = ["dep:sha2"]
 
 [[test]]
 name = "backup"

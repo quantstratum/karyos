@@ -459,6 +459,21 @@ pub enum Fencing {
     },
 }
 
+/// The promotion rule of an isolated rebuild (ADR-0123 decision 5),
+/// one for every promotion path: a node whose cluster identity record
+/// says it is isolated is never promoted.
+///
+/// # Errors
+///
+/// [`PromotionRefused::Isolated`] when `isolated`.
+pub fn refuse_isolated(isolated: bool) -> Result<(), PromotionRefused> {
+    if isolated {
+        Err(PromotionRefused::Isolated)
+    } else {
+        Ok(())
+    }
+}
+
 /// Why a promotion was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromotionRefused {
@@ -468,6 +483,8 @@ pub enum PromotionRefused {
     LeaseValid,
     /// Already promoted.
     Promoted,
+    /// An isolated rebuild is never promoted (ADR-0123 decision 5).
+    Isolated,
 }
 
 /// What a promotion reports (SPEC §9; ADR-0120 decision 8). The
@@ -557,6 +574,9 @@ pub struct Standby<S> {
     copy: Option<Copy>,
     stopped: bool,
     promoted: bool,
+    /// An isolated rebuild (ADR-0123 decision 5): never promoted, its
+    /// external effects never enabled.
+    isolated: bool,
     generation: u64,
 }
 
@@ -572,6 +592,7 @@ impl<S: SealCheck> Standby<S> {
             copy: None,
             stopped: false,
             promoted: false,
+            isolated: false,
             generation: config.generation,
         }
     }
@@ -637,10 +658,24 @@ impl<S: SealCheck> Standby<S> {
         self.generation
     }
 
-    /// Whether its service may have external effects: only once promoted.
+    /// Whether its service may have external effects: only once promoted,
+    /// and never for an isolated rebuild.
     #[must_use]
     pub fn effects_enabled(&self) -> bool {
-        self.promoted
+        self.promoted && !self.isolated
+    }
+
+    /// Marks the standby an isolated rebuild, whose cluster identity record
+    /// says so (ADR-0123 decision 5): it is never promoted, and its external
+    /// effects stay off. There is no way back.
+    pub fn isolate(&mut self) {
+        self.isolated = true;
+    }
+
+    /// Whether it is an isolated rebuild.
+    #[must_use]
+    pub fn isolated(&self) -> bool {
+        self.isolated
     }
 
     /// The active copy's ends.
@@ -902,6 +937,7 @@ impl<S: SealCheck> Standby<S> {
         fencing: &Fencing,
         mut unknown: Vec<InFlight>,
     ) -> Result<PromotionReport, PromotionRefused> {
+        refuse_isolated(self.isolated)?;
         if self.promoted {
             return Err(PromotionRefused::Promoted);
         }

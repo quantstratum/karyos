@@ -959,11 +959,14 @@ fn server_of(observation: &Observation) -> Option<NodeId> {
         | Observation::CopyStarted { node, .. }
         | Observation::RecoveryPoint { node, .. }
         | Observation::Promoted { node, .. }
+        | Observation::ForeignDropped { node, .. }
+        | Observation::IsolatedPromotion { node }
         | Observation::Leading { node, .. } => Some(*node),
         Observation::Success { .. }
         | Observation::StaleGeneration { .. }
         | Observation::ClientEvent { .. }
         | Observation::ClientRetry { .. }
+        | Observation::ForeignCluster { .. }
         | Observation::Fenced { .. }
         | Observation::PromotionRefused { .. }
         | Observation::Expired { .. }

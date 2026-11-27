@@ -40,7 +40,8 @@ use karyos_cluster::standby::{RecoveryPoint, Refusal};
 use karyos_sim::cluster::Node;
 use karyos_sim::harness::check::{self, Violation};
 use karyos_sim::harness::node::{
-    ClientNode, Command, Observation, Op, Recorder, Ret, Shared, Wire,
+    ClientNode, Command, HARNESS_CLUSTER, HARNESS_STANDBY, Observation, Op, Recorder, Ret, Shared,
+    Wire,
 };
 use karyos_sim::harness::reference::{Message, Reference};
 use karyos_sim::harness::standby::{
@@ -230,6 +231,7 @@ fn s5_a_client_rejects_a_lower_generation_once_it_saw_a_higher() {
     let mut client = ClientNode::new(10, 0, script, Rc::clone(&recorder));
     let mut out: Vec<(NodeId, Wire<Message>)> = Vec::new();
     let answer = |sequence: u64, generation: u64| Wire::<Message>::Response {
+        cluster: HARNESS_CLUSTER,
         sequence,
         bytes: Ret::Appended(sequence).canonical(),
         index: sequence,
@@ -1032,14 +1034,21 @@ fn s5_a_cluster_client_rejects_generation_1_once_it_saw_generation_2() {
     ];
     let mut client = ClientNode::new(10, OLD, script, Rc::clone(&recorder)).with_cluster_client();
     let mut out: Vec<(NodeId, Wire<Message>)> = Vec::new();
+    // The old primary answers in generation 1 under the run's identity,
+    // the promoted standby in generation 2 under its own.
     let answer = |sequence: u64, generation: u64| Wire::<Message>::Response {
+        cluster: if generation == 1 {
+            HARNESS_CLUSTER
+        } else {
+            HARNESS_STANDBY
+        },
         sequence,
         bytes: Ret::Appended(sequence).canonical(),
         index: sequence,
         generation,
     };
     let sent = |out: &[(NodeId, Wire<Message>)]| match out.last() {
-        Some((to, Wire::Request(command))) => (*to, command.sequence),
+        Some((to, Wire::Request(_, command))) => (*to, command.sequence),
         other => panic!("{other:?}"),
     };
     client.tick(0, &mut out);
@@ -1050,7 +1059,11 @@ fn s5_a_cluster_client_rejects_generation_1_once_it_saw_generation_2() {
     // The promotion: the operator sends the client to the standby. The
     // open request is unknown, and nothing is sent on its own.
     let before = out.len();
-    client.deliver(OPERATOR, Wire::Redirect { server: NEW }, 3, &mut out);
+    let redirect = Wire::Redirect {
+        cluster: HARNESS_STANDBY,
+        server: NEW,
+    };
+    client.deliver(OPERATOR, redirect, 3, &mut out);
     assert_eq!(out.len(), before);
     assert_eq!(client.open(), Some(2));
     // The caller's retry: the same request, to the standby.
@@ -1123,11 +1136,22 @@ fn a_late_old_primary_refusal_after_a_retry_on_the_standby_steers_nothing() {
     let mut client = ClientNode::new(10, OLD, script, Rc::clone(&recorder)).with_cluster_client();
     let mut out: Vec<(NodeId, Wire<Message>)> = Vec::new();
     client.tick(0, &mut out);
-    client.deliver(OPERATOR, Wire::Redirect { server: NEW }, 1, &mut out);
+    let redirect = Wire::Redirect {
+        cluster: HARNESS_STANDBY,
+        server: NEW,
+    };
+    client.deliver(OPERATOR, redirect, 1, &mut out);
     client.tick(2, &mut out);
-    assert!(matches!(out.last(), Some((NEW, Wire::Request(_)))));
+    assert!(matches!(
+        out.last(),
+        Some((NEW, Wire::Request(HARNESS_STANDBY, _)))
+    ));
     let before = out.len();
-    client.deliver(OLD, Wire::Refused { sequence: 1 }, 3, &mut out);
+    let refused = Wire::Refused {
+        cluster: HARNESS_CLUSTER,
+        sequence: 1,
+    };
+    client.deliver(OLD, refused, 3, &mut out);
     assert_eq!(out.len(), before, "{:?}", out.last());
     let failover = client.failover().unwrap().cluster_client();
     assert_eq!(failover.leader(), Some(u64::from(NEW)));
@@ -1147,6 +1171,7 @@ fn a_late_old_primary_refusal_after_a_retry_on_the_standby_steers_nothing() {
     client.deliver(
         NEW,
         Wire::Response {
+            cluster: HARNESS_STANDBY,
             sequence: 1,
             bytes: Ret::Appended(1).canonical(),
             index: 1,

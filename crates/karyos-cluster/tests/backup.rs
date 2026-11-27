@@ -24,6 +24,7 @@ use karyos_archive::segment::Geometry;
 use karyos_cluster::backup::{
     self, BackupError, LOG_OBJECTS, MANIFEST_OBJECT, NOT_INCLUDED, Retention, Target,
 };
+use karyos_cluster::cluster_identity::{ClusterId, IdentityRecord, rebuild_identity};
 use karyos_cluster::snapshot::{Section, SectionKind, SnapshotConfig, SnapshotStore};
 use karyos_cluster::{Entry, HardState, RaftLog};
 
@@ -194,12 +195,27 @@ fn a_rebuild_matches_its_source_up_to_the_reported_top() {
             log: &log_dir,
             snapshots: &snap_dir,
             geometry: geometry(),
+            nonce: [7; 32],
         },
     )
     .unwrap();
     assert_eq!(
         (report.base, report.top, report.entries),
         (exported.base, exported.top, 190)
+    );
+    // ADR-0123 decision 2: the rebuild took its own identity, derived from
+    // the export's, isolated from it, and stored it next to its log.
+    let identity = IdentityRecord {
+        identity: rebuild_identity(ClusterId(CLUSTER), report.top.0, report.top.1, [7; 32]),
+        isolated_from: Some(ClusterId(CLUSTER)),
+    };
+    assert_ne!(identity.identity, ClusterId(CLUSTER));
+    assert_eq!(report.identity, Some(identity));
+    assert_eq!(exported.identity, None);
+    assert_eq!((report.nonce, exported.nonce), (Some([7; 32]), None));
+    assert_eq!(
+        IdentityRecord::load(&mut StdDisk, &log_dir).unwrap(),
+        Some(identity)
     );
     // The rebuilt node: its snapshot's sections and its log's entries are
     // the source's, up to the top.
@@ -263,6 +279,7 @@ fn a_damaged_object_is_refused_naming_its_range_before_anything_is_written() {
                 log: &log_dir,
                 snapshots: &snap_dir,
                 geometry: geometry(),
+                nonce: [7; 32],
             },
         )
         .map(|_| ());
@@ -340,6 +357,7 @@ fn a_rebuild_into_a_node_s_directories_is_refused_and_changes_nothing() {
             log: &log_dir,
             snapshots: &snap_dir,
             geometry: geometry(),
+            nonce: [7; 32],
         },
     );
     assert!(
@@ -399,6 +417,7 @@ fn a_manifest_that_does_not_cover_the_log_is_refused() {
                 log: &log_dir,
                 snapshots: &snap_dir,
                 geometry: geometry(),
+                nonce: [7; 32],
             },
         ),
         Err(BackupError::Manifest(_))
@@ -579,6 +598,7 @@ fn a_section_the_service_check_refuses_is_refused_before_anything_is_written() {
                 log: &log_dir,
                 snapshots: &snap_dir,
                 geometry: geometry(),
+                nonce: [7; 32],
             },
             &mut |kind, _, _| if kind == SectionKind::Service {
                 Err("the service cannot open it".to_owned())
@@ -608,9 +628,46 @@ fn a_section_the_service_check_refuses_is_refused_before_anything_is_written() {
                 log: &log_dir,
                 snapshots: &snap_dir,
                 geometry: geometry(),
+                nonce: [7; 32],
             },
             &mut |_, _, _| Ok(()),
         )
         .is_ok()
     );
+}
+
+/// Codex review of karyos#1283: an export under the all-zero identity,
+/// which no identity record can name as a source, is refused before the
+/// rebuild writes anything.
+#[test]
+fn a_rebuild_of_the_zero_identity_is_refused_unwritten() {
+    let source_dir = TempDir::new("zero-source");
+    let (mut log, snapshots) = source(&source_dir.0);
+    let mut bucket = Bucket::default();
+    let _ = backup::export(
+        &snapshots,
+        &mut log,
+        &mut bucket,
+        [0; 32],
+        Retention::until(u64::MAX),
+    )
+    .unwrap();
+    let dir = TempDir::new("zero-rebuilt");
+    let (log_dir, snap_dir) = target(&dir.0);
+    let refused = backup::rebuild(
+        &mut bucket,
+        [0; 32],
+        &Target {
+            disk: &StdDisk,
+            log: &log_dir,
+            snapshots: &snap_dir,
+            geometry: geometry(),
+            nonce: [7; 32],
+        },
+    );
+    assert!(
+        matches!(refused, Err(BackupError::ZeroIdentity)),
+        "{refused:?}"
+    );
+    assert!(files(&dir.0).is_empty(), "a refused rebuild wrote");
 }

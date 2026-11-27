@@ -949,6 +949,7 @@ dependencies = [
  "karyos-codec",
  "karyos-sys",
  "karyos-trace",
+ "sha2",
  "thiserror",
 ]
 
