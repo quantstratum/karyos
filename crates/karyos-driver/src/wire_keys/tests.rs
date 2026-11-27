@@ -621,3 +621,61 @@ fn h5_the_embedded_key_file_vectors_are_the_tracked_output() {
     assert_eq!(count("keyfile valid "), PY_VALID.len());
     assert_eq!(count("keyfile refused "), PY_REFUSED.len());
 }
+
+/// `(label, file bytes, entries)` of the script: `revoked` lists of
+/// wire-key-files.md 2.4 it reads, as hex (`-` for the 0-byte file).
+const PY_REVOKED_VALID: [(&str, &str, &str); 3] = [
+    ("empty", "-", "none"),
+    ("one", "332d330a", "3-3"),
+    (
+        "increasing",
+        "332d320a332d330a31363930393036302d330a",
+        "3-2,3-3,16909060-3",
+    ),
+];
+
+/// `(label, file bytes)` of the script: the `revoked` refusal vectors of
+/// wire-key-files.md 2.7 (`3-03`, `3_3`, and `3-3` followed by `3-3`).
+const PY_REVOKED_REFUSED: [(&str, &str); 3] = [
+    ("3-03", "332d30330a"),
+    ("3_3", "335f330a"),
+    ("duplicate_3-3", "332d330a332d330a"),
+];
+
+/// Gate H5, the `revoked` vectors of wire-key-files.md 2.7: every one is
+/// a line of the tracked output of `enc_vectors2.py`, every such line is
+/// embedded, and the driver's `revoked` parser reads the valid lists to
+/// the script's entries and refuses the refused ones.
+#[test]
+fn h5_the_revoked_list_vectors_match_the_independent_script() {
+    use crate::wire_keys::store::parse_revoked;
+    let lines: Vec<&str> = PY2.lines().collect();
+    let bytes_of = |text: &str| if text == "-" { Vec::new() } else { hex(text) };
+    for (label, bytes, entries) in PY_REVOKED_VALID {
+        let line = format!("revoked valid {label} {bytes} {entries}");
+        assert!(lines.contains(&line.as_str()), "{label}");
+        let read = parse_revoked(&bytes_of(bytes)).unwrap_or_else(|| panic!("{label}"));
+        let rendered: Vec<String> = read.iter().map(|(k, e)| format!("{k}-{e}")).collect();
+        let rendered = if rendered.is_empty() {
+            "none".to_string()
+        } else {
+            rendered.join(",")
+        };
+        assert_eq!(rendered, entries, "{label}");
+    }
+    for (label, bytes) in PY_REVOKED_REFUSED {
+        let prefix = format!("revoked refused {label} {bytes} (");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with(&prefix))
+                .count(),
+            1,
+            "{label}"
+        );
+        assert_eq!(parse_revoked(&hex(bytes)), None, "{label}");
+    }
+    let count = |prefix: &str| lines.iter().filter(|line| line.starts_with(prefix)).count();
+    assert_eq!(count("revoked valid "), PY_REVOKED_VALID.len());
+    assert_eq!(count("revoked refused "), PY_REVOKED_REFUSED.len());
+}

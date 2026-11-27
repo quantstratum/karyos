@@ -12,7 +12,13 @@
 //!   the sealed datagram ([`AesGcmSiv::seal_next`]).
 //! - Receive: the received datagram to the verify and replay decision
 //!   ([`AesGcmSiv::open_in_place`], then [`AesGcmSiv::mark`]).
-//! - Both: the sum of one message's send and receive samples.
+//! - Both: the sum of one envelope's send and receive samples.
+//!
+//! Every sample is one envelope operation (one datagram), not one message:
+//! a W5 envelope carries 20 messages, and `rekey` is one epoch change. A
+//! rate derived from these rows (`1e9 / mean_ns`) is envelope operations
+//! per second; messages per second multiply it by the point's messages
+//! per envelope.
 //!
 //! Refilling the frames and copying the datagram to the receive buffer
 //! precede each timed call and are outside every sample.

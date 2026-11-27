@@ -164,6 +164,26 @@ fn an_encrypted_channel_naming_a_profile_1_file_is_refused() {
     nothing_created(&subscriber);
 }
 
+/// One class per file (ADR-0114 section 4a), the other way: an
+/// authenticated channel naming `profile_id=16` files, valid as they are
+/// for the encrypted class, is refused, typed, and nothing is created:
+/// the authenticated class sees no `profile_id=1` channel file of that
+/// key id ([`AuthRefusal::ChannelKey`]).
+#[test]
+fn an_authenticated_channel_naming_a_profile_16_file_is_refused() {
+    let (mut publisher, _) = keyed(&borrowed(&enc_files()));
+    let security = Security::Authenticated(AuthenticatedChannel {
+        channel_key_id: ENC_CHANNEL,
+        pairwise_key_id: ENC_PAIRWISE,
+        ..auth(None)
+    });
+    assert_eq!(
+        publish(&mut publisher, unicast(), security),
+        refused(AuthRefusal::ChannelKey)
+    );
+    nothing_created(&publisher);
+}
+
 /// Anything but one unicast receiver is ambiguous and refused, typed:
 /// several destinations, multicast, another receiver identity.
 #[test]

@@ -661,6 +661,28 @@ fn the_state_directory_lock_is_never_refused_by_a_spawn() {
 }
 
 #[test]
+fn a_pairwise_file_reusing_a_channel_secret_is_refused() {
+    // wire-key-files.md 2.7: a pairwise file with the same `secret` as the
+    // channel file, refused at admission as a reused secret.
+    let (keys, state) = fresh();
+    keys.put(
+        "3-3.key",
+        channel(3, 3, "2026-11-01", "2027-01-30", 0x11).as_bytes(),
+    );
+    let secret: String = (0..KEY_LEN).map(|_| "11").collect();
+    keys.put(
+        "16909060-3.key",
+        format!(
+            "format=karyos-wire-key-v1\nkey_id=16909060\nfile_epoch=3\npurpose=pairwise\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret={secret}\nreceiver_id=66\npublisher_id=5\n"
+        )
+        .as_bytes(),
+    );
+    let (store, report) = Store::start(keys, state, DEC_01).unwrap();
+    assert_eq!(reasons(&report), [(16_909_060, 3, Reason::ReusedSecret)]);
+    assert_eq!(epochs(&store), [(3, 3)]);
+}
+
+#[test]
 fn a_secret_reused_across_classes_is_refused() {
     // wire-key-files.md 2.7: the `profile_id=1` channel file and the same
     // secret as a `profile_id=16` file, presented as `4-3.key`.

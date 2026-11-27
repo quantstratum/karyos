@@ -4,8 +4,8 @@
 //! sections 6.1 and 7; ADR-0114): the test-level equivalent of the R4
 //! load, since the bench harness has no `encrypted` profile. A real
 //! encrypted publication and subscription over loopback carry valid W1
-//! traffic (`L` = 32, one message per append) at a fixed rate for a fixed
-//! time in wall-clock time, while datagrams forged under a wrong key (the
+//! traffic (`L` = 32, one message per append) at R2's two rates (100 000
+//! and 1 000 000 messages/s) for a fixed time in wall-clock time, while datagrams forged under a wrong key (the
 //! genuine context and frames, invalid tag) reach the receiver's real
 //! intake at 10% or 100% of the valid rate. Each run states the
 //! allocations of the forged intake and of each agent's duties, the
@@ -19,7 +19,7 @@
 //! intake samples per second. Ignored:
 //! run explicitly in release (`cargo test --release -p karyos-driver
 //! --lib r4_ -- --ignored --nocapture`); each run prints its report, and
-//! writes it to `r4-<p>.txt` in the directory `KARYOS_R4_OUT` names, when
+//! writes it to `r4-<rate>-<p>.txt` in the directory `KARYOS_R4_OUT` names, when
 //! set.
 
 use std::fmt::Write as _;
@@ -32,8 +32,10 @@ use karyos_sys::log_buffer::{AppendOptions, AppendOutcome, PollOutcome, Role};
 use super::*;
 use crate::wire_enc::{ChannelKeys, EncSealer, MAX_SEALED};
 
-/// The valid rate: R2's lower rate (manifest 6.1).
-const RATE: u64 = 100_000;
+/// R2's lower valid rate (manifest 6.1), messages/s.
+const RATE_LOW: u64 = 100_000;
+/// R2's higher valid rate (manifest 6.1), messages/s.
+const RATE_HIGH: u64 = 1_000_000;
 /// Seconds each run lasts.
 const SECONDS: u64 = 10;
 /// Distinct forged datagrams, injected in a cycle.
@@ -44,7 +46,7 @@ const MAX_SAMPLES: usize = 1 << 24;
 /// inject, or it is refused as underloaded.
 const MIN_LOAD_PERCENT: u64 = 95;
 /// The longest the valid load may fall behind its schedule: 10 ms, 1 000
-/// messages at [`RATE`].
+/// messages at [`RATE_LOW`], 10 000 at [`RATE_HIGH`].
 const MAX_LAG_NS: u64 = 10_000_000;
 /// Intake intervals a run must time per second, at least (one per 1 ms on
 /// average).
@@ -80,17 +82,18 @@ fn percentiles(label: &str, samples: &mut [u64], report: &mut String) {
     );
 }
 
-/// Whether a run at `invalid_percent` sustained its load: at least
+/// Whether a run at `rate` valid messages/s and `invalid_percent` sustained its load: at least
 /// [`MIN_LOAD_PERCENT`] of the scheduled valid and forged datagrams, a
 /// schedule lag within [`MAX_LAG_NS`] and enough intake samples.
 fn sustained(
+    rate: u64,
     appended: u64,
     forged: u64,
     invalid_percent: u64,
     late_ns: u64,
     samples: usize,
 ) -> Result<(), String> {
-    let valid_target = RATE * SECONDS;
+    let valid_target = rate * SECONDS;
     let forged_target = valid_target * invalid_percent / 100;
     if appended * 100 < valid_target * MIN_LOAD_PERCENT {
         return Err(format!("underloaded: {appended} valid of {valid_target}"));
@@ -107,10 +110,10 @@ fn sustained(
     Ok(())
 }
 
-/// One R4 run at `invalid_percent` of the valid rate; returns the report
-/// and asserts the H10 properties.
+/// One R4 run at `rate` valid messages/s and `invalid_percent` of it
+/// forged; returns the report and asserts the H10 properties.
 #[allow(clippy::too_many_lines, reason = "one measured run, read top down")]
-fn r4(invalid_percent: u64) -> String {
+fn r4(rate: u64, invalid_percent: u64) -> String {
     let (mut rig, b) = encrypted_rig();
     crate::wire_enc::record_seals();
     let slot = established(&mut rig);
@@ -138,7 +141,7 @@ fn r4(invalid_percent: u64) -> String {
     .unwrap();
     // Sequences ahead of every genuine one of the run: each forged datagram
     // passes the replay precheck and is refused for its tag.
-    sealer.key().set_next_seq(last.seq + 10 * RATE * SECONDS);
+    sealer.key().set_next_seq(last.seq + 10 * rate * SECONDS);
     let pool: Vec<Vec<u8>> = (0..POOL)
         .map(|_| {
             let mut bytes = vec![0_u8; MAX_SEALED];
@@ -188,7 +191,7 @@ fn r4(invalid_percent: u64) -> String {
         let now = rig.now;
         VIRTUAL_NOW.with(|cell| cell.set(now));
         // Valid load on its schedule; a back-pressured append retries.
-        let due = elapsed * RATE / 1_000_000_000;
+        let due = elapsed * rate / 1_000_000_000;
         while appended < due {
             message[..8].copy_from_slice(&appended.to_le_bytes());
             match rig.log.as_mut().unwrap().publications[0]
@@ -202,7 +205,7 @@ fn r4(invalid_percent: u64) -> String {
                 }
             }
         }
-        late_ns = late_ns.max((due - appended) * 1_000_000_000 / RATE);
+        late_ns = late_ns.max((due - appended) * 1_000_000_000 / rate);
         if let Some(log) = rig.log.as_mut() {
             for conductor in &mut log.conductors {
                 let _ = conductor.duty_cycle().unwrap();
@@ -282,9 +285,19 @@ fn r4(invalid_percent: u64) -> String {
     let mut report = String::new();
     let _ = writeln!(
         report,
-        "R4 encrypted (W1 L=32, F1 unicast, loopback): valid {RATE}/s for {SECONDS} s, \
+        "R4 encrypted (W1 L=32, F1 unicast, loopback): valid {rate}/s for {SECONDS} s, \
          invalid tags at {invalid_percent}% ({} /s)",
-        RATE * invalid_percent / 100
+        rate * invalid_percent / 100
+    );
+    let elapsed_s = start.elapsed().as_secs_f64();
+    #[allow(clippy::cast_precision_loss, reason = "a reported rate")]
+    let achieved = (appended as f64 / elapsed_s, forged as f64 / elapsed_s);
+    let _ = writeln!(
+        report,
+        "achieved: valid {:.0}/s forged {:.0}/s over {elapsed_s:.3} s (scheduled {rate}/s and {}/s)",
+        achieved.0,
+        achieved.1,
+        rate * invalid_percent / 100
     );
     let _ = writeln!(
         report,
@@ -337,11 +350,15 @@ fn r4(invalid_percent: u64) -> String {
     if let Some(dir) = std::env::var_os("KARYOS_R4_OUT") {
         let dir = std::path::PathBuf::from(dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("r4-{invalid_percent}.txt")), &report).unwrap();
+        std::fs::write(
+            dir.join(format!("r4-{rate}-{invalid_percent}.txt")),
+            &report,
+        )
+        .unwrap();
     }
 
     // The load was sustained: an underloaded run measures nothing.
-    if let Err(why) = sustained(appended, forged, invalid_percent, late_ns, samples) {
+    if let Err(why) = sustained(rate, appended, forged, invalid_percent, late_ns, samples) {
         panic!(
             "{why}
 {report}"
@@ -370,29 +387,50 @@ fn r4(invalid_percent: u64) -> String {
 #[test]
 #[ignore = "H10 R4 measurement: run explicitly in release"]
 fn r4_encrypted_invalid_tags_at_10_percent() {
-    let _ = r4(10);
+    let _ = r4(RATE_LOW, 10);
 }
 
 #[test]
 #[ignore = "H10 R4 measurement: run explicitly in release"]
 fn r4_encrypted_invalid_tags_at_100_percent() {
-    let _ = r4(100);
+    let _ = r4(RATE_LOW, 100);
+}
+
+#[test]
+#[ignore = "H10 R4 measurement: run explicitly in release"]
+fn r4_encrypted_1m_invalid_tags_at_10_percent() {
+    let _ = r4(RATE_HIGH, 10);
+}
+
+#[test]
+#[ignore = "H10 R4 measurement: run explicitly in release"]
+fn r4_encrypted_1m_invalid_tags_at_100_percent() {
+    let _ = r4(RATE_HIGH, 100);
 }
 
 #[test]
 fn an_underloaded_r4_run_is_refused() {
-    let full = RATE * SECONDS;
-    let samples = usize::try_from(MIN_SAMPLES_PER_SECOND * SECONDS).unwrap();
-    assert_eq!(sustained(full, full / 10, 10, 0, samples), Ok(()));
-    assert_eq!(
-        sustained(full * 95 / 100, full * 95 / 100, 100, MAX_LAG_NS, samples),
-        Ok(())
-    );
-    // A stall before the first iteration: nothing injected at all.
-    assert!(sustained(0, 0, 10, 0, 0).is_err());
-    assert!(sustained(full * 94 / 100, full, 100, 0, samples).is_err());
-    assert!(sustained(full, full * 94 / 100, 100, 0, samples).is_err());
-    assert!(sustained(full, full / 10 * 94 / 100, 10, 0, samples).is_err());
-    assert!(sustained(full, full, 100, MAX_LAG_NS + 1, samples).is_err());
-    assert!(sustained(full, full, 100, 0, samples - 1).is_err());
+    for rate in [RATE_LOW, RATE_HIGH] {
+        let full = rate * SECONDS;
+        let samples = usize::try_from(MIN_SAMPLES_PER_SECOND * SECONDS).unwrap();
+        assert_eq!(sustained(rate, full, full / 10, 10, 0, samples), Ok(()));
+        assert_eq!(
+            sustained(
+                rate,
+                full * 95 / 100,
+                full * 95 / 100,
+                100,
+                MAX_LAG_NS,
+                samples
+            ),
+            Ok(())
+        );
+        // A stall before the first iteration: nothing injected at all.
+        assert!(sustained(rate, 0, 0, 10, 0, 0).is_err());
+        assert!(sustained(rate, full * 94 / 100, full, 100, 0, samples).is_err());
+        assert!(sustained(rate, full, full * 94 / 100, 100, 0, samples).is_err());
+        assert!(sustained(rate, full, full / 10 * 94 / 100, 10, 0, samples).is_err());
+        assert!(sustained(rate, full, full, 100, MAX_LAG_NS + 1, samples).is_err());
+        assert!(sustained(rate, full, full, 100, 0, samples - 1).is_err());
+    }
 }

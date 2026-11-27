@@ -57,8 +57,9 @@
 //! ```
 //!
 //! times one complete seal and open of the encrypted profile, or of the
-//! trusted channel, per message at one point (`enc_cost.rs`) and prints
-//! one CSV row per operation; one process is one run.
+//! trusted channel, per envelope (one datagram, 20 messages at W5) at one
+//! point (`enc_cost.rs`) and prints one CSV row per operation, in
+//! nanoseconds per envelope operation; one process is one run.
 //!
 //! ```text
 //! karyos-bench timeouts pause --seconds <s> [--tick-us <us>]

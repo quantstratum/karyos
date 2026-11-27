@@ -18,7 +18,8 @@ Run: python3 -I enc_vectors2.py
 
 Prints (a) a SETUP variant 3 ENC ANSWER transcript sealed in domain 5,
 (b) the KDF and one envelope per domain at the next `party_epoch` and the
-next `key_epoch`, (c) the key file vectors of wire-key-files.md 2.7.
+next `key_epoch`, (c) the key file vectors of wire-key-files.md 2.7, the
+`revoked` list ones (grammar of section 2.4) included.
 """
 import calendar
 import hashlib
@@ -391,3 +392,47 @@ for label, name, data in refused:
 assert parse("3-3.key", CHANNEL)["secret"] == parse("3-3.key", ENC_CHANNEL)["secret"]
 print("keyfile reused secret across classes: 3-3.key (profile 1) and 4-3.key (profile 16) share "
       + parse("3-3.key", ENC_CHANNEL)["secret"].hex())
+
+
+def parse_revoked(data):
+    """A `revoked` list (wire-key-files.md 2.4): one canonical
+    `<key_id>-<file_epoch>` per line, strictly increasing, LF-terminated,
+    at most 4096 bytes; a 0-byte file revokes nothing."""
+    if len(data) > 4096:
+        raise ValueError("size")
+    if data == b"":
+        return []
+    if not data.endswith(b"\n") or any(b < 0x21 and b != 0x0A or b > 0x7E for b in data):
+        raise ValueError("encoding")
+    out = []
+    for line in data[:-1].decode("ascii").split("\n"):
+        m = re.fullmatch(r"(0|[1-9][0-9]*)-(0|[1-9][0-9]*)", line)
+        if not m:
+            raise ValueError("name")
+        ref = (number(m.group(1), 1, 2**32 - 1), number(m.group(2), 1, 2**32 - 1))
+        if out and out[-1] >= ref:
+            raise ValueError("duplicate or out of order")
+        out.append(ref)
+    return out
+
+
+revoked_valid = [
+    ("empty", b""),
+    ("one", b"3-3\n"),
+    ("increasing", b"3-2\n3-3\n16909060-3\n"),
+]
+for label, data in revoked_valid:
+    entries = ",".join(f"{k}-{e}" for k, e in parse_revoked(data)) or "none"
+    print(f"revoked valid {label} {data.hex() or '-'} {entries}")
+revoked_refused = [
+    ("3-03", b"3-03\n"),
+    ("3_3", b"3_3\n"),
+    ("duplicate_3-3", b"3-3\n3-3\n"),
+]
+for label, data in revoked_refused:
+    try:
+        parse_revoked(data)
+    except ValueError as reason:
+        print(f"revoked refused {label} {data.hex()} ({reason})")
+    else:
+        raise AssertionError(f"revoked {label} parsed")
