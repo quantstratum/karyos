@@ -940,6 +940,10 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// (MTU accounting, H8 SS-11).
     #[cfg(test)]
     largest_in: Vec<(EndpointId, usize)>,
+    /// Test only: the datagrams of one watched length the intake read, of
+    /// any endpoint (`(length, count)`; the R4 flood counts its forgeries).
+    #[cfg(test)]
+    watched_in: (usize, u64),
     /// Test only: the positions and lengths of the DATA `drop_data` lost,
     /// shared with a sender that holds back only the NAKs for them
     /// (karyos#1067). First term positions: the term offset.
@@ -2406,6 +2410,8 @@ pub(super) fn roles<T: StreamTerms>(
             #[cfg(test)]
             largest_in: Vec::new(),
             #[cfg(test)]
+            watched_in: (0, 0),
+            #[cfg(test)]
             data_seen: 0,
             #[cfg(test)]
             dropped: None,
@@ -3568,6 +3574,9 @@ impl<T: StreamTerms> ReceiverRole<T> {
     /// intake, as a lossy path would (tests).
     #[cfg(test)]
     fn note_in(&mut self, endpoint: EndpointId, length: usize) {
+        if length == self.watched_in.0 {
+            self.watched_in.1 += 1;
+        }
         match self.largest_in.iter_mut().find(|(at, _)| *at == endpoint) {
             Some((_, largest)) => *largest = (*largest).max(length),
             None => self.largest_in.push((endpoint, length)),
@@ -3589,6 +3598,20 @@ impl<T: StreamTerms> ReceiverRole<T> {
     #[cfg(test)]
     pub(super) fn signed_cached(&self) -> usize {
         self.signed.as_deref().map_or(0, SignedIntake::cached)
+    }
+
+    /// Counts from now on the datagrams of `length` the intake reads, from
+    /// 0 (tests).
+    #[cfg(test)]
+    pub(super) fn watch_length(&mut self, length: usize) {
+        self.watched_in = (length, 0);
+    }
+
+    /// The datagrams of the watched length read since
+    /// [`Self::watch_length`] (tests).
+    #[cfg(test)]
+    pub(super) fn watched_in(&self) -> u64 {
+        self.watched_in.1
     }
 
     /// The largest datagram `endpoint`'s intake has read (tests).

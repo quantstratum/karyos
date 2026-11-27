@@ -51,6 +51,17 @@
 //! and `analysis.json` into it (`analyze.rs`).
 //!
 //! ```text
+//! karyos-bench enc-cost --point W1|W2|W3|W4|W5|ctl152|rekey
+//!              --profile trusted|encrypted [--samples <N>] [--warmup <n>]
+//!              [--run <k>] [--backend <label>] [--header]
+//! ```
+//!
+//! times one complete seal and open of the encrypted profile, or of the
+//! trusted channel, per envelope (one datagram, 20 messages at W5) at one
+//! point (`enc_cost.rs`) and prints one CSV row per operation, in
+//! nanoseconds per envelope operation; one process is one run.
+//!
+//! ```text
 //! karyos-bench timeouts pause --seconds <s> [--tick-us <us>]
 //! karyos-bench timeouts echo --bind <addr> --seconds <s>
 //! karyos-bench timeouts rtt --to <addr> [--count <n>] [--interval-us <us>] [--size <bytes>]
@@ -348,6 +359,50 @@ fn analyze_command(args: &[String]) -> Result<String, String> {
     ))
 }
 
+/// `karyos-bench enc-cost ...`: one run of one point, as CSV rows.
+fn enc_cost_command(args: &[String]) -> Result<String, String> {
+    use karyos_bench::enc_cost::{Point, Profile, Run, run};
+    let mut point = None;
+    let mut profile = None;
+    let mut samples = 1_000_000_u64;
+    let mut warmup = 100_000_u64;
+    let mut index = 1_u32;
+    let mut backend = "accel".to_string();
+    let mut header = false;
+    let mut rest = args.iter();
+    while let Some(flag) = rest.next() {
+        if flag == "--header" {
+            header = true;
+            continue;
+        }
+        let value = rest.next().ok_or_else(|| format!("{flag} needs a value"))?;
+        let bad = |_| format!("bad {flag} {value}");
+        match flag.as_str() {
+            "--point" => point = Some(Point::of(value).map_err(|e| e.0)?),
+            "--profile" => profile = Some(Profile::of(value).map_err(|e| e.0)?),
+            "--samples" => samples = value.parse().map_err(bad)?,
+            "--warmup" => warmup = value.parse().map_err(bad)?,
+            "--run" => index = value.parse().map_err(bad)?,
+            "--backend" => backend.clone_from(value),
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    let (Some(point), Some(profile)) = (point, profile) else {
+        return Err("enc-cost needs --point and --profile".to_string());
+    };
+    karyos_bench::enc_cost::timing_build(cfg!(feature = "alloc-count")).map_err(|e| e.0)?;
+    let result = run(point, profile, warmup, samples).map_err(|e| e.0)?;
+    let mut out = String::new();
+    if header {
+        out.push_str(&karyos_bench::enc_cost::build_identity());
+        out.push('\n');
+        out.push_str(Run::HEADER);
+        out.push('\n');
+    }
+    out.push_str(&result.csv(&backend, index));
+    Ok(out)
+}
+
 /// `karyos-bench timeouts <probe> ...`: one probe, its report on `out`.
 fn timeouts(args: &[String], out: &mut impl Write, err: &mut impl Write) -> ExitCode {
     use karyos_bench::timeouts;
@@ -436,6 +491,18 @@ fn main() -> ExitCode {
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("enc-cost") {
+        return match enc_cost_command(args.get(1..).unwrap_or_default()) {
+            Ok(rows) => {
+                let _ = write!(out, "{rows}");
+                ExitCode::SUCCESS
+            }
+            Err(message) => {
+                let _ = writeln!(err, "karyos-bench enc-cost: {message}");
+                ExitCode::from(2)
+            }
+        };
+    }
     if args.first().map(String::as_str) == Some("timeouts") {
         return timeouts(args.get(1..).unwrap_or(&[]), &mut out, &mut err);
     }

@@ -15,6 +15,10 @@
 //! stable), so no kernel series to rely on emits it. A platform signal
 //! implements [`GenerationSignal`] and is returned by [`platform_signal`];
 //! nothing else changes. Tests inject the signal (`InjectedSignal`).
+//! What a Linux host does expose is the device's presence ([`vmgenid`]):
+//! [`platform_device`] says whether the host is a virtual machine with a
+//! VM Generation ID device (its generation can change, unseen), has none,
+//! or could not be read; the signal stays [`NoSignal`] in every case.
 //! The trigger is the signal, never a timer: a [`VmGenerationWatch`] only
 //! limits how often it reads it.
 //!
@@ -37,6 +41,8 @@
 //! has a new `driver_id` or `receiver_boot_id` in its context.
 
 use core::sync::atomic::{AtomicU64, Ordering};
+
+pub mod vmgenid;
 
 /// How often a watch reads the platform's signal at most. Between reads
 /// the fence itself is a load.
@@ -80,6 +86,20 @@ impl GenerationSignal for NoSignal {
 #[must_use]
 pub fn platform_signal() -> Box<dyn GenerationSignal> {
     Box::new(NoSignal)
+}
+
+/// The platform's VM Generation ID device, as the host's sysfs states it
+/// ([`vmgenid::detect`] on `/sys`; [`vmgenid::VmGenIdDevice::Absent`]
+/// off Linux). [`vmgenid::VmGenIdDevice::Present`] is a virtual machine
+/// whose generation can change with no signal to user space: only the
+/// deployment rule protects it.
+#[must_use]
+pub fn platform_device() -> vmgenid::VmGenIdDevice {
+    if cfg!(target_os = "linux") {
+        vmgenid::detect(std::path::Path::new(vmgenid::SYSFS))
+    } else {
+        vmgenid::VmGenIdDevice::Absent
+    }
 }
 
 /// A signal a test changes through its [`SignalInjector`].

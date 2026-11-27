@@ -11432,6 +11432,8 @@ fn an_install_whose_high_water_cannot_be_committed_is_refused() {
 }
 /// H8 round 4: insufficient evidence raised and missing properties (karyos#648).
 mod invariants_r4;
+/// H10 R4 evidence for the encrypted class: timed, ignored (manifest 7).
+mod r4_flood;
 
 /// `record` sealed again, byte for byte as it went out: AES-GCM-SIV is
 /// deterministic, so the same key context, sequence and plaintext give the

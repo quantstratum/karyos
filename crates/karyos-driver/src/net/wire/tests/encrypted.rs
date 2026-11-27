@@ -164,6 +164,26 @@ fn an_encrypted_channel_naming_a_profile_1_file_is_refused() {
     nothing_created(&subscriber);
 }
 
+/// One class per file (ADR-0114 section 4a), the other way: an
+/// authenticated channel naming `profile_id=16` files, valid as they are
+/// for the encrypted class, is refused, typed, and nothing is created:
+/// the authenticated class sees no `profile_id=1` channel file of that
+/// key id ([`AuthRefusal::ChannelKey`]).
+#[test]
+fn an_authenticated_channel_naming_a_profile_16_file_is_refused() {
+    let (mut publisher, _) = keyed(&borrowed(&enc_files()));
+    let security = Security::Authenticated(AuthenticatedChannel {
+        channel_key_id: ENC_CHANNEL,
+        pairwise_key_id: ENC_PAIRWISE,
+        ..auth(None)
+    });
+    assert_eq!(
+        publish(&mut publisher, unicast(), security),
+        refused(AuthRefusal::ChannelKey)
+    );
+    nothing_created(&publisher);
+}
+
 /// Anything but one unicast receiver is ambiguous and refused, typed:
 /// several destinations, multicast, another receiver identity.
 #[test]
@@ -370,6 +390,12 @@ fn enc_mtu_run(batches: &[Vec<usize>]) -> Vec<Vec<usize>> {
 /// whole datagram's `mtu`, and the receiver's image log takes the inner
 /// budget, derived locally (H8-13).
 fn enc_run(mtu: u32, batches: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    enc_run_traced(mtu, batches, false)
+}
+
+/// [`enc_run`], each message traced when `traced`: every fragment
+/// carries the 64-byte `EXT` frame extension (ADR-0035).
+fn enc_run_traced(mtu: u32, batches: &[Vec<usize>], traced: bool) -> Vec<Vec<usize>> {
     use karyos_protocol::network::encrypted::{EncSetup, decode_setup};
     use karyos_protocol::protection::aes_gcm_siv::{Domain, ENVELOPE_LEN};
 
@@ -455,10 +481,21 @@ fn enc_run(mtu: u32, batches: &[Vec<usize>]) -> Vec<Vec<usize>> {
                 .map(|at| u8::try_from((at * 31 + index) % 251).unwrap())
                 .collect();
             offered.push(payload.clone());
-            assert!(matches!(
-                lane.offer(&payload).unwrap(),
-                OfferOutcome::Accepted { .. }
-            ));
+            let outcome = if traced {
+                let decision =
+                    karyos_client::TraceDecision::traced(karyos_protocol::frame::TraceExtension {
+                        extension_flags: 0,
+                        trace_id: [7, u64::try_from(index).unwrap() + 1],
+                        span_id: 3,
+                        parent_span_id: 0,
+                        message_id: u64::try_from(offered.len()).unwrap(),
+                    });
+                assert!(decision.is_traced());
+                lane.offer_with_trace(&payload, &decision).unwrap()
+            } else {
+                lane.offer(&payload).unwrap()
+            };
+            assert!(matches!(outcome, OfferOutcome::Accepted { .. }));
         }
         let want = delivered.len() + messages.len();
         let done = pump(&mut [&mut publisher, &mut subscriber], |_| {
@@ -797,4 +834,89 @@ fn an_encrypted_reload_refuses_a_successor_of_another_scope() {
             assert_eq!(epochs, want, "{field}");
         }
     }
+}
+
+/// The frames of each sealed DATA datagram longer than `above` bytes
+/// (heartbeats and pads aside), datagrams without one dropped.
+fn enc_message_frames(data: &[Vec<usize>], above: usize) -> Vec<Vec<usize>> {
+    data.iter()
+        .map(|frames| {
+            frames
+                .iter()
+                .copied()
+                .filter(|length| *length > above)
+                .collect::<Vec<usize>>()
+        })
+        .filter(|frames| !frames.is_empty())
+        .collect()
+}
+
+/// Gate H11, W9 at the MTU boundary (manifest 6.1 and 7; ADR-0114 section
+/// 11; ADR-0035 Validation), through production admission at `mtu` 1408
+/// (inner budget 1324, a frame of at most 1312): the encrypted sender
+/// emits `EXT` frames. A traced frame's header is 32 + 64 bytes, so the
+/// largest traced message left whole is 1312 - 96 = 1216 bytes, one frame
+/// of 1312 in a datagram of 1396; one byte more fragments as 1216 and 1,
+/// each fragment carrying its `EXT`; 21 traced 32-byte messages pack at
+/// most floor(1324 / 128) = 10 per datagram. Every message is delivered
+/// intact and no sealed datagram exceeds 1408 bytes (checked by the run).
+#[test]
+fn h11_w9_encrypted_ext_frames_fill_the_mtu_and_never_exceed_it() {
+    let full = enc_run_traced(1408, &[vec![1216]], true);
+    let frames: Vec<usize> = enc_message_frames(&full, 96)
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(frames, vec![96 + 1216], "{full:?}");
+    let over = enc_run_traced(1408, &[vec![1217]], true);
+    let frames: Vec<usize> = enc_message_frames(&over, 96)
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(frames, vec![96 + 1216, 96 + 1], "{over:?}");
+    let batched = enc_run_traced(1408, &[vec![32; 21]], true);
+    let packed = enc_message_frames(&batched, 96);
+    assert!(
+        packed.iter().all(|frames| frames.len() <= 10),
+        "{batched:?}"
+    );
+    assert_eq!(packed.iter().map(Vec::len).max(), Some(10), "{batched:?}");
+    assert_eq!(packed.iter().map(Vec::len).sum::<usize>(), 21);
+}
+
+/// Gate H11, W6 (manifest 6.1, "the datagram count of 6.1 under each
+/// profile"; ADR-0114 section 11): a 6000-byte message under the
+/// encrypted envelope leaves in exactly ceil(6000 / 1280) = 5 datagrams,
+/// four fragments of 1280 and one of 880, each alone in its datagram,
+/// and arrives intact. Traced (`c` = 1216) it is still 5: four of 1216
+/// and one of 1136.
+#[test]
+fn h11_w6_an_encrypted_6000_byte_message_takes_five_datagrams() {
+    let data = enc_mtu_run(&[vec![6000]]);
+    let datagrams = enc_message_frames(&data, 96);
+    assert_eq!(datagrams.len(), 6000_usize.div_ceil(1280), "{data:?}");
+    assert_eq!(
+        datagrams,
+        vec![
+            vec![32 + 1280],
+            vec![32 + 1280],
+            vec![32 + 1280],
+            vec![32 + 1280],
+            vec![32 + 880]
+        ],
+        "{data:?}"
+    );
+    let traced = enc_run_traced(1408, &[vec![6000]], true);
+    let datagrams = enc_message_frames(&traced, 96);
+    assert_eq!(
+        datagrams,
+        vec![
+            vec![96 + 1216],
+            vec![96 + 1216],
+            vec![96 + 1216],
+            vec![96 + 1216],
+            vec![96 + 1136]
+        ],
+        "{traced:?}"
+    );
 }
