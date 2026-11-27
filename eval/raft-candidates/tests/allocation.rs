@@ -304,6 +304,7 @@ fn a_reply_framed_into_the_kept_frame_allocates_nothing() {
     use karyos_sim::harness::node::Wire as Harness;
     let _serial = serial();
     let message: Harness<()> = Harness::Response {
+        cluster: karyos_sim::harness::node::HARNESS_CLUSTER,
         sequence: 1,
         bytes: vec![7; 9],
         index: 4,
@@ -439,7 +440,13 @@ fn the_reply_queue_takes_its_bound_without_allocating() {
         let _enrolled = enroll();
         for _ in 0..4 {
             for sequence in 0..u64::try_from(room).unwrap() {
-                replies.push((1, Harness::Refused { sequence }));
+                replies.push((
+                    1,
+                    Harness::Refused {
+                        cluster: karyos_sim::harness::node::HARNESS_CLUSTER,
+                        sequence,
+                    },
+                ));
             }
             replies.clear();
         }

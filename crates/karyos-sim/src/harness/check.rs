@@ -152,6 +152,23 @@ pub enum Violation {
         /// The entry's index.
         index: u64,
     },
+    /// Two servers led the same term (karyos#712).
+    TwoLeaders {
+        /// The term.
+        term: u64,
+        /// The first server seen leading it.
+        first: NodeId,
+        /// The second.
+        second: NodeId,
+    },
+    /// A server led, or committed as leader, after its own removal had
+    /// committed (karyos#712).
+    RemovedLeaderLed {
+        /// The server.
+        node: NodeId,
+        /// The index of the committed configuration entry that removed it.
+        removed_at: u64,
+    },
     /// A leader committed an entry fewer than a majority of its voters
     /// held durably: learners or strangers were counted.
     QuorumOfVoters {
@@ -904,6 +921,7 @@ pub fn learner_caught_up(observations: &[Observation], lag: u64) -> Result<(), V
 pub fn membership(observations: &[Observation], lag: u64) -> Result<(), Violation> {
     quorum_of_voters(observations)?;
     configuration_from_log(observations)?;
+    removed_leader_steps_down(observations)?;
     learner_caught_up(observations, lag)
 }
 
@@ -930,20 +948,31 @@ fn server_of(observation: &Observation) -> Option<NodeId> {
         | Observation::SnapshotRefused { node, .. }
         | Observation::SnapshotPiece { node, .. }
         | Observation::SnapshotPieceLost { node, .. }
+        | Observation::SnapshotAbandoned { node, .. }
+        | Observation::SnapshotSent { node, .. }
         | Observation::Unsupported { node, .. }
         | Observation::Transfer { node, .. }
         | Observation::Deduplicated { node, .. }
         | Observation::Redirected { node, .. }
         | Observation::FeedApplied { node, .. }
-        | Observation::Promoted { node, .. } => Some(*node),
+        | Observation::ReplicationRefused { node, .. }
+        | Observation::CopyStarted { node, .. }
+        | Observation::RecoveryPoint { node, .. }
+        | Observation::Promoted { node, .. }
+        | Observation::ForeignDropped { node, .. }
+        | Observation::IsolatedPromotion { node }
+        | Observation::Leading { node, .. } => Some(*node),
         Observation::Success { .. }
         | Observation::StaleGeneration { .. }
+        | Observation::ClientEvent { .. }
+        | Observation::ClientRetry { .. }
+        | Observation::ForeignCluster { .. }
         | Observation::Fenced { .. }
         | Observation::PromotionRefused { .. }
         | Observation::Expired { .. }
         | Observation::Healed
-        | Observation::Triggered { .. }
-        | Observation::Leading { .. } => None,
+        | Observation::Split { .. }
+        | Observation::Triggered { .. } => None,
     }
 }
 
@@ -1178,7 +1207,101 @@ pub fn group(observations: &[Observation], servers: usize) -> Result<(), Violati
     committed_prefixes_agree(observations)?;
     responses_agree(observations)?;
     no_old_term_direct_commit(observations)?;
+    one_leader_per_term(observations)?;
     positions_ordered(observations)
+}
+
+/// No two servers lead the same term, across every configuration
+/// (karyos#712; Raft's election safety). Reads [`Observation::Leading`].
+///
+/// # Errors
+///
+/// [`Violation::TwoLeaders`].
+pub fn one_leader_per_term(observations: &[Observation]) -> Result<(), Violation> {
+    let mut leaders: BTreeMap<u64, NodeId> = BTreeMap::new();
+    for observation in observations {
+        if let Observation::Leading { node, term } = observation {
+            match leaders.get(term) {
+                Some(first) if first != node => {
+                    return Err(Violation::TwoLeaders {
+                        term: *term,
+                        first: *first,
+                        second: *node,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    let _ = leaders.insert(*term, *node);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A server whose own removal it knows committed never leads again, nor
+/// commits as leader past the removal, unless a later configuration makes
+/// it a voter again (karyos#712, M2). The removal is known by its own
+/// [`Observation::Configuration`], whose voters exclude it, and its own
+/// commit reaching that entry.
+///
+/// # Errors
+///
+/// [`Violation::RemovedLeaderLed`].
+pub fn removed_leader_steps_down(observations: &[Observation]) -> Result<(), Violation> {
+    // Per server: the removing entry's index, and whether its commit has
+    // reached it.
+    let mut removal: BTreeMap<NodeId, (u64, bool)> = BTreeMap::new();
+    let mut commits: BTreeMap<NodeId, u64> = BTreeMap::new();
+    for observation in observations {
+        match observation {
+            Observation::Configuration {
+                node,
+                configuration,
+                ..
+            } => match configuration.index {
+                Some(index) if !configuration.voters.contains(node) => {
+                    let reached = commits.get(node).is_some_and(|commit| *commit >= index);
+                    let _ = removal.insert(*node, (index, reached));
+                }
+                _ => {
+                    let _ = removal.remove(node);
+                }
+            },
+            Observation::Commit {
+                node,
+                leader,
+                index,
+                ..
+            } => {
+                let _ = commits.insert(*node, *index);
+                if let Some((at, reached)) = removal.get_mut(node) {
+                    if *reached && *leader && *index > *at {
+                        return Err(Violation::RemovedLeaderLed {
+                            node: *node,
+                            removed_at: *at,
+                        });
+                    }
+                    if *index >= *at {
+                        *reached = true;
+                    }
+                }
+            }
+            Observation::Leading { node, .. } => {
+                if let Some(&(at, true)) = removal.get(node) {
+                    return Err(Violation::RemovedLeaderLed {
+                        node: *node,
+                        removed_at: at,
+                    });
+                }
+            }
+            Observation::Crashed { node } => {
+                let _ = commits.remove(node);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Every check of a run with `servers` servers.

@@ -1353,3 +1353,53 @@ fn a_released_source_stops_bounding_the_strategy_edge() {
     assert_eq!(table.limit(lane(0), 1), Limit::Edge(200));
     assert!(!table.release_source(second, 2));
 }
+
+/// H8-28: `would_accept` decides each SM as `status` then does: a join
+/// window, a join, a changed window, a stale and a beyond consumption, a
+/// table full for an optional newcomer, a required join and its changed
+/// boot id, an expired member's tombstone (stationary, then fresh) and a
+/// required loss.
+#[test]
+fn would_accept_decides_as_status_does() {
+    let mut config = config(1);
+    config.max_receivers = 2;
+    config.max_pending = 2;
+    let mut table = table(
+        config,
+        &Roles {
+            required: &[3],
+            tags: &[],
+        },
+    );
+    let steps = [
+        (sm(1, &[(0, 5)]), 0, Some(StatusRejected::Window)),
+        (sm(1, &[(0, 100)]), 0, None),
+        (sm(1, &[(0, 200)]), 0, Some(StatusRejected::WindowChanged)),
+        (sm(1, &[(50, 100)]), 0, None),
+        (sm(1, &[(40, 100)]), 0, Some(StatusRejected::Stale)),
+        (
+            sm(1, &[((1 << 30) + 1, 100)]),
+            0,
+            Some(StatusRejected::Beyond),
+        ),
+        (sm(2, &[(0, 100)]), 0, Some(StatusRejected::TableFull)),
+        (sm(3, &[(0, 100)]), 0, None),
+        (
+            sm_from(receiver(3, 2), 0, &[(0, 100)]),
+            0,
+            Some(StatusRejected::BootChanged),
+        ),
+        (sm(1, &[(50, 100)]), TIMEOUT, Some(StatusRejected::Expired)),
+        (sm(1, &[(60, 100)]), TIMEOUT + 1, None),
+        (sm(3, &[(0, 100)]), TIMEOUT + 2, Some(StatusRejected::Lost)),
+    ];
+    for (sm, now, expected) in steps {
+        let key = path(sm.receiver, 1);
+        let would = table.would_accept(&key, &sm, now);
+        assert_eq!(would, expected.map_or(Ok(()), Err), "{sm:?} at {now}");
+        match table.status(&key, &sm, now) {
+            StatusOutcome::Accepted { .. } => assert_eq!(would, Ok(()), "{sm:?}"),
+            StatusOutcome::Rejected(reason) => assert_eq!(would, Err(reason), "{sm:?}"),
+        }
+    }
+}

@@ -201,6 +201,18 @@ impl SendSessions {
         self.counters
     }
 
+    /// How many sessions the table holds.
+    #[must_use]
+    pub fn registered(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// How many more sessions the table can take.
+    #[must_use]
+    pub fn free(&self) -> usize {
+        self.capacity.saturating_sub(self.sessions.len())
+    }
+
     /// Starts announcing `publication`; its first SETUP is due at once.
     ///
     /// # Errors
@@ -251,6 +263,13 @@ impl SendSessions {
                 session.publication.endpoint == endpoint && session.publication.alias == alias
             })
             .map(|session| session.publication.identity)
+    }
+
+    /// The publication `alias` on `endpoint`, read only.
+    #[must_use]
+    pub fn publication(&self, endpoint: EndpointId, alias: Alias) -> Option<Publication> {
+        self.find(endpoint, alias)
+            .map(|session| session.publication)
     }
 
     /// Whether the publication received its first SM.
@@ -439,6 +458,34 @@ impl SendSessions {
             solicit.challenge,
             joins(&publication),
         )
+    }
+
+    /// Whether [`SendSessions::challenge`] or [`SendSessions::solicit`]
+    /// would answer `control` from `source` at `now` with `joins` lanes of
+    /// join points, charging nothing (H8-25).
+    pub(crate) fn would_answer(
+        &mut self,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        now: u64,
+        control: &karyos_protocol::network::Control,
+        joins: u8,
+    ) -> bool {
+        use karyos_protocol::network::Control;
+        let (alias, identity) = match control {
+            Control::Challenge(challenge) => (challenge.alias, Some(challenge.identity)),
+            Control::Solicit(solicit) => (solicit.alias, None),
+            _ => return false,
+        };
+        let Some(publication) = self
+            .find(endpoint, alias)
+            .map(|session| session.publication)
+        else {
+            return false;
+        };
+        identity.is_none_or(|identity| identity == publication.identity)
+            && joins == publication.lane_count
+            && self.rates.would_admit(source, now).is_ok()
     }
 
     fn answer(

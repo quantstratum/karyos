@@ -659,3 +659,22 @@ fn the_state_directory_lock_is_never_refused_by_a_spawn() {
     assert_eq!(refused, 0, "{refused} of {tries} locks refused");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn a_secret_reused_across_classes_is_refused() {
+    // wire-key-files.md 2.7: the `profile_id=1` channel file and the same
+    // secret as a `profile_id=16` file, presented as `4-3.key`.
+    let (keys, state) = fresh();
+    let authenticated = channel(3, 3, "2026-11-01", "2027-01-30", 0x11);
+    keys.put("3-3.key", authenticated.as_bytes());
+    keys.put(
+        "4-3.key",
+        authenticated
+            .replace("key_id=3", "key_id=4")
+            .replace("profile_id=1", "profile_id=16")
+            .as_bytes(),
+    );
+    let (store, report) = Store::start(keys, state, DEC_01).unwrap();
+    assert_eq!(reasons(&report), [(4, 3, Reason::ReusedSecret)]);
+    assert_eq!(epochs(&store), [(3, 3)]);
+}

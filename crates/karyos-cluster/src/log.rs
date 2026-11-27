@@ -221,21 +221,39 @@ impl Entry {
     ///
     /// [`LogError::TooLarge`] for a payload over `u32::MAX` bytes.
     pub fn frame(&self) -> Result<Vec<u8>, LogError> {
-        let length = u32::try_from(self.payload.len())
-            .map_err(|_| LogError::TooLarge { index: self.index })?;
+        // Refused before the buffer is allocated (karyos#1285 review).
+        if u32::try_from(self.payload.len()).is_err() {
+            return Err(LogError::TooLarge { index: self.index });
+        }
         let mut frame =
             Vec::with_capacity(self.payload.len().checked_add(FRAME_HEADER).unwrap_or(0));
+        self.frame_into(&mut frame)?;
+        Ok(frame)
+    }
+
+    /// [`Entry::frame`] into `frame`, cleared first: a caller that keeps
+    /// `frame` encodes without allocating once it has grown to the
+    /// largest entry (karyos#691).
+    ///
+    /// # Errors
+    ///
+    /// [`LogError::TooLarge`] for a payload over `u32::MAX` bytes, with
+    /// `frame` left empty.
+    pub fn frame_into(&self, frame: &mut Vec<u8>) -> Result<(), LogError> {
+        frame.clear();
+        let length = u32::try_from(self.payload.len())
+            .map_err(|_| LogError::TooLarge { index: self.index })?;
         frame.extend_from_slice(&MAGIC);
         frame.extend_from_slice(&length.to_le_bytes());
         frame.extend_from_slice(&self.index.to_le_bytes());
         frame.extend_from_slice(&self.term.to_le_bytes());
         frame.extend_from_slice(&self.event_time.to_le_bytes());
         let mut crc = Crc32c::new();
-        crc.update(&frame);
+        crc.update(frame);
         crc.update(&self.payload);
         frame.extend_from_slice(&crc.finish().to_le_bytes());
         frame.extend_from_slice(&self.payload);
-        Ok(frame)
+        Ok(())
     }
 
     /// Its encoded size: header and payload; `None` past `u64::MAX`.
@@ -281,10 +299,75 @@ impl Header {
     }
 }
 
+/// Why a Cluster log replication from a node ends (ADR-0120 decision 4):
+/// its request ends with `state` 5 `interrupted` (ADR-0094).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationEnd {
+    /// The node no longer leads its group.
+    NotLeading,
+    /// The log started a new seal epoch.
+    NewEpoch {
+        /// The new epoch.
+        epoch: u64,
+    },
+    /// A purge moved the store's start past the next position to send.
+    PurgedPast {
+        /// The store's start.
+        start: u64,
+    },
+}
+
+/// One frame read from bytes by [`read_frame`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Frame<'a> {
+    /// Its index.
+    pub index: u64,
+    /// Its term.
+    pub term: u64,
+    /// Its event time.
+    pub event_time: u64,
+    /// Its payload.
+    pub payload: &'a [u8],
+    /// Its bytes, header included.
+    pub span: u64,
+}
+
+/// The frame `bytes` start with, checked as the log checks a frame at
+/// recovery: its magic, its length within `bytes`, its CRC-32C
+/// (ADR-0120 decision 6, the standby's frame check).
+///
+/// # Errors
+///
+/// [`ChainProblem::Foreign`] for another magic, [`ChainProblem::PastEnd`]
+/// for a header or payload past `bytes`' end, [`ChainProblem::Checksum`].
+pub fn read_frame(bytes: &[u8]) -> Result<Frame<'_>, ChainProblem> {
+    let (header, rest) = bytes
+        .split_first_chunk::<FRAME_HEADER>()
+        .ok_or(ChainProblem::PastEnd)?;
+    let decoded = Header::decode(header).ok_or(ChainProblem::Foreign)?;
+    let length = usize::try_from(decoded.length).map_err(|_| ChainProblem::PastEnd)?;
+    let payload = rest.get(..length).ok_or(ChainProblem::PastEnd)?;
+    check_crc(header, payload, decoded.crc, 0).map_err(|_| ChainProblem::Checksum)?;
+    Ok(Frame {
+        index: decoded.index,
+        term: decoded.term,
+        event_time: decoded.event_time,
+        payload,
+        span: decoded.end(0).ok_or(ChainProblem::PastEnd)?,
+    })
+}
+
 /// Why the log refuses an operation, or its files.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LogError {
+    /// [`RaftLog::reserve`] could not size the entry index for
+    /// `additional` more entries.
+    #[error("the entry index cannot reserve {additional} more entries")]
+    IndexFull {
+        /// The entries asked for.
+        additional: usize,
+    },
     /// An append that does not start right after the last index.
     #[error("an append at index {got}; the next index is {expected}")]
     NotNext {
@@ -531,6 +614,11 @@ pub struct RaftLog<D: Disk + Clone> {
     epoch: u64,
     /// The bytes of one seal, reused.
     seal_buf: Vec<u8>,
+    /// The frame of the entry being appended, reused (karyos#691).
+    frame_buf: Vec<u8>,
+    /// The hard state's file and its temporary file, built once, so a
+    /// save allocates nothing (karyos#691).
+    hard_state_paths: file::Paths,
     /// The longest a committed tail waits unsealed ([`RaftLog::tick`]).
     seal_interval_ns: u64,
     /// When [`RaftLog::tick`] first saw the current unsealed tail.
@@ -733,6 +821,8 @@ impl<D: Disk + Clone> RaftLog<D> {
             integrity,
             epoch,
             seal_buf: Vec::new(),
+            frame_buf: Vec::new(),
+            hard_state_paths: file::Paths::new(dir, HARD_STATE_FILE),
             seal_interval_ns: DEFAULT_SEAL_INTERVAL_NS,
             tail_since: None,
         })
@@ -1003,6 +1093,8 @@ impl<D: Disk + Clone> RaftLog<D> {
             integrity,
             epoch,
             seal_buf: Vec::new(),
+            frame_buf: Vec::new(),
+            hard_state_paths: file::Paths::new(dir, HARD_STATE_FILE),
             seal_interval_ns: DEFAULT_SEAL_INTERVAL_NS,
             tail_since: None,
         };
@@ -1109,6 +1201,86 @@ impl<D: Disk + Clone> RaftLog<D> {
     pub fn base(&self) -> Option<(u64, u64)> {
         let term = self.base_term?;
         Some((self.first_index.checked_sub(1)?, term))
+    }
+
+    /// The log's current seal epoch: the `subject` of its `ClusterLog`
+    /// seals since its last install or unsealed purge (ADR-0120).
+    #[must_use]
+    pub fn seal_epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// A2's start: the first stored byte, a frame start.
+    #[must_use]
+    pub fn store_start(&self) -> u64 {
+        self.store.start()
+    }
+
+    /// The replication source's seals (ADR-0120 decision 4): the current
+    /// epoch and its `ClusterLog` seals that cover bytes, in journal
+    /// order, which is position order. Every one starts and ends on a
+    /// frame boundary (decision 3).
+    ///
+    /// # Errors
+    ///
+    /// The journal's read errors.
+    pub fn replication_seals(&mut self) -> Result<(u64, Vec<SealRecord>), LogError> {
+        let epoch = self.epoch;
+        let mut seals = self.integrity.records()?;
+        seals.retain(|record| {
+            record.kind == SealKind::ClusterLog
+                && record.subject == epoch
+                && record.start < record.end
+        });
+        Ok((epoch, seals))
+    }
+
+    /// Where a Cluster log replication from this node starts (ADR-0120
+    /// decision 4): the current epoch's first seal boundary at or after
+    /// the store's start, always a frame start; `None` while the epoch
+    /// seals nothing there.
+    ///
+    /// # Errors
+    ///
+    /// As [`RaftLog::replication_seals`].
+    pub fn replication_start(&mut self) -> Result<Option<u64>, LogError> {
+        let start = self.store.start();
+        let (_, seals) = self.replication_seals()?;
+        Ok(seals
+            .iter()
+            .flat_map(|seal| [seal.start, seal.end])
+            .filter(|&boundary| boundary >= start)
+            .min())
+    }
+
+    /// Reads the stored bytes at `position` into `buf`, as a replication
+    /// sender polls them.
+    ///
+    /// # Errors
+    ///
+    /// [`LogError::Store`] for a range the store does not hold whole.
+    pub fn read_stored(&mut self, position: u64, buf: &mut [u8]) -> Result<(), LogError> {
+        self.store.read(position, buf)?;
+        Ok(())
+    }
+
+    /// Whether a replication of `epoch`, its next byte at `next`, must
+    /// end (ADR-0120 decision 4, `state` 5 `interrupted`): the node no
+    /// longer leads (`leading` is the caller's), the log started a new
+    /// epoch, or a purge moved its start past `next`.
+    #[must_use]
+    pub fn replication_end(&self, epoch: u64, next: u64, leading: bool) -> Option<ReplicationEnd> {
+        if !leading {
+            Some(ReplicationEnd::NotLeading)
+        } else if self.epoch != epoch {
+            Some(ReplicationEnd::NewEpoch { epoch: self.epoch })
+        } else if self.store.start() > next {
+            Some(ReplicationEnd::PurgedPast {
+                start: self.store.start(),
+            })
+        } else {
+            None
+        }
     }
 
     /// Discards every entry and restarts the log after a snapshot at
@@ -1240,7 +1412,12 @@ impl<D: Disk + Clone> RaftLog<D> {
                 commit: Some(base),
             },
         };
-        match file::replace(&mut self.disk, &self.dir, HARD_STATE_FILE, &state.encode()) {
+        match file::replace_at(
+            &mut self.disk,
+            &self.dir,
+            &self.hard_state_paths,
+            &state.encode(),
+        ) {
             Ok(()) => {
                 self.hard_state = Some(state);
                 Ok(())
@@ -1306,6 +1483,20 @@ impl<D: Disk + Clone> RaftLog<D> {
         result.map_err(LogError::Store)
     }
 
+    /// Reserves the in-memory index for `additional` more entries, so the
+    /// appends that fill it allocate nothing (karyos#691); the index
+    /// otherwise grows by doubling, an allocation now and then.
+    ///
+    /// # Errors
+    ///
+    /// [`LogError::IndexFull`] when the index cannot hold `additional`
+    /// more entries: nothing changes.
+    pub fn reserve(&mut self, additional: usize) -> Result<(), LogError> {
+        self.entries
+            .try_reserve(additional)
+            .map_err(|_| LogError::IndexFull { additional })
+    }
+
     /// Appends `entries`, each starting at [`RaftLog::next_index`] and not
     /// lowering the term; returns the last index written. Not durable
     /// until [`RaftLog::sync`].
@@ -1328,7 +1519,7 @@ impl<D: Disk + Clone> RaftLog<D> {
             .last()
             .map(|(_, term)| *term)
             .or(self.base_term);
-        let mut frames = Vec::with_capacity(entries.len());
+        // Every entry is checked before anything is written.
         for entry in entries {
             if entry.index != expected {
                 return Err(LogError::NotNext {
@@ -1343,18 +1534,32 @@ impl<D: Disk + Clone> RaftLog<D> {
                     got: entry.term,
                 });
             }
-            frames.push((entry.term, entry.frame()?));
+            if u32::try_from(entry.payload.len()).is_err() {
+                return Err(LogError::TooLarge { index: entry.index });
+            }
             last = Some(entry.term);
             expected = expected
                 .checked_add(1)
                 .ok_or(LogError::TooLarge { index: entry.index })?;
         }
-        for (term, frame) in frames {
+        // Then each is framed into the kept buffer and written: no
+        // allocation per entry once the buffer and the index have grown.
+        let mut frame = std::mem::take(&mut self.frame_buf);
+        for entry in entries {
+            let framed = entry.frame_into(&mut frame);
+            if let Err(error) = framed {
+                self.frame_buf = frame;
+                return Err(error);
+            }
             let position = self.store.written();
             let appended = self.store.append(position, &frame);
-            self.poison_on(appended)?;
-            self.entries.push((position, term));
+            if let Err(error) = self.poison_on(appended) {
+                self.frame_buf = frame;
+                return Err(error);
+            }
+            self.entries.push((position, entry.term));
         }
+        self.frame_buf = frame;
         Ok(self.last_index())
     }
 
@@ -1769,7 +1974,12 @@ impl<D: Disk + Clone> RaftLog<D> {
         if let Some(commit) = state.commit {
             self.check_commit(commit)?;
         }
-        match file::replace(&mut self.disk, &self.dir, HARD_STATE_FILE, &state.encode()) {
+        match file::replace_at(
+            &mut self.disk,
+            &self.dir,
+            &self.hard_state_paths,
+            &state.encode(),
+        ) {
             Ok(()) => {
                 self.hard_state = Some(state);
             }
@@ -1805,8 +2015,11 @@ impl<D: Disk + Clone> RaftLog<D> {
     /// Seals the log's bytes up to the end of the stored commit's entry,
     /// from where the current subject's seals end (karyos#990): never a
     /// byte Raft may still truncate. Committed bytes are durable, so they
-    /// read back as written. Unless `all`, only whole [`SEAL_CHUNK`]s are
-    /// sealed, and a shorter tail waits (karyos#1050).
+    /// read back as written. Each chunk ends on a frame boundary
+    /// ([`RaftLog::chunk_end`], ADR-0120 decision 3), so a seal never ends
+    /// inside a frame and a replicated range is whole frames. Unless
+    /// `all`, a chunk is sealed only once at least [`SEAL_CHUNK`] bytes
+    /// wait, and a shorter tail waits (karyos#1050).
     fn seal_committed(&mut self, all: bool) -> Result<(), LogError> {
         let Some((commit, end)) = self.committed_end() else {
             return Ok(());
@@ -1822,10 +2035,10 @@ impl<D: Disk + Clone> RaftLog<D> {
             start = self.store.start();
         }
         while start < end {
-            let chunk_end = end.min(start.saturating_add(SEAL_CHUNK));
-            if !all && chunk_end.saturating_sub(start) < SEAL_CHUNK {
+            if !all && end.saturating_sub(start) < SEAL_CHUNK {
                 break;
             }
+            let chunk_end = self.chunk_end(start, end);
             let length = usize::try_from(chunk_end.saturating_sub(start))
                 .map_err(|_| LogError::TooLarge { index: commit })?;
             self.seal_buf.resize(length, 0);
@@ -1835,6 +2048,35 @@ impl<D: Disk + Clone> RaftLog<D> {
             start = chunk_end;
         }
         Ok(())
+    }
+
+    /// Where the seal chunk from `start` ends, on a frame boundary, at most
+    /// `end` (ADR-0120 decision 3): `end` itself when it is within
+    /// [`SEAL_CHUNK`], else the last frame start that fits the chunk, or,
+    /// when the frame at `start` alone is longer than a chunk, that
+    /// frame's end. `end` is a frame's end (the stored commit's), and a
+    /// frame start is the start of an entry's frame, so the chunk is
+    /// always whole frames once `start` is a frame start, as every seal
+    /// written since this rule is.
+    fn chunk_end(&self, start: u64, end: u64) -> u64 {
+        let limit = start.saturating_add(SEAL_CHUNK);
+        if end <= limit {
+            return end;
+        }
+        // The frame starts strictly after `start`, in order.
+        let after = self
+            .entries
+            .partition_point(|&(position, _)| position <= start);
+        let fits = self
+            .entries
+            .partition_point(|&(position, _)| position <= limit);
+        match self.entries.get(after..fits).and_then(<[_]>::last) {
+            Some(&(position, _)) => position,
+            None => self
+                .entries
+                .get(after)
+                .map_or(end, |&(position, _)| position.min(end)),
+        }
     }
 
     /// The stored commit and where its entry ends in the log, if the log

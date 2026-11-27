@@ -15,15 +15,23 @@
 //! - [`HmacSha256`] is the selected wire authentication profile,
 //!   HMAC-SHA-256 with a 16-byte tag (owner decision D51). No channel uses
 //!   it yet: the channel gate keeps `authenticated` refused.
+//! - [`AesGcmSiv`] is the selected encrypted profile, AES-256-GCM-SIV with
+//!   a 16-byte tag (ADR-0114, owner decision D53). No channel uses it: the
+//!   channel gate keeps `encrypted` refused.
 //! - `Synthetic` (feature `test-hooks`, or tests) spins for a calibrated
 //!   time on each side. It checks the measurement harness end to end and
 //!   is never a profile: its results never reach a decision report.
 
+pub mod aes_gcm_siv;
+pub mod hkdf;
 pub mod hmac_key;
 pub mod hmac_sha256;
 pub mod replay;
 pub mod signed;
+#[cfg(test)]
+pub(crate) mod timing;
 
+pub use self::aes_gcm_siv::AesGcmSiv;
 pub use hmac_sha256::HmacSha256;
 
 /// A datagram buffer too small for its frames and the envelope.

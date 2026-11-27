@@ -56,8 +56,8 @@ use karyos_sim::harness::core::{
     drive_into,
 };
 use karyos_sim::harness::node::{
-    Breach, Command, Observation, Positions, SEAL_TICKS, ServiceBounds, TestService,
-    Wire as Harness,
+    Breach, Command, HARNESS_CLUSTER, Observation, Positions, SEAL_TICKS, ServiceBounds,
+    TestService, Wire as Harness,
 };
 use karyos_sim::harness::probe::{self, Probed};
 use karyos_sim::harness::standby::FIRST_GENERATION;
@@ -374,7 +374,9 @@ pub fn ticks_since(start: Instant) -> u64 {
 /// length, the session's id, a kind, then its fields, little endian; `None`
 /// for a message no client or server sends the other. The id routes a
 /// server's answer to its session: one client process runs every session
-/// of its window over one connection.
+/// of its window over one connection. A process run has one cluster, the
+/// harness's ([`HARNESS_CLUSTER`]; ADR-0123): the frame does not carry
+/// it, and a decoded message names it.
 #[must_use]
 pub fn frame<M>(client: NodeId, message: &Harness<M>) -> Option<Vec<u8>> {
     let mut framed = Vec::new();
@@ -392,7 +394,7 @@ pub fn frame_into<M>(client: NodeId, message: &Harness<M>, out: &mut Vec<u8>) ->
     out.extend_from_slice(&client.to_le_bytes());
     let body = out;
     match message {
-        Harness::Request(command) => {
+        Harness::Request(_, command) => {
             body.push(1);
             body.extend_from_slice(&command.encode());
         }
@@ -401,6 +403,7 @@ pub fn frame_into<M>(client: NodeId, message: &Harness<M>, out: &mut Vec<u8>) ->
             bytes,
             index,
             generation,
+            ..
         } => {
             body.push(2);
             body.extend_from_slice(&sequence.to_le_bytes());
@@ -408,15 +411,15 @@ pub fn frame_into<M>(client: NodeId, message: &Harness<M>, out: &mut Vec<u8>) ->
             body.extend_from_slice(&generation.to_le_bytes());
             body.extend_from_slice(bytes);
         }
-        Harness::Refused { sequence } => {
+        Harness::Refused { sequence, .. } => {
             body.push(3);
             body.extend_from_slice(&sequence.to_le_bytes());
         }
-        Harness::Busy { sequence } => {
+        Harness::Busy { sequence, .. } => {
             body.push(4);
             body.extend_from_slice(&sequence.to_le_bytes());
         }
-        Harness::Redirect { server } => {
+        Harness::Redirect { server, .. } => {
             body.push(5);
             body.extend_from_slice(&server.to_le_bytes());
         }
@@ -543,20 +546,24 @@ fn message_of<M>(body: &[u8]) -> Option<Harness<M>> {
             .map(|bytes| u64::from_le_bytes(*bytes))
     };
     Some(match kind {
-        1 => Harness::Request(Command::decode(rest)?),
+        1 => Harness::Request(HARNESS_CLUSTER, Command::decode(rest)?),
         2 => Harness::Response {
+            cluster: HARNESS_CLUSTER,
             sequence: u64_at(0)?,
             index: u64_at(8)?,
             generation: u64_at(16)?,
             bytes: rest.get(24..)?.to_vec(),
         },
         3 if rest.len() == 8 => Harness::Refused {
+            cluster: HARNESS_CLUSTER,
             sequence: u64_at(0)?,
         },
         4 if rest.len() == 8 => Harness::Busy {
+            cluster: HARNESS_CLUSTER,
             sequence: u64_at(0)?,
         },
         5 if rest.len() == 4 => Harness::Redirect {
+            cluster: HARNESS_CLUSTER,
             server: NodeId::from_le_bytes(*rest.first_chunk::<4>()?),
         },
         _ => return None,
@@ -761,6 +768,9 @@ struct Serving<M> {
     pending: Pending,
     commit: Option<u64>,
     configuration: Option<karyos_sim::harness::core::Configuration>,
+    /// The core's configuration stamp when it was last asked, as
+    /// `ServerNode` keeps it (karyos#711).
+    configuration_stamp: Option<u64>,
     positions: Option<Positions>,
     items: Vec<(u64, Item)>,
     /// Messages to clients.
@@ -864,8 +874,13 @@ impl<M> Serving<M> {
     ) {
         let sequence = command.sequence;
         if self.stopped {
-            self.replies
-                .push((command.client, Harness::Refused { sequence }));
+            self.replies.push((
+                command.client,
+                Harness::Refused {
+                    cluster: HARNESS_CLUSTER,
+                    sequence,
+                },
+            ));
             return;
         }
         command.encode_into(&mut self.command);
@@ -881,8 +896,13 @@ impl<M> Serving<M> {
                     sequence,
                     limit,
                 });
-                self.replies
-                    .push((command.client, Harness::Busy { sequence }));
+                self.replies.push((
+                    command.client,
+                    Harness::Busy {
+                        cluster: HARNESS_CLUSTER,
+                        sequence,
+                    },
+                ));
             }
             Err(Refused::NotLeader(NotLeader {
                 leader: Some(leader),
@@ -893,12 +913,21 @@ impl<M> Serving<M> {
                     sequence,
                     to: leader,
                 });
-                self.replies
-                    .push((command.client, Harness::Redirect { server: leader }));
+                self.replies.push((
+                    command.client,
+                    Harness::Redirect {
+                        cluster: HARNESS_CLUSTER,
+                        server: leader,
+                    },
+                ));
             }
-            Err(Refused::NotLeader(_)) => self
-                .replies
-                .push((command.client, Harness::Refused { sequence })),
+            Err(Refused::NotLeader(_)) => self.replies.push((
+                command.client,
+                Harness::Refused {
+                    cluster: HARNESS_CLUSTER,
+                    sequence,
+                },
+            )),
         }
     }
 
@@ -1004,6 +1033,7 @@ impl<M> Serving<M> {
                         replies.push((
                             applied.client,
                             Harness::Response {
+                                cluster: HARNESS_CLUSTER,
                                 sequence: applied.sequence,
                                 bytes,
                                 index: entry.index,
@@ -1056,7 +1086,14 @@ impl<M> Serving<M> {
     /// The configuration, commit and positions, each when it changed.
     fn record_state<C: ConsensusCore<Message = M>>(&mut self, core: &C, log: &RaftLog<StdDisk>) {
         let node = self.id;
-        if let Some(configuration) = core.configuration()
+        // Asked only when the core says it may have moved, as `ServerNode`
+        // asks it: building it allocates, and the replication path must
+        // not (ADR-0105).
+        let stamp = core.configuration_stamp();
+        let moved = stamp.is_none() || stamp != self.configuration_stamp;
+        self.configuration_stamp = stamp;
+        if moved
+            && let Some(configuration) = core.configuration()
             && self.configuration.as_ref() != Some(&configuration)
         {
             let entry_term = configuration.index.and_then(|index| log.term(index));
@@ -1277,6 +1314,7 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
         pending: Pending::prefilled(pending_room(&bounds)),
         commit: core.committed(),
         configuration: None,
+        configuration_stamp: None,
         positions: None,
         items: Vec::new(),
         replies: Vec::with_capacity(reply_room(&bounds)),
@@ -1380,7 +1418,7 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
         // Clients' requests, each on the connection that sent it.
         for (at, connection) in connections.iter_mut().enumerate() {
             for (_, message) in connection.poll::<C::Message>(&mut scratch) {
-                if let Harness::Request(command) = message {
+                if let Harness::Request(_, command) = message {
                     let _ = clients.insert(command.client, at);
                     serving.request(&mut core, &mut log, &command);
                 }
@@ -1520,16 +1558,26 @@ mod tests {
             op: karyos_sim::harness::node::Op::Append(vec![1, 2, 3]),
         };
         for message in [
-            Harness::<()>::Request(command),
+            Harness::<()>::Request(HARNESS_CLUSTER, command),
             Harness::Response {
+                cluster: HARNESS_CLUSTER,
                 sequence: 2,
                 bytes: vec![0, 1],
                 index: 9,
                 generation: 1,
             },
-            Harness::Refused { sequence: 2 },
-            Harness::Busy { sequence: 2 },
-            Harness::Redirect { server: 1 },
+            Harness::Refused {
+                cluster: HARNESS_CLUSTER,
+                sequence: 2,
+            },
+            Harness::Busy {
+                cluster: HARNESS_CLUSTER,
+                sequence: 2,
+            },
+            Harness::Redirect {
+                cluster: HARNESS_CLUSTER,
+                server: 1,
+            },
         ] {
             let mut buffer = frame(7, &message).unwrap_or_default();
             // Split across two reads: nothing until the frame is whole.

@@ -69,6 +69,107 @@ pub enum TimedNetworkUnsupported {
     EtfDeclarationInvalid,
 }
 
+/// An authenticated operation this build does not support: refused at
+/// admission, never run under a weaker rule (ADR-0035, ADR-0076; karyos#648:
+/// the authenticated class serves one unicast publisher-to-receiver pair).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AuthUnsupported {
+    /// A multicast destination.
+    #[error("multicast")]
+    Multicast,
+    /// A multi-destination channel, or required destinations.
+    #[error("multi-destination")]
+    MultiDestination,
+    /// Dynamic registration (`control-mode=dynamic`, an allowlist or a
+    /// registering subscription).
+    #[error("dynamic registration")]
+    Dynamic,
+    /// Redundant (routed) paths.
+    #[error("redundant paths")]
+    Routed,
+    /// Paired unicast paths.
+    #[error("paired paths")]
+    PairedPaths,
+    /// Receiver roles or tags.
+    #[error("receiver roles")]
+    Roles,
+    /// An `etf` declaration (ADR-0109).
+    #[error("an etf declaration")]
+    Etf,
+}
+
+/// Why an authenticated channel is refused at admission, before anything
+/// is established (karyos#648; ADR-0086 sections 4, 6 and 7, ADR-0118).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AuthRefusal {
+    /// The driver has no wire key store
+    /// ([`crate::EmbeddedDriver::start_wire_keys`]).
+    #[error("no wire key store")]
+    NoKeyStore,
+    /// The key store failed and names no key.
+    #[error("the wire key store is disabled")]
+    KeyStoreDisabled,
+    /// No valid channel key of the configured id, purpose and stream.
+    #[error("no valid channel key")]
+    ChannelKey,
+    /// No valid pairwise key of the configured id for its one receiver.
+    #[error("no valid pairwise key")]
+    PairwiseKey,
+    /// No valid authority key of the configured id, authority and guard
+    /// that may abort.
+    #[error("no valid authority key")]
+    AuthorityKey,
+    /// Not one unicast receiver: fan-out, multicast, several or dynamic
+    /// destinations, redundant or paired paths, a receiver identity other
+    /// than the configured one, an unanswerable authority endpoint, or a
+    /// second handle of the key under other keys.
+    #[error("not a single unicast receiver")]
+    Ambiguous,
+    /// The verify budget of the authority's control endpoint cannot be
+    /// reserved: the receiver's peer table is full.
+    #[error("the signed control budget cannot be reserved")]
+    ControlBudget,
+    /// A remote guard needs the driver's durable guard state
+    /// ([`crate::EmbeddedDriver::start_guard_state`]), or a guarded
+    /// publication names both a local and a remote guard.
+    #[error("no durable guard state")]
+    GuardState,
+    /// An operation the authenticated class does not support yet.
+    #[error("unsupported on an authenticated channel: {operation}")]
+    Unsupported {
+        /// Which.
+        operation: AuthUnsupported,
+    },
+    /// The channel key file's scope (`channel_id`, `stream_id`) is not the
+    /// channel's, or the key id is bound to another scope already.
+    #[error("the channel key's scope is not the channel's")]
+    ChannelScope,
+    /// The pairwise key file's scope (`receiver_id`, `publisher_id`) is not
+    /// the channel's, or the key id is bound to another scope already.
+    #[error("the pairwise key's scope is not the channel's")]
+    PairwiseScope,
+    /// A VM generation change is not released: no authenticated key is
+    /// derived until every role redrew its identities (ADR-0086 section 7,
+    /// ADR-0114 section 10).
+    #[error("a VM generation change is not released")]
+    GenerationChange,
+    /// A key file the channel names serves the other protection class:
+    /// an `encrypted` channel names only `profile_id=16` channel and
+    /// pairwise files (ADR-0114 section 4a, one class per file).
+    #[error("a key file of the other protection class")]
+    KeyClass,
+    /// An `authenticated` or `encrypted` channel whose MTU less its
+    /// class's envelope leaves a log MTU below the smallest a receiver
+    /// accepts (ADR-0086 section 5, ADR-0114 section 11).
+    #[error("the channel MTU leaves no inner budget for the envelope")]
+    Mtu,
+    /// The driver's challenge table is configured above the authenticated
+    /// profile's hard ceilings: more than 256 pending challenges, or more
+    /// than 8 per source address (ADR-0086 section 6; H8 R5-04).
+    #[error("the challenge table is configured above the profile ceilings")]
+    ChallengeCeiling,
+}
+
 /// Errors returned by the embedded driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
@@ -450,6 +551,16 @@ pub enum DriverError {
         /// The stream id.
         stream: u64,
     },
+    /// An authenticated channel was refused at admission (karyos#648).
+    #[error("authenticated channel refused: {reason}")]
+    AuthenticatedRefused {
+        /// Why.
+        reason: AuthRefusal,
+    },
+    /// The wire key store could not start
+    /// ([`crate::EmbeddedDriver::start_wire_keys`]).
+    #[error("the wire key store cannot start: {0}")]
+    KeyStoreStart(crate::wire_keys::store::StoreError),
     /// A network publication's timed lanes cannot take this yet.
     #[error("a timed network publication does not support {reason}")]
     TimedNetworkUnsupported {

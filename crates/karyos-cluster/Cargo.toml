@@ -17,8 +17,23 @@ categories = ["network-programming", "concurrency"]
 karyos-archive.workspace = true
 karyos-codec.workspace = true
 thiserror.workspace = true
+# The rebuild identity's derivation (ADR-0123 decision 2), with backups only.
+sha2 = { workspace = true, optional = true }
+
+[features]
+# Backups to remote storage and a rebuild from them (`backup`): control
+# path only. Off by default; karyos-tools enables it, and
+# scripts/check-cluster-backup-graph.sh keeps it out of every data-path
+# graph.
+backup = ["dep:sha2"]
+
+[[test]]
+name = "backup"
+required-features = ["backup"]
 
 [dev-dependencies]
+# The counting allocator of the client's allocation test (karyos#720).
+karyos-sys = { workspace = true, features = ["alloc-count"] }
 # The calibration and UTC reference records of tests/c_time_evidence.rs.
 karyos-trace.workspace = true
 

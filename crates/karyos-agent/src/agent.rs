@@ -308,8 +308,28 @@ impl Agent {
         let (mut journal, journal_error) = match config.journal.as_deref() {
             None => (None, None),
             Some(dir) => match Journal::open_with(dir, start, config.journal_retention.clone()) {
-                Ok(journal) => (Some(journal), None),
-                Err(error) => (None, Some(error.to_string())),
+                Ok(mut journal) => {
+                    // An earlier start that could not open the journal is
+                    // an unknown interval, from its marker (karyos#773
+                    // review); the marker goes once it is recorded.
+                    let marker = crate::journal::outage_marker(dir);
+                    if let Ok(text) = std::fs::read_to_string(&marker) {
+                        let from = text.trim().parse().unwrap_or(0);
+                        if journal.record_outage(from, start).is_ok() {
+                            let _ = std::fs::remove_file(&marker);
+                        }
+                    }
+                    (Some(journal), None)
+                }
+                Err(error) => {
+                    // Best effort: a marker that cannot be written leaves
+                    // the outage in memory only, for this run.
+                    let marker = crate::journal::outage_marker(dir);
+                    if !marker.exists() {
+                        let _ = std::fs::write(&marker, start.to_string());
+                    }
+                    (None, Some(error.to_string()))
+                }
             },
         };
         let operations = journal
@@ -581,6 +601,58 @@ impl Agent {
             self.config.guard_timeout,
             host_monotonic_ns,
         )
+    }
+
+    /// Journals a guard close (`reopen_at` `None`) or a reopen at epoch
+    /// `reopen_at` of `guard` in the driver in `dir` that `requester`'s
+    /// role does not allow, refused `not_authorised`, and sends nothing
+    /// (karyos#719; `operations::refuse_unauthorised`).
+    pub fn guard_refused(
+        &mut self,
+        dir: &Path,
+        guard: u64,
+        reopen_at: Option<u64>,
+        requester: Requester,
+        reason: &[u8],
+    ) {
+        let operation = self.allocate_operation();
+        let command = operations::Command {
+            dir,
+            guard,
+            transition: reopen_at.map_or(
+                operations::Transition::Close,
+                operations::Transition::Reopen,
+            ),
+            instance: None,
+            operation,
+            operator: requester.operator,
+            relay: requester.relay,
+            reason: operations::cut_reason(reason),
+            timeout: self.config.guard_timeout,
+        };
+        operations::refuse_unauthorised(self.journal.as_mut(), &command, host_monotonic_ns());
+    }
+
+    /// Journals a retention `operation` on Archive `recording` that
+    /// `requester`'s role does not allow, refused `not_authorised`, and
+    /// sends nothing (karyos#719; [`crate::retention::refuse_unauthorised`]).
+    pub fn retention_refused(
+        &mut self,
+        operation: crate::retention::Operation,
+        recording: u64,
+        requester: Requester,
+        reason: &[u8],
+    ) {
+        let id = self.allocate_operation();
+        let command = crate::retention::Command {
+            operation,
+            recording,
+            id,
+            operator: requester.operator,
+            relay: requester.relay,
+            reason,
+        };
+        crate::retention::refuse_unauthorised(self.journal.as_mut(), &command, host_monotonic_ns());
     }
 
     /// Makes a retention `operation` on the agent's own operations journal
@@ -1563,7 +1635,85 @@ impl Agent {
                 .map(|integrity| integrity.purged.clone())
                 .unwrap_or_default(),
             purge_pending: journal.is_some_and(Journal::purge_pending),
+            head: journal.and_then(Journal::head),
         })
+    }
+
+    /// Appends a product service's record to the operations journal for
+    /// `requester` (R-CORE-42, karyos#773; [`crate::product`] states the
+    /// contract): durably when `append` waits for it, refused when the
+    /// journal cannot record it, and an import only when it names an
+    /// unknown interval the journal holds. Nothing in it is interpreted.
+    pub fn journal_append(
+        &mut self,
+        append: &crate::product::ProductAppend<'_>,
+        requester: Requester,
+    ) -> crate::product::ProductAnswer {
+        use crate::product::ProductAnswer;
+
+        let Some(journal) = self.journal.as_mut() else {
+            return ProductAnswer::JournalUnavailable;
+        };
+        if let Some(import) = append.import
+            && (import.recording != journal.recording()
+                || !journal.holds_unknown_interval(import.interval))
+        {
+            // An unavailable journal holds nothing to name.
+            if journal.unavailable() {
+                return ProductAnswer::JournalUnavailable;
+            }
+            return ProductAnswer::NotAnInterval {
+                recording: import.recording,
+                position: import.interval,
+            };
+        }
+        let now = host_monotonic_ns();
+        let record = append.record(requester, now);
+        let written = if append.waits() {
+            journal.append_durable(&record, now)
+        } else {
+            journal.append(&record, now)
+        };
+        match written {
+            Ok(position) => ProductAnswer::Journalled {
+                recording: journal.recording(),
+                position,
+                durable: append.waits(),
+            },
+            Err(_) => ProductAnswer::JournalUnavailable,
+        }
+    }
+
+    /// Makes every journal record already written durable before a view
+    /// is taken, so the view's `journal.head` follows every record
+    /// written before it (R-CORE-14; karyos#725; [`Journal::settle`]).
+    pub fn settle_journal(&mut self) {
+        if let Some(journal) = self.journal.as_mut() {
+            journal.settle(host_monotonic_ns());
+        }
+    }
+
+    /// A page of the operations journal's history (R-CORE-14;
+    /// karyos#725): up to `count` records from `from`, or from the
+    /// retention floor (see [`crate::journal::history`]).
+    ///
+    /// # Errors
+    ///
+    /// [`HistoryRefusal::NotConfigured`](crate::journal::HistoryRefusal)
+    /// without a journal, and [`Journal::history`]'s refusals.
+    pub fn journal_history(
+        &mut self,
+        from: Option<crate::journal::HistoryCursor>,
+        count: usize,
+    ) -> Result<crate::journal::HistoryPage, crate::journal::HistoryRefusal> {
+        use crate::journal::HistoryRefusal;
+        if self.config.journal.is_none() {
+            return Err(HistoryRefusal::NotConfigured);
+        }
+        self.journal
+            .as_mut()
+            .ok_or(HistoryRefusal::Unavailable)?
+            .history(from, count)
     }
 
     /// Attaches to every driver it is not attached to, reads every one it
@@ -1764,8 +1914,9 @@ impl Agent {
 
     /// Its capabilities for a caller who may close guards (`close`),
     /// reopen them (`reopen`), acknowledge the journal's unknown interval
-    /// (`acknowledge`) and write the join registry (`register`,
-    /// karyos#736), in [`crate::api::CAPABILITIES`] order
+    /// (`acknowledge`), write the join registry (`register`,
+    /// karyos#736) and append a product's records to the journal
+    /// (`append`, karyos#773), in [`crate::api::CAPABILITIES`] order
     /// (R-CORE-24). What this deployment does not offer is `Unavailable`,
     /// whatever the role; what it offers but the role does not allow is
     /// `Forbidden`.
@@ -1776,6 +1927,7 @@ impl Agent {
         reopen: bool,
         acknowledge: bool,
         register: bool,
+        append: bool,
     ) -> Vec<crate::api::Capability> {
         use crate::api::{CAPABILITIES, Capability, CapabilityState};
 
@@ -1790,6 +1942,12 @@ impl Agent {
                 (Some("journal_unavailable"), Some("journal_unavailable"))
             }
             (Some(_), Some(_)) => (None, None),
+        };
+        // The history reads a journal that opened and can still be read.
+        let history_off = match (&self.config.journal, &self.journal) {
+            (None, _) => Some("not_configured"),
+            (Some(_), Some(journal)) if journal.head().is_some() => None,
+            (Some(_), _) => Some("journal_unavailable"),
         };
         let catalog = self.drivers.iter().any(|driver| driver.catalog.is_some());
         // The admin command clearance these flags name: an administrator
@@ -1813,6 +1971,11 @@ impl Agent {
                     "view" | "trace-window" | "limits" | "trace-buckets" | "trace-export"
                     | "join-registry" | "clocks" | "rate-limits" => (None, true),
                     "join-put" => (None, register),
+                    // Every role reads the history the view summarises.
+                    "journal-history" => (history_off, true),
+                    // A product service's records need a journal that
+                    // records (karyos#773).
+                    "journal-append" => (history_off, append),
                     // The safety path is a closer's; an administrator's
                     // change needs the journal, which the answer reports.
                     "rate-change" => (None, close || acknowledge),
@@ -2220,13 +2383,7 @@ fn gap_view(gap: Gap) -> GapView {
         position: gap.position,
         from: gap.from,
         to: gap.to,
-        reason: match gap.reason {
-            GapReason::RequestWithoutOutcome => "request_without_outcome",
-            GapReason::TornTail => "torn_tail",
-            GapReason::JournalReplaced => "journal_replaced",
-            GapReason::JournalUnavailableAtStart => "journal_unavailable_at_start",
-            _ => "unclean_stop",
-        },
+        reason: gap.reason.name(),
     }
 }
 
@@ -2235,3 +2392,6 @@ mod tests;
 
 #[cfg(test)]
 mod approval_tests;
+
+#[cfg(test)]
+mod product_tests;

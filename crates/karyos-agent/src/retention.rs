@@ -14,6 +14,10 @@
 //!   answer [`RetentionAnswer::JournalUnavailable`] and nothing is sent.
 //! - A **seal verification** reads; its request is journalled without
 //!   waiting, like a hold.
+//! - A request the role does **not allow** is never sent: its request and
+//!   its outcome, refused `not_authorised`, are journalled without
+//!   waiting ([`refuse_unauthorised`]), so every request and its outcome
+//!   are in the journal (SPEC §13, Audited operations; karyos#719).
 //!
 //! The reserved recording name `journal` (ADR-0113) names the agent's own
 //! operations journal instead: [`journal_command`] runs the same four
@@ -330,6 +334,24 @@ pub fn retention_command(
         let _ = journal.append(&record, record.time);
     }
     answer
+}
+
+/// Journals `command`, which its requester's role does not allow, as
+/// refused `not_authorised` (karyos#719): its request record, then its
+/// outcome record with the refusal, both without waiting. Nothing is
+/// sent; a journal that cannot record them changes nothing else, the
+/// answer being `forbidden` either way.
+pub fn refuse_unauthorised(journal: Option<&mut Journal>, command: &Command<'_>, now: u64) {
+    let Some(journal) = journal else {
+        return;
+    };
+    let (request, outcome) = command.operation.kinds();
+    let record = command.record(request, now);
+    let _ = journal.append(&record, now);
+    let mut record = command.record(outcome, now);
+    record.code = crate::journal::retention::REFUSED;
+    record.word = refusal_word("not_authorised");
+    let _ = journal.append(&record, now);
 }
 
 /// The outcome record of `command` that came to `answer`.

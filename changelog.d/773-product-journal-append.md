@@ -1,0 +1,8 @@
+### Added
+
+- A product service's records in the operations journal (R-CORE-42, karyos#773), new in agent API v1 with every existing answer unchanged:
+  - **`journal-append request|outcome durable|ordinary OPID SERVICE COMMAND VALUE CORRELATION [REASON]`:** a request record before the product sends a command and an outcome record after, under the product's operation id, with the service, the command, the parameters digest (request) or outcome code (outcome) and the product's log-entry correlation. Only the new role `service` (`--role UID=service`) and an administrator may append; every other role is answered `forbidden`. The agent checks the form only and interprets nothing.
+  - **Durable or ordinary:** a `durable` append answers once the record is durable, and one that cannot be made durable is refused (`{"error":"journal unavailable","journalled":false}`) with nothing recorded, so a fail-closed command is never sent unrecorded. An `ordinary` one does not wait.
+  - **`journal-import INTERVAL TIME request|outcome ...`:** after an outage, the product imports what it kept by operation id, naming the unknown interval the journal recorded at the next start, with the product's own time of the original record; an import is durable, has its own record kinds, and is refused for a position that is no unknown interval. The interval stays visible as the journal's gap until an administrator acknowledges it.
+  - **Records:** four new journal kinds, `product_request`, `product_outcome`, `product_request_imported` and `product_outcome_imported`, which the journal history serves with their fields; existing records decode unchanged.
+  - **Capabilities:** `journal-append`, for a service and an administrator while the journal can record.

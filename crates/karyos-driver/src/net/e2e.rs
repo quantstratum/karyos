@@ -52,6 +52,15 @@ fn driver(threading: ThreadingMode) -> EmbeddedDriver {
     driver_with(threading, AgentConfig::default())
 }
 
+/// A driver whose IPv4 loopback data endpoints bind a fixed port, from
+/// outside the ephemeral range ([`crate::net::Network::pin_data_ports`]):
+/// its publishers are fixed port ones, which a reset never moves.
+fn fixed_port_driver(threading: ThreadingMode) -> EmbeddedDriver {
+    let mut driver = driver(threading);
+    driver.net.as_mut().unwrap().pin_data_ports();
+    driver
+}
+
 /// A driver whose silent images retire within 100 ms.
 fn fast_driver(threading: ThreadingMode) -> EmbeddedDriver {
     driver_with(threading, fast_agents())
@@ -3420,6 +3429,110 @@ fn a_reset_under_max_leaves_a_lagging_optional_receivers_loss_reported() {
     {
         assert_eq!(closes, (1, 0), "C closed as unrecoverable");
     }
+}
+
+/// A port 0 publisher whose port another socket takes while a reset has
+/// it closed is not failed: it reopens on a new ephemeral port, announces
+/// again, and its receiver binds the new source as a path of the same
+/// image, so every message still arrives, once and in order.
+#[test]
+fn a_port_0_publisher_whose_port_is_taken_across_a_reset_moves() {
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (publication, image) = connected(&mut a, &mut b, true, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let (endpoint, _) = a
+        .net
+        .as_ref()
+        .unwrap()
+        .publication_route(publication.registration())
+        .unwrap();
+    let before = a.net.as_ref().unwrap().endpoint_address(endpoint).unwrap();
+    a.net.as_mut().unwrap().occupy_ports_on_reset();
+    let (mut sent, mut seen) = (0u32, 0u32);
+    for (round, until) in [16u32, 32].into_iter().enumerate() {
+        if round > 0 {
+            force_reset(&a, &publication);
+        }
+        pump(&mut [&mut a, &mut b], |drivers| {
+            while sent < until {
+                match lane.offer(&sent.to_le_bytes()).unwrap() {
+                    OfferOutcome::Accepted { .. } => sent += 1,
+                    _ => break,
+                }
+            }
+            let _ = reader.poll(
+                |bytes, _, _| {
+                    assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), seen);
+                    seen += 1;
+                },
+                BUDGET,
+            );
+            let net = drivers[0].net.as_ref().unwrap();
+            net.ports_moved() >= u64::try_from(round).unwrap() && seen >= until
+        });
+    }
+    let net = a.net.as_mut().unwrap();
+    let after = net.endpoint_address(endpoint).unwrap();
+    assert_ne!(after.port(), before.port(), "moved to a new port");
+    assert_eq!(after.ip(), before.ip());
+    assert_eq!(net.endpoints_failed(), 0);
+    assert!(net.sender_counters().unwrap().endpoints_moved >= 1);
+    // The socket that took the old port still holds it.
+    let occupied = net.take_occupied();
+    assert_eq!(occupied.len(), 1);
+    assert_eq!(occupied[0].local_addr().unwrap(), before);
+}
+
+/// A publisher bound to a fixed port whose port another socket takes
+/// while a reset has it closed keeps the documented behaviour: the
+/// endpoint fails (its receivers bind that address), nothing moves.
+#[test]
+fn a_fixed_port_publisher_whose_port_is_taken_across_a_reset_fails() {
+    let (mut a, mut b) = (
+        fixed_port_driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+    );
+    let (publication, image) = connected(&mut a, &mut b, true, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    // Traffic first: the publication serves its endpoint in this epoch,
+    // so the reset asked for below is one it acts on.
+    let (mut sent, mut seen) = (0u32, 0u32);
+    pump(&mut [&mut a, &mut b], |_| {
+        while sent < 16 {
+            match lane.offer(&sent.to_le_bytes()).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        let _ = reader.poll(|_, _, _| seen += 1, BUDGET);
+        seen >= 16
+    });
+    let (endpoint, _) = a
+        .net
+        .as_ref()
+        .unwrap()
+        .publication_route(publication.registration())
+        .unwrap();
+    let before = a.net.as_ref().unwrap().endpoint_address(endpoint).unwrap();
+    assert_ne!(before.port(), 0);
+    a.net.as_mut().unwrap().occupy_ports_on_reset();
+    force_reset(&a, &publication);
+    pump(&mut [&mut a, &mut b], |drivers| {
+        let net = drivers[0].net.as_ref().unwrap();
+        net.endpoints_failed() >= 1 || net.reopened() >= 1
+    });
+    let net = a.net.as_mut().unwrap();
+    assert_eq!(net.endpoints_failed(), 1, "the endpoint failed");
+    assert_eq!(net.ports_moved(), 0);
+    assert_eq!(net.reopened(), 0);
+    assert_eq!(net.endpoint_address(endpoint), None, "the endpoint is gone");
+    assert_eq!(net.take_occupied().len(), 1);
 }
 
 /// Posts an endpoint reset of `publication`'s route on A.

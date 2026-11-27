@@ -1242,8 +1242,11 @@ impl<T: StreamTerms> Stream<T> {
 #[derive(Debug)]
 pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) id: u64,
-    /// The random 128-bit `driver_id` of SPEC.md §4, drawn once at start.
+    /// The random 128-bit `driver_id` of SPEC.md §4, drawn at start and
+    /// again after each VM generation change (ADR-0114 section 10).
     pub(crate) driver_id: [u64; 2],
+    /// The VM generation `driver_id` was drawn for.
+    pub(crate) driver_generation: u64,
     /// The next trace number: journal numbers and traced subscriber
     /// registrations, never reused within this driver instance.
     pub(crate) next_trace_number: u64,
@@ -1757,6 +1760,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             point_names: Vec::new(),
             id,
             driver_id,
+            driver_generation: crate::wire_enc::vm_generation::generation(),
             next_trace_number: 1,
             config,
             streams: Vec::new(),
@@ -4521,6 +4525,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// [`DriverError::WorkCountOverflow`] when the work count does not fit
     /// `u32`.
     pub fn do_work(&mut self) -> Result<u32, DriverError> {
+        // ADR-0114 section 10 step 3: the fresh `driver_id` of each VM
+        // generation change, the one the sender role took; the admission
+        // instance id stays the one drawn at start.
+        while self.driver_generation < crate::wire_enc::vm_generation::generation() {
+            let generation = self.driver_generation.saturating_add(1);
+            let Some(next) = crate::wire_enc::vm_generation::successor(self.driver_id, generation)
+            else {
+                break;
+            };
+            self.driver_id = next;
+            self.driver_generation = self.driver_generation.saturating_add(1);
+        }
         // Replay targets whose feed was dropped unfinished retire.
         self.reap_replays();
         #[cfg(target_os = "linux")]

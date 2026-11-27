@@ -28,6 +28,7 @@
 pub mod archive;
 pub mod archive_signer;
 pub mod args;
+pub mod backup;
 pub mod calibrate;
 pub mod capability_log;
 pub mod catalog;
@@ -42,6 +43,7 @@ pub mod daemon_archive;
 pub mod daemon_replica;
 #[cfg(target_os = "linux")]
 pub mod daemon_replication;
+pub mod daemon_trace;
 pub mod errors;
 pub mod idle;
 #[cfg(target_os = "linux")]
@@ -50,4 +52,5 @@ pub mod replay;
 pub mod replay_live;
 pub mod stat;
 pub mod trace;
+pub mod upgrade_evidence;
 pub mod versions;

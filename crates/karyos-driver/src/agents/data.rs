@@ -142,10 +142,73 @@ struct DataGate<'a> {
     held: bool,
     /// A guarded publication's gate, which decides every exposure.
     guard: Option<&'a mut GuardGate>,
+    /// An authenticated or encrypted publication's provenance check at
+    /// exposure (H8 R5-03); `None` on a trusted channel and when only
+    /// returning heads.
+    seal: Option<SealGate<'a>>,
+    /// The lane the sender is flushing: the next check is its exposure.
+    flushing: Option<usize>,
+}
+
+/// The security provenance of one sealed datagram (H8 R5-03, MP-3): the
+/// VM generation and the publication's sealer epoch it was sealed under,
+/// recorded with its staged head (no allocation: two words beside it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct SealStamp {
+    /// [`crate::wire_enc::vm_generation::generation`] when it was sealed.
+    vm: u64,
+    /// The publication's sealer epoch when it was sealed.
+    sealer: u64,
+}
+
+/// The final exposure check of a sealed head (H8 R5-03): it may reach the
+/// backend only while its provenance is current, no VM generation change
+/// is pending and the role's key fence admits the sender. A head the
+/// backend kept pending (would block) is checked again at each exposure,
+/// so a withdrawal, a sealer retirement, a VM generation change or a key
+/// view the role has not applied stops it there.
+struct SealGate<'a> {
+    /// The publication's current sealer epoch.
+    sealer: u64,
+    /// The role's key fence, if bound.
+    fence: Option<&'a crate::wire_auth::KeyGeneration>,
+}
+
+impl SealGate<'_> {
+    fn admits(&self, stamp: SealStamp) -> bool {
+        stamp.sealer == self.sealer
+            && stamp.vm == crate::wire_enc::vm_generation::generation()
+            && !crate::wire_enc::vm_generation::quiesced()
+            && self
+                .fence
+                .is_none_or(|fence| fence.admits_now(crate::wire_auth::Side::Sender))
+    }
+}
+
+impl DataGate<'_> {
+    /// Whether `lane`'s staged head may be exposed under its seal: always
+    /// on a trusted channel; never without a recorded head.
+    fn sealed_head_admits(&self, lane: usize) -> bool {
+        let Some(seal) = self.seal.as_ref() else {
+            return true;
+        };
+        self.lanes
+            .get(lane)
+            .and_then(|track| track.staged.front())
+            .is_some_and(|&(_, _, stamp)| seal.admits(stamp))
+    }
 }
 
 impl SenderGate for DataGate<'_> {
     fn check(&mut self, candidate: &Exposure<'_>) -> GateDecision {
+        // The last decision before the backend hands a sealed head to the
+        // kernel (H8 R5-03): its provenance and the fences, read now.
+        if self.seal.is_some() {
+            let lane = self.flushing.take();
+            if !lane.is_some_and(|lane| self.sealed_head_admits(lane)) {
+                return GateDecision::Deny;
+            }
+        }
         if let Some(guard) = self.guard.as_deref_mut() {
             return guard.check(candidate);
         }
@@ -166,7 +229,7 @@ impl LaneGate for DataGate<'_> {
             .guard
             .as_deref_mut()
             .is_none_or(|guard| guard.admits(lane));
-        guarded && !self.held
+        guarded && !self.held && self.sealed_head_admits(lane)
     }
 
     // Read by a gate that wraps this one (a timed gate, G7); the lane
@@ -178,6 +241,7 @@ impl LaneGate for DataGate<'_> {
     }
 
     fn flushing(&mut self, lane: usize) {
+        self.flushing = Some(lane);
         if let Some(guard) = self.guard.as_deref_mut() {
             guard.flushing(lane);
         }
@@ -194,7 +258,7 @@ impl LaneGate for DataGate<'_> {
         let ends = track.ends.pop_front().unwrap_or(false);
         let mut left_at = None;
         match track.staged.pop_front() {
-            Some((ticket, next)) if ticket == staged.ticket => {
+            Some((ticket, next, _)) if ticket == staged.ticket => {
                 match how {
                     Left::Submitted => track.submitted = Some(next),
                     Left::Returned | Left::Unknown => track.unsent = true,
@@ -234,8 +298,9 @@ pub const RESET_REQUEST_CYCLES: u64 = 64;
 /// One lane's staged heads, in order, and what left.
 #[derive(Debug)]
 struct LaneTrack {
-    /// Ticket and the stream position after it, per staged datagram.
-    staged: VecDeque<(TxTicket, u64)>,
+    /// Ticket, the stream position after it and its seal's provenance,
+    /// per staged datagram.
+    staged: VecDeque<(TxTicket, u64, SealStamp)>,
     /// The position the last submitted head reached, this call.
     submitted: Option<u64>,
     /// The highest position any submitted head reached: a reliable lane's
@@ -343,9 +408,16 @@ pub struct OutboundCounters {
     /// seal: no session key yet, or the key's usage limit reached
     /// (ADR-0086 section 6; manifest 4.3). Nothing is read or sent.
     pub seal_waits: u64,
+    /// Times a publication guarded by a remote guard could not send
+    /// because it is not admitted yet: its guard has not read open after
+    /// recovery and confirmation.
+    pub admission_waits: u64,
     /// Datagrams read but not sealed: an invariant failure, the frames
     /// left as a gap the receiver repairs, as a failed commit's.
     pub seal_failures: u64,
+    /// Sealed datagrams returned unsent from their queue because their
+    /// sealer or VM generation is no longer current (H8 R5-03).
+    pub seal_obsolete: u64,
     /// Traced frames not recorded: their EXT did not decode or did not fit
     /// their frame (NT-2).
     pub trace_invalid: u64,
@@ -443,6 +515,19 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     picked: Vec<(TraceExtension, u64)>,
     /// How its sender frames are authenticated (domain 1, ADR-0086).
     auth: SenderAuth,
+    /// The key fence of its role (H8 R3-1): an authenticated publication
+    /// seals nothing while it does not admit the sender.
+    key_fence: Option<Arc<crate::wire_auth::KeyGeneration>>,
+    /// Moves on whenever its sealer is withdrawn, retired or replaced:
+    /// a staged head sealed under an older epoch never reaches the
+    /// backend (H8 R5-03).
+    sealer_epoch: u64,
+    /// A remote guard's spec while the publication is admission-pending:
+    /// no incarnation is bound to an open epoch and nothing is sent until
+    /// the guard's word first reads `(e, Open)`.
+    pending_guard: Option<GuardSpec>,
+    /// Its remote guard's gate could not be built: it never sends.
+    admission_refused: bool,
     /// The redundant paths of a routed publication ([`Outbound::new_routed`]).
     routed: Option<Box<routed::Routed>>,
     /// The destinations of a multi-destination publication
@@ -716,6 +801,10 @@ impl<T: StreamTerms> Outbound<T> {
             fanout: None,
             registration: None,
             auth: SenderAuth::Off,
+            key_fence: None,
+            sealer_epoch: 0,
+            pending_guard: None,
+            admission_refused: false,
             route: None,
             idle_since: [None; 4],
             open_tried: None,
@@ -1013,6 +1102,8 @@ impl<T: StreamTerms> Outbound<T> {
                 lanes: tracks,
                 held: false,
                 guard: Some(&mut **guard),
+                seal: None,
+                flushing: None,
             };
             // A timed lane's heads leave its timed record too, as dropped.
             let cancelled_now = match timed.as_deref_mut() {
@@ -1027,6 +1118,121 @@ impl<T: StreamTerms> Outbound<T> {
         if cancelled {
             guard.between_gates();
         }
+    }
+
+    /// Returns, through the gate, the staged heads sealed under a sealer
+    /// epoch or VM generation that is no longer current (H8 R5-03): a
+    /// withdrawn, retired or replaced sealer, or a VM generation change.
+    /// The exposure check already refuses them; this frees their TX slots.
+    /// Only items the backend still holds pending are returned: an item it
+    /// already handed to the kernel is out of reach (and passed the check
+    /// first). The lane's reader moved past them, so the endpoint needs a
+    /// reset, which rewinds a reliable lane to its first unsubmitted
+    /// position for the next sealer.
+    fn cancel_obsolete<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) {
+        if matches!(self.auth, SenderAuth::Off) {
+            return;
+        }
+        let current = self.seal_stamp();
+        let Self {
+            guard,
+            sender,
+            tracks,
+            readers,
+            counters,
+            timed,
+            needs_reset,
+            ..
+        } = self;
+        let mut cancelled = false;
+        for lane in 0..readers.len() {
+            let obsolete = tracks
+                .get(lane)
+                .is_some_and(|track| track.staged.iter().any(|&(_, _, stamp)| stamp != current));
+            let pending = sender.pending(lane).unwrap_or(0);
+            if !obsolete || pending == 0 {
+                continue;
+            }
+            let mut gate = DataGate {
+                lanes: tracks,
+                held: false,
+                guard: guard.as_deref_mut(),
+                seal: None,
+                flushing: None,
+            };
+            let returned = match timed.as_deref_mut() {
+                Some(timed) => sender.cancel(tx, lane, &mut timed.state.view(&mut gate)),
+                None => sender.cancel(tx, lane, &mut gate),
+            };
+            match returned {
+                Ok(()) => {
+                    let left = pending.saturating_sub(sender.pending(lane).unwrap_or(0));
+                    counters.bump(
+                        |c| &mut c.seal_obsolete,
+                        u64::try_from(left).unwrap_or(u64::MAX),
+                    );
+                    cancelled |= left > 0;
+                }
+                Err(_) => counters.bump(|c| &mut c.queue_failures, 1),
+            }
+        }
+        if cancelled {
+            *needs_reset = true;
+            if let Some(guard) = guard.as_deref_mut() {
+                guard.between_gates();
+            }
+        }
+    }
+
+    /// Guards the publication by a remote (followed) guard whose word is
+    /// `spec.word` (`crate::remote_guard::RemoteGuard::word`): it is
+    /// admission-pending, sending nothing (no DATA, repair, heartbeat or
+    /// EOS), until that word first reads `(e, Open)`, which happens only
+    /// after the guard's recovery and confirmation. Admission then binds
+    /// the incarnation to `e` exactly as [`Outbound::guard`] does for a
+    /// local guard (`spec.epoch` is ignored), and from then on its gate
+    /// aborts it for good on any other word (guards-and-abort.md, "The
+    /// sender gate and applied epoch", step 3).
+    pub fn guard_remote(&mut self, spec: GuardSpec) {
+        self.pending_guard = Some(spec);
+    }
+
+    /// Whether the publication waits for its remote guard's first open.
+    #[must_use]
+    pub fn admission_pending(&self) -> bool {
+        self.pending_guard.is_some() || self.admission_refused
+    }
+
+    /// Admits an admission-pending publication at `now` if its guard reads
+    /// open; returns whether it may send. A gate that cannot be built
+    /// leaves it pending (fail closed).
+    fn admit(&mut self, now: u64) -> bool {
+        if self.admission_refused {
+            self.counters.bump(|c| &mut c.admission_waits, 1);
+            return false;
+        }
+        let Some(spec) = self.pending_guard.as_ref() else {
+            return true;
+        };
+        let open = karyos_sys::guard::load_in(&*spec.word, 0)
+            .ok()
+            .filter(|state| state.open)
+            .map(|state| state.epoch);
+        let Some(epoch) = open else {
+            self.counters.bump(|c| &mut c.admission_waits, 1);
+            return false;
+        };
+        let Some(mut spec) = self.pending_guard.take() else {
+            return false;
+        };
+        spec.epoch = epoch;
+        if self.guard(spec, now).is_err() {
+            // Without a gate it never sends.
+            self.counters.bump(|c| &mut c.admission_waits, 1);
+            self.admission_refused = true;
+            return false;
+        }
+        true
     }
 
     /// Returns, through the timed gate, the heads still queued on each lane
@@ -1061,6 +1267,8 @@ impl<T: StreamTerms> Outbound<T> {
                 lanes: tracks,
                 held: false,
                 guard: guard.as_deref_mut(),
+                seal: None,
+                flushing: None,
             };
             if sender
                 .cancel(tx, lane, &mut timed.state.view(&mut gate))
@@ -1075,6 +1283,7 @@ impl<T: StreamTerms> Outbound<T> {
     /// served this cycle (not established yet): a close applies and its
     /// applied epoch is published all the same.
     pub fn guard_tick(&mut self, now: u64) {
+        let _ = self.admit(now);
         if let Some(guard) = self.guard.as_deref_mut() {
             guard.set_now(now);
             guard.between_gates();
@@ -1091,6 +1300,14 @@ impl<T: StreamTerms> Outbound<T> {
     #[must_use]
     pub fn repair(&self) -> Option<&RepairPath> {
         self.repair.as_deref()
+    }
+
+    /// Gives its repair path the publication's fresh identity (ADR-0114
+    /// section 10 step 3).
+    pub(crate) fn set_repair_identity(&mut self, identity: Identity) {
+        if let Some(repair) = self.repair.as_deref_mut() {
+            repair.set_identity(identity);
+        }
     }
 
     /// Admits `nak` from a receiver bound to this publication, whose state
@@ -1219,8 +1436,9 @@ impl<T: StreamTerms> Outbound<T> {
                 *closed = LaneGate::aborting(&*guard, lane);
             }
         }
-        // An authenticated publication repairs only under its sealer.
-        if !self.auth.ready() {
+        // An authenticated publication repairs only under its sealer, and
+        // an admission-pending one not at all.
+        if !self.auth_ready() || self.admission_pending() {
             return 0;
         }
         let Some(repair) = self.repair.as_deref_mut() else {
@@ -1322,6 +1540,30 @@ impl<T: StreamTerms> Outbound<T> {
     #[must_use]
     pub fn max_frame(&self) -> u64 {
         self.max_frame
+    }
+
+    /// Cancels its pending repairs (NAK service and retransmission), with
+    /// no outcome record, as its incarnation aborts (guards-and-abort.md,
+    /// Session abort, sender step 2). Repairs already handed to the backend
+    /// keep their storage leases until the backend releases them. Returns
+    /// the jobs cancelled.
+    pub fn cancel_repairs(&mut self) -> u64 {
+        let own = self
+            .repair
+            .as_deref_mut()
+            .map_or(0, super::repair::RepairPath::cancel_pending);
+        let fanout = self
+            .fanout
+            .as_deref_mut()
+            .map_or(0, fanout::Fanout::cancel_repairs);
+        own.saturating_add(fanout)
+    }
+
+    /// `lane`'s submitted high-water mark: the highest end handed to the
+    /// backend; `None` for a lane it does not have.
+    #[must_use]
+    pub fn submitted_high(&self, lane: usize) -> Option<u64> {
+        self.tracks.get(lane).map(|track| track.high)
     }
 
     /// Each lane's join point for an answer now: where its next read
@@ -1873,6 +2115,9 @@ impl<T: StreamTerms> Outbound<T> {
         now: u64,
         mut hook: Option<&mut (dyn NetworkTraceHook + 'static)>,
     ) -> Result<u32, AgentError> {
+        if !self.admit(now) {
+            return Ok(0);
+        }
         if self.fanout.is_some() {
             return self.serve_fanout(tx, budget, consumption, now);
         }
@@ -1912,10 +2157,16 @@ impl<T: StreamTerms> Outbound<T> {
         if let Some(guard) = self.guard.as_deref_mut() {
             guard.set_now(now);
         }
+        let seal = (!matches!(self.auth, SenderAuth::Off)).then_some(SealGate {
+            sealer: self.sealer_epoch,
+            fence: self.key_fence.as_deref(),
+        });
         let mut gate = DataGate {
             lanes: &mut self.tracks,
             held,
             guard: self.guard.as_deref_mut(),
+            seal,
+            flushing: None,
         };
         // A timed publication's heads wait for their time over the data
         // gate, which decides them once due (timed-tx.md section 4).
@@ -1934,6 +2185,7 @@ impl<T: StreamTerms> Outbound<T> {
         }
         self.cancel_aborted(tx);
         self.cancel_missed(tx);
+        self.cancel_obsolete(tx);
         // After the cancel, whose returned heads end their messages too.
         self.release_ended();
         self.handle_failure(tx, report.failure);
@@ -2303,6 +2555,8 @@ impl<T: StreamTerms> Outbound<T> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         let mut staged = 0u32;
         let tai_offset = self.tai_offset;
+        // The key fence, read once per staging call (H8 R3-1).
+        let fenced = !matches!(self.auth, SenderAuth::Off) && !self.fence_admits();
         let (Some(queue), Some(reader)) =
             (self.queues.get(lane).copied(), self.readers.get_mut(lane))
         else {
@@ -2381,7 +2635,7 @@ impl<T: StreamTerms> Outbound<T> {
             // before any read moves the cursor. Its frames fit the inner
             // budget, the MTU less the envelope, which the log was sized
             // for (ADR-0086 section 5); the datagram is the whole MTU.
-            if !self.auth.ready() {
+            if !self.auth.ready() || fenced {
                 self.counters.bump(|c| &mut c.seal_waits, 1);
                 break;
             }
@@ -2485,6 +2739,12 @@ impl<T: StreamTerms> Outbound<T> {
             // The log's charge stays the inner frames'; the datagram is
             // the sealed one.
             let inner_len = len;
+            // Its provenance, read before it is sealed: a change after
+            // this read makes it obsolete at exposure (H8 R5-03).
+            let stamp = SealStamp {
+                vm: crate::wire_enc::vm_generation::generation(),
+                sealer: self.sealer_epoch,
+            };
             let Some(len) = self.auth.seal(frame.bytes_mut(), len) else {
                 self.counters.bump(|c| &mut c.seal_failures, 1);
                 if traced.is_some() && !remember_unpicked(&mut self.traced, lane, from, next) {
@@ -2583,7 +2843,7 @@ impl<T: StreamTerms> Outbound<T> {
                 let _ = drops.ledger.reserve(lane, txtime, (from, next));
             }
             if let Some(track) = self.tracks.get_mut(lane) {
-                track.staged.push_back((ticket, next));
+                track.staged.push_back((ticket, next, stamp));
                 if let Some((_, ends)) = schedule {
                     track.ends.push_back(ends);
                 }

@@ -40,6 +40,13 @@ pub struct Ed25519Verifier {
 }
 
 impl Ed25519Verifier {
+    /// The 32 public key bytes (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; KEY_LEN] {
+        self.key.to_bytes()
+    }
+
     /// Loads a public key. It is accepted only when decoding and
     /// re-encoding reproduces `bytes` and the point is not of small order
     /// (ADR-0086 section 8).
@@ -106,5 +113,7 @@ impl AuthoritySigner for Ed25519Signer {
     }
 }
 
+#[cfg(test)]
+mod h7_tests;
 #[cfg(test)]
 mod tests;

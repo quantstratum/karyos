@@ -2672,6 +2672,81 @@ fn a_dynamic_publication_holds_its_whole_destination_share_at_admission() {
     });
 }
 
+/// H8 finding 5 and ABT-12 (guards-and-abort.md, Session abort, sender
+/// step 5), through the conductor's duty: the sender's `SenderAbortEnded`
+/// taken from its event ring retires the publication through its removal,
+/// with no linger, whose `RemoveSenderSession` and `RemovePublishedAlias`
+/// quarantine the alias, until it is gone. A report naming another
+/// incarnation (one delayed across a replacement) retires nothing, and a
+/// second report changes nothing.
+#[test]
+fn an_ended_abort_retires_only_its_own_incarnation() {
+    let mut driver = driver();
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    let handle = driver
+        .add_network_publication(aggregate(10, 1), &channel(destination))
+        .unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&handle) == Some(NetworkPublicationState::Active)
+    });
+    let registration = handle.registration();
+    let (endpoint, alias) = driver.net.as_ref().unwrap().key_of(registration).unwrap();
+    assert_eq!(
+        driver.net.as_ref().unwrap().alias_held(endpoint, alias),
+        Some((true, true)),
+        "live: its session and published alias"
+    );
+    let incarnation = driver
+        .net
+        .as_ref()
+        .unwrap()
+        .incarnation_of(registration)
+        .unwrap();
+    // Another incarnation's report, delayed across a replacement.
+    assert!(
+        driver
+            .net
+            .as_ref()
+            .unwrap()
+            .post_abort_ended(registration, incarnation.wrapping_add(1))
+    );
+    for _ in 0..50 {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(
+        driver.network_publication_state(&handle),
+        Some(NetworkPublicationState::Active),
+        "another incarnation's report retires nothing"
+    );
+    assert!(
+        driver
+            .net
+            .as_ref()
+            .unwrap()
+            .post_abort_ended(registration, incarnation)
+    );
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&handle) != Some(NetworkPublicationState::Active)
+    });
+    // A second report of the same incarnation changes nothing.
+    let _ = driver
+        .net
+        .as_ref()
+        .unwrap()
+        .post_abort_ended(registration, incarnation);
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&handle).is_none()
+    });
+    // Retired for good: its sender session is removed and its alias left
+    // the receiver's published set (`RemoveSenderSession`, then the stale
+    // alias's `RemovePublishedAlias`), so the alias goes to quarantine as
+    // for any retired identity.
+    until(&mut driver, |driver| {
+        driver.net.as_ref().unwrap().alias_held(endpoint, alias) == Some((false, false))
+    });
+}
+
 /// ADR-0109 (#625): the `etf` route needs the channel's declaration and
 /// the declaration needs the route; the leaf's `delta` is at most the
 /// declared advance; a multicast destination is refused; off Linux the

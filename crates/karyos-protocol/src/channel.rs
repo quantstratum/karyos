@@ -22,9 +22,12 @@
 //! this crate's manifest. [`parse_duration`] is the duration grammar new
 //! keys use.
 //!
-//! Phase 2 implements the `trusted` protection class only: `authenticated`
-//! and `encrypted` are refused with [`ChannelError::SecurityUnsupported`]
-//! until the security profile is accepted.
+//! The `trusted` and `encrypted` protection classes parse; `authenticated`
+//! is refused with [`ChannelError::SecurityUnsupported`] until its
+//! capability gate passes. An `encrypted` channel (ADR-0114) names its
+//! channel key, its receiver's pairwise key and that receiver, serves one
+//! unicast receiver and takes `mtu` at most 1408; multicast and every
+//! multi-receiver form are refused at parse.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -37,6 +40,9 @@ pub const MAX_URI_LENGTH: usize = 2048;
 /// The largest MTU a channel may configure: jumbo frames up to 8 KiB
 /// (SPEC.md §5).
 pub const MAX_CHANNEL_MTU: u32 = 8192;
+/// The largest MTU an `encrypted` channel may configure (ADR-0114
+/// sections 6 and 11): the plaintext bound of its usage budgets.
+pub const MAX_ENCRYPTED_MTU: u32 = 1408;
 /// The most redundant paths of one channel (network-sessions.md S5,
 /// `max_paths`).
 pub const MAX_PATHS: usize = 4;
@@ -227,14 +233,100 @@ pub enum FlowControl {
     Tagged(u64),
 }
 
-/// A channel's protection class (SPEC.md §5). Only [`Security::Trusted`]
-/// parses in Phase 2.
+/// A channel's protection class (SPEC.md §5). [`Security::Trusted`] and
+/// [`Security::Encrypted`] parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Security {
     /// No authentication or encryption.
     #[default]
     Trusted,
+    /// The authenticated class (ADR-0086, ADR-0107, ADR-0118) with the key
+    /// ids and the single unicast receiver it binds at admission. Built in
+    /// code by tests only (`test-hooks`, karyos#648): `security=authenticated`
+    /// is still refused at parse until its capability gate passes.
+    #[cfg(feature = "test-hooks")]
+    Authenticated(AuthenticatedChannel),
+    /// The encrypted class (ADR-0114, AES-256-GCM-SIV, `profile_id` 16)
+    /// with the key ids and the single unicast receiver it binds at
+    /// admission.
+    Encrypted(EncryptedChannel),
+}
+
+/// What an encrypted channel binds at publication and subscription
+/// admission (ADR-0114 section 4a): the key ids each side must find valid
+/// in its driver's key store, both `profile_id` 16, and the one unicast
+/// receiver the channel serves. No `key_id` travels on the wire; these
+/// select the files by configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncryptedChannel {
+    /// The channel key (`purpose=channel`, `profile_id` 16): the `IKM` of
+    /// every derivation of ADR-0114 section 4 (`channel-key`).
+    pub channel_key_id: u32,
+    /// The receiver's pairwise key (`purpose=pairwise`, `profile_id` 16):
+    /// the trailer of every domain 4 and 6 datagram (`pairwise-key`).
+    pub pairwise_key_id: u32,
+    /// The single unicast receiver: the pairwise key's `receiver_id`
+    /// (`receiver-id`), nonzero.
+    pub receiver_id: u64,
+    /// The channel's operator-assigned identity (`channel-id`), nonzero:
+    /// admission uses a channel file only when its `channel_id` is this one
+    /// (wire-key-files.md section 2.2).
+    pub channel_id: u64,
+    /// The configured identity of the one publishing driver
+    /// (`publisher-id`), nonzero: admission uses a pairwise file only when
+    /// its `publisher_id` is this one, on the publisher (its own) and on
+    /// the receiver (its peer's) alike (wire-key-files.md section 2.2).
+    pub publisher_id: u64,
+}
+
+/// What an authenticated channel binds at publication and subscription
+/// admission (karyos#648; ADR-0086 sections 4, 6 and 7, ADR-0118): the
+/// key ids each side must find valid in its driver's key store, and the
+/// one unicast receiver the channel serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthenticatedChannel {
+    /// The channel key (`purpose=channel`): SETUP proofs and the session's
+    /// DATA.
+    pub channel_key_id: u32,
+    /// The channel's operator-assigned identity: the channel key file's
+    /// `channel_id` must name it (wire-key-files.md section 2.2).
+    pub channel_id: u64,
+    /// The publishing driver of the pair: the pairwise key file's
+    /// `publisher_id` must name it.
+    pub publisher_id: u64,
+    /// The receiver's pairwise key (`purpose=pairwise`): RSP_SETUP and the
+    /// receiver's controls.
+    pub pairwise_key_id: u32,
+    /// The single unicast receiver: the pairwise key's `receiver_id` and the
+    /// subscription's receiver identity.
+    pub receiver_id: u64,
+    /// The abort and guard authority of the publication (ADR-0118 (a): only
+    /// the authority that guards a publication may abort it); `None` when
+    /// nothing may abort it remotely.
+    pub authority: Option<ChannelAuthority>,
+}
+
+/// The abort and guard authority an authenticated channel names
+/// (ADR-0118; design guards-and-abort.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelAuthority {
+    /// Its key: `authority-signing` at the publisher, which signs the
+    /// publication's aborts, and `authority-public` at the receiver.
+    pub key_id: u32,
+    /// The `authority_id` its key file names.
+    pub authority_id: u64,
+    /// The guard it serves for this publication, nonzero; its file must
+    /// list it.
+    pub guard_id: u64,
+    /// Its guard control endpoint: the only source of its signed controls,
+    /// whose verify budget the receiver reserves at admission.
+    pub control: SocketAddr,
+    /// At a publisher holding the authority's public key (a remotely
+    /// guarded publication): the receiver id it follows the guard as, its
+    /// entry in the authority's configuration, nonzero. Unused where the
+    /// publisher holds the authority's signing key.
+    pub follower_id: u64,
 }
 
 /// How a multi-destination channel learns its receivers (ADR-0056).
@@ -415,9 +507,14 @@ enum Key {
     PathSkew,
     EtfPriority,
     EtfDelta,
+    ChannelKeyId,
+    PairwiseKeyId,
+    ReceiverId,
+    ChannelId,
+    PublisherId,
 }
 
-const KEYS: [(&str, Key); 23] = [
+const KEYS: [(&str, Key); 28] = [
     ("endpoint", Key::Endpoint),
     ("group", Key::Group),
     ("interface", Key::Interface),
@@ -441,6 +538,11 @@ const KEYS: [(&str, Key); 23] = [
     ("path-skew", Key::PathSkew),
     ("etf-priority", Key::EtfPriority),
     ("etf-delta", Key::EtfDelta),
+    ("channel-key", Key::ChannelKeyId),
+    ("pairwise-key", Key::PairwiseKeyId),
+    ("receiver-id", Key::ReceiverId),
+    ("channel-id", Key::ChannelId),
+    ("publisher-id", Key::PublisherId),
 ];
 
 /// Whether `name` is kebab-case (`CHANNEL-URI.md` section 2): words of
@@ -750,7 +852,7 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
             "authenticated" => Err(ChannelError::SecurityUnsupported {
                 class: "authenticated",
             }),
-            "encrypted" => Err(ChannelError::SecurityUnsupported { class: "encrypted" }),
+            "encrypted" => parse_encrypted(get, &destination, &paths).map(Security::Encrypted),
             _ => Err(invalid(
                 Key::Security,
                 "`trusted`, `authenticated` or `encrypted`",
@@ -758,6 +860,19 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
         })
         .transpose()?
         .unwrap_or_default();
+    if !matches!(security, Security::Encrypted(_))
+        && let Some(key) = [
+            Key::ChannelKeyId,
+            Key::PairwiseKeyId,
+            Key::ReceiverId,
+            Key::ChannelId,
+            Key::PublisherId,
+        ]
+        .into_iter()
+        .find(|&key| get(key).is_some())
+    {
+        return Err(ChannelError::NotApplicable { key: key.name() });
+    }
     // `require-abort-ack` (owner decision item 8) is defined with the
     // authenticated capability. Until that capability is supported a
     // request requiring it is refused, typed, and never downgraded to a
@@ -806,6 +921,57 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
         linger,
         path_skew,
         etf,
+    })
+}
+
+/// An `encrypted` channel (ADR-0114 sections 4a, 6 and 11): `mtu` at most
+/// [`MAX_ENCRYPTED_MTU`], refused first whatever else holds; one unicast
+/// `endpoint` (no `group`, `destinations`, `control` or `paths`: v1 binds
+/// one receiver, and multicast stays refused); and its five key settings,
+/// each required. A nonzero key id is not checked here: the key store
+/// refuses an unknown one at admission.
+fn parse_encrypted<'a>(
+    get: &impl Fn(Key) -> Option<&'a str>,
+    destination: &Destination,
+    paths: &[Interface],
+) -> Result<EncryptedChannel, ChannelError> {
+    if get(Key::Mtu)
+        .map(parse_mtu)
+        .transpose()?
+        .is_some_and(|mtu| mtu > MAX_ENCRYPTED_MTU)
+    {
+        return Err(invalid(Key::Mtu, "above 1408 on an `encrypted` channel"));
+    }
+    if !matches!(destination, Destination::Unicast(_)) || !paths.is_empty() {
+        return Err(invalid(
+            Key::Security,
+            "`encrypted` on a channel other than one unicast `endpoint`",
+        ));
+    }
+    let id = |key: Key, what: &'static str| -> Result<u64, ChannelError> {
+        let value = get(key).ok_or(invalid(key, "required on an `encrypted` channel"))?;
+        decimal::<u64>(value)
+            .filter(|&id| id != 0)
+            .ok_or(invalid(key, what))
+    };
+    let narrow = |key: Key, id: u64| {
+        u32::try_from(id).map_err(|_| invalid(key, "an integer from 1 to 4294967295"))
+    };
+    Ok(EncryptedChannel {
+        channel_key_id: narrow(
+            Key::ChannelKeyId,
+            id(Key::ChannelKeyId, "an integer from 1 to 4294967295")?,
+        )?,
+        pairwise_key_id: narrow(
+            Key::PairwiseKeyId,
+            id(Key::PairwiseKeyId, "an integer from 1 to 4294967295")?,
+        )?,
+        receiver_id: id(Key::ReceiverId, "an integer from 1 to 18446744073709551615")?,
+        channel_id: id(Key::ChannelId, "an integer from 1 to 18446744073709551615")?,
+        publisher_id: id(
+            Key::PublisherId,
+            "an integer from 1 to 18446744073709551615",
+        )?,
     })
 }
 

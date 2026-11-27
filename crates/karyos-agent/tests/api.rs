@@ -182,7 +182,9 @@ fn capabilities_tell_unavailable_from_forbidden() {
             r#"{"name":"submit","state":"forbidden","reason":"role"},"#,
             r#"{"name":"clocks","state":"served","reason":null},"#,
             r#"{"name":"rate-limits","state":"served","reason":null},"#,
-            r#"{"name":"cluster-command","state":"unavailable","reason":"not_configured"}]}"#,
+            r#"{"name":"cluster-command","state":"unavailable","reason":"not_configured"},"#,
+            r#"{"name":"journal-history","state":"unavailable","reason":"not_configured"},"#,
+            r#"{"name":"journal-append","state":"unavailable","reason":"not_configured"}]}"#,
             "\n"
         )
     );
@@ -228,7 +230,7 @@ fn a_configured_journal_and_catalog_are_served_by_role() {
                 ),
             ),
     );
-    let caps = agent.capabilities(false, false, false, false);
+    let caps = agent.capabilities(false, false, false, false, false);
     let state = |name: &str| {
         caps.iter()
             .find(|capability| capability.name == name)
@@ -310,7 +312,8 @@ fn a_client_negotiates_the_limits() {
         r#""join.value_bytes":{"value":64,"negotiable":false},"#,
         r#""join.key_bytes":{"value":64,"negotiable":false},"#,
         r#""join.list_page":{"value":64,"negotiable":false},"#,
-        r#""join.memory_bytes":{"value":7241728,"negotiable":false}}}"#,
+        r#""join.memory_bytes":{"value":7241728,"negotiable":false},"#,
+        r#""journal.history_records":{"value":256,"negotiable":false}}}"#,
         "\n"
     );
     let (answer, served) = ask(&mut server, &mut agent, "KARYOS-AGENT 1 limits\n");

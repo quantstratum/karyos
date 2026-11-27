@@ -25,11 +25,13 @@ thiserror.workspace = true
 
 [features]
 # Hooks only tests use: hidden API, never in a release build (karyos#852).
-test-hooks = []
+test-hooks = ["karyos-protocol/test-hooks"]
 
 [dev-dependencies]
 # Cross-checks the erased HMAC of the key state fingerprints.
 hmac.workspace = true
+# The H8-01 nonce property over arbitrary key lifecycles.
+proptest.workspace = true
 karyos-driver = { path = ".", features = ["test-hooks"] }
 karyos-io = { workspace = true, features = ["test-hooks"] }
 karyos-sys = { workspace = true, features = ["test-hooks"] }

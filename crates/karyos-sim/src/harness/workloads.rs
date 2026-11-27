@@ -25,10 +25,10 @@ use karyos_archive::segment::{Geometry, SegmentError};
 use karyos_cluster::{Entry, LogError};
 
 use super::check::{self, Violation};
-use super::core::{Change, ConsensusCore, Limits, Unsupported};
+use super::core::{Change, Configuration, ConsensusCore, Limits, Unsupported};
 use super::node::{
-    ClientNode, Compaction, Member, Observation, Op, RETRY_AFTER, Recorder, Ret, ServerError,
-    ServerNode, ServiceModel, Shared, TestService, Wire,
+    ClientNode, Compaction, HARNESS_CLUSTER, HARNESS_STANDBY, Member, Observation, Op, RETRY_AFTER,
+    Recorder, Ret, ServerError, ServerNode, ServiceModel, Shared, TestService, Wire,
 };
 use super::reference;
 use super::standby::{ExternalLease, FeedFault, Fencing};
@@ -281,7 +281,8 @@ pub struct W5 {
 
 /// The log bytes of one W5 entry: a client's append of `payload` bytes,
 /// as the log frames it.
-fn w5_frame(payload: usize) -> u64 {
+#[must_use]
+pub fn w5_frame(payload: usize) -> u64 {
     let command = super::node::Command {
         client: 0,
         sequence: 1,
@@ -312,6 +313,7 @@ impl W5 {
                 every: 1_000,
                 keep: 100,
                 frame: w5_frame(256),
+                every_bytes: None,
             },
         }
     }
@@ -325,6 +327,7 @@ impl W5 {
                 every: 100,
                 keep: 10,
                 frame: w5_frame(256),
+                every_bytes: None,
             },
             ..Self::manifest()
         }
@@ -554,7 +557,48 @@ pub enum Action {
     /// its leader (but those of [`Case::stay_on_primary`]); refused, and
     /// recorded so, when it is not.
     Promote(Fencing),
+    /// An action on whichever primary server leads when it acts
+    /// (karyos#712; never a standby server, karyos#713): the
+    /// harness waits up to [`LEADER_WAIT`] steps for one, and records
+    /// whom it acted on ([`Observation::Triggered`]).
+    Leader(LeaderAction),
+    /// An operator's membership change, sent again every [`ENSURE_RETRY`]
+    /// steps until the leader acts under a committed configuration in
+    /// which it holds; queued after any earlier one (karyos#712).
+    Ensure(Change),
 }
+
+/// What a leader-relative [`Action::Leader`] does to the leader `L`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaderAction {
+    /// Crashes `L`.
+    Crash,
+    /// Restarts the server the last [`LeaderAction::Crash`] crashed.
+    RestartCrashed,
+    /// Cuts `L` from every other server, both ways.
+    Isolate,
+    /// Cuts every other server's link to `L`, one way: `L` still sends,
+    /// and hears nothing, so it commits nothing new.
+    MuteAcks,
+    /// As [`LeaderAction::MuteAcks`], on the first leader of a term above
+    /// the last one an [`Action::Leader`] acted on, at the step it is
+    /// first seen leading: before it can commit an entry of its term.
+    MuteNextLeaderAcks,
+    /// Splits `L` and the first `with` other servers from the rest.
+    Split {
+        /// The other servers on `L`'s side.
+        with: usize,
+    },
+    /// The operator removes `L` from the membership.
+    Remove,
+    /// The operator removes the highest-numbered voter other than `L`.
+    RemoveFollower,
+}
+
+/// Steps an [`Action::Leader`] waits for a leader before the run fails.
+pub const LEADER_WAIT: u64 = 400;
+/// Steps between two sends of an [`Action::Ensure`]'s change.
+pub const ENSURE_RETRY: u64 = 30;
 
 /// What a case expects of progress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -617,10 +661,18 @@ pub struct Case {
     pub lease: Option<u64>,
     /// Ticks the arbiter waits past a lease's end for the clocks' skew.
     pub lease_margin: u64,
-    /// Faults on the feed, each on one send of its primary index.
+    /// Faults on the feed, each on one send of its primary index; over
+    /// replication, damage in transit to one send of that index's frame.
     pub feed_faults: Vec<(u64, FeedFault)>,
+    /// The standby follows the primary's Cluster log over replication
+    /// (ADR-0120, karyos#714) rather than the feed, which stays as the
+    /// control.
+    pub replication: bool,
     /// Clients, by index, that stay on the primary after a promotion.
     pub stay_on_primary: Vec<usize>,
+    /// Every client's failover is the Cluster client's
+    /// ([`super::failover`]; karyos#720).
+    pub cluster_clients: bool,
     /// The limits every server's core is declared (W2), if any: a core
     /// that takes none cannot run the case ([`RunError::Unsupported`]).
     pub limits: Option<Limits>,
@@ -723,7 +775,9 @@ impl Case {
             lease: None,
             lease_margin: 0,
             feed_faults: Vec::new(),
+            replication: false,
             stay_on_primary: Vec::new(),
+            cluster_clients: false,
             limits: None,
             window: 1,
             converged: false,
@@ -952,6 +1006,9 @@ pub enum RunError {
     Geometry(SegmentError),
     /// A count beyond the node id range.
     Count,
+    /// An [`Action::Leader`] found no leader within [`LEADER_WAIT`]
+    /// steps.
+    NoLeader,
     /// A [`LostReply`] case with a static schedule: its triggers act at
     /// steps the schedule cannot be ordered with.
     Schedule,
@@ -1051,6 +1108,150 @@ fn per_server(survives: Survives, id: NodeId) -> Survives {
     }
 }
 
+type Sim<C> = ClusterSim<Member<C>, Wire<<C as ConsensusCore>::Message>>;
+
+/// The server of `servers` that leads the highest term any of them is
+/// in, if exactly one does, and that term.
+fn current_leader<C: ConsensusCore>(sim: &Sim<C>, servers: &[NodeId]) -> Option<(NodeId, u64)> {
+    let up: Vec<(NodeId, bool, u64)> = servers
+        .iter()
+        .filter_map(|id| {
+            let core = sim.node(*id).and_then(Member::server)?.core()?;
+            Some((*id, core.leads(), core.term()))
+        })
+        .collect();
+    let highest = up.iter().map(|(_, _, term)| *term).max()?;
+    let mut leaders = up
+        .iter()
+        .filter(|(_, leads, term)| *leads && *term == highest);
+    match (leaders.next(), leaders.next()) {
+        (Some(&(leader, _, term)), None) => Some((leader, term)),
+        _ => None,
+    }
+}
+
+/// Whether `configuration` holds the effect of `change`.
+fn holds(change: Change, configuration: &Configuration) -> bool {
+    match change {
+        Change::AddLearner(node) => {
+            configuration.learners.contains(&node) || configuration.voters.contains(&node)
+        }
+        Change::Promote(node) => configuration.voters.contains(&node),
+        Change::Remove(node) => {
+            !configuration.voters.contains(&node) && !configuration.learners.contains(&node)
+        }
+    }
+}
+
+/// The operator's changes an [`Action::Ensure`] queued, and when the
+/// first was last sent.
+#[derive(Debug, Default)]
+struct Ensuring {
+    queue: std::collections::VecDeque<Change>,
+    sent: Option<u64>,
+}
+
+/// What the stepping of a run reads and keeps.
+struct Stepping<'a> {
+    everyone: &'a [NodeId],
+    clients: &'a [NodeId],
+    operator: Option<NodeId>,
+    recorder: &'a Shared,
+    ensuring: Ensuring,
+    done: u64,
+}
+
+/// Sends `change` from the operator to every server that is up.
+fn send_change<C: ConsensusCore>(
+    sim: &mut Sim<C>,
+    operator: NodeId,
+    everyone: &[NodeId],
+    change: Change,
+) -> Result<(), RunError> {
+    for &id in everyone {
+        if sim
+            .node(id)
+            .and_then(Member::server)
+            .is_some_and(ServerNode::is_up)
+        {
+            let _ = sim
+                .send(operator, id, Wire::Change(change))
+                .map_err(RunError::Sim)?;
+        }
+    }
+    Ok(())
+}
+
+/// Runs `steps` steps, serving the queued [`Action::Ensure`]s before each.
+fn advance<C: ConsensusCore>(
+    sim: &mut Sim<C>,
+    steps: u64,
+    stepping: &mut Stepping<'_>,
+    joined: &[NodeId],
+) -> Result<(), RunError> {
+    for _ in 0..steps {
+        let step = stepping.done.saturating_add(1);
+        if let Some(&change) = stepping.ensuring.queue.front() {
+            let leader = current_leader(sim, joined).map(|(leader, _)| leader);
+            let settled = leader.is_some_and(|leader| {
+                sim.node(leader)
+                    .and_then(Member::server)
+                    .and_then(ServerNode::core)
+                    .is_some_and(|core| {
+                        core.configuration().is_some_and(|configuration| {
+                            holds(change, &configuration)
+                                && core.committed().unwrap_or(0) >= configuration.index.unwrap_or(0)
+                        })
+                    })
+            });
+            if settled {
+                let _ = stepping.ensuring.queue.pop_front();
+                // A removal: the clients learn the membership changed, and
+                // go to the leader (a removed server names none).
+                if let (Change::Remove(_), Some(leader), Some(operator)) =
+                    (change, leader, stepping.operator)
+                {
+                    for &client in stepping.clients {
+                        let _ = sim
+                            .send(
+                                operator,
+                                client,
+                                Wire::Redirect {
+                                    cluster: HARNESS_CLUSTER,
+                                    server: leader,
+                                },
+                            )
+                            .map_err(RunError::Sim)?;
+                    }
+                }
+                stepping.ensuring.sent = None;
+                stepping
+                    .recorder
+                    .borrow_mut()
+                    .observations
+                    .push(Observation::Triggered {
+                        what: "ensured",
+                        node: 0,
+                        client: 0,
+                        at: step,
+                        request: None,
+                    });
+            } else if stepping
+                .ensuring
+                .sent
+                .is_none_or(|at| step.saturating_sub(at) >= ENSURE_RETRY)
+            {
+                let operator = stepping.operator.ok_or(RunError::Count)?;
+                send_change(sim, operator, stepping.everyone, change)?;
+                stepping.ensuring.sent = Some(step);
+            }
+        }
+        sim.run_for(1).map_err(RunError::Sim)?;
+        stepping.done = step;
+    }
+    Ok(())
+}
+
 /// Runs `case` of core `C` under `seed`.
 ///
 /// # Errors
@@ -1148,8 +1349,13 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         };
         if in_standby {
             server = server.as_standby(primary.clone());
+            if case.replication {
+                server = server.over_replication();
+            }
         } else {
-            if !standby.is_empty() {
+            if !standby.is_empty() && case.replication {
+                server = server.with_replication(standby.clone(), &case.feed_faults);
+            } else if !standby.is_empty() {
                 server = server.with_feed(standby.clone(), &case.feed_faults);
             }
             if let Some(lease) = &lease {
@@ -1192,10 +1398,12 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             .ok()
             .and_then(|index| standby_end.checked_add(index))
             .ok_or(RunError::Count)?;
-        #[cfg_attr(not(feature = "test-hooks"), allow(unused_mut))]
         let mut client = ClientNode::new(id, leader, script(case, index), Rc::clone(&recorder))
             .with_retry_after(case.retry_after)
             .with_servers(servers);
+        if case.cluster_clients {
+            client = client.with_cluster_client();
+        }
         #[cfg(feature = "test-hooks")]
         if case.faults.corrupt_reads.contains(&index) {
             client = client.corrupting_reads();
@@ -1210,7 +1418,11 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
     let changes = case.schedule.iter().any(|(_, action)| {
         matches!(
             action,
-            Action::Change(_) | Action::Promote(_) | Action::TransferLeadership(_)
+            Action::Change(_)
+                | Action::Promote(_)
+                | Action::TransferLeadership(_)
+                | Action::Ensure(_)
+                | Action::Leader(LeaderAction::Remove | LeaderAction::RemoveFollower)
         )
     });
     let mut operator = None;
@@ -1248,12 +1460,21 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
     let mut promoted = false;
     let mut schedule = case.schedule.clone();
     schedule.sort_by_key(|(step, _)| *step);
-    let mut done = 0u64;
+    let mut stepping = Stepping {
+        everyone: &everyone,
+        clients: &clients,
+        operator,
+        recorder: &recorder,
+        ensuring: Ensuring::default(),
+        done: 0,
+    };
+    // What the last leader-relative action acted on, and whom it crashed.
+    let mut acted: Option<(NodeId, u64)> = None;
     let mut marks: Vec<(u64, String, usize)> = Vec::new();
+    let mut crashed: Option<NodeId> = None;
     for (step, action) in schedule {
-        if let Some(steps) = step.checked_sub(done).filter(|steps| *steps > 0) {
-            sim.run_for(steps).map_err(RunError::Sim)?;
-            done = step;
+        if let Some(steps) = step.checked_sub(stepping.done).filter(|steps| *steps > 0) {
+            advance(&mut sim, steps, &mut stepping, &joined)?;
         }
         marks.push((
             step,
@@ -1261,11 +1482,111 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             recorder.borrow().observations.len(),
         ));
         match action {
+            Action::Ensure(change) => stepping.ensuring.queue.push_back(change),
+            Action::Leader(LeaderAction::RestartCrashed) => {
+                if let Some(id) = crashed.take() {
+                    sim.restart(id).map_err(RunError::Node)?;
+                }
+            }
+            Action::Leader(act) => {
+                let floor = match act {
+                    LeaderAction::MuteNextLeaderAcks => acted.map(|(_, term)| term),
+                    _ => None,
+                };
+                // The primary's leader: a standby server leads only its
+                // own group (karyos#713).
+                let primary: Vec<NodeId> = joined
+                    .iter()
+                    .copied()
+                    .filter(|id| !standby.contains(id))
+                    .collect();
+                let mut waited = 0;
+                let (leader, term) = loop {
+                    if let Some(found) = current_leader(&sim, &primary)
+                        .filter(|(_, term)| floor.is_none_or(|floor| *term > floor))
+                    {
+                        break found;
+                    }
+                    if waited >= LEADER_WAIT {
+                        return Err(RunError::NoLeader);
+                    }
+                    advance(&mut sim, 1, &mut stepping, &joined)?;
+                    waited += 1;
+                };
+                acted = Some((leader, term));
+                let what = match act {
+                    LeaderAction::Crash => {
+                        sim.crash(leader).map_err(RunError::Node)?;
+                        crashed = Some(leader);
+                        "leader crash"
+                    }
+                    LeaderAction::Isolate => {
+                        sim.net_mut().isolate(leader, &everyone);
+                        "leader isolate"
+                    }
+                    LeaderAction::MuteAcks | LeaderAction::MuteNextLeaderAcks => {
+                        for &other in everyone.iter().filter(|id| **id != leader) {
+                            sim.net_mut().cut(other, leader);
+                        }
+                        "leader mute"
+                    }
+                    LeaderAction::Split { with } => {
+                        let mut left = vec![leader];
+                        left.extend(joined.iter().copied().filter(|id| *id != leader).take(with));
+                        let right: Vec<NodeId> = joined
+                            .iter()
+                            .copied()
+                            .filter(|id| !left.contains(id))
+                            .collect();
+                        sim.net_mut().split(&left, &right);
+                        "leader split"
+                    }
+                    LeaderAction::Remove => {
+                        let operator = operator.ok_or(RunError::Count)?;
+                        send_change(&mut sim, operator, &everyone, Change::Remove(leader))?;
+                        "leader remove"
+                    }
+                    LeaderAction::RemoveFollower => {
+                        let operator = operator.ok_or(RunError::Count)?;
+                        let voters = sim
+                            .node(leader)
+                            .and_then(Member::server)
+                            .and_then(ServerNode::core)
+                            .and_then(ConsensusCore::configuration)
+                            .map(|configuration| configuration.voters)
+                            .unwrap_or_default();
+                        let follower = voters
+                            .into_iter()
+                            .filter(|id| *id != leader)
+                            .max()
+                            .ok_or(RunError::Count)?;
+                        send_change(&mut sim, operator, &everyone, Change::Remove(follower))?;
+                        "follower remove"
+                    }
+                    LeaderAction::RestartCrashed => "leader restart",
+                };
+                recorder
+                    .borrow_mut()
+                    .observations
+                    .push(Observation::Triggered {
+                        what,
+                        node: leader,
+                        client: 0,
+                        at: stepping.done,
+                        request: None,
+                    });
+            }
             Action::Crash(id) => sim.crash(id).map_err(RunError::Node)?,
             Action::Restart(id) => sim.restart(id).map_err(RunError::Node)?,
             Action::Isolate(id) => sim.net_mut().isolate(id, &everyone),
             Action::Cut { from, to } => sim.net_mut().cut(from, to),
-            Action::Split { left, right } => sim.net_mut().split(&left, &right),
+            Action::Split { left, right } => {
+                sim.net_mut().split(&left, &right);
+                recorder
+                    .borrow_mut()
+                    .observations
+                    .push(Observation::Split { left, right });
+            }
             Action::Heal => {
                 sim.net_mut().heal();
                 recorder.borrow_mut().observations.push(Observation::Healed);
@@ -1324,6 +1645,7 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                                 operator,
                                 id,
                                 Wire::Promote {
+                                    fencing,
                                     unknown: unknown.clone(),
                                 },
                             )
@@ -1333,7 +1655,14 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                     for (index, &client) in clients.iter().enumerate() {
                         if !case.stay_on_primary.contains(&index) {
                             let _ = sim
-                                .send(operator, client, Wire::Redirect { server })
+                                .send(
+                                    operator,
+                                    client,
+                                    Wire::Redirect {
+                                        cluster: HARNESS_STANDBY,
+                                        server,
+                                    },
+                                )
                                 .map_err(RunError::Sim)?;
                         }
                     }
@@ -1370,6 +1699,7 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             }
         }
     }
+    let mut done = stepping.done;
     if let Some(lost) = case.lost_reply {
         if !case.schedule.is_empty() {
             return Err(RunError::Schedule);
@@ -1507,7 +1837,7 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             }
         }
     } else if let Some(steps) = case.steps.checked_sub(done).filter(|steps| *steps > 0) {
-        sim.run_for(steps).map_err(RunError::Sim)?;
+        advance(&mut sim, steps, &mut stepping, &joined)?;
     }
 
     let waiting_on: Vec<NodeId> = clients

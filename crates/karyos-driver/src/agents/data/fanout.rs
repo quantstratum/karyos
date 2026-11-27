@@ -480,6 +480,17 @@ impl LaneGate for TargetGate<'_> {
 }
 
 impl Fanout {
+    /// Cancels every target's pending repairs, with no outcome; returns
+    /// the jobs cancelled (`RepairPath::cancel_pending`).
+    pub(crate) fn cancel_repairs(&mut self) -> u64 {
+        self.targets
+            .iter_mut()
+            .filter_map(|target| target.repair.as_deref_mut())
+            .fold(0u64, |sum, repair| {
+                sum.saturating_add(repair.cancel_pending())
+            })
+    }
+
     /// `max_destinations` (MD-6): the most targets it holds.
     pub(super) const fn max(&self) -> usize {
         self.max

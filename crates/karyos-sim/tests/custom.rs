@@ -686,10 +686,9 @@ fn a_stall_on_the_failed_flush_server_alone_is_a_gap() {
     assert_eq!(case.failing_flushes, vec![2]);
     let outcome = workloads::run::<Custom>(&case, seed).unwrap();
     assert!(
-        outcome
-            .trace
-            .iter()
-            .any(|line| line.contains("sent 0->3") && line.contains("Redirect { server: 2 }")),
+        outcome.trace.iter().any(|line| line.contains("sent 0->3")
+            && line.contains("Redirect {")
+            && line.contains("server: 2 }")),
         "node 2 led and the clients were sent to it"
     );
     assert_eq!(outcome.waiting_on, vec![2, 2]);

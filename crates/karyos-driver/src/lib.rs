@@ -29,6 +29,7 @@ pub mod error;
 mod generations;
 pub mod grant_audit;
 pub mod guard_ack;
+pub mod guard_authority;
 pub mod guard_gate;
 mod guard_streams;
 pub mod guards;
@@ -40,19 +41,31 @@ pub mod paths;
 mod positions;
 pub mod recording;
 mod remote_generations;
+pub mod remote_guard;
 pub mod repair;
 pub mod replay;
 pub mod rtt;
 pub mod schedule;
 pub mod sessions;
 pub(crate) mod shared_words;
+pub mod signed_control;
 #[cfg(target_os = "linux")]
 pub mod sizing;
 pub mod sm_schedule;
 pub mod spin;
 pub mod timed_gate;
+// The H7 timing harness of `karyos-protocol`, shared rather than copied:
+// that crate keeps it test-only, so it is included here by path.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "the AEAD backend probes serve the encrypted class's H7 tests"
+)]
+#[path = "../../karyos-protocol/src/protection/timing.rs"]
+mod timing;
 mod trace_journals;
 pub mod wire_auth;
+pub mod wire_enc;
 pub mod wire_keys;
 
 #[cfg(test)]
@@ -73,7 +86,10 @@ pub use embedded::{
     FailedReason, NotReadyReason, Readiness, StreamConfig, StreamHandle, StreamState,
     stream_lane_bytes,
 };
-pub use error::{DriverError, EndpointLimit, TimedNetworkUnsupported, WalkerUnavailable};
+pub use error::{
+    AuthRefusal, AuthUnsupported, DriverError, EndpointLimit, TimedNetworkUnsupported,
+    WalkerUnavailable,
+};
 pub use generations::{GenerationInfo, Reconfiguration};
 pub use guards::{
     Audit, AuditOutcome, AuditRecord, GuardHandle, GuardRate, LaneRefusal, RateAuthority,

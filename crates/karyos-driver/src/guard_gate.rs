@@ -776,6 +776,13 @@ impl GuardGate {
         self.counts
     }
 
+    /// The applied epoch: the highest closed epoch the gate applied, 0
+    /// before any.
+    #[must_use]
+    pub fn applied_epoch(&self) -> u64 {
+        self.applied
+    }
+
     /// Why `lane`'s incarnation is aborting; `None` while it is not (or for
     /// an unknown lane).
     #[must_use]

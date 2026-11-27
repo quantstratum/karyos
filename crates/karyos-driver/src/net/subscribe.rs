@@ -700,6 +700,25 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         own_port: bool,
     ) -> Result<NetworkSubscription, DriverError> {
         let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
+        // An authenticated channel asks for nothing the class does not
+        // support, refused typed before any other check (fail closed;
+        // ADR-0035, ADR-0076).
+        if super::wire::protected(channel.security)?.is_some()
+            && let Some(operation) =
+                super::wire::unsupported(channel, dynamic || register_at(channel).is_some(), None)
+        {
+            if operation == crate::error::AuthUnsupported::Etf
+                && let Some(wire) = net.wire_keys_mut()
+            {
+                wire.count_etf_refused();
+            }
+            return Err(DriverError::AuthenticatedRefused {
+                reason: crate::error::AuthRefusal::Unsupported { operation },
+            });
+        }
+        if super::wire::protected(channel.security)?.is_some() {
+            net.check_auth_challenge_ceilings()?;
+        }
         // Redundant paths need sockets isolated per interface; without
         // that every datagram would count on every path (owner item 12).
         if !channel.paths.is_empty() && !net.paths_isolated() {
@@ -722,16 +741,69 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
         let route = receive_route(channel, dynamic)?;
         let later = later_routes(channel)?;
+        // An authenticated channel binds its keys, its one unicast
+        // publisher-to-receiver pair (the receiver identity is the pairwise
+        // key's `receiver_id`) and its abort and guard authority now, its
+        // authority's control budget reserved; anything else is refused
+        // before the receiver learns of the key (karyos#648).
+        let mut identity = options.0;
+        let auth = match super::wire::protected(channel.security)? {
+            None => None,
+            Some(auth) => {
+                // Its one receiver is the configured one (the unsupported
+                // operations were refused above).
+                let single =
+                    identity.is_none_or(|held| held.receiver_id.get() == auth.receiver_id());
+                let receiver_id = core::num::NonZeroU64::new(auth.receiver_id()).filter(|_| single);
+                let Some(receiver_id) = receiver_id else {
+                    return Err(DriverError::AuthenticatedRefused {
+                        reason: crate::error::AuthRefusal::Ambiguous,
+                    });
+                };
+                identity = Some(crate::membership::ReceiverIdentity {
+                    receiver_id,
+                    group_tag: identity.map_or(0, |held| held.group_tag),
+                });
+                let wire = net
+                    .wire_keys_mut()
+                    .ok_or(DriverError::AuthenticatedRefused {
+                        reason: crate::error::AuthRefusal::NoKeyStore,
+                    })?;
+                Some(match auth {
+                    super::wire::Protected::Auth(auth) => super::wire::SubscriptionGrant::Auth(
+                        auth,
+                        wire.subscription(&auth, stream_id)?,
+                    ),
+                    super::wire::Protected::Enc(enc) => super::wire::SubscriptionGrant::Enc(
+                        enc,
+                        wire.enc_subscription(&enc, stream_id)?,
+                    ),
+                })
+            }
+        };
+        let peer = auth
+            .as_ref()
+            .and_then(|grant| grant.channel().authority())
+            .map(|authority| authority.control);
         // The channel's NAK control groups join the driver's one table
         // first, so the subscription's join finds them (karyos#654).
-        let held = net.map_nak_control(channel)?;
+        let held = match net.map_nak_control(channel) {
+            Ok(held) => held,
+            Err(error) => {
+                if let (Some(peer), Some(wire)) = (peer, net.wire_keys_mut()) {
+                    wire.release(peer);
+                }
+                return Err(error);
+            }
+        };
         let added = net.add_subscription(
             stream_id,
             route,
             &later,
             DEFAULT_MAX_IMAGE_TERM_LENGTH,
             (channel.reliable, own_port, !channel.nak_control.is_empty()),
-            (options.0, options.1, register_at(channel), path_skew),
+            (identity, options.1, register_at(channel), path_skew),
+            auth,
         );
         // The channel's entries stay counted while its key lives, beside
         // those its paths select, and are released when it ends or the add
@@ -743,6 +815,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
             Err(error) => {
                 net.release_control_groups(&held);
+                if let (Some(peer), Some(wire)) = (peer, net.wire_keys_mut()) {
+                    wire.release(peer);
+                }
                 Err(error)
             }
         }

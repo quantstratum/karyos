@@ -716,6 +716,51 @@ mod tests {
         );
     }
 
+    /// ADR-0114 section 11 (the E-4 method of ADR-0086, gate H11): the
+    /// `encrypted` envelope `E` = 68 + 16 = 84 bytes, counted in `mtu`,
+    /// gives a raw inner budget of 1324 bytes at MTU 1408, `c` = 1280
+    /// (96 less than `trusted`, 32 less than `authenticated`), and
+    /// `max_message_length` 7968 at 64 KiB terms: seven fragments, six of
+    /// 1280 bytes and one of 288, reserving 7872 + 320 = 8192 bytes.
+    #[test]
+    fn the_encrypted_mtu_figures_of_adr_0114_section_11() {
+        use karyos_protocol::protection::aes_gcm_siv::{ENVELOPE_LEN, MAX_PLAINTEXT, TRAILER_LEN};
+        let e = u32::try_from(ENVELOPE_LEN).unwrap();
+        assert_eq!(e, 84);
+        let rule = MtuRule::CountsEnvelope;
+        assert_eq!(rule.frame_budget(MTU, e), Ok(1324));
+        assert_eq!(usize::try_from(MTU - e).unwrap(), MAX_PLAINTEXT);
+        let c = w6_fragment_payload(e, rule).unwrap();
+        assert_eq!(c, 1280);
+        assert_eq!(w6_fragment_payload(0, rule).unwrap() - c, 96, "trusted");
+        assert_eq!(
+            w6_fragment_payload(48, rule).unwrap() - c,
+            32,
+            "authenticated"
+        );
+        assert_eq!(w4_payload(e), Ok(1280));
+        let max = max_message_length_64k(e, rule).unwrap();
+        assert_eq!(max, 7968);
+        assert_eq!(
+            max,
+            max_message_length_64k(48, rule).unwrap(),
+            "the authenticated figure"
+        );
+        let term = TermLength::try_new(64 * 1024).unwrap();
+        let plan = FragmentPlan::new(MTU - e, Flags::NONE).unwrap();
+        assert_eq!(plan.fragments(max), 7);
+        assert_eq!(max - 6 * c, 288);
+        assert_eq!(plan.reserved(max), Ok(7872 + 320));
+        assert_eq!(plan.reserved(max), Ok(term.max_reserved_limit()));
+        // At the 256-byte control MTU floor the inner budget is 172 bytes:
+        // a four-lane SM of 152 bytes fits exactly with its pairwise
+        // trailer, and RSP_SETUP CHALLENGE (108 bytes) fits with room.
+        let control_inner = 256 - ENVELOPE_LEN;
+        assert_eq!(control_inner, 172);
+        assert_eq!(152 + TRAILER_LEN, control_inner);
+        assert!(108 + TRAILER_LEN <= control_inner);
+    }
+
     #[test]
     fn the_primary_set_has_seventeen_points() {
         let points = primary();

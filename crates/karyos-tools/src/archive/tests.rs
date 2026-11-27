@@ -158,9 +158,12 @@ where
         self.requests.0.lock().unwrap().push_back(out);
     }
 
-    /// Cycles until a message `pick` accepts is sent, at most five seconds.
+    /// Cycles until a message `pick` accepts is sent, at most a minute: on
+    /// a loaded host running the whole suite in parallel, five seconds was
+    /// not always enough. The wait only bounds a stall.
     fn until<R>(&mut self, mut pick: impl FnMut(ControlMessage<'_>) -> Option<R>) -> R {
-        for _ in 0..5000 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             self.cycle();
             let sent = std::mem::take(&mut *self.responses.0.lock().unwrap());
             self.backlog.extend(sent);
@@ -179,7 +182,7 @@ where
             .iter()
             .map(|bytes| format!("{:?}", ControlMessage::decode(bytes).unwrap()))
             .collect();
-        panic!("no such message within five seconds; saw {seen:#?}");
+        panic!("no such message within a minute; saw {seen:#?}");
     }
 
     /// The response to `correlation_id`.

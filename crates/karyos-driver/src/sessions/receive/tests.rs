@@ -1673,3 +1673,106 @@ fn refused_retries_end_at_the_retry_window() {
     sessions.due_solicits(3 * SECOND, &mut due);
     assert!(due.is_empty());
 }
+
+/// H8 R5-04 (EST-13, BUD-4): a table at the authenticated profile's hard
+/// ceilings (ADR-0086 section 6: 256 pending challenges per driver, 8 per
+/// source address, one current entry per key) holds exactly 8 challenges
+/// per source and 256 in all; a ninth from one source and a 257th from a
+/// new source are dropped and counted, never allocated; a repeated
+/// announcement of a pending key keeps its one entry, and a changed one
+/// replaces it in place.
+#[test]
+fn an_authenticated_challenge_table_holds_the_profile_ceilings_exactly() {
+    let config = SessionConfig {
+        max_images: 512,
+        max_pending_challenges: AUTH_MAX_PENDING_CHALLENGES,
+        max_pending_per_source: AUTH_MAX_PENDING_PER_SOURCE,
+        ..SessionConfig::default()
+    };
+    assert!(config.within_auth_ceilings());
+    let mut sessions = table(config);
+    let mut nonces = Counter::default();
+    let entry = |ip: u8, port: u16| {
+        let key = BindingKey {
+            source: SocketAddr::from(([10, 0, 1, ip], port)),
+            ..key(port)
+        };
+        let mut ann = announce(u64::from(ip) * 100 + u64::from(port));
+        ann.alias = key.alias;
+        (key, ann)
+    };
+    let sources = u8::try_from(AUTH_MAX_PENDING_CHALLENGES / AUTH_MAX_PENDING_PER_SOURCE).unwrap();
+    let per_source = u16::try_from(AUTH_MAX_PENDING_PER_SOURCE).unwrap();
+    for ip in 1..=sources {
+        for port in 1..=per_source {
+            let (key, ann) = entry(ip, port);
+            challenged(sessions.announce(key, &ann, 0, &mut nonces));
+        }
+        // A ninth key from the same source address.
+        let (key, ann) = entry(ip, per_source + 1);
+        assert_eq!(
+            sessions.announce(key, &ann, 0, &mut nonces),
+            AnnounceOutcome::Dropped(Ignored::ChallengeCapacity),
+            "per source, source {ip}"
+        );
+    }
+    assert_eq!(sessions.pending(None), AUTH_MAX_PENDING_CHALLENGES);
+    // A 257th from a source with nothing pending.
+    let (key, ann) = entry(sources + 1, 1);
+    assert_eq!(
+        sessions.announce(key, &ann, 0, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::ChallengeCapacity),
+        "global"
+    );
+    // One current entry per key: a repeated announcement resends the
+    // same challenge after the resend interval, a changed one replaces
+    // the entry; neither takes a second one.
+    let (key, ann) = entry(1, 1);
+    let resend = challenged(sessions.announce(key, &ann, SECOND / 2, &mut nonces));
+    let mut changed = ann;
+    changed.lane_count = 1;
+    let replaced = challenged(sessions.announce(key, &changed, SECOND / 2 + MS, &mut nonces));
+    assert_ne!(resend.challenge.nonce, replaced.challenge.nonce);
+    assert_eq!(sessions.pending(None), AUTH_MAX_PENDING_CHALLENGES);
+    assert_eq!(
+        sessions.pending(Some(key.source)),
+        AUTH_MAX_PENDING_PER_SOURCE
+    );
+    assert_eq!(
+        sessions
+            .ignored_counts()
+            .seen()
+            .find(|(reason, _)| *reason == Ignored::ChallengeCapacity)
+            .map(|(_, count)| count),
+        Some(u64::from(sources) + 1)
+    );
+}
+
+/// H8 R5-04: configurations at and above the profile ceilings: only a
+/// table within both is within the authenticated ceilings (the conductor
+/// refuses a protected channel otherwise; `net/wire/tests/challenge_ceilings.rs`).
+#[test]
+fn the_authenticated_ceilings_are_checked() {
+    let at = SessionConfig {
+        max_images: 1024,
+        max_pending_challenges: AUTH_MAX_PENDING_CHALLENGES,
+        max_pending_per_source: AUTH_MAX_PENDING_PER_SOURCE,
+        ..SessionConfig::default()
+    };
+    assert!(at.within_auth_ceilings());
+    assert!(SessionConfig::default().within_auth_ceilings());
+    for above in [
+        SessionConfig {
+            max_pending_challenges: AUTH_MAX_PENDING_CHALLENGES + 1,
+            ..at
+        },
+        SessionConfig {
+            max_pending_per_source: AUTH_MAX_PENDING_PER_SOURCE + 1,
+            ..at
+        },
+    ] {
+        // A valid table for a trusted channel, above the ceilings.
+        assert!(ReceiveSessions::new(above, BOOT).is_ok());
+        assert!(!above.within_auth_ceilings(), "{above:?}");
+    }
+}

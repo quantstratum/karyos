@@ -1,0 +1,3 @@
+### Added
+
+- Election-timeout profiles for the custom Raft core (ADR-0039; ADR-0105, decision 5): `TimeoutProfile` and `SAME_HOST`, `LAN_DEDICATED` and `LAN_SHARED` in `karyos_cluster::consensus`, each chosen from measured process pauses and UDP round trips (`karyos-bench timeouts pause|echo|rtt`, every report with its host's load) by the rule in `tests/timeout_profiles.rs`: the smallest swept timeout with no false election in the simulated core under the measured tails, doubled. The record with the measurements, the false elections against recovery time and the deployment assumptions is quantstratum-docs karyos/environments/election-timeouts.md.
