@@ -1585,7 +1585,10 @@ enum Selected {
 /// and promotes, and only for an accepted datagram. It names the opener
 /// instance that verified it: no other opener commits it, and the mark is
 /// the window's atomic check and mark, so a token committed twice, or two
-/// tokens of one sequence, mark it once.
+/// tokens of one sequence, mark it once. It carries the one clock reading
+/// and the VM generation it was verified at, which its commit uses: a
+/// datagram verified and accepted commits however long its handler took
+/// (H8-39).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pending {
     /// Length of the inner frames in the output buffer.
@@ -1594,6 +1597,10 @@ pub struct Pending {
     pub epochs: (u32, u16),
     seq: u64,
     opener: u64,
+    /// The clock reading it was verified at.
+    at: u64,
+    /// The VM generation it was verified in, the opener's.
+    generation: u64,
 }
 
 /// Opener instances, so a [`Pending`] commits only in the opener that
@@ -1874,7 +1881,7 @@ impl EncOpener {
         inner: impl FnOnce(&[u8]) -> Result<(), EncRejection>,
     ) -> Result<Accepted, EncRejection> {
         let pending = self.verify(datagram, out, rate, now_ns, inner)?;
-        self.commit(pending, now_ns)
+        self.commit(pending)
     }
 
     /// Verifies `datagram` into `out` in the receive order of section 8,
@@ -1944,6 +1951,8 @@ impl EncOpener {
             epochs: (header.key_epoch, header.party_epoch),
             seq: opened.seq,
             opener: self.instance,
+            at: now_ns,
+            generation: self.generation,
         })
     }
 
@@ -1974,14 +1983,30 @@ impl EncOpener {
     /// datagram is never committed, so it marks and promotes nothing.
     /// Allocates nothing.
     ///
+    /// It decides at the token's own clock reading and VM generation, its
+    /// verification's (H8-39): the previous epoch's overlap ending, or the
+    /// process generation moving, while the handler ran refuses nothing,
+    /// since the handler's effects are already applied. The token is the
+    /// generation's: a later generation verifies nothing new.
+    ///
     /// # Errors
     ///
-    /// [`EncRejection::VmGeneration`], [`EncRejection::Withdrawn`],
-    /// [`EncRejection::Epoch`] for another opener's token or an epoch no
-    /// longer selected, or the replay refusal of a sequence already marked;
-    /// nothing changes.
-    pub fn commit(&mut self, pending: Pending, now_ns: u64) -> Result<Accepted, EncRejection> {
-        self.owns(&pending)?;
+    /// [`EncRejection::VmGeneration`] for a token of another generation,
+    /// [`EncRejection::Withdrawn`], [`EncRejection::Epoch`] for another
+    /// opener's token or an epoch no longer selected, or the replay refusal
+    /// of a sequence already marked; nothing changes. None is reachable for
+    /// a token verified and handled in one step.
+    pub fn commit(&mut self, pending: Pending) -> Result<Accepted, EncRejection> {
+        if pending.generation != self.generation {
+            return Err(EncRejection::VmGeneration);
+        }
+        if self.withdrawn {
+            return Err(EncRejection::Withdrawn);
+        }
+        if pending.opener != self.instance {
+            return Err(EncRejection::Epoch);
+        }
+        let now_ns = pending.at;
         let accepted = |promoted| Accepted {
             frames: pending.frames,
             epochs: pending.epochs,

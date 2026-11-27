@@ -856,6 +856,14 @@ impl Membership {
         }
     }
 
+    /// Counts `reason`, the refusal [`Self::would_accept`] gave an SM, and
+    /// changes nothing else (H8-37): no entry expires, no tombstone's
+    /// silence timer moves and no event is queued. Lifecycle timers stay
+    /// with [`Self::timers`].
+    pub fn count_rejected(&mut self, reason: StatusRejected) {
+        let _ = self.reject(reason);
+    }
+
     /// Whether [`Self::status`] would accept `sm` for `key` at `now`,
     /// changing nothing (H8-28): the same key, identity, lane, tag, credit
     /// (window, unchanged window, stale, `sent_high`, overflow), lifecycle

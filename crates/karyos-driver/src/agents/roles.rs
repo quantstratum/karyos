@@ -1189,12 +1189,29 @@ fn classify_heartbeat<T: StreamTerms>(
     image: &mut Installed<T>,
     heartbeat: &Heartbeat,
 ) -> HeartbeatClass {
+    let (class, position) = peek_heartbeat(image, heartbeat);
+    if class == HeartbeatClass::Fresh
+        && let Some(mark) = image
+            .heartbeat_marks
+            .get_mut(usize::from(heartbeat.lane().get()))
+    {
+        *mark = Some(position);
+    }
+    class
+}
+
+/// What [`classify_heartbeat`] makes of `heartbeat`, changing nothing
+/// (H8-38), with the position a fresh one raises its lane's mark to.
+fn peek_heartbeat<T: StreamTerms>(
+    image: &Installed<T>,
+    heartbeat: &Heartbeat,
+) -> (HeartbeatClass, u64) {
     let lane = heartbeat.lane();
     let Some(position) = heartbeat_position(image, heartbeat) else {
-        return HeartbeatClass::Rejected;
+        return (HeartbeatClass::Rejected, 0);
     };
     if !image.owner.within_window(lane, position).unwrap_or(false) {
-        return HeartbeatClass::Rejected;
+        return (HeartbeatClass::Rejected, position);
     }
     // Nothing past a recorded terminal bound is marked: the sender has
     // nothing there to repair.
@@ -1202,17 +1219,13 @@ fn classify_heartbeat<T: StreamTerms>(
         Some(bound) => position.min(bound),
         None => position,
     };
-    let Some(mark) = image.heartbeat_marks.get_mut(usize::from(lane.get())) else {
-        return HeartbeatClass::Rejected;
+    let class = match image.heartbeat_marks.get(usize::from(lane.get())) {
+        None => HeartbeatClass::Rejected,
+        Some(Some(seen)) if position < *seen => HeartbeatClass::Stale,
+        Some(Some(seen)) if position == *seen => HeartbeatClass::Stationary,
+        Some(_) => HeartbeatClass::Fresh,
     };
-    match *mark {
-        Some(seen) if position < seen => HeartbeatClass::Stale,
-        Some(seen) if position == seen => HeartbeatClass::Stationary,
-        _ => {
-            *mark = Some(position);
-            HeartbeatClass::Fresh
-        }
-    }
+    (class, position)
 }
 
 /// The stream position `heartbeat` names in `image`, or `None` for a term
@@ -1241,23 +1254,30 @@ enum Terminal {
 /// the lane's complete prefix or its covered data. EOS ahead of a hole is
 /// recorded; the hole is still repaired before the image completes.
 fn record_terminal<T: StreamTerms>(image: &mut Installed<T>, lane: Lane, bound: u64) -> Terminal {
+    let outcome = terminal_outcome(image, lane, bound);
+    if outcome == Terminal::Recorded
+        && let Some(slot) = image.terminal.get_mut(usize::from(lane.get()))
+    {
+        *slot = Some(bound);
+    }
+    outcome
+}
+
+/// What [`record_terminal`] would do with `bound`, changing nothing
+/// (H8-38).
+fn terminal_outcome<T: StreamTerms>(image: &Installed<T>, lane: Lane, bound: u64) -> Terminal {
     let (Some(rebuild), Some(high)) = (
         image.owner.rebuild_position(lane),
         image.owner.high_water(lane),
     ) else {
         return Terminal::Refused;
     };
-    let Some(slot) = image.terminal.get_mut(usize::from(lane.get())) else {
-        return Terminal::Refused;
-    };
-    match *slot {
-        Some(recorded) if recorded == bound => Terminal::Repeated,
-        Some(_) => Terminal::Refused,
-        None if bound < rebuild || bound < high => Terminal::Refused,
-        None => {
-            *slot = Some(bound);
-            Terminal::Recorded
-        }
+    match image.terminal.get(usize::from(lane.get())) {
+        None => Terminal::Refused,
+        Some(Some(recorded)) if *recorded == bound => Terminal::Repeated,
+        Some(Some(_)) => Terminal::Refused,
+        Some(None) if bound < rebuild || bound < high => Terminal::Refused,
+        Some(None) => Terminal::Recorded,
     }
 }
 
@@ -2305,7 +2325,7 @@ pub(super) fn roles<T: StreamTerms>(
             due: Vec::with_capacity(config.publications),
             publication_auth: Vec::new(),
             publication_installs: Vec::new(),
-            enc: publish_enc::SenderEnc::default(),
+            enc: publish_enc::SenderEnc::new(config.sessions.setup_challenge_timeout),
             aborts: Vec::with_capacity(config.publications),
             abort_expiry: config.image_liveness_timeout,
             #[cfg(test)]
@@ -5504,8 +5524,16 @@ impl<T: StreamTerms> Intake<'_, T> {
         let Some(image) = self.role.images.get_mut(index) else {
             return false;
         };
+        // Only a REPLY naming the probe whose send is still in its backend
+        // call settles that send as submitted; any other collects only a
+        // final report, as the duty would (H8-38 audit): a refused REPLY,
+        // never committed and so replayable, settles nothing.
+        let generation = image.rtt.generation(path);
         if let Some(probe) = image.probes.get_mut(path) {
-            collect_probe(&mut image.rtt, probe, true);
+            let answers = probe.pending.is_some_and(|pending| {
+                pending.probe_id == rttm.probe_id && Some(pending.generation) == generation
+            });
+            collect_probe(&mut image.rtt, probe, answers);
         }
         let taken = image
             .rtt
@@ -5835,22 +5863,33 @@ impl<T: StreamTerms> Intake<'_, T> {
                     // An EOS heartbeat names its lane's terminal bound, its
                     // position, inside the receive window only. A refused
                     // one is rejected: no evidence, and no heartbeat mark.
-                    let refused = heartbeat.flags().eos() && {
-                        let lane = heartbeat.lane();
-                        let outcome = match heartbeat_position(image, &heartbeat) {
-                            Some(bound)
-                                if image.owner.within_window(lane, bound).unwrap_or(false) =>
-                            {
-                                record_terminal(image, lane, bound)
-                            }
-                            _ => Terminal::Refused,
-                        };
-                        tally_terminal(&mut role.counters, outcome);
-                        outcome == Terminal::Refused
-                    };
-                    if refused {
+                    // The bound and the heartbeat are decided together
+                    // before either is recorded (H8-38): an EOS heartbeat
+                    // refused as stale or outside the window records no
+                    // bound, so a refusal, never committed, changes nothing.
+                    let lane = heartbeat.lane();
+                    let position = heartbeat_position(image, &heartbeat);
+                    let terminal = heartbeat.flags().eos().then(|| match position {
+                        Some(bound) if image.owner.within_window(lane, bound).unwrap_or(false) => {
+                            terminal_outcome(image, lane, bound)
+                        }
+                        _ => Terminal::Refused,
+                    });
+                    let class = peek_heartbeat(image, &heartbeat).0;
+                    if terminal == Some(Terminal::Refused) {
+                        tally_terminal(&mut role.counters, Terminal::Refused);
+                        (6, None)
+                    } else if terminal.is_some() && class == HeartbeatClass::Stale {
+                        (4, None)
+                    } else if terminal.is_some() && class == HeartbeatClass::Rejected {
                         (6, None)
                     } else {
+                        if terminal.is_some()
+                            && let Some(bound) = position
+                        {
+                            let outcome = record_terminal(image, lane, bound);
+                            tally_terminal(&mut role.counters, outcome);
+                        }
                         if let (Some(bound), Some(position)) = (
                             terminal_bound(image, heartbeat.lane()),
                             heartbeat_position(image, &heartbeat),
@@ -10922,6 +10961,12 @@ impl<T: StreamTerms> SenderRole<T> {
                 membership.requester(nak.receiver, nak.range.lane, now)
             });
         let intake = outbound.nak_at(normal, nak, requester, (route, validated), now);
+        if matches!(intake, NakIntake::Dropped) {
+            // Refused by repair admission: it spends none of the cycle's
+            // NAK budget, so a refused NAK, never committed and so
+            // replayable, cannot starve the cycle (H8-38 audit).
+            self.naks_this_cycle = self.naks_this_cycle.saturating_sub(1);
+        }
         if let NakIntake::Reply(reply) = intake
             && self
                 .send_sender_control(halves, endpoint, source, &Control::NakReply(reply))
@@ -11214,9 +11259,11 @@ impl<T: StreamTerms> SenderRole<T> {
         };
         // The membership decides before the binding moves (H8-28): an SM it
         // rejects (credit, window, lifecycle, capacity, another
-        // incarnation) refreshes no liveness, lane state or session; it is
-        // counted there. A redraw takes the membership to the new
-        // incarnation first, so none is exempt (H8-32).
+        // incarnation) refreshes no liveness, lane state or session. It is
+        // only counted there: no entry expires and no tombstone's silence
+        // timer moves, so a refused SM, never committed and so replayable,
+        // changes no lifecycle state (H8-37). A redraw takes the membership
+        // to the new incarnation first, so none is exempt (H8-32).
         let key = SmKey {
             endpoint,
             alias: status.alias,
@@ -11229,9 +11276,9 @@ impl<T: StreamTerms> SenderRole<T> {
             .iter_mut()
             .find(|outbound| outbound.serves(endpoint) && outbound.alias() == status.alias)
             .and_then(|outbound| outbound.membership_mut())
-            && membership.would_accept(&key, status, now).is_err()
+            && let Err(reason) = membership.would_accept(&key, status, now)
         {
-            let _ = membership.status(&key, status, now);
+            membership.count_rejected(reason);
             return (None, false);
         }
         let index = match found {

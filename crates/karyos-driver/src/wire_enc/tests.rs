@@ -1852,9 +1852,9 @@ fn a_verified_datagram_marks_and_promotes_only_once_committed() {
     let copy = verify(&mut ours, &first).unwrap();
     assert_eq!(copy, pending, "uncommitted, it verifies again");
     assert_eq!(ours.check(&pending, now), Ok(()));
-    assert_eq!(ours.commit(pending, now).map(|a| a.promoted), Ok(false));
+    assert_eq!(ours.commit(pending).map(|a| a.promoted), Ok(false));
     assert_eq!(ours.current_window().highest(), Some(0));
-    assert_eq!(ours.commit(copy, now), Err(EncRejection::Duplicate), "once");
+    assert_eq!(ours.commit(copy), Err(EncRejection::Duplicate), "once");
     assert_eq!(ours.check(&copy, now), Err(EncRejection::Duplicate));
     assert_eq!(verify(&mut ours, &first), Err(EncRejection::Duplicate));
     // Only the opener that verified a token commits it.
@@ -1862,18 +1862,46 @@ fn a_verified_datagram_marks_and_promotes_only_once_committed() {
     let second = seal(&mut sealer, &frame(DATA));
     let token = verify(&mut ours, &second).unwrap();
     assert_eq!(theirs.check(&token, now), Err(EncRejection::Epoch));
-    assert_eq!(theirs.commit(token, now), Err(EncRejection::Epoch));
+    assert_eq!(theirs.commit(token), Err(EncRejection::Epoch));
     assert_eq!(theirs.current_window().highest(), None);
     // The next epoch is promoted at the commit, not at the verification.
     sealer.roll_now();
     let rolled = seal(&mut sealer, &frame(DATA));
     let next = verify(&mut ours, &rolled).unwrap();
     assert_eq!(ours.epochs(), (1, 0), "not promoted");
-    assert_eq!(ours.commit(next, now).map(|a| a.promoted), Ok(true));
+    assert_eq!(ours.commit(next).map(|a| a.promoted), Ok(true));
     assert_eq!(ours.epochs(), (1, 1));
     // Never after a withdrawal.
     let third = seal(&mut sealer, &frame(DATA));
     let late = verify(&mut ours, &third).unwrap();
     ours.withdraw();
-    assert_eq!(ours.commit(late, now), Err(EncRejection::Withdrawn));
+    assert_eq!(ours.commit(late), Err(EncRejection::Withdrawn));
+}
+
+/// H8-39 (sections 8 and 10): a datagram verified before a VM generation
+/// change commits after it, its handler having run on a verification of
+/// the opener's own generation; nothing verifies after the change.
+#[test]
+fn a_datagram_verified_before_a_generation_change_still_commits() {
+    let mut ours = opener();
+    let mut sealer = sender();
+    let mut rate = OpenRate::default();
+    let mut out = [0_u8; MAX_PLAINTEXT];
+    let now = clock();
+    let first = seal(&mut sealer, &frame(DATA));
+    let second = seal(&mut sealer, &frame(DATA));
+    let pending = ours
+        .verify(&first, &mut out, &mut rate, now, |_| Ok(()))
+        .unwrap();
+    let before = vm_generation::generation();
+    let (signal, injector) = vm_generation::InjectedSignal::new();
+    let mut watch = vm_generation::VmGenerationWatch::new(Box::new(signal));
+    injector.change();
+    assert_ne!(watch.poll(0), before, "the generation moved");
+    assert_eq!(ours.commit(pending).map(|a| a.promoted), Ok(false));
+    assert_eq!(ours.current_window().highest(), Some(0), "marked");
+    assert_eq!(
+        ours.verify(&second, &mut out, &mut rate, now, |_| Ok(())),
+        Err(EncRejection::VmGeneration)
+    );
 }

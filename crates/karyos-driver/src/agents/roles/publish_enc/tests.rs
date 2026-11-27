@@ -14,6 +14,7 @@ use karyos_protocol::network::{
 use karyos_protocol::protection::aes_gcm_siv::{EncRejection, MAX_PLAINTEXT};
 
 use super::*;
+use crate::agents::Half;
 use crate::wire_enc::open_bootstrap;
 use crate::wire_enc::{EncOpener, MAX_SEALED, OpenRate, SECOND_NS};
 use crate::wire_keys::{KEY_LEN, parse};
@@ -1719,6 +1720,11 @@ fn tick() {
     NOW.with(|now| now.set(now.get() + SECOND_NS));
 }
 
+/// Moves the test clock past the re-key holdoff (H8-40).
+fn past_holdoff() {
+    NOW.with(|now| now.set(now.get() + REKEY_HOLDOFF_NS));
+}
+
 /// H8-30 (sections 4, 6b and 7): challenge A of a receiver boot is
 /// answered and committed, and that ANSWER is lost; the receiver, still
 /// unbound, challenges again under the same boot with nonce B. Its
@@ -1738,6 +1744,11 @@ fn a_lost_answer_then_a_fresh_challenge_of_the_same_boot_exchanges_data_and_sm()
     let b = [a[0] + 1, a[1] + 1];
     receiver.nonce = b;
     tick();
+    assert!(
+        establish(&mut sender, destination, &receiver.challenge()).is_none(),
+        "inside the re-key holdoff A's ANSWER may still be installed (H8-40)"
+    );
+    past_holdoff();
     let Some(Control::SetupAnswer(answer)) =
         establish(&mut sender, destination, &receiver.challenge())
     else {
@@ -1801,10 +1812,11 @@ fn a_lost_answer_then_a_fresh_challenge_of_the_same_boot_exchanges_data_and_sm()
         Some(receiver.sm()),
         "the SM authenticates"
     );
-    // Confirmed: a resynchronising challenge keeps the salt.
+    // Confirmed: a further CHALLENGE is refused and keeps the salt
+    // (H8-40).
     receiver.nonce = [b[0] + 1, b[1] + 1];
-    tick();
-    assert!(establish(&mut sender, destination, &receiver.challenge()).is_some());
+    past_holdoff();
+    assert!(establish(&mut sender, destination, &receiver.challenge()).is_none());
     assert_eq!(session_salt(&mut sender), Some(salt));
 }
 
@@ -2099,7 +2111,7 @@ fn a_superseded_or_bound_challenge_replayed_after_confirmation_changes_nothing()
         "A is answered; the ANSWER is lost"
     );
     receiver.nonce = [a[0] + 1, a[1] + 1];
-    tick();
+    past_holdoff();
     let challenge_b = receiver.challenge();
     assert!(establish(&mut sender, destination, &challenge_b).is_some());
     let salt = session_salt(&mut sender);
@@ -2189,4 +2201,227 @@ fn a_redrawn_publications_membership_judges_its_fresh_incarnations_sms() {
     );
     let _ = sender.status(EndpointId(1), destination, &sm(fresh, 0), clock());
     assert_eq!(binding(&sender, fresh).last_sm, Some(clock()), "accepted");
+}
+
+/// H8-37: an SM its membership refuses changes no lifecycle state. A
+/// stationary optional member expires to a tombstone; its SM, refused
+/// again and again as not fresh against it (`Expired`), is counted each
+/// time and never extends the tombstone's silence: `receiver_timeout`
+/// after the expiry the tombstone is free, and the same SM would join.
+#[test]
+fn a_replayed_refused_sm_never_extends_a_tombstone() {
+    use crate::membership::{MembershipConfig, SmKey, StatusRejected};
+
+    let (mut sender, destination, receiver) = with_membership();
+    sender.confirmed_timeout = u64::MAX;
+    fn membership(sender: &mut super::super::SenderRole) -> &mut crate::membership::Membership {
+        sender.publications[0].membership_mut().unwrap()
+    }
+    assert!(membership(&mut sender).advance_sent(Lane::ZERO, 4096));
+    let status = sm_at(&receiver, 64, 32_768);
+    let _ = sender.status(EndpointId(1), destination, &status, clock());
+    assert_eq!(sender.bindings[0].last_sm, Some(clock()), "accepted");
+    let timeout = MembershipConfig::new(1, 1408, 32_768).receiver_timeout;
+    let expired_at = clock() + timeout;
+    membership(&mut sender).timers(expired_at, 64);
+    let key = SmKey {
+        endpoint: EndpointId(1),
+        alias: ALIAS,
+        source: destination,
+        identity: IDENTITY,
+        receiver: status.receiver,
+    };
+    assert_eq!(
+        membership(&mut sender).would_accept(&key, &status, expired_at),
+        Err(StatusRejected::Expired),
+        "a tombstone, and the SM not fresh against it"
+    );
+    let counted = membership(&mut sender).counters().expired_rejected;
+    let replays = 4;
+    for replay in 1..=replays {
+        let at = expired_at + replay * SECOND_NS;
+        assert!(
+            sender
+                .status(EndpointId(1), destination, &status, at)
+                .is_none()
+        );
+        assert_eq!(sender.bindings[0].last_sm, Some(clock()), "{replay}");
+    }
+    assert_eq!(
+        membership(&mut sender).counters().expired_rejected,
+        counted + replays,
+        "each refusal counted"
+    );
+    assert_eq!(
+        membership(&mut sender).would_accept(&key, &status, expired_at + timeout),
+        Ok(()),
+        "silent since its expiry: the tombstone is free"
+    );
+}
+
+/// H8-38 audit: a NAK its repair admission drops (lane 1 of a one-lane
+/// publication) spends none of the cycle's NAK budget, so a refused NAK,
+/// never committed, cannot starve the cycle: with one NAK left in the
+/// budget, the valid NAK after it is still served.
+#[test]
+fn a_dropped_nak_spends_no_cycle_budget() {
+    let (mut sender, _): (super::super::SenderRole, super::super::ReceiverRole) =
+        super::super::roles(&crate::agents::AgentConfig::default()).unwrap();
+    sender.clock = clock;
+    let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 0,
+        mtu: 1408,
+    };
+    let (mut path, _log) =
+        crate::agents::data::testing::outbound(EndpointId(1), ALIAS, destination, term, 1, true);
+    path.enable_repair(
+        &crate::agents::repair::RepairConfig::default(),
+        term.term_length,
+        IDENTITY,
+    )
+    .unwrap();
+    expect_receiver(&mut path, destination, 5);
+    sender.publications.push(path);
+    sender.enc.publish(publication());
+    sender.bind(EndpointId(1), destination, &plain_answer(), None, clock());
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    assert!(open(&mut sender.enc.publications[0], &receiver.challenge()).is_ok());
+    let (mut sealer, _) = receiver.data_keys();
+    let mut lane_one = receiver.nak();
+    if let Control::Nak(nak) = &mut lane_one {
+        nak.range.lane = Lane::try_new(1).unwrap();
+    }
+    let lane_one = seal_control(&mut sealer, &lane_one);
+    let valid = seal_control(&mut sealer, &receiver.nak());
+    let left = sender.repair.naks_per_cycle - 1;
+    sender.naks_this_cycle = left;
+    for _ in 0..3 {
+        assert!(
+            sender
+                .open_sealed_from(EndpointId(1), destination, &lane_one)
+                .is_none(),
+            "dropped, never committed"
+        );
+        assert_eq!(sender.naks_this_cycle, left, "no budget spent");
+    }
+    assert_eq!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &valid)
+            .map(|(control, _)| control),
+        Some(receiver.nak()),
+        "the cycle still serves it"
+    );
+}
+
+/// H8-39 (sections 6 and 8): a control is committed at the clock reading
+/// it was verified at. An SM of the previous epoch verified one
+/// nanosecond inside its overlap, its handler running as the overlap
+/// ends, is accepted and committed, not refused after its effects.
+#[test]
+fn a_previous_epoch_sm_verified_inside_its_overlap_commits_after_it() {
+    use crate::wire_enc::EPOCH_OVERLAP_NS;
+
+    let (mut sender, destination, receiver) = with_membership();
+    sender.confirmed_timeout = u64::MAX;
+    let (mut previous, _) = receiver.data_keys();
+    let (mut next, _) = receiver.data_keys();
+    next.roll_now();
+    let status = Control::Status(sm_at(&receiver, 0, 32_768));
+    assert!(
+        sender
+            .open_sealed_from(
+                EndpointId(1),
+                destination,
+                &seal_control(&mut next, &status)
+            )
+            .is_some()
+    );
+    assert_eq!(sender.enc.publications[0].bound_epochs(), Some((1, 1)));
+    let promoted = clock();
+    let late = seal_control(&mut previous, &status);
+    NOW.with(|now| now.set(promoted + EPOCH_OVERLAP_NS - 1));
+    let verified = clock();
+    let (control, _, received) = sender
+        .open_sealed(EndpointId(1), Some(destination), &late, verified)
+        .unwrap();
+    let received = received.unwrap();
+    // The handler runs as the overlap ends.
+    NOW.with(|now| now.set(promoted + EPOCH_OVERLAP_NS));
+    let mut halves: [(EndpointId, Half<karyos_io::sockets::OsSocket>); 0] = [];
+    let accepted = sender.receiver_control(
+        &mut halves,
+        (EndpointId(1), destination),
+        &control,
+        verified,
+        clock(),
+    );
+    assert!(accepted, "its handler took it");
+    assert_eq!(sender.bindings[0].last_sm, Some(clock()));
+    assert!(
+        sender.settle_enc(received, accepted),
+        "committed at its verification's reading"
+    );
+}
+
+/// H8-40 (sections 6b and 7): challenge X of a receiver boot is captured
+/// and never delivered; the receiver challenges again with A, installs
+/// A's ANSWER and its first SM is delayed. X, delivered inside the re-key
+/// holdoff, is refused: nothing is re-keyed or answered, and the delayed
+/// SM opens under A. No CHALLENGE re-keys or resets a confirmed binding:
+/// X, delivered after confirmation at once and long after, is refused
+/// each time, with the runtime binding, salt and epochs unchanged.
+#[test]
+fn an_obsolete_challenge_never_rekeys_or_resets_the_binding() {
+    let (mut sender, destination, _log) = answering();
+    sender.confirmed_timeout = u64::MAX;
+    sender.unconfirmed_timeout = u64::MAX;
+    let mut receiver = peer(5, 0x22, 1, &keys());
+    let a = receiver.nonce;
+    receiver.nonce = [a[0] + 7, a[1] + 7];
+    let x = receiver.challenge();
+    receiver.nonce = a;
+    tick();
+    assert!(
+        establish(&mut sender, destination, &receiver.challenge()).is_some(),
+        "A is answered, and the receiver installs it"
+    );
+    let salt = session_salt(&mut sender);
+    let (mut sm_sealer, _) = receiver.data_keys();
+    let sm = seal_control(&mut sm_sealer, &receiver.sm());
+    let refused = |sender: &super::super::SenderRole| {
+        sender.enc.publications[0]
+            .channel
+            .rejections
+            .get(EncRejection::ResyncRefused)
+    };
+    tick();
+    let before = refused(&sender);
+    assert!(
+        establish(&mut sender, destination, &x).is_none(),
+        "X inside the holdoff"
+    );
+    assert_eq!(refused(&sender), before + 1);
+    assert_eq!(session_salt(&mut sender), salt, "nothing re-keyed");
+    assert_eq!(
+        sender
+            .open_sealed_from(EndpointId(1), destination, &sm)
+            .map(|(control, _)| control),
+        Some(receiver.sm()),
+        "the delayed SM opens under A"
+    );
+    let held = sender.bindings.clone();
+    assert!(held.iter().all(|binding| binding.last_sm.is_some()));
+    let epochs = sender.enc.publications[0].bound_epochs();
+    for wait in [0, REKEY_HOLDOFF_NS, 10 * REKEY_HOLDOFF_NS] {
+        NOW.with(|now| now.set(now.get() + wait));
+        tick();
+        let before = refused(&sender);
+        assert!(establish(&mut sender, destination, &x).is_none(), "{wait}");
+        assert_eq!(refused(&sender), before + 1, "{wait}");
+        assert_eq!(session_salt(&mut sender), salt, "{wait}");
+        assert_eq!(sender.enc.publications[0].bound_epochs(), epochs);
+        assert_eq!(sender.bindings, held, "no runtime reset, {wait}");
+    }
 }

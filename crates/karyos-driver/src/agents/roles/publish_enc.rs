@@ -44,6 +44,33 @@ use std::net::SocketAddr;
 /// its receiver never confirmed (H8-30); more are refused (fail closed).
 const MAX_RECHALLENGES: usize = 4;
 
+/// The longest a receiver's pending entry takes an ANSWER, in its
+/// `setup_challenge_timeout`s: a CHALLENGE entry one, a SOLICIT entry its
+/// retry window of two (`sessions::receive`, H8-40).
+const CHALLENGE_LIFETIMES: u64 = 2;
+
+/// The margin over that lifetime, 1 s: the two peers' clock rates and the
+/// ANSWER's own flight (H8-40).
+const REKEY_MARGIN_NS: u64 = crate::wire_enc::SECOND_NS;
+
+/// How long after its ANSWER an unconfirmed binding is re-keyed by no
+/// fresh CHALLENGE, for a receiver `setup_challenge_timeout` of
+/// `challenge_timeout` ns (H8-40): the receiver's longest challenge
+/// lifetime plus [`REKEY_MARGIN_NS`]. Inside it the receiver may still
+/// install that ANSWER, so a CHALLENGE then may be an obsolete one; after
+/// it, one that installed the ANSWER no longer challenges and one whose
+/// challenge expired can no longer install it.
+const fn rekey_holdoff(challenge_timeout: u64) -> u64 {
+    challenge_timeout
+        .saturating_mul(CHALLENGE_LIFETIMES)
+        .saturating_add(REKEY_MARGIN_NS)
+}
+
+/// [`rekey_holdoff`] at the default `setup_challenge_timeout`, 1 s: 3 s,
+/// the least any publication takes.
+pub(crate) const REKEY_HOLDOFF_NS: u64 =
+    rekey_holdoff(super::receive_enc::RESYNC_CHALLENGE_TIMEOUT_NS);
+
 /// A receiver's binding: its block, the nonce of the challenge that bound
 /// it, and its committed domain 4 keys.
 #[derive(Debug)]
@@ -57,6 +84,9 @@ struct Bound {
     /// The nonces of this boot's earlier, never confirmed, bindings: each
     /// one's domain 1 key may have sealed, so none binds again (H8-30).
     superseded: [Option<[u8; 16]>; MAX_RECHALLENGES],
+    /// When `nonce` was first answered: no fresh CHALLENGE re-keys the
+    /// binding until [`PublicationEnc::rekey_holdoff`] after it (H8-40).
+    answered_at: u64,
 }
 
 /// A new binding a verified RSP_SETUP staged: its domain 4 keys, made
@@ -111,6 +141,9 @@ pub(crate) struct PublicationEnc {
     /// The scratch slot of its domain 6 opens, made here and re-keyed for
     /// each RSP_SETUP: the data path constructs no key.
     bootstrap: Option<AesGcmSiv>,
+    /// How long after its ANSWER an unconfirmed binding is re-keyed by no
+    /// fresh CHALLENGE ([`rekey_holdoff`], H8-40).
+    rekey_holdoff: u64,
 }
 
 impl PublicationEnc {
@@ -146,6 +179,7 @@ impl PublicationEnc {
             channel: EncChannel::default(),
             clock,
             bootstrap: None,
+            rekey_holdoff: REKEY_HOLDOFF_NS,
         };
         made.rekey()?;
         Ok(made)
@@ -303,13 +337,14 @@ impl PublicationEnc {
     /// The [`EncRejection`] of [`EncOpener::commit`], or
     /// [`EncRejection::Party`] with no binding.
     pub(crate) fn commit_receiver(&mut self, pending: Pending) -> Result<(), EncRejection> {
-        let now = (self.clock)();
+        // At the verification's clock reading, which the token carries
+        // (H8-39): no second reading.
         let result = self
             .bound
             .as_mut()
             .ok_or(EncRejection::Party)
             .and_then(|bound| {
-                bound.opener.commit(pending, now)?;
+                bound.opener.commit(pending)?;
                 // Opened under its keys and accepted: the receiver took
                 // this binding's answer.
                 bound.confirmed = true;
@@ -453,8 +488,16 @@ impl PublicationEnc {
             }
             if same && bound.confirmed {
                 // A confirmed binding keeps its salt (section 6b step 2):
-                // the resynchronisation answer changes no key.
-                return answer(matches!(control, Control::Solicit(_)));
+                // the resynchronisation answer changes no key. Its receiver
+                // installed the answer, so it resynchronises by SOLICIT and
+                // never challenges this boot again: a CHALLENGE is obsolete
+                // establishment traffic, delayed or captured, whatever its
+                // nonce. Refused, it re-keys nothing and resets no runtime
+                // binding (H8-40).
+                return match control {
+                    Control::Solicit(_) => answer(true),
+                    _ => Err(EncRejection::ResyncRefused),
+                };
             }
             if same && !matches!(control, Control::Challenge(_)) {
                 // Before confirmation a fresh SOLICIT of the bound boot may
@@ -475,7 +518,16 @@ impl PublicationEnc {
                 // The bound boot's fresh CHALLENGE before confirmation: its
                 // answer was lost, so the receiver, unbound, takes the salt
                 // of the nonce it is answered with (sections 4 and 7). The
-                // binding is re-keyed to it, staged.
+                // binding is re-keyed to it, staged, but only once the bound
+                // ANSWER is older than the receiver's longest challenge
+                // lifetime (H8-40): until then the receiver may install it,
+                // its first SM delayed, and the CHALLENGE may be an older
+                // one never delivered before, which would split the salt.
+                // It is refused; the receiver's challenge then expires and
+                // its next fresh one re-keys.
+                if now.saturating_sub(bound.answered_at) < self.rekey_holdoff {
+                    return Err(EncRejection::ResyncRefused);
+                }
                 superseded = bound.superseded;
                 let free = superseded
                     .iter_mut()
@@ -510,6 +562,7 @@ impl PublicationEnc {
                 opener,
                 confirmed: false,
                 superseded,
+                answered_at: now,
             })),
         ))
     }
@@ -716,6 +769,9 @@ pub(crate) struct SenderEnc {
     /// it is, receiver id, consumption and liveness included (H8-36). Set
     /// by the open of that SOLICIT, taken by its answer.
     pub(super) keep_binding: Option<(EndpointId, Alias, [u64; 2])>,
+    /// The re-key holdoff of its publications, from the role's
+    /// `setup_challenge_timeout`, at least [`REKEY_HOLDOFF_NS`] (H8-40).
+    rekey_holdoff: u64,
 }
 
 /// A receiver control verified under its publication's domain 4 keys and
@@ -729,6 +785,15 @@ pub(super) struct EncReceived {
 }
 
 impl SenderEnc {
+    /// The encrypted class of a sender role whose receivers' challenges
+    /// live `challenge_timeout` ns (`setup_challenge_timeout`, H8-40).
+    pub(crate) fn new(challenge_timeout: u64) -> Self {
+        Self {
+            rekey_holdoff: rekey_holdoff(challenge_timeout),
+            ..Self::default()
+        }
+    }
+
     /// Applies the key store's current key set to every encrypted
     /// publication (H8 finding 4): see [`PublicationEnc::apply_keys`].
     pub(crate) fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
@@ -753,6 +818,7 @@ impl SenderEnc {
     /// encrypted too.
     pub(crate) fn publish(&mut self, mut publication: PublicationEnc) {
         self.unpublish(publication.endpoint, publication.alias);
+        publication.rekey_holdoff = self.rekey_holdoff.max(REKEY_HOLDOFF_NS);
         // It starts at the role's activation floor, not 0 (H8-17).
         self.activation.hold(&mut publication.keys);
         self.publications.push(publication);
@@ -1131,7 +1197,14 @@ impl<T: StreamTerms> SenderRole<T> {
                 .bump(EncRejection::InnerRejected);
             return false;
         }
-        publication.commit_receiver(received.pending).is_ok()
+        // Verified at one clock reading, which its commit uses, in the
+        // opener's generation, and handled in the same step: an accepted
+        // control always commits (H8-39). A failure would leave its
+        // effects unmarked; none is reachable, so it is asserted, and
+        // counted by its reason.
+        let committed = publication.commit_receiver(received.pending).is_ok();
+        debug_assert!(committed, "an accepted receiver control commits");
+        committed
     }
 
     /// Whether [`SenderRole::answer_for`] would answer the domain 6

@@ -12568,3 +12568,157 @@ fn a_next_epoch_heartbeat_its_image_refuses_marks_nothing() {
         "its sequence was never marked"
     );
 }
+
+/// H8-38 (ADR-0114 sections 8 and 9): an EOS heartbeat its image refuses
+/// records no terminal bound. A heartbeat 128 bytes past the committed
+/// data raises the lane's mark; an EOS heartbeat 64 bytes past it, inside
+/// the window and above the complete prefix, is then stale: refused under
+/// the next `party_epoch`, it marks nothing, promotes nothing and records
+/// no bound. The EOS at the mark, sealed at the same sequence, then
+/// records its bound and promotes.
+#[test]
+fn a_refused_eos_heartbeat_records_no_terminal_bound() {
+    use karyos_protocol::protection::aes_gcm_siv::EncRejection;
+
+    let (mut rig, b, slot, heartbeat, _receiver, _subscriber) = quiet_encrypted_image(300);
+    let offset = u32::from_le_bytes(heartbeat.frames[8..12].try_into().unwrap());
+    let at = |ahead: u32, eos: bool| {
+        let mut frames = heartbeat.frames.clone();
+        frames[8..12].copy_from_slice(&(offset + ahead).to_le_bytes());
+        if eos {
+            // The EOS flag of the frame header's flags byte.
+            frames[5] |= 0x04;
+        }
+        frames
+    };
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let refused = |rig: &Rig| {
+        rig.agents
+            .receiver
+            .role
+            .enc_rejections(b, alias().stream_id)
+            .unwrap()
+            .get(EncRejection::InnerRejected)
+    };
+    let inject = |rig: &mut Rig, bytes: &[u8]| {
+        let receiver = &mut rig.agents.receiver;
+        receiver
+            .role
+            .inject_datagram(&receiver.sessions, b, source, bytes, rig.now);
+    };
+    let mut ahead = heartbeat.clone();
+    // A sequence above any the quiet sender sealed.
+    ahead.seq += 1024;
+    ahead.frames = at(128, false);
+    let counters = rig.agents.receiver.role.counters();
+    inject(&mut rig, &replayed(&ahead));
+    assert_eq!(
+        rig.agents.receiver.role.counters().heartbeats,
+        counters.heartbeats + 1,
+        "the mark rises"
+    );
+    let epochs = rig.agents.receiver.role.enc_epochs(slot);
+    let before = refused(&rig);
+    let counters = rig.agents.receiver.role.counters();
+    inject(&mut rig, &next_epoch(&heartbeat, at(64, true), 0));
+    assert_eq!(rig.agents.receiver.role.enc_epochs(slot), epochs);
+    assert_eq!(refused(&rig), before + 1);
+    let after = rig.agents.receiver.role.counters();
+    assert_eq!(after.eos_bounds, counters.eos_bounds, "no bound recorded");
+    assert_eq!(after.heartbeats_stale, counters.heartbeats_stale + 1);
+    inject(&mut rig, &next_epoch(&heartbeat, at(128, true), 0));
+    assert_eq!(
+        rig.agents.receiver.role.enc_epochs(slot),
+        Some((
+            heartbeat.context.key_epoch,
+            heartbeat.context.party_epoch + 1
+        )),
+        "its sequence was never marked"
+    );
+    let after = rig.agents.receiver.role.counters();
+    assert_eq!(
+        after.eos_bounds,
+        counters.eos_bounds + 1,
+        "the bound at 128"
+    );
+    assert_eq!(after.eos_refused, counters.eos_refused);
+}
+
+/// H8-38 audit (ADR-0114 sections 8 and 9): a refused RTTM REPLY settles
+/// no probe send. With path 0's probe in its backend call, a REPLY naming
+/// another probe id is refused under the next `party_epoch` and leaves
+/// the send unsettled; the probe's own REPLY, sealed at the same
+/// sequence, then settles it, takes a sample and promotes.
+#[test]
+fn a_refused_rttm_reply_settles_no_probe_send() {
+    use karyos_protocol::network::{Control, Datagram, Rttm, RttmKind, classify};
+    use karyos_protocol::protection::aes_gcm_siv::Domain;
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, b) = encrypted_rig();
+    crate::wire_enc::record_seals();
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let first: Vec<Vec<u8>> = (0..3u8).map(|i| vec![i; 100]).collect();
+    assert_eq!(enc_deliver(&mut rig, &mut subscriber, &first), first);
+    rig.sender_stopped = true;
+    let seals = crate::wire_enc::take_seals();
+    let data = seals
+        .iter()
+        .rfind(|record| record.context.domain == Domain::Sender)
+        .unwrap()
+        .clone();
+    let receiver = seals
+        .iter()
+        .filter(|record| record.context.domain == Domain::Receiver)
+        .find_map(|record| match classify(&record.frames) {
+            Ok(Datagram::Control(Control::Status(status))) => Some(status.receiver),
+            _ => None,
+        })
+        .unwrap();
+    let sealed = |probe_id: u64| {
+        let control = Control::Rttm(Rttm {
+            alias: alias(),
+            identity: identity(),
+            receiver,
+            probe_id,
+            kind: RttmKind::Reply {
+                service_delay_ns: 0,
+            },
+        });
+        next_epoch(&data, control_frames(&control), 0)
+    };
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let epochs = rig.agents.receiver.role.enc_epochs(slot);
+    let (probe_id, _send) = rig
+        .agents
+        .receiver
+        .role
+        .sending_probe(slot, rig.now, rig.now)
+        .unwrap();
+    rig.now += MS;
+    VIRTUAL_NOW.with(|now| now.set(rig.now));
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_datagram(
+        &receiver.sessions,
+        b,
+        source,
+        &sealed(probe_id.wrapping_add(1)),
+        rig.now,
+    );
+    assert_eq!(rig.agents.receiver.role.enc_epochs(slot), epochs);
+    assert!(
+        rig.agents.receiver.role.probe_unsettled(slot),
+        "a refused REPLY settles nothing"
+    );
+    let receiver = &mut rig.agents.receiver;
+    receiver
+        .role
+        .inject_datagram(&receiver.sessions, b, source, &sealed(probe_id), rig.now);
+    assert!(!rig.agents.receiver.role.probe_unsettled(slot), "settled");
+    assert_eq!(
+        rig.agents.receiver.role.enc_epochs(slot),
+        Some((data.context.key_epoch, data.context.party_epoch + 1)),
+        "its sequence was never marked"
+    );
+}

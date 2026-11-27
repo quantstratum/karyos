@@ -1117,16 +1117,23 @@ impl<T: StreamTerms> Intake<'_, T> {
     }
 
     /// Commits `queued`, which its handler took ([`EncOpener::commit`]).
+    ///
+    /// At the clock reading and VM generation of its verification, which
+    /// the token carries (H8-39): a datagram its handler took always
+    /// commits. A failure would leave its effects unmarked; none is
+    /// reachable, so it is asserted, and counted by its reason.
     fn enc_commit(&mut self, queued: EncQueued) -> Result<(), EncRejection> {
-        let now = self.now;
-        self.role
+        let committed = self
+            .role
             .enc
             .images
             .iter_mut()
             .find(|image| image.slot == queued.slot)
             .ok_or(EncRejection::Binding)
-            .and_then(|image| image.opener.commit(queued.pending, now))
-            .map(|_| ())
+            .and_then(|image| image.opener.commit(queued.pending))
+            .map(|_| ());
+        debug_assert!(committed.is_ok(), "an accepted datagram commits");
+        committed
     }
 
     /// A queued encrypted DATA datagram of `alias` from `source`, its
@@ -1674,6 +1681,37 @@ impl<T: StreamTerms> ReceiverRole<T> {
             image.rtt.submitted(probe, now);
         }
         Some(probe.probe_id)
+    }
+
+    /// Issues a probe on path 0 of the image at `slot` and puts its send
+    /// in its backend call, started at `start`, as the sender does: its
+    /// probe id and that send's guard (tests).
+    #[cfg(test)]
+    pub(crate) fn sending_probe(
+        &mut self,
+        slot: SlotRef,
+        now: u64,
+        start: u64,
+    ) -> Option<(u64, super::ReportGuard)> {
+        let image = self.images.iter_mut().find(|image| image.slot == slot)?;
+        image.rtt.rebind(0);
+        let probe = image.rtt.due(0, now)?;
+        let path = image.probes.get_mut(0)?;
+        path.pending = Some(probe);
+        let mut guard = super::ReportGuard::take(&path.slot);
+        guard.sending(start);
+        Some((probe.probe_id, guard))
+    }
+
+    /// Whether path 0's probe of the image at `slot` still awaits its
+    /// send's settlement (tests).
+    #[cfg(test)]
+    pub(crate) fn probe_unsettled(&self, slot: SlotRef) -> bool {
+        self.images
+            .iter()
+            .find(|image| image.slot == slot)
+            .and_then(|image| image.probes.first())
+            .is_some_and(|probe| probe.pending.is_some())
     }
 }
 
