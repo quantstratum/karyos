@@ -430,7 +430,11 @@ impl<T: StreamTerms> ReceiverRole<T> {
     /// budget and loads its durable mark. Refused, with nothing kept, when
     /// the budget cannot be reserved or no mark store is held; the
     /// publication it guards then stays admission-pending (fail closed).
-    /// Following a guard again (a new incarnation) replaces its mirror.
+    /// Following a guard again (another publication of it, or a new
+    /// incarnation) adds that publication's mirror: every publication the
+    /// guard guards reads its word, so a close or a lapse stops each one.
+    /// A mirror only this role still holds (its publication gone) is
+    /// dropped then.
     fn follow(
         &mut self,
         authority: BoundAuthority,
@@ -452,7 +456,14 @@ impl<T: StreamTerms> ReceiverRole<T> {
             .iter_mut()
             .find(|followed| followed.guard.guard_id() == authority.guard_id)
         {
-            followed.mirror = Some(mirror);
+            followed.mirrors.retain(|held| Arc::strong_count(held) > 1);
+            if !followed
+                .mirrors
+                .iter()
+                .any(|held| Arc::ptr_eq(held, &mirror))
+            {
+                followed.mirrors.push(mirror);
+            }
             self.publish_guard_words(now);
             return true;
         }
@@ -482,7 +493,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             receiver_id: follower_id,
             endpoint,
             authority: authority.control,
-            mirror: Some(mirror),
+            mirrors: vec![mirror],
         });
         self.apply_keys(view);
         self.publish_guard_words(now);

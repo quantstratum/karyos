@@ -1821,6 +1821,58 @@ fn announce_with(identity: Identity, alias: Alias, term_length: u32) -> Vec<u8> 
     sealed(&mut sealer, &control)
 }
 
+/// PR #1286 review (P2), the subscriber side: a verified ANNOUNCE on the
+/// encrypted subscription stating an MTU above the 1408-byte ceiling
+/// (ADR-0114 section 11) is counted and never challenged, so no image of
+/// it is made; one at the ceiling is challenged.
+#[test]
+fn an_encrypted_announce_above_the_mtu_ceiling_is_never_challenged() {
+    let (mut role, sessions) = subscribed();
+    let keys = ChannelKeys::new(&[&channel(0x11)]).unwrap();
+    let mut sealer = EncSealer::new(
+        &keys,
+        None,
+        KeyContext {
+            domain: Domain::Setup,
+            key_epoch: 1,
+            party_epoch: 0,
+            session_id: ALIAS.session_id,
+            stream_id: ALIAS.stream_id,
+            publication: publication_of(&IDENTITY),
+            receiver: None,
+            salt: Salt::Empty,
+        },
+        monotonic_ns,
+    )
+    .unwrap();
+    let ceiling = karyos_protocol::channel::MAX_ENCRYPTED_MTU;
+    let mut large = announce();
+    if let Control::SetupAnnounce(setup) = &mut large {
+        setup.identity = IDENTITY;
+        setup.alias = ALIAS;
+        setup.term.mtu = ceiling + 1;
+    }
+    let large = sealed(&mut sealer, &large);
+    role.inject_datagram(&sessions, EndpointId(1), source_n(0), &large, 1_000);
+    assert_eq!(role.counters().mtu_too_large, 1);
+    assert!(
+        !role
+            .posted_challenges()
+            .iter()
+            .any(|(_, control)| matches!(control, Control::Challenge(_))),
+        "challenged"
+    );
+    role.inject_datagram(
+        &sessions,
+        EndpointId(1),
+        source_n(0),
+        &announce_under(IDENTITY),
+        1_000,
+    );
+    assert_eq!(role.counters().mtu_too_large, 1);
+    let _ = posted(&role, IDENTITY, ALIAS);
+}
+
 /// A receiver role subscribed to stream 6 on endpoint 1, whose session
 /// rings take many chains.
 fn subscribed() -> (super::super::ReceiverRole, super::super::SessionEnd) {

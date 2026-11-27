@@ -1598,13 +1598,22 @@ fn envelope_mtu(protected: super::wire::Protected) -> Result<u32, DriverError> {
 ///
 /// # Errors
 ///
-/// [`crate::error::AuthRefusal::Mtu`] when `mtu` is below the floor or its
-/// inner budget holds no frame.
+/// [`crate::error::AuthRefusal::Mtu`] when `mtu` is below the floor, above
+/// [`MAX_ENCRYPTED_MTU`](karyos_protocol::channel::MAX_ENCRYPTED_MTU) on
+/// an encrypted channel, or its inner budget holds no frame.
 fn inner_mtu(protected: super::wire::Protected, mtu: u32) -> Result<u32, DriverError> {
     let refused = DriverError::AuthenticatedRefused {
         reason: crate::error::AuthRefusal::Mtu,
     };
     if mtu < karyos_protocol::network::MIN_MTU {
+        return Err(refused);
+    }
+    // The encrypted ceiling (ADR-0114 section 11) holds whatever set the
+    // MTU, a typed configuration or a URI's network default, not only a
+    // URI's `mtu`: above it a DATA frame exceeds the AEAD plaintext bound.
+    if matches!(protected, super::wire::Protected::Enc(_))
+        && mtu > karyos_protocol::channel::MAX_ENCRYPTED_MTU
+    {
         return Err(refused);
     }
     mtu.checked_sub(envelope_mtu(protected)?)

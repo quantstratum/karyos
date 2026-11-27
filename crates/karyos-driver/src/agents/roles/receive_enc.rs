@@ -890,6 +890,19 @@ impl<T: StreamTerms> Intake<'_, T> {
         true
     }
 
+    /// Whether a SETUP for the subscription to `stream_id` states an `mtu`
+    /// above the encrypted ceiling (ADR-0114 section 11) on an encrypted
+    /// subscription: its DATA would exceed the AEAD plaintext bound, so
+    /// it is never challenged nor imaged.
+    pub(super) fn enc_mtu_too_large(&self, stream_id: i32, mtu: u32) -> bool {
+        mtu > karyos_protocol::channel::MAX_ENCRYPTED_MTU
+            && self
+                .role
+                .enc
+                .subscription(self.endpoint, stream_id)
+                .is_some()
+    }
+
     /// The log MTU of an image of the subscription to `stream_id` whose
     /// SETUP advertised `mtu`, the whole datagram (ADR-0086 section 5,
     /// ADR-0114 section 11; H8-13): less the 84-byte envelope on an

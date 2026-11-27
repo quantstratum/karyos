@@ -529,6 +529,76 @@ fn an_encrypted_message_is_fragmented_at_c_1280() {
     );
 }
 
+/// PR #1286 review (P2): the 1408-byte encrypted ceiling (ADR-0114
+/// section 11) holds at admission whatever set the channel MTU: a typed
+/// publication above it is refused, typed, and nothing is created; 1408
+/// is admitted.
+#[test]
+fn a_typed_encrypted_publication_above_the_mtu_ceiling_is_refused_typed() {
+    let (mut publisher, _keys) = keyed(&borrowed(&enc_files()));
+    let mut config = aggregate(STREAM);
+    config.stream.buffer.mtu = karyos_protocol::channel::MAX_ENCRYPTED_MTU + 1;
+    assert_eq!(
+        publisher
+            .add_network_publication(config, &udp(unicast(), encrypted()))
+            .unwrap_err(),
+        refused(AuthRefusal::Mtu)
+    );
+    nothing_created(&publisher);
+    let mut config = aggregate(STREAM);
+    config.stream.buffer.mtu = karyos_protocol::channel::MAX_ENCRYPTED_MTU;
+    assert!(
+        publisher
+            .add_network_publication(config, &udp(unicast(), encrypted()))
+            .is_ok()
+    );
+}
+
+/// PR #1286 review (P2), the client path: an encrypted channel URI with
+/// no `mtu` takes the driver's network default; a default above the
+/// 1408-byte ceiling is refused at admission and nothing is created,
+/// rather than admitting DATA frames above the AEAD plaintext bound.
+#[test]
+fn an_encrypted_uri_without_an_mtu_above_the_ceiling_by_default_is_refused() {
+    use karyos_client::Outcome;
+
+    let mut network = NetworkConfig {
+        threading: ThreadingMode::Shared,
+        ..NetworkConfig::default()
+    };
+    network.stream_defaults.mtu = karyos_protocol::channel::MAX_ENCRYPTED_MTU + 64;
+    let mut publisher = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(network),
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    let (keys, state) = dirs(&borrowed(&enc_files()));
+    let report = publisher
+        .start_wire_keys_at(Box::new(keys) as Dir, Box::new(state) as Dir, wall)
+        .unwrap();
+    assert!(!report.alarm(), "{report:?}");
+    let mut client = publisher.connect().unwrap();
+    let uri = format!(
+        "karyos:udp?endpoint=127.0.0.1:{}|interface=127.0.0.1|security=encrypted|channel-key={ENC_CHANNEL}|pairwise-key={ENC_PAIRWISE}|receiver-id={RECEIVER}|channel-id={CHANNEL_ID}|publisher-id={PUBLISHER_ID}",
+        crate::test_ports::test_port()
+    );
+    let sequence = client.add_network_publication(&uri, STREAM, true).unwrap();
+    let mut outcome = None;
+    assert!(pump(&mut [&mut publisher], |_| {
+        let _ = client.poll(usize::MAX, |completion| {
+            if completion.sequence == sequence {
+                outcome = Some(completion.outcome);
+            }
+        });
+        outcome.is_some()
+    }));
+    assert!(
+        matches!(outcome, Some(Outcome::Refused { .. })),
+        "{outcome:?}"
+    );
+    nothing_created(&publisher);
+}
+
 /// H8-13 (ADR-0114 section 11): the 256-byte floor applies to the
 /// channel MTU, the whole datagram. 255 is refused, typed, and nothing is
 /// created; 256 and 288 (inner budgets of 172 and 204 bytes) are admitted.

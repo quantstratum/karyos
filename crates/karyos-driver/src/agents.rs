@@ -1950,6 +1950,16 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         self.role.outbound(index).map(data::Outbound::counters)
     }
 
+    /// Whether its `index`-th publication was admitted behind a guard
+    /// gate, and how many of its incarnations that gate aborted (tests).
+    #[cfg(test)]
+    pub(crate) fn guard_aborts(&self, index: usize) -> Option<u64> {
+        self.role
+            .outbound(index)
+            .and_then(data::Outbound::guard_gate)
+            .map(|gate| gate.counts().aborted)
+    }
+
     /// What the etf drop ledger of its `index`-th publication counted, on
     /// the etf route (the Linux end to end tests).
     #[cfg(all(test, target_os = "linux"))]

@@ -875,6 +875,21 @@ fn remotely_guarded_keys(
     crate::embedded::AggregateHandle,
     (Mem, Mem),
 ) {
+    remotely_guarded_by(marks, commits, open_word(2), 5_000)
+}
+
+/// [`remotely_guarded_keys`], the authority's guard word `word` (which
+/// the test may keep, to close the guard) and its `lifetime_ms`.
+fn remotely_guarded_by(
+    marks: &Mem,
+    commits: &Mem,
+    word: Arc<karyos_client::HeapWords>,
+    lifetime_ms: u32,
+) -> (
+    [EmbeddedDriver; 3],
+    crate::embedded::AggregateHandle,
+    (Mem, Mem),
+) {
     let control = SocketAddr::new(LOOPBACK, crate::test_ports::test_port());
     let guard = ChannelAuthority {
         follower_id: 66,
@@ -916,8 +931,8 @@ fn remotely_guarded_keys(
             10,
             vec![crate::guard_authority::AuthorityGuard {
                 guard_id: 11,
-                word: open_word(2) as Arc<dyn karyos_client::SharedWords>,
-                lifetime_ms: 5_000,
+                word: word as Arc<dyn karyos_client::SharedWords>,
+                lifetime_ms,
                 receivers: vec![(66, from)],
             }],
             &[control],
@@ -986,6 +1001,144 @@ fn a_remote_guard_opens_the_publication_through_its_authority() {
             .lock()
             .unwrap()
             .contains_key("authority-guard-11")
+    );
+}
+
+/// Two remotely guarded publications of one guard (PR #1286 review): the
+/// first opens and delivers, then a second of the same guard, on another
+/// stream, is admitted on the guard's current open while the first runs.
+/// Returns the drivers, publisher first, both handles and the authority's
+/// guard word.
+fn two_publications_on_one_guard(
+    marks: &Mem,
+    commits: &Mem,
+    lifetime_ms: u32,
+) -> (
+    [EmbeddedDriver; 3],
+    [crate::embedded::AggregateHandle; 2],
+    Arc<karyos_client::HeapWords>,
+) {
+    let word = open_word(2);
+    let ([mut publisher, mut subscriber, mut authority_driver], first, _) =
+        remotely_guarded_by(marks, commits, Arc::clone(&word), lifetime_ms);
+    let registration = first.registration();
+    assert!(pump(
+        &mut [&mut publisher, &mut subscriber, &mut authority_driver],
+        |drivers| drivers[0]
+            .net
+            .as_ref()
+            .unwrap()
+            .publication_established(registration),
+    ));
+    let security = Security::Authenticated(AuthenticatedChannel {
+        channel_key_id: 4,
+        ..auth(Some(ChannelAuthority {
+            follower_id: 66,
+            ..authority(control())
+        }))
+    });
+    let to = subscriber.network_subscription_address(STREAM).unwrap();
+    let second = publisher
+        .add_network_publication(
+            aggregate(STREAM + 1),
+            &udp(Destination::Unicast(to), security),
+        )
+        .unwrap();
+    assert!(
+        pump(
+            &mut [&mut publisher, &mut subscriber, &mut authority_driver],
+            |drivers| roles(drivers[0]).0.2 == 0,
+        ),
+        "the second is admitted on the open: {:?}",
+        roles(&publisher)
+    );
+    assert_eq!(publisher.net.as_ref().unwrap().followed_guards(), Some(1));
+    (
+        [publisher, subscriber, authority_driver],
+        [first, second],
+        word,
+    )
+}
+
+/// How many incarnations the guard gate of the Shared sender's
+/// `index`-th publication aborted; `None` before it was admitted.
+fn guard_aborts(driver: &EmbeddedDriver, index: usize) -> Option<u64> {
+    match &driver.net.as_ref().unwrap().agents {
+        crate::net::Agents::Shared(agents) => agents.sender.guard_aborts(index),
+        _ => panic!("not shared"),
+    }
+}
+
+/// Runs `drivers` until the guard gates of both publications of
+/// `drivers[0]` aborted their incarnation, each offering a message
+/// whenever it may; returns each gate's aborts.
+fn both_abort(
+    drivers: &mut [&mut EmbeddedDriver],
+    handles: &[crate::embedded::AggregateHandle; 2],
+) -> [Option<u64>; 2] {
+    let mut lanes = handles.each_ref().map(|handle| {
+        drivers[0]
+            .publication(handle.lane(Lane::ZERO).unwrap())
+            .unwrap()
+    });
+    let _ = pump(drivers, |drivers| {
+        for lane in &mut lanes {
+            let _ = lane.offer(&[7u8; 64]);
+            let _ = lane.poll_outcomes(64, |_, _| {}).unwrap();
+        }
+        (0..2).all(|index| guard_aborts(drivers[0], index).is_some_and(|aborted| aborted >= 1))
+    });
+    [guard_aborts(drivers[0], 0), guard_aborts(drivers[0], 1)]
+}
+
+/// PR #1286 review (P1): every publication a remote guard guards stops
+/// when its authority closes the guard, the one admitted first as well as
+/// the one admitted while it ran: both incarnations end.
+#[test]
+fn a_remote_guard_close_stops_every_publication_it_guards() {
+    let (marks, commits) = (Mem::default(), Mem::default());
+    let ([mut publisher, mut subscriber, mut authority_driver], [first, second], word) =
+        two_publications_on_one_guard(&marks, &commits, 5_000);
+    // Both were admitted behind their gate, nothing aborted yet.
+    assert_eq!(
+        [guard_aborts(&publisher, 0), guard_aborts(&publisher, 1)],
+        [Some(0); 2]
+    );
+    word.words()[0].store(
+        karyos_sys::guard::encode(karyos_sys::guard::GuardState {
+            epoch: 3,
+            open: false,
+        })
+        .unwrap(),
+        karyos_sys::sync::Ordering::Release,
+    );
+    assert_eq!(
+        both_abort(
+            &mut [&mut publisher, &mut subscriber, &mut authority_driver],
+            &[first, second],
+        ),
+        [Some(1); 2],
+        "the first publication kept its open mirror"
+    );
+}
+
+/// PR #1286 review (P1): every publication a remote guard guards stops
+/// when its confirmation expires (the authority silent), the one admitted
+/// first as well as the one admitted while it ran.
+#[test]
+fn a_lapsed_remote_guard_stops_every_publication_it_guards() {
+    let (marks, commits) = (Mem::default(), Mem::default());
+    let ([mut publisher, mut subscriber, _authority], [first, second], _word) =
+        two_publications_on_one_guard(&marks, &commits, 1_000);
+    assert_eq!(
+        [guard_aborts(&publisher, 0), guard_aborts(&publisher, 1)],
+        [Some(0); 2]
+    );
+    // The authority answers no more: the open lapses.
+    assert_eq!(
+        both_abort(&mut [&mut publisher, &mut subscriber], &[first, second]),
+        [Some(1); 2],
+        "the first publication kept its open mirror"
     );
 }
 

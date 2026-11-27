@@ -298,6 +298,55 @@ fn an_open_lives_only_by_its_confirmations() {
     assert!(!guard.is_open(last + DEFAULT_LIFETIME_NS));
 }
 
+/// Design 4.4 (PR #1286 review): an `Open` confirmed for a STATE's
+/// nondefault lifetime keeps that lifetime once its confirmation clears
+/// the pending STATE: the renewal round falls due half of it in, each
+/// renewal extends the `Open` by it, and with the authority silent the
+/// guard lapses one such lifetime after the last confirmation, never the
+/// 5 s default.
+#[test]
+fn a_confirmed_lifetime_governs_its_renewals_and_expiry() {
+    const LIFETIME: u64 = 1_000 * MS;
+    let mut nonces = Counter(0);
+    let mut marks = Marks::default();
+    let mut guard = recovered(2, &mut marks, &mut nonces);
+    assert_eq!(
+        guard.on_state(&state(4, 1_000), 2 * MS, &mut marks),
+        Ok(GuardChange::ConfirmationDue)
+    );
+    let challenge = guard.challenge(RECEIVER, 2 * MS, &mut nonces).unwrap();
+    let confirmed = 3 * MS;
+    assert_eq!(
+        guard.on_status(&status(challenge.nonce, 4), RECEIVER, confirmed, &mut marks),
+        Ok(GuardChange::Applied(Phase::Open {
+            epoch: 4,
+            until: confirmed + LIFETIME
+        }))
+    );
+    // The renewal falls due half the confirmed lifetime in.
+    let half = confirmed + LIFETIME / 2;
+    assert!(!guard.round_due(half - 1));
+    assert!(guard.round_due(half));
+    let challenge = guard.challenge(RECEIVER, half, &mut nonces).unwrap();
+    let renewed = half + MS;
+    assert_eq!(
+        guard.on_status(&status(challenge.nonce, 4), RECEIVER, renewed, &mut marks),
+        Ok(GuardChange::Applied(Phase::Open {
+            epoch: 4,
+            until: renewed + LIFETIME
+        })),
+        "a renewal extends by the confirmed lifetime"
+    );
+    // Silent from now on: closed one confirmed lifetime later.
+    assert!(guard.is_open(renewed + LIFETIME - 1));
+    assert!(!guard.is_open(renewed + LIFETIME));
+    assert_ne!(
+        guard.word(renewed + LIFETIME),
+        guard.word(renewed),
+        "the gates read it closed"
+    );
+}
+
 /// ADR-0086 section 7: a replay after a restart is refused by the durable
 /// epoch: the old STATE at the persisted floor, and the old STATUS for a
 /// nonce of the previous start.

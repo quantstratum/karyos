@@ -519,6 +519,9 @@ pub struct RemoteGuard {
     retired: Option<[u64; 2]>,
     /// The lifetime of the `Open` STATE awaiting confirmation, by epoch.
     pending: Option<(u64, u64)>,
+    /// The lifetime of the last confirmed `Open` STATE (the default until
+    /// one is): each confirmation extends the `Open` by it, and its
+    /// renewal round falls due from half of it before the `Open` lapses.
     lifetime_ns: u64,
     refusals: [u64; GUARD_REFUSALS],
 }
@@ -740,10 +743,14 @@ impl RemoteGuard {
         }
         self.floor = epoch;
         self.phase = if status.word.is_open() {
-            let lifetime = match self.pending {
-                Some((pending, lifetime)) if pending == epoch => lifetime,
-                _ => self.lifetime_ns,
-            };
+            // The confirmed STATE's lifetime stays the lifetime of every
+            // later confirmation and of the renewal schedule.
+            if let Some((pending, lifetime)) = self.pending
+                && pending == epoch
+            {
+                self.lifetime_ns = lifetime;
+            }
+            let lifetime = self.lifetime_ns;
             Phase::Open {
                 epoch,
                 until: now.saturating_add(lifetime),

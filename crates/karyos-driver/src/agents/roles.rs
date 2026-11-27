@@ -207,6 +207,9 @@ pub struct ReceiverCounters {
     /// Announcements whose term length is above the subscription's
     /// `max_image_term_length`.
     pub term_too_large: u64,
+    /// Announcements and answers on an encrypted subscription whose MTU
+    /// is above the 1408-byte encrypted ceiling (ADR-0114 section 11).
+    pub mtu_too_large: u64,
     /// CHALLENGE, SOLICIT and SM for an alias not published on the
     /// endpoint, and REGISTER for a stream not published on it.
     pub not_published: u64,
@@ -3264,12 +3267,12 @@ impl<T: StreamTerms> ReceiverRole<T> {
     /// it: open only while open and confirmed (Release, as a local close).
     fn publish_guard_words(&self, now: u64) {
         for followed in &self.remote_guards {
-            if let Some(word) = followed
-                .mirror
-                .as_deref()
-                .and_then(|words| words.words().first())
+            let next = followed.guard.word(now);
+            for word in followed
+                .mirrors
+                .iter()
+                .filter_map(|words| words.words().first())
             {
-                let next = followed.guard.word(now);
                 if word.load(karyos_sys::sync::Ordering::Acquire) != next {
                     word.store(next, karyos_sys::sync::Ordering::Release);
                 }
@@ -3395,7 +3398,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             receiver_id,
             endpoint,
             authority,
-            mirror,
+            mirrors: mirror.into_iter().collect(),
         });
         self.guard_marks = Some(marks);
         self.publish_guard_words(0);
@@ -6333,6 +6336,10 @@ impl<T: StreamTerms> Intake<'_, T> {
                     self.role.count(|c| &mut c.term_too_large);
                     return;
                 }
+                if self.enc_mtu_too_large(announce.alias.stream_id, announce.term.mtu) {
+                    self.role.count(|c| &mut c.mtu_too_large);
+                    return;
+                }
                 // A registering key is set up by its `control` address
                 // alone (karyos#941 item 5); an ANNOUNCE from there leaves
                 // its REGISTER backoff as it is (karyos#947).
@@ -6406,6 +6413,10 @@ impl<T: StreamTerms> Intake<'_, T> {
                 };
                 if answer.term.term_length > max_term_length {
                     self.role.count(|c| &mut c.term_too_large);
+                    return;
+                }
+                if self.enc_mtu_too_large(answer.alias.stream_id, answer.term.mtu) {
+                    self.role.count(|c| &mut c.mtu_too_large);
                     return;
                 }
                 if !self.setup_from_control(endpoint, answer.alias.stream_id, source, false) {
@@ -6713,9 +6724,10 @@ struct FollowedGuard {
     endpoint: EndpointId,
     /// The authority's guard control address.
     authority: SocketAddr,
-    /// The guard word local sender gates read for it, written here on
-    /// every change and lapse; `None` when no publication is guarded by it.
-    mirror: Option<Arc<karyos_client::HeapWords>>,
+    /// The guard words local sender gates read for it, one per
+    /// publication it guards, each written here on every change and
+    /// lapse; a word no publication holds any more is dropped.
+    mirrors: Vec<Arc<karyos_client::HeapWords>>,
 }
 
 /// The first SESSION_ABORT resend's delay (design G3,
