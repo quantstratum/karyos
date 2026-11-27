@@ -678,3 +678,26 @@ fn a_secret_reused_across_classes_is_refused() {
     assert_eq!(reasons(&report), [(4, 3, Reason::ReusedSecret)]);
     assert_eq!(epochs(&store), [(3, 3)]);
 }
+
+/// The current epoch is the newest active one (H8 review 6 follow-on), and
+/// it respects the durable cutover (#1288 review): before epoch 2's
+/// `not_before` epoch 1 is current; from it epoch 2 is, and stays so even
+/// when its file is removed during the overlap, where epoch 1 only
+/// verifies and never becomes current again.
+#[test]
+fn the_current_epoch_is_the_newest_active_one_and_keeps_its_cutover() {
+    let (keys, state) = fresh();
+    keys.put("3-1.key", first().as_bytes());
+    let (mut store, _) = Store::start(keys.clone(), state, DEC_01).unwrap();
+    keys.put("3-2.key", second().as_bytes());
+    assert!(!store.reload(DEC_01).alarm());
+    assert_eq!(store.current_epoch(3, JAN_01 - 1), Some(1), "admitted ahead");
+    assert_eq!(store.current_epoch(3, JAN_01), Some(2), "at its not_before");
+    keys.remove("3-2.key");
+    store.reload(JAN_01);
+    assert_eq!(
+        store.current_epoch(3, JAN_01 + 1),
+        Some(2),
+        "the retiring epoch never becomes current again"
+    );
+}

@@ -11197,6 +11197,14 @@ fn an_abort_lost_to_two_failed_writes_stays_terminal_after_an_unclean_stop() {
         ..identity()
     };
     assert!(!restarted.terminal(&stranger), "never live here");
+    // A genuinely new incarnation admitted after the unclean restart is not
+    // made terminal by its own admission (#1288 review).
+    assert!(!restarted.terminal(&later), "the new run's install");
+    // A clean stop now does not forget the recovered floor (#1288 review).
+    drop(restarted);
+    let again = AbortedIncarnations::new(state);
+    assert!(again.terminal(&identity()), "still terminal after a clean stop");
+    assert!(!again.terminal(&later));
 }
 
 /// H8 review 6, R5-02: an unclean stop with no failed write refuses the
@@ -11232,6 +11240,8 @@ fn an_install_whose_high_water_cannot_be_committed_is_refused() {
     let mut record = AbortedIncarnations::new(state.clone());
     state.fail_writes(&[ABORTED_FILE, ABORTED_REPLICA]);
     assert!(record.admit(identity()).is_err());
+    // Raised in memory only: a repeat retries the commit (#1288 review).
+    assert!(record.admit(identity()).is_err(), "still not durable");
     state.fail_writes(&[]);
     assert!(
         record.admit(identity()).is_ok(),

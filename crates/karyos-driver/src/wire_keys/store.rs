@@ -362,12 +362,21 @@ impl<K: Files, S: Files> KeyStore<K, S> {
             return None;
         }
         let lineage = self.state.lineages.get(&key_id)?;
+        // The same cutover as `signing_key` (#1288 review): the
+        // predecessor stops being current at its successor's `not_before`,
+        // durably, even when the successor's file is gone; an epoch below
+        // the predecessor never is.
+        let cutover = |file: &KeyFile| match lineage.predecessor {
+            _ if file.file_epoch == lineage.highest => i64::MAX,
+            Some((epoch, deadline)) if epoch == file.file_epoch => successor_not_before(deadline),
+            _ => i64::MIN,
+        };
         let active = self
             .loaded
             .range((key_id, 0)..=(key_id, lineage.highest))
             .rev()
             .map(|(_, file)| file)
-            .find(|file| file.not_before <= now && now <= file.not_after)
+            .find(|file| file.not_before <= now && now <= file.not_after && now < cutover(file))
             .map(|file| file.file_epoch);
         Some(active.unwrap_or(lineage.highest))
     }

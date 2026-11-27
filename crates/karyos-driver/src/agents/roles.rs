@@ -6396,17 +6396,6 @@ impl<T: StreamTerms> Intake<'_, T> {
                     self.role.count(|c| &mut c.setup_after_abort);
                     return;
                 }
-                // The image is installed only once its publisher's
-                // incarnation high-water is durable (H8 R5-02): after an
-                // unclean stop, the record refuses every incarnation that
-                // was live here, whose abort may have been lost.
-                if self.subscription_authenticated(answer.alias.stream_id)
-                    && let Some(record) = self.role.abort_record.as_deref_mut()
-                    && record.admit(answer.identity).is_err()
-                {
-                    self.role.count(|c| &mut c.abort_records_failed);
-                    return;
-                }
                 // A solicited answer brings its own term parameters: the
                 // subscription's term length bound applies here too (an
                 // answer to a challenge restates the announced ones).
@@ -6443,10 +6432,32 @@ impl<T: StreamTerms> Intake<'_, T> {
                 // challenge stays pending.
                 let mut reserved = None;
                 let sessions = self.sessions;
+                // The image is installed only once its publisher's
+                // incarnation high-water is durable (H8 R5-02): after an
+                // unclean stop, the record refuses every incarnation that
+                // was live here, whose abort may have been lost. It is
+                // admitted here, once the answer passed every check and
+                // matched its challenge, so a refused answer consumes no
+                // publisher entry (#1288 review).
+                let mut record = if self.subscription_authenticated(answer.alias.stream_id) {
+                    self.role.abort_record.as_deref_mut()
+                } else {
+                    None
+                };
+                let mut admit_failed = false;
                 let outcome = self.role.sessions.answer(key, &answer, now, || {
+                    if let Some(record) = record.as_mut()
+                        && record.admit(answer.identity).is_err()
+                    {
+                        admit_failed = true;
+                        return false;
+                    }
                     reserved = reserve_chain(sessions);
                     reserved.is_some()
                 });
+                if admit_failed {
+                    self.role.count(|c| &mut c.abort_records_failed);
+                }
                 #[cfg(test)]
                 self.role.note(format!(
                     "{now} answer ep{} from {source} {outcome:?}",
