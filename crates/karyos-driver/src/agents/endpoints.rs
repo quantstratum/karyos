@@ -86,7 +86,9 @@ pub enum EndpointError {
     Exhausted,
     /// A reset reopened the endpoint at another local address than the one
     /// it had bound: its receivers' bindings name the old one, so the
-    /// endpoint fails rather than move silently (ACS 15721).
+    /// endpoint fails rather than move silently (ACS 15721). A port 0
+    /// publisher's move to a new port after `EADDRINUSE` is not this
+    /// ([`Endpoints::allow_move`]).
     #[error("the endpoint reopened at {found}, not its bound {expected}")]
     AddressChanged {
         /// The address it had bound.
@@ -196,6 +198,13 @@ enum State<O: SocketOps> {
 struct Entry<O: SocketOps> {
     id: EndpointId,
     config: SocketsConfig,
+    /// A publisher's endpoint on port 0 ([`Endpoints::allow_move`]): a
+    /// reset whose rebind of its port is refused (`EADDRINUSE`) binds a
+    /// new ephemeral port instead of failing.
+    movable: bool,
+    /// A subscription holds it ([`Endpoints::pin`]): its address is what
+    /// publishers send to, so it never moves.
+    pinned: bool,
     /// The bound local address of the current epoch.
     local: std::net::SocketAddr,
     /// The effective capabilities of the current epoch.
@@ -250,6 +259,10 @@ pub struct EndpointCounters {
     /// Standing reset requests dropped on an error other than a full
     /// command ring (the agent gone, a broken invariant).
     pub standing_dropped: u64,
+    /// Resets of a publisher's port 0 endpoint whose port another socket
+    /// took while it was closed: the endpoint reopened on a new ephemeral
+    /// port ([`Endpoints::allow_move`]).
+    pub ports_moved: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -276,6 +289,14 @@ pub struct Endpoints<O: SocketOps> {
     /// Opens and reopens refused for a required capability
     /// (`capability missing`, SPEC §16.8); checked, never wraps.
     missing: u64,
+    /// Tests: each reset binds a socket to the endpoint's address between
+    /// its close and its rebind, as another process taking the port would
+    /// ([`Endpoints::occupy_on_reset`]).
+    #[cfg(test)]
+    occupy_on_reset: bool,
+    /// Tests: the sockets [`Endpoints::occupy_on_reset`] bound, held.
+    #[cfg(test)]
+    occupied: Vec<std::net::UdpSocket>,
 }
 
 impl<O: SocketOps> std::fmt::Debug for Endpoints<O> {
@@ -316,7 +337,46 @@ impl<O: SocketOps> Endpoints<O> {
             report: TxReport::new(),
             counters: EndpointCounters::default(),
             missing: 0,
+            #[cfg(test)]
+            occupy_on_reset: false,
+            #[cfg(test)]
+            occupied: Vec::new(),
         }
+    }
+
+    /// Lets `endpoint`, a publisher's, move to a new ephemeral port when a
+    /// reset cannot bind its port again (`EADDRINUSE`): a publisher that
+    /// asked for port 0 was never promised a port, and its receivers
+    /// re-establish on the new one through the reset's re-announce. Not an
+    /// endpoint bound to a fixed port, nor one a subscription or an
+    /// authenticated publication holds ([`Endpoints::pin`]): a reset of
+    /// those that cannot rebind fails the endpoint.
+    pub fn allow_move(&mut self, endpoint: EndpointId) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == endpoint) {
+            entry.movable = entry.config.local.port() == 0 && entry.config.multicast.is_none();
+        }
+    }
+
+    /// Keeps `endpoint` at its address for good: a subscription holds it,
+    /// and publishers send to that address.
+    pub fn pin(&mut self, endpoint: EndpointId) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == endpoint) {
+            entry.pinned = true;
+        }
+    }
+
+    /// Tests: every later reset finds its endpoint's address taken by
+    /// another socket between the close and the rebind.
+    #[cfg(test)]
+    pub fn occupy_on_reset(&mut self) {
+        self.occupy_on_reset = true;
+    }
+
+    /// Tests: the sockets that took reset endpoints' addresses, handed
+    /// over (they keep the addresses while held).
+    #[cfg(test)]
+    pub fn take_occupied(&mut self) -> Vec<std::net::UdpSocket> {
+        std::mem::take(&mut self.occupied)
     }
 
     /// Each endpoint's effective capabilities of its current epoch, failing
@@ -460,6 +520,8 @@ impl<O: SocketOps> Endpoints<O> {
                 self.entries.push(Entry {
                     id,
                     config,
+                    movable: false,
+                    pinned: false,
                     local,
                     capabilities,
                     backoff: RESET_BACKOFF_MIN,
@@ -479,6 +541,8 @@ impl<O: SocketOps> Endpoints<O> {
         self.entries.push(Entry {
             id,
             config,
+            movable: false,
+            pinned: false,
             local,
             capabilities,
             state,
@@ -495,10 +559,14 @@ impl<O: SocketOps> Endpoints<O> {
     /// reopened at its next epoch and attached again
     /// ([`EndpointEvent::Reopened`]). The reopen binds the address the
     /// endpoint had bound (a port-0 endpoint keeps its port), so receivers'
-    /// bindings keyed by it stay valid. A reopen that fails, or that comes
-    /// back at another address ([`EndpointError::AddressChanged`]), fails
-    /// the endpoint: [`EndpointEvent::Failed`] follows and the entry leaves
-    /// the table. The sender requests resets itself through
+    /// bindings keyed by it stay valid. When another socket took that port
+    /// while it was closed (`EADDRINUSE`), a publisher's port 0 endpoint
+    /// ([`Endpoints::allow_move`]) binds a new ephemeral port instead,
+    /// counted in [`EndpointCounters::ports_moved`]; its sender announces
+    /// again so its receivers bind the new source. Any other reopen that
+    /// fails, or that comes back at another address
+    /// ([`EndpointError::AddressChanged`]), fails the endpoint:
+    /// [`EndpointEvent::Failed`] follows and the entry leaves the table. The sender requests resets itself through
     /// [`AgentEvent::ResetRequested`], which [`Endpoints::poll`] serves
     /// under a doubling interval.
     ///
@@ -801,6 +869,8 @@ impl<O: SocketOps> Endpoints<O> {
             | AgentEvent::PublicationRemoved { .. }
             | AgentEvent::PublicationDraining { .. }
             | AgentEvent::SenderSessionDrained { .. }
+            | AgentEvent::SenderAbortEnded { .. }
+            | AgentEvent::ReceiverAbortApplied { .. }
             | AgentEvent::ScheduleViolated { .. }
             | AgentEvent::DeadlineMissed { .. }
             | AgentEvent::EtfLateDropReport { .. }
@@ -987,13 +1057,15 @@ impl<O: SocketOps> Endpoints<O> {
         };
         let id = entry.id;
         // A reset reopens at the address the endpoint actually bound (a
-        // port 0 bind resolved by the kernel), never a new one: receivers
-        // bind on the source address (ACS 15721).
+        // port 0 bind resolved by the kernel): receivers bind on the source
+        // address (ACS 15721). Only a movable one (a port 0 publisher)
+        // takes a new port, and only when its own was taken.
         let bound = entry.local;
         let config = SocketsConfig {
             local: bound,
             ..entry.config
         };
+        let movable = entry.movable && !entry.pinned;
         let joined = match (tx, rx) {
             (Some(tx), Some(rx)) => SocketsEndpoint::join(tx, rx).ok(),
             // A missing half: what came back is dropped, closing it.
@@ -1009,22 +1081,38 @@ impl<O: SocketOps> Endpoints<O> {
         };
         match purpose {
             Purpose::Reset => {
+                #[cfg(test)]
+                let (occupy, occupied) = (self.occupy_on_reset, &mut self.occupied);
+                let mut moved = false;
                 let outcome = Self::drain_reset(&mut endpoint, &mut self.report, id, on_event)
                     .and_then(|returned| {
-                        endpoint
-                            .reopen(&config)
-                            .copied()
-                            .map_err(EndpointError::Open)
-                            .and_then(|snapshot| {
-                                if snapshot.local == bound {
-                                    Ok((returned, snapshot))
-                                } else {
-                                    Err(EndpointError::AddressChanged {
-                                        expected: bound,
-                                        found: snapshot.local,
-                                    })
-                                }
-                            })
+                        #[cfg(test)]
+                        if occupy && let Ok(socket) = std::net::UdpSocket::bind(bound) {
+                            occupied.push(socket);
+                        }
+                        let reopened = match endpoint.reopen(&config).copied() {
+                            // Another socket took the port while it was
+                            // closed: a port 0 publisher binds a new one.
+                            Err(OpenError::Os { errno, .. }) if movable && in_use(errno) => {
+                                moved = true;
+                                let fresh = SocketsConfig {
+                                    local: std::net::SocketAddr::new(bound.ip(), 0),
+                                    ..config
+                                };
+                                endpoint.reopen(&fresh).copied()
+                            }
+                            reopened => reopened,
+                        };
+                        reopened.map_err(EndpointError::Open).and_then(|snapshot| {
+                            if snapshot.local == bound || moved {
+                                Ok((returned, snapshot))
+                            } else {
+                                Err(EndpointError::AddressChanged {
+                                    expected: bound,
+                                    found: snapshot.local,
+                                })
+                            }
+                        })
                     })
                     .and_then(|(returned, snapshot)| {
                         endpoint
@@ -1034,6 +1122,9 @@ impl<O: SocketOps> Endpoints<O> {
                     });
                 match outcome {
                     Ok(((tx, rx), returned, snapshot)) => {
+                        if moved {
+                            self.counters.bump(|c| &mut c.ports_moved);
+                        }
                         if let Some(entry) = self.entries.get_mut(index) {
                             entry.local = snapshot.local;
                             entry.capabilities = snapshot;
@@ -1256,6 +1347,11 @@ impl<O: SocketOps> Endpoints<O> {
 
 #[cfg(test)]
 mod tests;
+
+/// Whether `errno` says the address is in use (`EADDRINUSE`).
+fn in_use(errno: i32) -> bool {
+    std::io::Error::from_raw_os_error(errno).kind() == std::io::ErrorKind::AddrInUse
+}
 
 /// Whether `backoff` has elapsed since `at` by `now`. A clock behind `at`
 /// (stepped back) counts as elapsed: waiting for it to catch up would break

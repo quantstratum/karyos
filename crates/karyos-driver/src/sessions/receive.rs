@@ -130,7 +130,26 @@ impl Default for SessionConfig {
 #[error("invalid session configuration: {0}")]
 pub struct SessionConfigError(pub &'static str);
 
+/// The most pending challenges an authenticated or encrypted channel's
+/// driver may hold, both challenge kinds together (ADR-0086 section 6,
+/// challenge table bounds).
+pub const AUTH_MAX_PENDING_CHALLENGES: usize = 256;
+
+/// The most pending challenges an authenticated or encrypted channel's
+/// driver may hold for one source address (ADR-0086 section 6).
+pub const AUTH_MAX_PENDING_PER_SOURCE: usize = 8;
+
 impl SessionConfig {
+    /// Whether the challenge table stays within the authenticated
+    /// profile's hard ceilings ([`AUTH_MAX_PENDING_CHALLENGES`],
+    /// [`AUTH_MAX_PENDING_PER_SOURCE`]): a protected channel is admitted
+    /// only on a driver whose configuration does (H8 R5-04).
+    #[must_use]
+    pub const fn within_auth_ceilings(&self) -> bool {
+        self.max_pending_challenges <= AUTH_MAX_PENDING_CHALLENGES
+            && self.max_pending_per_source <= AUTH_MAX_PENDING_PER_SOURCE
+    }
+
     fn validate(&self) -> Result<(), SessionConfigError> {
         if self.max_images == 0
             || self.max_pending_challenges == 0
@@ -617,6 +636,16 @@ impl ReceiveSessions {
         self.boot_id
     }
 
+    /// Replaces the boot id after a VM generation change (ADR-0114
+    /// section 10 step 3): every later CHALLENGE and SOLICIT names
+    /// `boot_id`, so an answer to an earlier one no longer matches. A zero
+    /// id is refused, as at creation.
+    pub(crate) fn set_boot_id(&mut self, boot_id: [u64; 2]) {
+        if boot_id != [0, 0] {
+            self.boot_id = boot_id;
+        }
+    }
+
     /// Whether `slot` still names an active image (the admission recheck).
     #[must_use]
     pub fn is_active(&self, slot: SlotRef) -> bool {
@@ -634,6 +663,29 @@ impl ReceiveSessions {
         self.slots
             .get_mut(usize::try_from(slot.slot).ok()?)
             .filter(|entry| entry.generation == slot.generation)
+    }
+
+    /// Whether `identity` is a retired full identity still inside its
+    /// `alias_quarantine` at `now` (SPEC.md section 5; ADR-0114 section 7,
+    /// "Retired publication identities").
+    #[must_use]
+    pub fn is_quarantined(&self, identity: &Identity, now: u64) -> bool {
+        self.quarantined(identity, now)
+    }
+
+    /// Puts `identity` in a free slot as retired at `now` (tests).
+    #[cfg(test)]
+    pub(crate) fn quarantine_for_test(&mut self, identity: Identity, now: u64) {
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.state == State::Free)
+            .expect("a free slot");
+        slot.state = State::Retired {
+            identity,
+            retired_at: now,
+            reclaimed: false,
+        };
     }
 
     fn quarantined(&self, identity: &Identity, now: u64) -> bool {

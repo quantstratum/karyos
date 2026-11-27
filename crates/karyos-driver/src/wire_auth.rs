@@ -47,9 +47,12 @@ pub const ROTATE_AT: u64 = TAG_CAP / 4 * 3;
 /// its predecessor (manifest 4.4).
 pub const MAX_FILE_EPOCHS: usize = 2;
 /// How long the previous in-band key epoch keeps verifying after a sender
-/// moves to the next one: the 24-hour bound on two accepted key epochs
-/// (manifest 4.4).
-pub const IN_BAND_OVERLAP_S: i64 = crate::wire_keys::store::OVERLAP_S;
+/// moves to the next one, in monotonic nanoseconds: the 24-hour bound on
+/// two accepted key epochs (manifest 4.4). It is measured on the monotonic
+/// clock, so a wall clock correction can never reopen it (H8 finding 7);
+/// file validity and durable retirement keep their wall clock rules.
+pub const IN_BAND_OVERLAP_NS: u64 =
+    crate::wire_keys::store::OVERLAP_S.unsigned_abs() * 1_000_000_000;
 /// Boot ids a publisher retires per receiver and file epoch before it
 /// refuses another new one (ADR-0086 section 7, publisher rule).
 pub const MAX_RETIRED_BOOTS: usize = 8;
@@ -78,6 +81,11 @@ pub enum SealFailure {
     /// the incarnation must close.
     #[error("the key's usage limit is reached")]
     Exhausted,
+    /// The key was withdrawn by a key reload (expired, revoked, replaced
+    /// or the store disabled): nothing is sent until the session is
+    /// keyed again.
+    #[error("the key was withdrawn")]
+    Withdrawn,
     /// The buffer cannot hold the frames and the envelope.
     #[error(transparent)]
     Buffer(#[from] SealError),
@@ -140,6 +148,25 @@ pub enum Party {
 }
 
 impl Party {
+    /// Whether `other` is a party of the same key scope: both senders, or
+    /// receivers of the same receiver id. Only such a party may take over
+    /// a key already checked against its file.
+    fn same_scope(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Sender { .. }, Self::Sender { .. }) => true,
+            (
+                Self::Receiver {
+                    receiver_id: mine, ..
+                },
+                Self::Receiver {
+                    receiver_id: theirs,
+                    ..
+                },
+            ) => mine == theirs,
+            _ => false,
+        }
+    }
+
     fn domain(&self) -> Domain {
         match self {
             Self::Sender { .. } => Domain::Data,
@@ -247,6 +274,8 @@ pub struct Sealer {
     file_epoch: u32,
     party_epoch: u8,
     profile: HmacSha256,
+    /// Withdrawn by a key reload: it seals nothing again.
+    withdrawn: bool,
 }
 
 impl core::fmt::Debug for Sealer {
@@ -269,6 +298,32 @@ impl Sealer {
     /// [`KeyError`] when the file does not fit the party.
     pub fn new(file: &KeyFile, party: Party, alias: Alias) -> Result<Self, KeyError> {
         Self::starting(file, party, alias, 0, 0)
+    }
+
+    /// A sealer for `party` on `alias` under this sealer's key file, from
+    /// in-band epoch 0: a new establishment of the same publication or receiver
+    /// (a new boot id or nonce) without reading the key file again.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError::Scope`] for a party of another kind or receiver.
+    pub fn with_party(&self, party: Party, alias: Alias) -> Result<Self, KeyError> {
+        if !party.same_scope(&self.party) {
+            return Err(KeyError::Scope);
+        }
+        let key = party
+            .context(self.file_epoch, 0, self.key_id)
+            .derive(&self.secret);
+        Ok(Self {
+            secret: Zeroizing::new(*self.secret),
+            party,
+            alias,
+            key_id: self.key_id,
+            file_epoch: self.file_epoch,
+            party_epoch: 0,
+            profile: keyed(&key, binding(party.domain(), 0, alias, self.key_id), 0),
+            withdrawn: self.withdrawn,
+        })
     }
 
     fn starting(
@@ -296,7 +351,73 @@ impl Sealer {
             file_epoch: file.file_epoch,
             party_epoch,
             profile,
+            withdrawn: false,
         })
+    }
+
+    /// The `key_id` and file epoch of the key file it was made from.
+    #[must_use]
+    pub fn key_ref(&self) -> (u32, u32) {
+        (self.key_id, self.file_epoch)
+    }
+
+    /// Whether it still seals under `signing`, the key file the store now
+    /// names to sign for its `key_id`: the same file epoch, not withdrawn.
+    #[must_use]
+    pub fn signs_under(&self, signing: Option<&KeyFile>) -> bool {
+        !self.withdrawn
+            && signing.is_some_and(|file| (file.key_id, file.file_epoch) == self.key_ref())
+    }
+
+    /// A sealer of the same party and alias under `file`, from in-band
+    /// epoch 0: the prototype re-keyed after a reload.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError`] when the file does not fit the party.
+    pub fn rekeyed(&self, file: &KeyFile) -> Result<Self, KeyError> {
+        Self::new(file, self.party, self.alias)
+    }
+
+    /// Follows the store's key set as a live session sealer (ADR-0086
+    /// section 7, design wire-key-files section 2.3): see [`key_move`].
+    /// Kept while its file still signs; re-keyed to the new signing file,
+    /// under the same party and so the same establishment, from in-band
+    /// epoch 0 and sequence 0, when the key rotated to a newer file epoch
+    /// and its own still verifies (the overlap); withdrawn otherwise.
+    pub fn follow(&mut self, keys: &dyn KeySet) {
+        // A withdrawn sealer is a tombstone: it never comes back, even if
+        // its file does (H8 N1).
+        if self.withdrawn {
+            return;
+        }
+        match key_move(self.key_ref(), keys) {
+            KeyMove::Keep => {}
+            KeyMove::Rekey(file) => match self.rekeyed(file) {
+                Ok(rekeyed) => *self = rekeyed,
+                Err(_) => self.withdraw(),
+            },
+            KeyMove::Withdraw => self.withdraw(),
+        }
+    }
+
+    /// Withdraws the key (H8 finding 4): the secret and the session
+    /// profile are erased and it never seals again, so its publication or
+    /// image stops sending (fail closed) until a new sealer is made.
+    pub fn withdraw(&mut self) {
+        self.withdrawn = true;
+        self.secret.fill(0);
+        self.profile = keyed(
+            &[0; KEY_LEN],
+            binding(self.party.domain(), 0, self.alias, self.key_id),
+            TAG_CAP,
+        );
+    }
+
+    /// Whether it was withdrawn: a tombstone that seals nothing.
+    #[must_use]
+    pub fn is_withdrawn(&self) -> bool {
+        self.withdrawn
     }
 
     /// The domain this sealer tags in: 1 for a sender, 4 for a receiver.
@@ -322,6 +443,9 @@ impl Sealer {
     /// before it reads anything it would then have to drop.
     #[must_use]
     pub fn can_seal(&self) -> bool {
+        if self.withdrawn {
+            return false;
+        }
         let seq = self.profile.next_seq();
         if seq >= ROTATE_AT {
             self.party_epoch < u8::MAX
@@ -337,10 +461,14 @@ impl Sealer {
     ///
     /// # Errors
     ///
-    /// [`SealFailure::Exhausted`] at [`TAG_CAP`] with no epoch left, and
+    /// [`SealFailure::Exhausted`] at [`TAG_CAP`] with no epoch left,
+    /// [`SealFailure::Withdrawn`] once withdrawn, and
     /// [`SealFailure::Buffer`] when `datagram` is too small; nothing is
     /// sealed and no sequence is used.
     pub fn seal(&mut self, datagram: &mut [u8], frames: usize) -> Result<usize, SealFailure> {
+        if self.withdrawn {
+            return Err(SealFailure::Withdrawn);
+        }
         if self.profile.next_seq() >= ROTATE_AT {
             self.rotate()?;
         }
@@ -348,7 +476,17 @@ impl Sealer {
         if seq >= TAG_CAP {
             return Err(SealFailure::Exhausted);
         }
-        Ok(Protection::seal(&self.profile, datagram, frames)?)
+        #[cfg(test)]
+        let plaintext = recording().then(|| datagram.get(..frames).map(<[u8]>::to_vec));
+        let sealed = Protection::seal(&self.profile, datagram, frames)?;
+        #[cfg(test)]
+        if let Some(Some(frames)) = plaintext {
+            record(SealedRecord {
+                domain: self.domain(),
+                frames,
+            });
+        }
+        Ok(sealed)
     }
 
     fn with_seq(&self, party_epoch: u8, seq: u64) -> HmacSha256 {
@@ -373,6 +511,18 @@ impl Sealer {
         Ok(())
     }
 
+    /// Moves the next envelope to in-band `party_epoch` at `seq` (tests:
+    /// the 75% move and the usage limit, which would otherwise need 2^47
+    /// seals, reached on a live session).
+    #[cfg(test)]
+    pub(crate) fn jump_to(&mut self, party_epoch: u8, seq: u64) {
+        if self.withdrawn {
+            return;
+        }
+        self.profile = self.with_seq(party_epoch, seq);
+        self.party_epoch = party_epoch;
+    }
+
     #[cfg(test)]
     fn at_seq(file: &KeyFile, party: Party, alias: Alias, party_epoch: u8, seq: u64) -> Self {
         Self::starting(file, party, alias, party_epoch, seq).unwrap()
@@ -394,9 +544,10 @@ struct EpochKeys {
     file_epoch: u32,
     secret: Zeroizing<[u8; KEY_LEN]>,
     previous: Option<Slot>,
-    /// The previous in-band epoch verifies while `now` is below this, at
-    /// most [`IN_BAND_OVERLAP_S`] after the move (manifest 4.4).
-    previous_until: i64,
+    /// The previous in-band epoch verifies while the monotonic `now` is
+    /// below this, at most [`IN_BAND_OVERLAP_NS`] after the move (manifest
+    /// 4.4); once reached the slot is dropped for good.
+    previous_until: u64,
     current: Slot,
     next: Option<Slot>,
 }
@@ -407,6 +558,10 @@ pub struct Verifier {
     alias: Alias,
     key_id: u32,
     epochs: [Option<EpochKeys>; MAX_FILE_EPOCHS],
+    /// The highest file epoch a live verifier ever dropped (H8 N1): it
+    /// never verifies again, so a file withdrawn and then restored cannot
+    /// return with an empty replay window.
+    dropped: Option<u32>,
 }
 
 impl core::fmt::Debug for Verifier {
@@ -443,6 +598,7 @@ impl Verifier {
             alias,
             key_id: 0,
             epochs: [None, None],
+            dropped: None,
         };
         verifier.refresh(files)?;
         if verifier.epochs.iter().flatten().next().is_none() {
@@ -506,6 +662,108 @@ impl Verifier {
         Ok(())
     }
 
+    /// A verifier for `party` on `alias` under this verifier's key files,
+    /// with empty windows: the binding of a new boot id (ADR-0086 section 7, publisher
+    /// rule) without reading the key files again.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError::Scope`] for a party of another kind or receiver.
+    pub fn with_party(&self, party: Party, alias: Alias) -> Result<Self, KeyError> {
+        if !party.same_scope(&self.party) {
+            return Err(KeyError::Scope);
+        }
+        let mut verifier = Self {
+            party,
+            alias,
+            key_id: self.key_id,
+            epochs: [None, None],
+            dropped: None,
+        };
+        let mut epochs: [Option<EpochKeys>; MAX_FILE_EPOCHS] = [None, None];
+        for (slot, keys) in epochs.iter_mut().zip(&self.epochs) {
+            let Some(keys) = keys else { continue };
+            let secret = Zeroizing::new(*keys.secret);
+            let current = verifier.slot_for(&secret, self.key_id, keys.file_epoch, 0);
+            let next = Some(verifier.slot_for(&secret, self.key_id, keys.file_epoch, 1));
+            *slot = Some(EpochKeys {
+                file_epoch: keys.file_epoch,
+                secret,
+                previous: None,
+                previous_until: 0,
+                current,
+                next,
+            });
+        }
+        verifier.epochs = epochs;
+        Ok(verifier)
+    }
+
+    /// The `key_id` this verifier checks.
+    #[must_use]
+    pub fn key_id(&self) -> u32 {
+        self.key_id
+    }
+
+    /// Applies the store's current key set (H8 finding 4): the files that
+    /// now verify its `key_id` replace its keys as [`Verifier::refresh`]
+    /// does, so a retained file epoch keeps its window and a dropped one
+    /// (expired, revoked, or the store disabled) is erased at once. A set
+    /// that does not fit clears every key: nothing verifies (fail closed).
+    pub fn apply(&mut self, keys: &dyn KeySet) {
+        let files = keys.verifying(self.key_id);
+        if self.refresh(files.iter().flatten().copied()).is_err() {
+            self.epochs = [None, None];
+        }
+    }
+
+    /// Applies the key store's current key set to a live verifier, one
+    /// whose windows hold traffic (an image's, a bound receiver's), as
+    /// [`Verifier::apply`] does, but a file epoch once dropped is a
+    /// tombstone (H8 N1): if the same file returns (a store disabled and
+    /// then reloaded, a revocation undone) it is not re-admitted, because
+    /// its window would restart empty under an unchanged traffic key and
+    /// replay old datagrams. Traffic under it resumes only after a fresh
+    /// establishment, with new key derivation inputs.
+    pub fn apply_live(&mut self, keys: &dyn KeySet) {
+        let held = self
+            .epochs
+            .each_ref()
+            .map(|keys| keys.as_ref().map(|k| k.file_epoch));
+        let dropped = self.dropped;
+        let files = keys
+            .verifying(self.key_id)
+            .map(|file| file.filter(|file| dropped.is_none_or(|floor| file.file_epoch > floor)));
+        if self.refresh(files.iter().flatten().copied()).is_err() {
+            self.epochs = [None, None];
+        }
+        let kept = self
+            .epochs
+            .each_ref()
+            .map(|keys| keys.as_ref().map(|k| k.file_epoch));
+        for epoch in held.iter().flatten() {
+            if !kept.contains(&Some(*epoch)) {
+                self.dropped = Some(self.dropped.map_or(*epoch, |floor| floor.max(*epoch)));
+            }
+        }
+    }
+
+    /// Drops, and so erases, every previous in-band epoch whose overlap
+    /// ended at the monotonic `now` (H8 finding 7): it never verifies
+    /// again, whatever any clock later reads.
+    pub fn tick(&mut self, now: u64) {
+        for keys in self.epochs.iter_mut().flatten() {
+            keys.expire(now);
+        }
+    }
+
+    /// Whether any key verifies (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn has_keys(&self) -> bool {
+        self.epochs.iter().flatten().next().is_some()
+    }
+
     fn slot_for(
         &self,
         secret: &[u8; KEY_LEN],
@@ -536,7 +794,7 @@ impl Verifier {
             file_epoch: file.file_epoch,
             secret,
             previous: None,
-            previous_until: i64::MIN,
+            previous_until: 0,
             current,
             next,
         })
@@ -547,13 +805,14 @@ impl Verifier {
     /// checked, and only then the replay window of the key that verified
     /// it moves. A datagram under the next in-band epoch that verifies
     /// makes it current: the old current becomes the previous one, which
-    /// verifies for [`IN_BAND_OVERLAP_S`] from `now`, and the one before is
-    /// dropped. `now` is the wall clock in seconds. Allocates nothing.
+    /// verifies for [`IN_BAND_OVERLAP_NS`] from `now`, and the one before is
+    /// dropped. `now` is the monotonic clock in nanoseconds, never the wall
+    /// clock. Allocates nothing.
     ///
     /// # Errors
     ///
     /// The [`Refusal`]; nothing changes.
-    pub fn open(&mut self, datagram: &[u8], now: i64) -> Result<Opened, Refusal> {
+    pub fn open(&mut self, datagram: &[u8], now: u64) -> Result<Opened, Refusal> {
         let checked = self.check(datagram, now)?;
         self.commit(checked, now)
     }
@@ -566,7 +825,7 @@ impl Verifier {
     /// # Errors
     ///
     /// The [`Refusal`]; nothing changes.
-    pub fn check(&self, datagram: &[u8], now: i64) -> Result<Checked, Refusal> {
+    pub fn check(&self, datagram: &[u8], now: u64) -> Result<Checked, Refusal> {
         let (party_epoch, key_id) =
             header_selectors(datagram).ok_or(Refusal::Envelope(Rejection::Short))?;
         if key_id != self.key_id {
@@ -605,7 +864,10 @@ impl Verifier {
     ///
     /// The [`Refusal`] when the keys changed since the check (a refresh, or
     /// the same sequence committed meanwhile); nothing changes.
-    pub fn commit(&mut self, checked: Checked, now: i64) -> Result<Opened, Refusal> {
+    pub fn commit(&mut self, checked: Checked, now: u64) -> Result<Opened, Refusal> {
+        // An expired previous epoch is erased first, whatever this commit
+        // does: it changes nothing a check at `now` would accept.
+        self.tick(now);
         let key_id = self.key_id;
         let keys = self
             .epochs
@@ -641,7 +903,7 @@ impl EpochKeys {
         &self,
         party_epoch: u8,
         datagram: &[u8],
-        now: i64,
+        now: u64,
     ) -> Option<Result<(Opened, bool), Refusal>> {
         let previous_open = now < self.previous_until;
         let is_next = self
@@ -662,7 +924,7 @@ impl EpochKeys {
 
     /// The slot of `party_epoch` that [`EpochKeys::find`] would pick at
     /// `now`, to commit to.
-    fn slot_mut(&mut self, party_epoch: u8, now: i64) -> Option<&mut Slot> {
+    fn slot_mut(&mut self, party_epoch: u8, now: u64) -> Option<&mut Slot> {
         let previous_open = now < self.previous_until;
         if self.current.party_epoch == party_epoch {
             Some(&mut self.current)
@@ -679,11 +941,18 @@ impl EpochKeys {
         }
     }
 
-    fn advance(&mut self, upcoming: Option<Slot>, now: i64) {
+    /// Drops the previous epoch for good once its overlap ended at `now`.
+    fn expire(&mut self, now: u64) {
+        if self.previous.is_some() && now >= self.previous_until {
+            self.previous = None;
+        }
+    }
+
+    fn advance(&mut self, upcoming: Option<Slot>, now: u64) {
         if let Some(next) = self.next.take() {
             let current = core::mem::replace(&mut self.current, next);
             self.previous = Some(current);
-            self.previous_until = now.saturating_add(IN_BAND_OVERLAP_S);
+            self.previous_until = now.saturating_add(IN_BAND_OVERLAP_NS);
             self.next = upcoming;
         }
     }
@@ -691,6 +960,8 @@ impl EpochKeys {
 
 impl Slot {
     fn check(&self, datagram: &[u8]) -> Result<Opened, Refusal> {
+        #[cfg(test)]
+        count_crypto_open();
         let opened = self
             .profile
             .open_envelope(datagram)
@@ -700,12 +971,443 @@ impl Slot {
     }
 }
 
+/// The key set a key store names at one moment, which the live roles
+/// apply to every derived key after each reload and on each clock tick
+/// (H8 finding 4; design wire-key-files section 2.3). A disabled store
+/// names nothing, so every path that depends on it stops.
+pub trait KeySet {
+    /// The file that signs and sends for `key_id`, if any.
+    fn signing(&self, key_id: u32) -> Option<&KeyFile>;
+    /// The files that verify for `key_id`, at most two, lowest epoch first.
+    fn verifying(&self, key_id: u32) -> [Option<&KeyFile>; MAX_FILE_EPOCHS];
+    /// The current file epoch of `key_id` from the durable lineage.
+    fn current_epoch(&self, key_id: u32) -> Option<u32>;
+    /// A digest of the whole set (every file, whether it signs and
+    /// whether it verifies): it changes whenever the set does, so the
+    /// roles bump their [`KeyGeneration`] and drop prepared traffic made
+    /// under the previous set (H8 finding 4).
+    fn fingerprint(&self) -> u64;
+    /// The number the conductor gave this view when it published it, 0
+    /// for a set no conductor published: a role records it as applied, and
+    /// the [`KeyGeneration`] fence admits its authenticated paths only once
+    /// it has applied the newest published view (H8 R3-1).
+    fn view_generation(&self) -> u64;
+}
+
+/// Which role a [`KeyGeneration`] fence check is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// The sender role.
+    Sender = 0,
+    /// The receiver role.
+    Receiver = 1,
+}
+
+/// The process's monotonic clock in nanoseconds, the one every fence
+/// deadline is measured on (H8 R3-1): a wall clock step never moves it.
+#[must_use]
+pub fn monotonic_ns() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// FNV-1a over `words`, from `hash`.
+fn fnv(mut hash: u64, words: &[u64]) -> u64 {
+    for word in words {
+        for byte in word.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// The applied key generation shared by a driver's roles (H8 finding 4):
+/// bumped whenever an applied key set differs from the last one. Every
+/// prepared send (a queued proof, a signed or sealed datagram, a pending
+/// abort) records the generation it was made under and is dropped, or
+/// revalidated, at submission once the generation has moved.
+///
+/// It is also the fence of H8 R3-1, checked at every authenticated use
+/// (seal, open, verify) with no ring in between: the conductor publishes
+/// the number of each new view (`required`) before posting it, and renews
+/// a monotonic freshness deadline at each reload; a role whose applied
+/// view is older than the required one, or any role once the deadline has
+/// passed (the conductor stalled), stops every authenticated path, fail
+/// closed, until it catches up. With no conductor (no key store) it admits
+/// everything.
+#[derive(Debug)]
+pub struct KeyGeneration {
+    generation: core::sync::atomic::AtomicU64,
+    fingerprint: core::sync::atomic::AtomicU64,
+    /// The newest view the conductor published.
+    required: core::sync::atomic::AtomicU64,
+    /// The view each role ([`Side`]) applied.
+    applied: [core::sync::atomic::AtomicU64; 2],
+    /// The monotonic deadline of the current view's freshness.
+    fresh_until: core::sync::atomic::AtomicU64,
+}
+
+impl Default for KeyGeneration {
+    fn default() -> Self {
+        Self {
+            generation: core::sync::atomic::AtomicU64::new(0),
+            fingerprint: core::sync::atomic::AtomicU64::new(0),
+            required: core::sync::atomic::AtomicU64::new(0),
+            applied: [
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+            ],
+            fresh_until: core::sync::atomic::AtomicU64::new(u64::MAX),
+        }
+    }
+}
+
+impl KeyGeneration {
+    /// Whether `side` may use authenticated keys at the monotonic `now`:
+    /// it applied the newest published view, and that view is fresh.
+    #[must_use]
+    pub fn admits(&self, side: Side, now: u64) -> bool {
+        use core::sync::atomic::Ordering::Acquire;
+
+        let applied = self
+            .applied
+            .get(side as usize)
+            .map_or(0, |applied| applied.load(Acquire));
+        now < self.fresh_until.load(Acquire) && applied >= self.required.load(Acquire)
+    }
+
+    /// [`KeyGeneration::admits`] now.
+    #[must_use]
+    pub fn admits_now(&self, side: Side) -> bool {
+        self.admits(side, monotonic_ns())
+    }
+
+    /// The conductor published view `generation`: no role admits until it
+    /// has applied it.
+    pub fn require(&self, generation: u64) {
+        self.required
+            .fetch_max(generation, core::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// The conductor reloaded: the view stays fresh until the monotonic
+    /// `until`.
+    pub fn renew(&self, until: u64) {
+        self.fresh_until
+            .store(until, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether both roles have applied view `generation`.
+    #[must_use]
+    pub fn applied_by_both(&self, generation: u64) -> bool {
+        self.applied
+            .iter()
+            .all(|applied| applied.load(core::sync::atomic::Ordering::Acquire) >= generation)
+    }
+
+    /// `side` applied view `generation`.
+    pub fn applied(&self, side: Side, generation: u64) {
+        if let Some(applied) = self.applied.get(side as usize) {
+            applied.fetch_max(generation, core::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    /// The current generation.
+    #[must_use]
+    pub fn current(&self) -> u64 {
+        self.generation.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Records the key set `keys` was applied; bumps the generation when
+    /// it differs from the last one. Returns whether it did.
+    pub fn observe(&self, keys: &dyn KeySet) -> bool {
+        let fingerprint = keys.fingerprint();
+        let last = self
+            .fingerprint
+            .swap(fingerprint, core::sync::atomic::Ordering::AcqRel);
+        if last == fingerprint {
+            return false;
+        }
+        self.generation
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        true
+    }
+}
+
+/// What a live sealer under the file `(key_id, file_epoch)` does with a
+/// key set.
+#[derive(Debug, Clone, Copy)]
+pub enum KeyMove<'a> {
+    /// Its file still signs.
+    Keep,
+    /// A routine rotation: a newer file epoch signs and its own still
+    /// verifies through the overlap (ADR-0086 section 7). It moves to the
+    /// new file without re-establishment.
+    Rekey(&'a KeyFile),
+    /// Its file was revoked, expired, no longer verifies, or the store is
+    /// disabled: it stops (fail closed).
+    Withdraw,
+}
+
+/// What a live sealer under `key` (its `key_id` and file epoch) does with
+/// `keys`: see [`KeyMove`].
+#[must_use]
+pub fn key_move(key: (u32, u32), keys: &dyn KeySet) -> KeyMove<'_> {
+    let (key_id, epoch) = key;
+    match keys.signing(key_id) {
+        Some(file) if file.file_epoch == epoch => KeyMove::Keep,
+        Some(file)
+            if file.file_epoch > epoch
+                && keys
+                    .verifying(key_id)
+                    .iter()
+                    .flatten()
+                    .any(|held| held.file_epoch == epoch) =>
+        {
+            KeyMove::Rekey(file)
+        }
+        Some(_) | None => KeyMove::Withdraw,
+    }
+}
+
+/// A [`crate::wire_keys::store::KeyStore`]'s key set at the wall clock
+/// `now` (seconds): file validity and retirement keep their wall clock
+/// rules.
+pub struct StoreKeys<'a, K: crate::wire_keys::store::Files, S: crate::wire_keys::store::Files> {
+    /// The store.
+    pub store: &'a crate::wire_keys::store::KeyStore<K, S>,
+    /// The wall clock in seconds.
+    pub now: i64,
+}
+
+impl<K: crate::wire_keys::store::Files, S: crate::wire_keys::store::Files> KeySet
+    for StoreKeys<'_, K, S>
+{
+    fn signing(&self, key_id: u32) -> Option<&KeyFile> {
+        self.store.signing_key(key_id, self.now)
+    }
+
+    fn verifying(&self, key_id: u32) -> [Option<&KeyFile>; MAX_FILE_EPOCHS] {
+        let mut files = [None, None];
+        let mut found = self.store.verify_keys(key_id, self.now);
+        for slot in &mut files {
+            *slot = found.next();
+        }
+        // More than two verifying files does not fit: none verifies.
+        if found.next().is_some() {
+            return [None, None];
+        }
+        files
+    }
+
+    fn current_epoch(&self, key_id: u32) -> Option<u32> {
+        if self.store.is_disabled() {
+            return None;
+        }
+        self.store
+            .state()
+            .lineages
+            .get(&key_id)
+            .map(|lineage| lineage.highest)
+    }
+
+    fn fingerprint(&self) -> u64 {
+        let mut hash = fnv(FNV_OFFSET, &[u64::from(self.store.is_disabled())]);
+        for file in self.store.loaded() {
+            let signs = self
+                .signing(file.key_id)
+                .is_some_and(|signing| signing.file_epoch == file.file_epoch);
+            let verifies = self
+                .verifying(file.key_id)
+                .iter()
+                .flatten()
+                .any(|held| held.file_epoch == file.file_epoch);
+            hash = fnv(
+                hash,
+                &[
+                    u64::from(file.key_id),
+                    u64::from(file.file_epoch),
+                    u64::from(signs),
+                    u64::from(verifies),
+                ],
+            );
+        }
+        hash
+    }
+
+    fn view_generation(&self) -> u64 {
+        0
+    }
+}
+
+/// One datagram a sealer sealed: its domain and its plaintext frames
+/// (tests).
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct SealedRecord {
+    pub(crate) domain: Domain,
+    pub(crate) frames: Vec<u8>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SEALED: core::cell::RefCell<Option<Vec<SealedRecord>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn recording() -> bool {
+    SEALED.with(|sealed| sealed.borrow().is_some())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The envelope opens and signature verifications attempted on this
+    /// thread: an upper bound of its MAC and signature work (tests; H8
+    /// BUD-10).
+    static CRYPTO_OPENS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Counts one envelope open or signature verification attempt (tests).
+#[cfg(test)]
+pub(crate) fn count_crypto_open() {
+    CRYPTO_OPENS.with(|opens| opens.set(opens.get().saturating_add(1)));
+}
+
+/// The envelope opens and signature verifications attempted on this
+/// thread so far (tests).
+#[cfg(test)]
+pub(crate) fn crypto_opens() -> u64 {
+    CRYPTO_OPENS.with(core::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record(record: SealedRecord) {
+    SEALED.with(|sealed| {
+        if let Some(sealed) = sealed.borrow_mut().as_mut() {
+            sealed.push(record);
+        }
+    });
+}
+
+/// Starts recording every seal on this thread (tests).
+#[cfg(test)]
+pub(crate) fn record_seals() {
+    SEALED.with(|sealed| *sealed.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stops recording and returns what was sealed since [`record_seals`]
+/// (tests).
+#[cfg(test)]
+pub(crate) fn take_seals() -> Vec<SealedRecord> {
+    SEALED.with(|sealed| sealed.borrow_mut().take().unwrap_or_default())
+}
+
+/// A fixed key set (tests): `files` as loaded, the highest epoch of a
+/// `key_id` signs and is current, the two highest verify.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct FixedKeys {
+    pub(crate) files: Vec<KeyFile>,
+}
+
+#[cfg(test)]
+impl KeySet for FixedKeys {
+    fn signing(&self, key_id: u32) -> Option<&KeyFile> {
+        self.files
+            .iter()
+            .filter(|file| file.key_id == key_id)
+            .max_by_key(|file| file.file_epoch)
+    }
+
+    fn verifying(&self, key_id: u32) -> [Option<&KeyFile>; MAX_FILE_EPOCHS] {
+        let mut of: Vec<&KeyFile> = self.files.iter().filter(|f| f.key_id == key_id).collect();
+        of.sort_by_key(|file| file.file_epoch);
+        let skip = of.len().saturating_sub(MAX_FILE_EPOCHS);
+        let mut files = [None, None];
+        for (slot, file) in files.iter_mut().zip(of.into_iter().skip(skip)) {
+            *slot = Some(file);
+        }
+        files
+    }
+
+    fn current_epoch(&self, key_id: u32) -> Option<u32> {
+        self.signing(key_id).map(|file| file.file_epoch)
+    }
+
+    fn fingerprint(&self) -> u64 {
+        let mut hash = FNV_OFFSET;
+        for file in &self.files {
+            hash = fnv(hash, &[u64::from(file.key_id), u64::from(file.file_epoch)]);
+        }
+        hash
+    }
+
+    fn view_generation(&self) -> u64 {
+        0
+    }
+}
+
+/// A key set whose signing file and lineage epoch are set apart from its
+/// verifying files, as during a successor's early verify allowance or
+/// after the last signing window ended (wire-key-files.md 2.3; tests).
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct SplitKeys {
+    /// The one file that signs, if any.
+    pub(crate) signing: Option<KeyFile>,
+    /// The files that verify.
+    pub(crate) verifying: Vec<KeyFile>,
+    /// The durable lineage's highest epoch.
+    pub(crate) current: Option<u32>,
+}
+
+#[cfg(test)]
+impl KeySet for SplitKeys {
+    fn signing(&self, key_id: u32) -> Option<&KeyFile> {
+        self.signing.as_ref().filter(|file| file.key_id == key_id)
+    }
+
+    fn verifying(&self, key_id: u32) -> [Option<&KeyFile>; MAX_FILE_EPOCHS] {
+        let mut of: Vec<&KeyFile> = self
+            .verifying
+            .iter()
+            .filter(|file| file.key_id == key_id)
+            .collect();
+        of.sort_by_key(|file| file.file_epoch);
+        let mut files = [None, None];
+        for (slot, file) in files.iter_mut().zip(of) {
+            *slot = Some(file);
+        }
+        files
+    }
+
+    fn current_epoch(&self, _: u32) -> Option<u32> {
+        self.current
+    }
+
+    fn fingerprint(&self) -> u64 {
+        0
+    }
+
+    fn view_generation(&self) -> u64 {
+        0
+    }
+}
+
 /// Tags and checks the SETUP proof (domain 5) or RSP_SETUP (domain 6) of
 /// one channel or pair. These domains keep no window: freshness is the
 /// challenge transcript (ADR-0086 sections 6 and 7), and `envelope_seq` is
 /// a per-start counter.
 pub struct Proof {
     kind: ProofKind,
+    alias: Alias,
+    /// Whether it was made to seal: a key reload re-keys only a signing
+    /// proof's signing key.
+    signs: bool,
     key_id: u32,
     /// The current file epoch of the key, from the durable lineage: only a
     /// proof under it may bind.
@@ -714,6 +1416,10 @@ pub struct Proof {
     signing: Option<(u32, HmacSha256)>,
     /// One profile per verifying file epoch.
     verifying: [Option<(u32, HmacSha256)>; MAX_FILE_EPOCHS],
+    /// The derived keys of `signing` and `verifying`, for the same proof
+    /// on another alias ([`Proof::for_alias`]).
+    signing_key: Option<Zeroizing<[u8; KEY_LEN]>>,
+    verifying_keys: [Option<Zeroizing<[u8; KEY_LEN]>>; MAX_FILE_EPOCHS],
 }
 
 impl core::fmt::Debug for Proof {
@@ -778,7 +1484,11 @@ impl ProofKind {
         }
     }
 
-    fn profile(self, file: &KeyFile, alias: Alias) -> Result<HmacSha256, KeyError> {
+    fn profile(
+        self,
+        file: &KeyFile,
+        alias: Alias,
+    ) -> Result<(Zeroizing<[u8; KEY_LEN]>, HmacSha256), KeyError> {
         self.check(file)?;
         let context = match self {
             Self::Setup => Context::Setup {
@@ -794,11 +1504,8 @@ impl ProofKind {
             },
         };
         let key = context.derive(secret(file)?);
-        Ok(keyed(
-            &key,
-            binding(self.domain(), 0, alias, file.key_id),
-            0,
-        ))
+        let profile = keyed(&key, binding(self.domain(), 0, alias, file.key_id), 0);
+        Ok((key, profile))
     }
 }
 
@@ -821,15 +1528,23 @@ impl Proof {
     ) -> Result<Self, KeyError> {
         let mut proof = Self {
             kind,
+            alias,
+            signs: signing.is_some(),
             key_id: 0,
             current,
             signing: None,
             verifying: [None, None],
+            signing_key: None,
+            verifying_keys: [None, None],
         };
         let mut count = 0_usize;
         for file in verifying {
             let slot = proof.verifying.get_mut(count).ok_or(KeyError::NoKey)?;
-            *slot = Some((file.file_epoch, kind.profile(file, alias)?));
+            let (key, profile) = kind.profile(file, alias)?;
+            *slot = Some((file.file_epoch, profile));
+            if let Some(held) = proof.verifying_keys.get_mut(count) {
+                *held = Some(key);
+            }
             if count == 0 {
                 proof.key_id = file.key_id;
             } else if file.key_id != proof.key_id {
@@ -842,12 +1557,111 @@ impl Proof {
                 return Err(KeyError::Mixed);
             }
             proof.key_id = file.key_id;
-            proof.signing = Some((file.file_epoch, kind.profile(file, alias)?));
+            let (key, profile) = kind.profile(file, alias)?;
+            proof.signing = Some((file.file_epoch, profile));
+            proof.signing_key = Some(key);
         }
         if count == 0 && proof.signing.is_none() {
             return Err(KeyError::NoKey);
         }
         Ok(proof)
+    }
+
+    /// The same proof on `alias`: a subscription's SETUP proof checks, and
+    /// its RSP_SETUP proof seals, for each session of its stream, whose
+    /// alias it learns only from the datagram. Its sequence starts at 0:
+    /// these domains keep no window (ADR-0086 section 7).
+    #[must_use]
+    pub fn for_alias(&self, alias: Alias) -> Self {
+        let domain = self.kind.domain();
+        let rebound =
+            |key: &Zeroizing<[u8; KEY_LEN]>| keyed(key, binding(domain, 0, alias, self.key_id), 0);
+        let mut verifying: [Option<(u32, HmacSha256)>; MAX_FILE_EPOCHS] = [None, None];
+        let mut verifying_keys: [Option<Zeroizing<[u8; KEY_LEN]>>; MAX_FILE_EPOCHS] = [None, None];
+        for ((slot, held), (old, key)) in verifying
+            .iter_mut()
+            .zip(verifying_keys.iter_mut())
+            .zip(self.verifying.iter().zip(self.verifying_keys.iter()))
+        {
+            if let (Some((epoch, _)), Some(key)) = (old, key) {
+                *slot = Some((*epoch, rebound(key)));
+                *held = Some(Zeroizing::new(**key));
+            }
+        }
+        let signing = self
+            .signing
+            .as_ref()
+            .zip(self.signing_key.as_ref())
+            .map(|((epoch, _), key)| (*epoch, rebound(key)));
+        Self {
+            kind: self.kind,
+            alias,
+            signs: self.signs,
+            key_id: self.key_id,
+            current: self.current,
+            signing,
+            verifying,
+            signing_key: self.signing_key.as_ref().map(|key| Zeroizing::new(**key)),
+            verifying_keys,
+        }
+    }
+
+    /// The `key_id` this proof checks.
+    #[must_use]
+    pub fn key_id(&self) -> u32 {
+        self.key_id
+    }
+
+    /// Applies the store's current key set (H8 finding 4): its keys become
+    /// the files that now sign and verify its `key_id`, and its current
+    /// epoch the lineage's. Unchanged keys keep their profiles; a key no
+    /// longer in the set is erased. A set that leaves nothing, or does not
+    /// fit, clears every key: it neither seals nor verifies (fail closed).
+    pub fn apply(&mut self, keys: &dyn KeySet) {
+        let signing = if self.signs {
+            keys.signing(self.key_id)
+        } else {
+            None
+        };
+        let verifying = keys.verifying(self.key_id);
+        let current = keys.current_epoch(self.key_id).unwrap_or(0);
+        let held = |slot: &Option<(u32, HmacSha256)>| slot.as_ref().map(|(epoch, _)| *epoch);
+        let wanted = verifying.map(|file| file.map(|file| file.file_epoch));
+        if held(&self.signing) == signing.map(|file| file.file_epoch)
+            && self.verifying.each_ref().map(held) == wanted
+            && self.current == current
+        {
+            return;
+        }
+        let rebuilt = Self::new(
+            self.kind,
+            self.alias,
+            signing,
+            verifying.iter().flatten().copied(),
+            current,
+        );
+        match rebuilt {
+            Ok(proof) if proof.key_id == self.key_id => {
+                *self = Self {
+                    signs: self.signs,
+                    ..proof
+                };
+            }
+            _ => {
+                self.signing = None;
+                self.signing_key = None;
+                self.verifying = [None, None];
+                self.verifying_keys = [None, None];
+            }
+        }
+    }
+
+    /// Withdraws every key: it neither seals nor verifies again.
+    pub fn withdraw(&mut self) {
+        self.signing = None;
+        self.signing_key = None;
+        self.verifying = [None, None];
+        self.verifying_keys = [None, None];
     }
 
     /// The domain this proof tags in: 5 for SETUP, 6 for RSP_SETUP.
@@ -867,7 +1681,17 @@ impl Proof {
         if profile.next_seq() >= TAG_CAP {
             return Err(SealFailure::Exhausted);
         }
-        Ok(Protection::seal(profile, datagram, frames)?)
+        #[cfg(test)]
+        let plaintext = recording().then(|| datagram.get(..frames).map(<[u8]>::to_vec));
+        let sealed = Protection::seal(profile, datagram, frames)?;
+        #[cfg(test)]
+        if let Some(Some(frames)) = plaintext {
+            record(SealedRecord {
+                domain: self.domain(),
+                frames,
+            });
+        }
+        Ok(sealed)
     }
 
     /// Checks a received proof under each verifying file epoch.
@@ -882,6 +1706,8 @@ impl Proof {
         }
         let mut first = Rejection::Key;
         for (file_epoch, profile) in self.verifying.iter().flatten() {
+            #[cfg(test)]
+            count_crypto_open();
             match profile.open_envelope(datagram) {
                 Ok(opened) => {
                     return Ok(Proved {
@@ -1056,3 +1882,5 @@ impl BootTable {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vectors;

@@ -38,7 +38,7 @@ use karyos_protocol::network::{Control, MAX_CONTROL_LENGTH};
 
 use karyos_protocol::protection::hmac_sha256::Domain;
 
-use crate::wire_auth::{ENVELOPE_LEN, Proof, Sealer};
+use crate::wire_auth::{Proof, Sealer};
 
 use super::EndpointId;
 
@@ -127,6 +127,17 @@ impl ReportSlot {
             self.state.load(std::sync::atomic::Ordering::Acquire),
             REPORT_WAITING | REPORT_SENDING
         )
+    }
+
+    /// The start of a control still in its backend call, which a reply to
+    /// it settles as submitted ([`Self::collect`] with `replied`); `None`
+    /// in any other state. Changes nothing (H8-29).
+    #[must_use]
+    pub fn sending_start(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+
+        (self.state.load(Ordering::Acquire) == REPORT_SENDING)
+            .then(|| self.start.load(Ordering::Relaxed))
     }
 
     /// Takes the final report of the last control, if the sender made one,
@@ -232,6 +243,34 @@ pub enum ControlItem {
         /// `None` on a trusted channel, whose controls go bare.
         seal: Option<SharedSealer>,
     },
+    /// An envelope that arrived on `endpoint` from `source` for a local
+    /// authenticated publication: carried undecoded, so that the sender
+    /// agent verifies it before anything reads its inner frames (ADR-0086
+    /// section 2).
+    Sealed {
+        /// The endpoint it arrived on.
+        endpoint: EndpointId,
+        /// Its backend source.
+        source: SocketAddr,
+        /// The datagram.
+        bytes: SealedBytes,
+        /// When the receiver took it from the backend.
+        seen: u64,
+    },
+    /// Prepared bytes, a sealed or signed control or a bare guard status
+    /// challenge, sent on `endpoint` to `destination` as they are.
+    Raw {
+        /// The endpoint to send on.
+        endpoint: EndpointId,
+        /// Where to.
+        destination: SocketAddr,
+        /// The datagram.
+        bytes: SealedBytes,
+        /// The applied key generation it was signed or sealed under: the
+        /// sender drops it unsent once the generation has moved (H8
+        /// finding 4).
+        generation: u64,
+    },
     /// `control` arrived on `endpoint` from `source`, for a local
     /// publication.
     Incoming {
@@ -244,6 +283,43 @@ pub enum ControlItem {
         /// When the receiver took it from the backend.
         seen: u64,
     },
+}
+
+/// The bytes of one sealed control, in a fixed array: a control is at
+/// most [`MAX_CONTROL_LENGTH`] bytes and its envelope at most
+/// [`crate::wire_enc::MAX_CONTROL_ENVELOPE`], the encrypted one with its
+/// pairwise trailer.
+#[derive(Clone, Copy)]
+pub struct SealedBytes {
+    len: usize,
+    bytes: [u8; MAX_CONTROL_LENGTH + crate::wire_enc::MAX_CONTROL_ENVELOPE],
+}
+
+impl core::fmt::Debug for SealedBytes {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SealedBytes")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SealedBytes {
+    /// A copy of `datagram`; `None` when longer than any sealed control.
+    #[must_use]
+    pub fn copy(datagram: &[u8]) -> Option<Self> {
+        let mut bytes = [0u8; MAX_CONTROL_LENGTH + crate::wire_enc::MAX_CONTROL_ENVELOPE];
+        bytes.get_mut(..datagram.len())?.copy_from_slice(datagram);
+        Some(Self {
+            len: datagram.len(),
+            bytes,
+        })
+    }
+
+    /// The datagram.
+    #[must_use]
+    pub fn get(&self) -> &[u8] {
+        self.bytes.get(..self.len).unwrap_or(&[])
+    }
 }
 
 /// The gate of control traffic: every candidate is permitted.
@@ -396,6 +472,51 @@ pub trait ControlSeal {
     fn domain(&self) -> Domain;
     /// Seals the control.
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize>;
+    /// Seals the control with its header naming `alias` instead of the
+    /// key's own selectors, from the key's one sequence (an encrypted
+    /// domain 6 key reached on another alias, H8-14). The default seals
+    /// nothing (fail closed).
+    fn seal_control_as(
+        &mut self,
+        buffer: &mut [u8],
+        frames: usize,
+        alias: karyos_protocol::network::Alias,
+    ) -> Option<usize> {
+        let _ = (buffer, frames, alias);
+        None
+    }
+    /// Withdraws and erases its key: it seals nothing again (H8 finding 4).
+    fn withdraw(&mut self);
+    /// Moves to its next `party_epoch` now, as a budget would (tests).
+    #[cfg(test)]
+    fn roll_for_test(&mut self) {}
+    /// Re-keys it to `file` after a routine file epoch rotation, under the
+    /// same party. The default withdraws (fail closed): a sealer that
+    /// cannot move to another file never keeps the old key.
+    fn rekey(&mut self, file: &crate::wire_keys::KeyFile) {
+        let _ = file;
+        self.withdraw();
+    }
+    /// Applies the key store's current key set (H8 finding 4): withdrawn
+    /// once its key is revoked, expired or no longer verifies.
+    fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet);
+    /// The file epoch its current key derives from while it can still
+    /// seal; `None` once withdrawn, or for a sealer that does not say
+    /// (H8-11).
+    fn key_epoch(&self) -> Option<u32> {
+        None
+    }
+    /// Moves a session sealer to in-band `party_epoch` at `seq` (tests);
+    /// others ignore it.
+    #[cfg(test)]
+    fn jump_to(&mut self, party_epoch: u8, seq: u64) {
+        let _ = (party_epoch, seq);
+    }
+    /// A session sealer's in-band epoch (tests); `None` for others.
+    #[cfg(test)]
+    fn party_epoch_now(&self) -> Option<u8> {
+        None
+    }
 }
 
 impl ControlSeal for Sealer {
@@ -406,6 +527,31 @@ impl ControlSeal for Sealer {
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
         self.seal(buffer, frames).ok()
     }
+
+    fn withdraw(&mut self) {
+        Sealer::withdraw(self);
+    }
+
+    fn rekey(&mut self, file: &crate::wire_keys::KeyFile) {
+        match self.rekeyed(file) {
+            Ok(rekeyed) => *self = rekeyed,
+            Err(_) => Sealer::withdraw(self),
+        }
+    }
+
+    fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        self.follow(keys);
+    }
+
+    #[cfg(test)]
+    fn jump_to(&mut self, party_epoch: u8, seq: u64) {
+        Sealer::jump_to(self, party_epoch, seq);
+    }
+
+    #[cfg(test)]
+    fn party_epoch_now(&self) -> Option<u8> {
+        Some(self.party_epoch())
+    }
 }
 
 /// An image's session [`Sealer`], shared between the receiver agent, which
@@ -414,8 +560,15 @@ impl ControlSeal for Sealer {
 /// the control is not sent (fail closed).
 #[derive(Clone)]
 pub struct SharedSealer {
-    sealer: Arc<Mutex<Sealer>>,
+    sealer: Arc<Mutex<dyn ControlSeal + Send>>,
     domain: Domain,
+    /// Set once the key is withdrawn: no holder seals again, whatever the
+    /// shared sealer can erase itself (H8 finding 4).
+    withdrawn: Arc<core::sync::atomic::AtomicBool>,
+    /// The key generation it was made under, for a copy that must not
+    /// outlive a key change (a queued RSP_SETUP proof): it seals nothing
+    /// once the generation has moved (H8 finding 4).
+    generation: Option<(Arc<crate::wire_auth::KeyGeneration>, u64)>,
 }
 
 impl core::fmt::Debug for SharedSealer {
@@ -427,6 +580,21 @@ impl core::fmt::Debug for SharedSealer {
 }
 
 impl SharedSealer {
+    /// Moves the shared session sealer to in-band `party_epoch` at `seq`
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn jump_to(&self, party_epoch: u8, seq: u64) {
+        if let Ok(mut sealer) = self.sealer.lock() {
+            sealer.jump_to(party_epoch, seq);
+        }
+    }
+
+    /// The shared session sealer's in-band epoch (tests).
+    #[cfg(test)]
+    pub(crate) fn party_epoch_now(&self) -> Option<u8> {
+        self.sealer.lock().ok()?.party_epoch_now()
+    }
+
     /// Shares `sealer`.
     #[must_use]
     pub fn new(sealer: Sealer) -> Self {
@@ -434,7 +602,50 @@ impl SharedSealer {
         Self {
             sealer: Arc::new(Mutex::new(sealer)),
             domain,
+            withdrawn: Arc::default(),
+            generation: None,
         }
+    }
+
+    /// Shares any control `seal`: an encrypted class sealer (ADR-0114).
+    #[must_use]
+    pub fn of(seal: impl ControlSeal + Send + 'static) -> Self {
+        let domain = seal.domain();
+        Self {
+            sealer: Arc::new(Mutex::new(seal)),
+            domain,
+            withdrawn: Arc::default(),
+            generation: None,
+        }
+    }
+
+    /// Shares the RSP_SETUP or SETUP `proof` of a subscription: its
+    /// CHALLENGEs and SOLICITs are sealed by the sender agent.
+    #[must_use]
+    pub fn proof(proof: Proof) -> Self {
+        let domain = proof.domain();
+        Self {
+            sealer: Arc::new(Mutex::new(proof)),
+            domain,
+            withdrawn: Arc::default(),
+            generation: None,
+        }
+    }
+}
+
+impl SharedSealer {
+    /// Whether its key was withdrawn for every holder (tests).
+    #[cfg(test)]
+    pub(crate) fn is_withdrawn(&self) -> bool {
+        self.withdrawn.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Binds it to the current key `generation`: once that moves, it
+    /// seals nothing (H8 finding 4).
+    #[must_use]
+    pub fn bound_to(mut self, generation: &Arc<crate::wire_auth::KeyGeneration>) -> Self {
+        self.generation = Some((Arc::clone(generation), generation.current()));
+        self
     }
 }
 
@@ -444,7 +655,84 @@ impl ControlSeal for SharedSealer {
     }
 
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
-        self.sealer.lock().ok()?.seal(buffer, frames).ok()
+        if self.withdrawn.load(core::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        if self
+            .generation
+            .as_ref()
+            .is_some_and(|(generation, made)| generation.current() != *made)
+        {
+            return None;
+        }
+        self.sealer.lock().ok()?.seal_control(buffer, frames)
+    }
+
+    fn seal_control_as(
+        &mut self,
+        buffer: &mut [u8],
+        frames: usize,
+        alias: karyos_protocol::network::Alias,
+    ) -> Option<usize> {
+        if self.withdrawn.load(core::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        if self
+            .generation
+            .as_ref()
+            .is_some_and(|(generation, made)| generation.current() != *made)
+        {
+            return None;
+        }
+        self.sealer
+            .lock()
+            .ok()?
+            .seal_control_as(buffer, frames, alias)
+    }
+
+    /// Withdraws the shared key for every holder at once: the image's
+    /// controls, its repairs and any cached SESSION_ABORT_ACK resend all
+    /// seal nothing again. A poisoned lock is still withdrawn.
+    fn withdraw(&mut self) {
+        self.withdrawn
+            .store(true, core::sync::atomic::Ordering::Release);
+        self.sealer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .withdraw();
+    }
+
+    #[cfg(test)]
+    fn roll_for_test(&mut self) {
+        self.sealer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .roll_for_test();
+    }
+
+    /// Re-keys the shared key for every holder at once.
+    fn rekey(&mut self, file: &crate::wire_keys::KeyFile) {
+        self.sealer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rekey(file);
+    }
+
+    /// Applies the key set to the shared key for every holder at once.
+    fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        self.sealer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .apply_keys(keys);
+    }
+
+    /// The shared key's file epoch; `None` once withdrawn for every
+    /// holder, or under a poisoned lock.
+    fn key_epoch(&self) -> Option<u32> {
+        if self.withdrawn.load(core::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        self.sealer.lock().ok()?.key_epoch()
     }
 }
 
@@ -455,6 +743,20 @@ impl ControlSeal for Proof {
 
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
         self.seal(buffer, frames).ok()
+    }
+
+    fn withdraw(&mut self) {
+        Proof::withdraw(self);
+    }
+
+    /// A shared proof is a short-lived clone: it is withdrawn, and the
+    /// next one comes from the re-keyed original.
+    fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
+        self.apply(keys);
+    }
+
+    fn rekey(&mut self, _file: &crate::wire_keys::KeyFile) {
+        Proof::withdraw(self);
     }
 }
 
@@ -1047,7 +1349,7 @@ impl ControlRoutes {
         transient: bool,
         seal: Option<&mut dyn ControlSeal>,
     ) -> Result<(), ControlSendError> {
-        let mut bytes = [0u8; MAX_CONTROL_LENGTH + ENVELOPE_LEN];
+        let mut bytes = [0u8; MAX_CONTROL_LENGTH + crate::wire_enc::MAX_CONTROL_ENVELOPE];
         let plain = bytes
             .get_mut(..MAX_CONTROL_LENGTH)
             .ok_or(ControlSendError::Encode)?;
@@ -1063,6 +1365,35 @@ impl ControlRoutes {
                 .ok_or(ControlSendError::Encode)?;
         }
         let encoded = bytes.get(..length).ok_or(ControlSendError::Encode)?;
+        self.send_bytes(tx, address, encoded, transient)
+    }
+
+    /// Sends prepared datagram bytes to `address`: a control sealed or
+    /// signed by its owner, never encoded here.
+    ///
+    /// # Errors
+    ///
+    /// As [`ControlRoutes::send`].
+    pub fn send_raw<O: SocketOps>(
+        &mut self,
+        tx: &mut SocketsTx<O>,
+        address: SocketAddr,
+        bytes: &[u8],
+    ) -> Result<(), ControlSendError> {
+        self.send_waiting(tx);
+        if self.waiting.iter().any(|(at, _)| *at == address) {
+            return Err(ControlSendError::Blocked);
+        }
+        self.send_bytes(tx, address, bytes, false)
+    }
+
+    fn send_bytes<O: SocketOps>(
+        &mut self,
+        tx: &mut SocketsTx<O>,
+        address: SocketAddr,
+        encoded: &[u8],
+        transient: bool,
+    ) -> Result<(), ControlSendError> {
         // A reply that reuses a destination's own route (karyos#977
         // review): failing, it must not take that route with it.
         let protected = transient

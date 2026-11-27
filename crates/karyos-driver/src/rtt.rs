@@ -464,12 +464,55 @@ impl<I: ProbeIds> RttProbes<I> {
     /// A validated RTTM REPLY with `probe_id` from `path` at binding
     /// `generation`, seen by the receive owner at `now`.
     pub fn reply(&mut self, path: usize, generation: u64, probe_id: u64, now: u64) -> ReplyOutcome {
+        self.take_reply(path, generation, probe_id, now)
+            .unwrap_or(ReplyOutcome::Ignored)
+    }
+
+    /// Whether [`Self::take_reply`] would take `path`'s outstanding probe
+    /// `probe_id` of binding `generation` at `now`, were its send started
+    /// at `start`: matched, inside `rtt_probe_timeout` and of positive
+    /// duration. Changes nothing (H8-41): a reply settles a send still in
+    /// its backend call only once this holds.
+    #[must_use]
+    pub fn would_take(
+        &self,
+        path: usize,
+        generation: u64,
+        probe_id: u64,
+        start: u64,
+        now: u64,
+    ) -> bool {
+        let timeout = self.config.rtt_probe_timeout;
+        self.paths
+            .get(path)
+            .and_then(|state| {
+                state.outstanding.filter(|outstanding| {
+                    state.generation == generation && outstanding.probe_id == probe_id
+                })
+            })
+            .is_some_and(|outstanding| {
+                age_ns(now, outstanding.issued_at) < timeout && age_ns(now, start) != 0
+            })
+    }
+
+    /// [`Self::reply`], `None` when it takes no probe: no path, unmatched,
+    /// a duplicate, one never submitted, one late (its probe past
+    /// `rtt_probe_timeout` at `now`) or of no duration (H8-33). Such a
+    /// reply changes nothing but its counter: the outstanding probe stays,
+    /// to its timeout. A sample takes the probe.
+    pub fn take_reply(
+        &mut self,
+        path: usize,
+        generation: u64,
+        probe_id: u64,
+        now: u64,
+    ) -> Option<ReplyOutcome> {
         let timeout = self.config.rtt_probe_timeout;
         let floor = self.config.rtt_floor;
         let window = usize::from(self.config.rtt_sample_window);
         let Some(state) = self.paths.get_mut(path) else {
             bump(&mut self.counts.unmatched, &mut self.counts.overflows);
-            return ReplyOutcome::Ignored;
+            return None;
         };
         let matched = state.outstanding.filter(|outstanding| {
             state.generation == generation && outstanding.probe_id == probe_id
@@ -482,23 +525,23 @@ impl<I: ProbeIds> RttProbes<I> {
                 &mut self.counts.unmatched
             };
             bump(count, &mut self.counts.overflows);
-            return ReplyOutcome::Ignored;
+            return None;
         };
         let Some(start) = outstanding.start else {
             bump(&mut self.counts.unmatched, &mut self.counts.overflows);
-            return ReplyOutcome::Ignored;
+            return None;
         };
-        state.outstanding = None;
-        state.answered = Some(probe_id);
         if age_ns(now, outstanding.issued_at) >= timeout {
             bump(&mut self.counts.late, &mut self.counts.overflows);
-            return ReplyOutcome::Ignored;
+            return None;
         }
         let sample = age_ns(now, start);
         if sample == 0 {
             bump(&mut self.counts.invalid, &mut self.counts.overflows);
-            return ReplyOutcome::Ignored;
+            return None;
         }
+        state.outstanding = None;
+        state.answered = Some(probe_id);
         let sample = if sample < floor {
             bump(&mut self.counts.floored, &mut self.counts.overflows);
             floor
@@ -516,7 +559,7 @@ impl<I: ProbeIds> RttProbes<I> {
             .filter(|next| *next < window)
             .unwrap_or(0);
         bump(&mut self.counts.samples, &mut self.counts.overflows);
-        ReplyOutcome::Sample(sample)
+        Some(ReplyOutcome::Sample(sample))
     }
 
     /// `path` was bound again (a path lost and re-established): its

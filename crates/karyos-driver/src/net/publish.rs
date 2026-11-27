@@ -638,6 +638,56 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(net) = self.net.as_mut() else {
             return Err(DriverError::NetworkUnavailable);
         };
+        // An authenticated or encrypted channel serves one unicast
+        // receiver with its keys valid now; anything else is refused
+        // before anything exists (karyos#648; ADR-0086 open point 6,
+        // ADR-0076 clause 4, ADR-0114 section 11).
+        let auth = super::wire::protected(channel.security)?;
+        if let Some(auth) = &auth {
+            // Every operation the class does not support is refused,
+            // typed, before anything exists (fail closed; ADR-0035,
+            // ADR-0076).
+            use crate::error::AuthUnsupported;
+            let extra = if !required_destinations.is_empty() {
+                Some(AuthUnsupported::MultiDestination)
+            } else {
+                roles.is_some().then_some(AuthUnsupported::Roles)
+            };
+            if let Some(operation) = super::wire::unsupported(channel, allowlist.is_some(), extra) {
+                if operation == AuthUnsupported::Etf
+                    && let Some(wire) = net.wire_keys_mut()
+                {
+                    wire.count_etf_refused();
+                }
+                return Err(DriverError::AuthenticatedRefused {
+                    reason: crate::error::AuthRefusal::Unsupported { operation },
+                });
+            }
+            net.check_auth_challenge_ceilings()?;
+            let wire = net
+                .wire_keys_mut()
+                .ok_or(DriverError::AuthenticatedRefused {
+                    reason: crate::error::AuthRefusal::NoKeyStore,
+                })?;
+            let checked = match auth {
+                super::wire::Protected::Auth(auth) => wire
+                    .publication(auth, config.stream.buffer.stream_id)
+                    .map(|_| ()),
+                super::wire::Protected::Enc(enc) => wire
+                    .enc_publication(enc, Some(config.stream.buffer.stream_id))
+                    .map(|_| ()),
+            };
+            if let Err(error) = checked {
+                if error
+                    == (DriverError::AuthenticatedRefused {
+                        reason: crate::error::AuthRefusal::GenerationChange,
+                    })
+                {
+                    wire.count_generation_refused();
+                }
+                return Err(error);
+            }
+        }
         // The channel's `fc` is the strategy (owner item 7, karyos#637):
         // typed roles name the same one, and `max` or `tagged:<group>`
         // without roles runs on a membership with no required or tagged
@@ -789,6 +839,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .network
             .and_then(|network| network.stream_defaults.initial_term_id);
         let mut config = config;
+        // A protected datagram is its frames plus its class's envelope
+        // (ADR-0086 section 5, ADR-0114 section 11): the log keeps the
+        // inner budget, the channel MTU less the envelope, so its frames
+        // and fragments fit a datagram of at most the channel MTU. SETUP
+        // advertises the channel (wire) MTU, the whole datagram; each side
+        // derives its log budget from it locally (H8-13).
+        if let Some(protected) = auth {
+            config.stream.buffer.mtu = inner_mtu(protected, config.stream.buffer.mtu)?;
+        }
         config.stream.buffer.initial_term_id = self.draw_initial_term_id(forced)?;
         let handle = self.add_aggregate_drawn(config)?;
         if let Some(options) = timed
@@ -811,6 +870,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             linger,
             path_skew,
             registration,
+            auth,
             etf: etf_queue(channel).filter(|_| timed.is_some()),
         };
         let added = self.attach_sender(&handle, channel, FIRST_INCARNATION, false);
@@ -1140,6 +1200,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             linger: _,
             path_skew,
             registration,
+            auth,
             etf,
         } = channel;
         let mut readers = Vec::with_capacity(usize::from(handle.lanes()));
@@ -1200,6 +1261,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .map(|(spec, id)| (*id, Arc::clone(&spec.frontier)));
         let (config, alias) = term.ok_or(DriverError::InvalidConfig)?;
         let lane_count = u8::try_from(readers.len()).map_err(|_| DriverError::InvalidConfig)?;
+        // The datagram MTU: a protected log holds the inner budget, so its
+        // datagrams add the envelope back (ADR-0086 section 5, ADR-0114
+        // section 11).
+        let wire_mtu = match auth {
+            Some(protected) => wire_mtu(protected, config.mtu)?,
+            None => config.mtu,
+        };
         let publication = |endpoint| Publication {
             endpoint,
             alias,
@@ -1208,10 +1276,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 registration_id: handle.registration(),
                 incarnation,
             },
+            // `mtu` is the whole datagram's (ADR-0086 section 5, ADR-0114
+            // section 11), never the protected log's inner budget (H8-13).
             term: TermParams {
                 term_length: config.term_length.get(),
                 initial_term_id: config.initial_term_id.get().cast_signed(),
-                mtu: config.mtu,
+                mtu: wire_mtu,
             },
             lane_count,
         };
@@ -1261,7 +1331,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 net.hold_send_endpoint(bind)
             };
             match opened {
-                Ok(endpoint) => held.push((endpoint, to)),
+                Ok(endpoint) => {
+                    // A trusted publisher on port 0 may move to a new port
+                    // when a reset finds its port taken: its receivers
+                    // bind the new source through its ANNOUNCE. An
+                    // authenticated one may not: a receiver's challenge
+                    // from the new source would rebind its boot id under a
+                    // new nonce, which the publisher rule refuses
+                    // (ADR-0086 section 7), so it fails closed as before;
+                    // its shared endpoint never moves either. An etf
+                    // socket joins its endpoint's port: never moved.
+                    if auth.is_none() && etf.is_none() {
+                        net.allow_endpoint_move(endpoint);
+                    } else {
+                        net.pin_endpoint(endpoint);
+                    }
+                    held.push((endpoint, to));
+                }
                 Err(error) => {
                     for (endpoint, _) in held {
                         net.release_send_endpoint(endpoint);
@@ -1279,7 +1365,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .map(|address| address.is_ipv4());
         let max_destinations = net.max_destinations();
         let outbound = if held.len() > 1 {
-            Outbound::new_routed(&held, alias, readers, &quanta, config.mtu, reliable)
+            Outbound::new_routed(&held, alias, readers, &quanta, wire_mtu, reliable)
         } else {
             Outbound::new(
                 endpoint,
@@ -1287,7 +1373,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 destination,
                 readers,
                 &quanta,
-                config.mtu,
+                wire_mtu,
                 reliable,
             )
             .and_then(|mut outbound| {
@@ -1324,7 +1410,64 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 Ok(outbound)
             })
             .map_err(|_| DriverError::InvalidConfig)
-            .and_then(|outbound| {
+            .and_then(|mut outbound| {
+                // An authenticated incarnation binds its keys now, checked
+                // again against the current view, and its sender seals or
+                // sends nothing without them (karyos#648).
+                let binding = match &auth {
+                    None => None,
+                    // An encrypted incarnation likewise (ADR-0114): its
+                    // sender sends nothing until an establishment installs
+                    // its domain 1 sealer.
+                    Some(super::wire::Protected::Enc(enc)) => {
+                        outbound
+                            .require_enc()
+                            .map_err(|_| DriverError::AuthenticatedRefused {
+                                reason: crate::error::AuthRefusal::Ambiguous,
+                            })?;
+                        let wire =
+                            net.wire_keys_mut()
+                                .ok_or(DriverError::AuthenticatedRefused {
+                                    reason: crate::error::AuthRefusal::NoKeyStore,
+                                })?;
+                        Some(wire.enc_publication_binding(enc, &publication(endpoint))?)
+                    }
+                    Some(super::wire::Protected::Auth(auth)) => {
+                        outbound
+                            .require_auth()
+                            .map_err(|_| DriverError::AuthenticatedRefused {
+                                reason: crate::error::AuthRefusal::Ambiguous,
+                            })?;
+                        let wire =
+                            net.wire_keys_mut()
+                                .ok_or(DriverError::AuthenticatedRefused {
+                                    reason: crate::error::AuthRefusal::NoKeyStore,
+                                })?;
+                        let binding = wire.publication_binding(auth, &publication(endpoint))?;
+                        // A remotely guarded incarnation is
+                        // admission-pending until the followed guard's word
+                        // first reads open, and holds no live incarnation
+                        // until then (guards-and-abort.md, step 3).
+                        if let Some((_, mirror)) = &binding.follow {
+                            if guard.is_some() {
+                                return Err(DriverError::AuthenticatedRefused {
+                                    reason: crate::error::AuthRefusal::GuardState,
+                                });
+                            }
+                            outbound.guard_remote(crate::agents::data::GuardSpec {
+                                word: Arc::clone(mirror) as Arc<dyn karyos_client::SharedWords>,
+                                cell: Arc::new(karyos_sys::applied_epoch::AppliedEpoch::new()),
+                                epoch: 0,
+                                rate: None,
+                                reserve: None,
+                                empty_since: None,
+                                policy: None,
+                                frontier: Arc::default(),
+                            });
+                        }
+                        Some(binding)
+                    }
+                };
                 net.add_publication(
                     handle.registration(),
                     publication(endpoint),
@@ -1332,6 +1475,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     guard,
                     roles,
                     kept,
+                    binding,
                 )
             });
         if posted.is_err() {
@@ -1439,3 +1583,58 @@ fn etf_queue(channel: &UdpConfig) -> Option<karyos_io::backend::EtfQueue> {
 
 #[cfg(test)]
 mod tests;
+
+/// The envelope length of `protected` as an MTU quantity.
+fn envelope_mtu(protected: super::wire::Protected) -> Result<u32, DriverError> {
+    u32::try_from(protected.envelope_len()).map_err(|_| DriverError::InvalidConfig)
+}
+
+/// The log MTU of a `protected` publication on a channel of `mtu`: the
+/// channel MTU less its class's envelope (ADR-0086 section 5, ADR-0114
+/// section 11). The [`MIN_MTU`](karyos_protocol::network::MIN_MTU) floor
+/// applies to `mtu`, the whole datagram SETUP advertises (H8-13); the
+/// inner budget must only hold a DATA frame header and one payload byte
+/// ([`inner_budget_holds_a_frame`]).
+///
+/// # Errors
+///
+/// [`crate::error::AuthRefusal::Mtu`] when `mtu` is below the floor, above
+/// [`MAX_ENCRYPTED_MTU`](karyos_protocol::channel::MAX_ENCRYPTED_MTU) on
+/// an encrypted channel, or its inner budget holds no frame.
+fn inner_mtu(protected: super::wire::Protected, mtu: u32) -> Result<u32, DriverError> {
+    let refused = DriverError::AuthenticatedRefused {
+        reason: crate::error::AuthRefusal::Mtu,
+    };
+    if mtu < karyos_protocol::network::MIN_MTU {
+        return Err(refused);
+    }
+    // The encrypted ceiling (ADR-0114 section 11) holds whatever set the
+    // MTU, a typed configuration or a URI's network default, not only a
+    // URI's `mtu`: above it a DATA frame exceeds the AEAD plaintext bound.
+    if matches!(protected, super::wire::Protected::Enc(_))
+        && mtu > karyos_protocol::channel::MAX_ENCRYPTED_MTU
+    {
+        return Err(refused);
+    }
+    mtu.checked_sub(envelope_mtu(protected)?)
+        .filter(|inner| inner_budget_holds_a_frame(*inner))
+        .ok_or(refused)
+}
+
+/// The inner budget rule of a protected log (H8-13): `inner` holds a
+/// DATA frame header and one payload byte, `align_down(inner, 32) > 32`,
+/// the condition every log and image of that MTU is built under
+/// ([`karyos_sys::sizing::FragmentPlan::new`]). Above the 256-byte wire
+/// floor it always holds (172 inner bytes for the encrypted class, 208
+/// for the authenticated one).
+pub(crate) fn inner_budget_holds_a_frame(inner: u32) -> bool {
+    karyos_sys::sizing::FragmentPlan::new(inner, karyos_sys::frame::Flags::NONE).is_ok()
+}
+
+/// The datagram MTU of a `protected` publication whose log holds `inner`
+/// bytes: the inverse of [`inner_mtu`].
+fn wire_mtu(protected: super::wire::Protected, inner: u32) -> Result<u32, DriverError> {
+    inner
+        .checked_add(envelope_mtu(protected)?)
+        .ok_or(DriverError::InvalidConfig)
+}

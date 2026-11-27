@@ -260,7 +260,10 @@ impl<K: Files, S: Files> KeyStore<K, S> {
         let empty = KeyState::default().encode().map_err(StoreError::State)?;
         state_dir
             .write_atomic(STATE, empty.as_bytes())
-            .map_err(|_| StoreError::Commit)
+            .map_err(|_| StoreError::Commit)?;
+        // The abort record is created with the state, so that a later
+        // absence fails closed (H8 RCV-4).
+        crate::remote_guard::initialise_aborted(state_dir).map_err(|_| StoreError::Commit)
     }
 
     /// Starts the store: it takes the state directory's exclusive lock and

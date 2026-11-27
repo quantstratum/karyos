@@ -62,7 +62,7 @@ use crate::repair::jobs::{Domain, JobKey, JobRef, Jobs, JobsConfig, JobsError, J
 use crate::repair::scheduler::{
     Head, RepairBudget, RepairRead, RepairReadError, RepairSubmit, Scheduler, Submit,
 };
-use crate::wire_auth::{ENVELOPE_LEN, Sealer};
+use crate::wire_enc::DatagramSeal;
 
 /// The repair settings of the sender agent (RC-11, RC-12; provisional and
 /// configurable).
@@ -341,6 +341,18 @@ impl RepairPath {
         })
     }
 
+    /// Takes the publication's fresh incarnation identity, which its
+    /// later ERRs carry (ADR-0114 section 10 step 3).
+    pub(crate) fn set_identity(&mut self, identity: Identity) {
+        self.identity = identity;
+    }
+
+    /// The incarnation identity its ERRs carry (tests).
+    #[cfg(test)]
+    pub(crate) fn identity(&self) -> Identity {
+        self.identity
+    }
+
     /// How far below the sent position its lanes stay repairable
     /// ([`RepairConfig::retransmit_window`]).
     #[must_use]
@@ -617,7 +629,7 @@ impl RepairPath {
         (sent_high, closed): (&[u64], &[bool]),
         budget: &mut RepairBudget,
         now: u64,
-        seal: Option<&mut Sealer>,
+        seal: Option<&mut (dyn DatagramSeal + 'static)>,
     ) -> Report {
         let mut read = ReadView {
             readers,
@@ -654,6 +666,16 @@ impl RepairPath {
             .unwrap_or(0);
         budget.loads = read.loads;
         report
+    }
+
+    /// Cancels its pending repair jobs and the step 8 ERRs not sent yet,
+    /// with no outcome: the incarnation is aborting (guards-and-abort.md,
+    /// Session abort, sender step 2). Datagrams already handed to the
+    /// backend are untouched, so their storage leases are kept until the
+    /// backend releases them. Returns the jobs cancelled.
+    pub fn cancel_pending(&mut self) -> u64 {
+        self.replies.clear();
+        self.jobs.cancel_all()
     }
 
     /// The step 8 ERRs waiting to be sent, in order; `send` gets each.
@@ -775,7 +797,7 @@ struct SubmitView<'a, 'b, O: SocketOps> {
     /// The live routes' TX halves, by route.
     routes: &'a mut [Option<&'b mut SocketsTx<O>>],
     /// An authenticated publication's sealer.
-    seal: Option<&'a mut Sealer>,
+    seal: Option<&'a mut (dyn DatagramSeal + 'static)>,
     queues: [Option<TxQueueId>; MAX_ROUTES],
     route_counts: &'a mut [RouteRepairCounts; MAX_ROUTES],
     scratch: &'a RefCell<Scratch>,
@@ -838,7 +860,7 @@ fn submit_on<O: SocketOps>(
     tx: &mut SocketsTx<O>,
     queue: TxQueueId,
     bytes: &[u8],
-    seal: Option<&mut Sealer>,
+    seal: Option<&mut (dyn DatagramSeal + 'static)>,
     report: &mut TxReport,
     counts: &mut RepairCounts,
 ) -> Submit {
@@ -847,7 +869,7 @@ fn submit_on<O: SocketOps>(
     if seal.as_deref().is_some_and(|seal| !seal.can_seal()) {
         return Submit::NotSubmitted;
     }
-    let envelope = if seal.is_some() { ENVELOPE_LEN } else { 0 };
+    let envelope = seal.as_deref().map_or(0, DatagramSeal::envelope);
     let mut frame = match tx.claim_tx(queue, frames + envelope) {
         Ok(frame) => frame,
         Err(
@@ -862,9 +884,9 @@ fn submit_on<O: SocketOps>(
     };
     target.copy_from_slice(bytes);
     let len = match seal {
-        Some(seal) => match seal.seal(frame.bytes_mut(), frames) {
-            Ok(len) => len,
-            Err(_) => return Submit::NotSubmitted,
+        Some(seal) => match seal.seal_datagram(frame.bytes_mut(), frames) {
+            Some(len) => len,
+            None => return Submit::NotSubmitted,
         },
         None => frames,
     };

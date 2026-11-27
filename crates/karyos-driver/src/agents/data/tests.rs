@@ -2125,3 +2125,253 @@ fn a_missed_lane_returns_its_queued_heads_and_stages_nothing() {
     assert_eq!(f.path.counters().staged, staged, "nothing more staged");
     assert_eq!(f.observer.etf_send_calls(), 1);
 }
+
+/// A scripted endpoint whose socket refuses every send (would block) until
+/// the test scripts acceptances, its observer, and a one-lane outbound
+/// path with a log of `mtu` and the 1408-byte datagram MTU, 3000 bytes
+/// committed (H8 R5-03).
+fn blocked_path(
+    mtu: u32,
+) -> (
+    karyos_io::sockets::endpoint::SocketsTx<ScriptedSocket>,
+    ScriptedSocket,
+    Box<super::Outbound>,
+    super::testing::TestLog,
+) {
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let local = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let endpoint = SocketsEndpoint::open(&local, InstanceId::FIRST, socket).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 9,
+        mtu,
+    };
+    let destination = SocketAddr::from(([127, 0, 0, 1], 41_000));
+    let (path, mut log) =
+        super::testing::outbound_wire(EndpointId(1), AUTH_ALIAS, destination, term, 1408, false);
+    let _ = log.publications[0]
+        .append(&[1u8; 3000], AppendOptions::default())
+        .unwrap();
+    (tx, observer, path, log)
+}
+
+/// Serves `path` until the socket refused its heads: sealed DATA is staged
+/// and retained after `WouldBlock`, never accepted.
+fn retain_sealed(
+    tx: &mut karyos_io::sockets::endpoint::SocketsTx<ScriptedSocket>,
+    observer: &ScriptedSocket,
+    path: &mut super::Outbound,
+) -> u64 {
+    let _ = path.serve(tx, AUTH_BUDGET, None, 0).unwrap();
+    assert!(path.sender.pending(0).unwrap() > 0, "retained heads");
+    assert!(observer.unscripted_sends() > 0, "the socket would block");
+    assert_eq!(path.counters().submitted, 0);
+    observer.datagrams_offered()
+}
+
+/// Scripts `count` acceptances and serves `path` `rounds` times.
+fn unblock_and_serve(
+    tx: &mut karyos_io::sockets::endpoint::SocketsTx<ScriptedSocket>,
+    observer: &ScriptedSocket,
+    path: &mut super::Outbound,
+    rounds: usize,
+) {
+    for _ in 0..64 {
+        observer.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    for _ in 0..rounds {
+        let _ = path.serve(tx, AUTH_BUDGET, None, 0).unwrap();
+    }
+}
+
+/// The installed authenticated session sealer of `path`.
+fn seal_auth(path: &mut super::Outbound) -> crate::wire_keys::KeyFile {
+    use crate::wire_auth::Sealer;
+    let (file, party) = sender_key();
+    path.require_auth().unwrap();
+    path.install_sealer(Sealer::new(&file, party, AUTH_ALIAS).unwrap())
+        .unwrap();
+    file
+}
+
+/// H8 R5-03 (MP-3, REV-2, RLD-5), the baseline: sealed DATA the socket
+/// refused (would block) stays queued and leaves once the socket accepts,
+/// under a sealer still live. The next test differs only by a withdrawal.
+#[test]
+fn retained_sealed_data_leaves_under_a_live_sealer() {
+    let (mut tx, observer, mut path, _log) = blocked_path(1360);
+    let _ = seal_auth(&mut path);
+    let offered = retain_sealed(&mut tx, &observer, &mut path);
+    unblock_and_serve(&mut tx, &observer, &mut path, 4);
+    assert!(observer.datagrams_offered() > offered);
+    assert!(path.counters().submitted > 0);
+    assert_eq!(path.counters().seal_obsolete, 0);
+}
+
+/// H8 R5-03 (MP-3, REV-2, RLD-5): sealed DATA retained after `WouldBlock`
+/// and then withdrawn (its key file revoked) never reaches the socket: the
+/// exposure check refuses it, it is returned from its queue unsent and the
+/// endpoint needs a reset, which rewinds the lane for the next sealer.
+#[test]
+fn retained_sealed_data_never_leaves_after_a_withdrawal() {
+    let (mut tx, observer, mut path, _log) = blocked_path(1360);
+    let _ = seal_auth(&mut path);
+    let offered = retain_sealed(&mut tx, &observer, &mut path);
+    let pending = path.sender.pending(0).unwrap();
+    // The view revokes the session key: the sealer is withdrawn.
+    path.follow_keys(&crate::wire_auth::FixedKeys::default());
+    unblock_and_serve(&mut tx, &observer, &mut path, 4);
+    assert_eq!(
+        observer.datagrams_offered(),
+        offered,
+        "nothing reached the socket"
+    );
+    assert_eq!(path.counters().submitted, 0);
+    assert_eq!(path.sender.pending(0), Some(0), "returned from the queue");
+    assert_eq!(
+        path.counters().seal_obsolete,
+        u64::try_from(pending).unwrap()
+    );
+    assert!(path.needs_reset());
+}
+
+/// H8 R5-03 (RLD-1, RLD-4, REV-2): the conductor publishes a withdrawing
+/// key view while the role's command ring is blocked, so the role has not
+/// applied it. The key fence, read at exposure, keeps the retained sealed
+/// DATA off the socket however long that lasts; once the role applies the
+/// view, the withdrawn sealer's heads are returned unsent.
+#[test]
+fn retained_sealed_data_waits_for_an_unapplied_view_and_is_dropped_by_it() {
+    use crate::wire_auth::{KeyGeneration, Side};
+    let (mut tx, observer, mut path, _log) = blocked_path(1360);
+    let fence = Arc::new(KeyGeneration::default());
+    path.set_key_fence(Arc::clone(&fence));
+    let _ = seal_auth(&mut path);
+    let offered = retain_sealed(&mut tx, &observer, &mut path);
+    // View 1 published; the role's command ring is blocked.
+    fence.require(1);
+    unblock_and_serve(&mut tx, &observer, &mut path, 8);
+    assert_eq!(observer.datagrams_offered(), offered, "held by the fence");
+    assert!(path.sender.pending(0).unwrap() > 0, "held, not dropped");
+    // The ring drains: the role applies view 1, which withdraws the key.
+    path.follow_keys(&crate::wire_auth::FixedKeys::default());
+    fence.applied(Side::Sender, 1);
+    for _ in 0..4 {
+        let _ = path.serve(&mut tx, AUTH_BUDGET, None, 0).unwrap();
+    }
+    assert_eq!(observer.datagrams_offered(), offered, "never sent");
+    assert_eq!(path.counters().submitted, 0);
+    assert_eq!(path.sender.pending(0), Some(0));
+    assert!(path.counters().seal_obsolete > 0);
+}
+
+/// H8 R5-03 (RLD-1, RLD-4): a view that keeps the session key holds the
+/// retained heads only until the role applies it; they then leave, so the
+/// fence holds rather than drops.
+#[test]
+fn retained_sealed_data_leaves_once_a_keeping_view_is_applied() {
+    use crate::wire_auth::{FixedKeys, KeyGeneration, Side};
+    let (mut tx, observer, mut path, _log) = blocked_path(1360);
+    let fence = Arc::new(KeyGeneration::default());
+    path.set_key_fence(Arc::clone(&fence));
+    let file = seal_auth(&mut path);
+    let offered = retain_sealed(&mut tx, &observer, &mut path);
+    fence.require(1);
+    unblock_and_serve(&mut tx, &observer, &mut path, 4);
+    assert_eq!(observer.datagrams_offered(), offered);
+    path.follow_keys(&FixedKeys { files: vec![file] });
+    fence.applied(Side::Sender, 1);
+    for _ in 0..4 {
+        let _ = path.serve(&mut tx, AUTH_BUDGET, None, 0).unwrap();
+    }
+    assert!(observer.datagrams_offered() > offered);
+    assert!(path.counters().submitted > 0);
+    assert_eq!(path.counters().seal_obsolete, 0);
+}
+
+/// H8 R5-03 (VM-4, RNG-4): a VM generation change between staging and
+/// submission. While the fence is held nothing retained leaves; once it is
+/// released, the heads sealed under the old generation stay obsolete, even
+/// though this publication's sealer was not retired: they are returned
+/// unsent and never reach the socket.
+#[test]
+fn retained_sealed_data_never_leaves_after_a_vm_generation_change() {
+    use crate::wire_enc::VmGenerationWatch;
+    use crate::wire_enc::vm_generation::{self, InjectedSignal};
+    let (mut tx, observer, mut path, _log) = blocked_path(1360);
+    let _ = seal_auth(&mut path);
+    let offered = retain_sealed(&mut tx, &observer, &mut path);
+    vm_generation::register();
+    let (signal, injector) = InjectedSignal::new();
+    let mut watch = VmGenerationWatch::new(Box::new(signal));
+    injector.change();
+    let generation = watch.poll(0);
+    assert!(vm_generation::quiesced());
+    unblock_and_serve(&mut tx, &observer, &mut path, 4);
+    assert_eq!(observer.datagrams_offered(), offered, "held fence");
+    vm_generation::redrawn(generation);
+    assert!(!vm_generation::quiesced());
+    for _ in 0..4 {
+        let _ = path.serve(&mut tx, AUTH_BUDGET, None, 0).unwrap();
+    }
+    assert_eq!(path.counters().submitted, 0);
+    assert_eq!(path.sender.pending(0), Some(0));
+    assert!(path.counters().seal_obsolete > 0);
+    assert_eq!(observer.datagrams_offered(), offered, "never sent");
+}
+
+/// H8 R5-03, the encrypted class: its DATA rides the same staged heads and
+/// exposure check, so retained sealed DATA of an encrypted publication
+/// whose domain 1 sealer is withdrawn never reaches the socket either.
+#[test]
+fn retained_encrypted_data_never_leaves_after_a_withdrawal() {
+    use karyos_protocol::protection::aes_gcm_siv::{Domain, KeyContext, Salt};
+
+    use crate::wire_enc::{ChannelKeys, EncSealer, id128, publication_of};
+    let (mut tx, observer, mut path, _log) = blocked_path(1300);
+    let text = "format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=1\npurpose=channel\nprofile_id=16\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=1111111111111111111111111111111111111111111111111111111111111111\nchannel_id=7\nstream_id=6\n";
+    let file = crate::wire_keys::parse("3-1.key", text.as_bytes()).unwrap();
+    let keys = ChannelKeys::new(&[&file]).unwrap();
+    let identity = karyos_protocol::network::Identity {
+        driver_id: [1, 2],
+        registration_id: 1,
+        incarnation: 1,
+    };
+    let sealer = EncSealer::new(
+        &keys,
+        None,
+        KeyContext {
+            domain: Domain::Sender,
+            key_epoch: 1,
+            party_epoch: 0,
+            session_id: AUTH_ALIAS.session_id,
+            stream_id: AUTH_ALIAS.stream_id,
+            publication: publication_of(&identity),
+            receiver: None,
+            salt: Salt::Challenge {
+                receiver_boot_id: id128([3, 4]),
+                nonce: id128([5, 6]),
+            },
+        },
+        crate::wire_enc::monotonic_ns,
+    )
+    .unwrap();
+    path.require_enc().unwrap();
+    path.install_enc_sealer(sealer).unwrap();
+    let offered = retain_sealed(&mut tx, &observer, &mut path);
+    path.follow_keys(&crate::wire_auth::FixedKeys::default());
+    unblock_and_serve(&mut tx, &observer, &mut path, 4);
+    assert_eq!(
+        observer.datagrams_offered(),
+        offered,
+        "nothing reached the socket"
+    );
+    assert_eq!(path.counters().submitted, 0);
+    assert_eq!(path.sender.pending(0), Some(0));
+    assert!(path.counters().seal_obsolete > 0);
+}

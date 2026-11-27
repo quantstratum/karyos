@@ -20,6 +20,12 @@ categories = ["network-programming", "concurrency"]
 test-hooks = []
 
 [dependencies]
+# AES-256-GCM-SIV of the encrypted profile (ADR-0114), detached and in place.
+aes-gcm-siv.workspace = true
+# Declared only to enable `zeroize`, so the AES-256 and POLYVAL key
+# schedules inside `aes-gcm-siv` are erased on drop.
+aes.workspace = true
+polyval.workspace = true
 karyos-sys.workspace = true
 # `zeroize` erases the keyed SHA-256 states of the HMAC profile on drop.
 sha2 = { workspace = true, features = ["zeroize"] }
@@ -29,6 +35,8 @@ zeroize.workspace = true
 
 [dev-dependencies]
 karyos-sys = { workspace = true, features = ["test-hooks"] }
+# The second HKDF-SHA-256 the erasing `protection::hkdf` is checked against.
+hkdf.workspace = true
 proptest.workspace = true
 
 [lints]

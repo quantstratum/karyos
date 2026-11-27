@@ -1631,6 +1631,10 @@ fn installed_image_with(
         group_tag: 0,
         nonce: [0; 2],
         auth: None,
+        enc_seal: None,
+        aborted: None,
+        abort_uncommitted: false,
+        abort_scope: None,
     };
     (image, params)
 }
@@ -7460,3 +7464,329 @@ fn the_sender_sends_a_sealed_receiver_control_only_sealed() {
     );
     assert!(matches!(classify(&seen[1]), Ok(Datagram::Control(_))));
 }
+
+/// ADR-0086 section 7a: an authenticated publication's sender controls
+/// (PATH_HB here) leave sealed in domain 1 under its session sealer and
+/// open under the receiver's verifier as the bare control's bytes; with no
+/// sealer installed nothing leaves; a trusted publication's go bare, byte
+/// for byte.
+#[test]
+fn sender_controls_of_an_authenticated_publication_go_sealed_in_domain_1() {
+    use std::sync::{Arc, Mutex};
+
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::ops::SendResult;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    use super::super::Half;
+    use super::publish_auth::PublicationAuth;
+    use crate::wire_auth::{Party, Verifier};
+
+    let (mut sender, _role) = receiver_with(AgentConfig::default());
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    observer.set_send_hook(Box::new(move |_, datagrams| {
+        for datagram in datagrams {
+            record.lock().unwrap().push(datagram.to_vec());
+        }
+    }));
+    for _ in 0..4 {
+        observer.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let endpoint = SocketsEndpoint::open(&loopback(), InstanceId::FIRST, socket).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    let mut halves = vec![(EndpointId(1), Half::Tx(Box::new(tx)))];
+    let channel = crate::wire_keys::parse(
+        "3-1.key",
+        b"format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=1\npurpose=channel\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=1111111111111111111111111111111111111111111111111111111111111111\nchannel_id=7\nstream_id=6\n",
+    )
+    .unwrap();
+    let pair = crate::wire_keys::parse(
+        "9-1.key",
+        b"format=karyos-wire-key-v1\nkey_id=9\nfile_epoch=1\npurpose=pairwise\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=2222222222222222222222222222222222222222222222222222222222222222\nreceiver_id=66\npublisher_id=5\n",
+    )
+    .unwrap();
+    let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let (mut path, _log) = outbound(EndpointId(1), destination);
+    path.require_auth().unwrap();
+    sender.publications.push(path);
+    let auth =
+        PublicationAuth::new(EndpointId(1), alias(), identity(), 1, &channel, &[&pair]).unwrap();
+    let party = Party::Sender {
+        identity: identity(),
+        lane_count: 1,
+        receiver_boot_id: [7, 8],
+        nonce: [9, 9],
+    };
+    let sealer = auth.sealer(party).unwrap();
+    sender.authenticate_publication(auth);
+    let heartbeat = Control::PathHeartbeat(karyos_protocol::network::PathHeartbeat {
+        alias: alias(),
+        identity: identity(),
+    });
+    // No sealer yet: nothing leaves.
+    assert!(!sender.send_sender_control_for(&mut halves, EndpointId(1), destination, &heartbeat));
+    assert_eq!(sender.counters().seal_failures, 1);
+    sender.publications[0].install_sealer(sealer).unwrap();
+    assert!(sender.send_sender_control_for(&mut halves, EndpointId(1), destination, &heartbeat));
+    // A trusted publication's: bare.
+    let trusted = Control::PathHeartbeat(karyos_protocol::network::PathHeartbeat {
+        alias: Alias {
+            session_id: 99,
+            ..alias()
+        },
+        identity: identity(),
+    });
+    assert!(sender.send_sender_control_for(&mut halves, EndpointId(1), destination, &trusted));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    let mut verifier = Verifier::new([&channel], party, alias()).unwrap();
+    let opened = verifier.open(&seen[0], 1_795_000_000).unwrap();
+    assert_eq!(
+        &seen[0][opened.start..][..opened.frames],
+        encoded(&heartbeat).as_slice()
+    );
+    assert_eq!(
+        seen[1],
+        encoded(&trusted),
+        "a trusted control is byte-identical"
+    );
+}
+
+/// H8 finding 4: a key reload that leaves the channel file no longer
+/// signing withdraws the publication's installed session sealer and its
+/// prototype, so it sends nothing (fail closed); once the key is back, a
+/// new establishment keys it again.
+#[test]
+fn a_reload_without_the_channel_key_stops_an_authenticated_publication() {
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::ops::SendResult;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    use super::super::Half;
+    use super::publish_auth::PublicationAuth;
+    use crate::wire_auth::{FixedKeys, Party};
+
+    let (mut sender, _role) = receiver_with(AgentConfig::default());
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    for _ in 0..4 {
+        observer.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let endpoint = SocketsEndpoint::open(&loopback(), InstanceId::FIRST, socket).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    let mut halves = vec![(EndpointId(1), Half::Tx(Box::new(tx)))];
+    let channel_text = b"format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=1\npurpose=channel\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=1111111111111111111111111111111111111111111111111111111111111111\nchannel_id=7\nstream_id=6\n";
+    let pair_text = b"format=karyos-wire-key-v1\nkey_id=9\nfile_epoch=1\npurpose=pairwise\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=2222222222222222222222222222222222222222222222222222222222222222\nreceiver_id=66\npublisher_id=5\n";
+    let parse = |name: &str, text: &[u8]| crate::wire_keys::parse(name, text).unwrap();
+    let both = || FixedKeys {
+        files: vec![parse("3-1.key", channel_text), parse("9-1.key", pair_text)],
+    };
+    let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let (mut path, _log) = outbound(EndpointId(1), destination);
+    path.require_auth().unwrap();
+    sender.publications.push(path);
+    let auth = PublicationAuth::new(
+        EndpointId(1),
+        alias(),
+        identity(),
+        1,
+        &parse("3-1.key", channel_text),
+        &[&parse("9-1.key", pair_text)],
+    )
+    .unwrap();
+    let party = Party::Sender {
+        identity: identity(),
+        lane_count: 1,
+        receiver_boot_id: [7, 8],
+        nonce: [9, 9],
+    };
+    let sealer = auth.sealer(party).unwrap();
+    sender.authenticate_publication(auth);
+    sender.publications[0].install_sealer(sealer).unwrap();
+    let heartbeat = Control::PathHeartbeat(karyos_protocol::network::PathHeartbeat {
+        alias: alias(),
+        identity: identity(),
+    });
+    // The same key set changes nothing.
+    sender.apply_keys(&both());
+    assert!(sender.send_sender_control_for(&mut halves, EndpointId(1), destination, &heartbeat));
+    // The channel file revoked (only the pairwise key left): withdrawn.
+    sender.apply_keys(&FixedKeys {
+        files: vec![parse("9-1.key", pair_text)],
+    });
+    // Withdrawn, and kept as a tombstone (H8 N1): it seals nothing.
+    assert_eq!(sender.publications[0].sealer_party(), Some(party));
+    assert!(!sender.send_sender_control_for(&mut halves, EndpointId(1), destination, &heartbeat));
+    assert_eq!(sender.counters().seal_failures, 1);
+    assert!(sender.publication_auth[0].sealer(party).is_err());
+    // The key back: the same establishment stays withdrawn, its sealer
+    // never reinstalled (H8 N1); a new establishment installs one and it
+    // sends.
+    sender.apply_keys(&both());
+    assert!(!sender.send_sender_control_for(&mut halves, EndpointId(1), destination, &heartbeat));
+    let same = sender.publication_auth[0].sealer(party).unwrap();
+    assert!(sender.publications[0].install_sealer(same).is_err());
+    let fresh = Party::Sender {
+        identity: identity(),
+        lane_count: 1,
+        receiver_boot_id: [7, 8],
+        nonce: [5, 5],
+    };
+    let sealer = sender.publication_auth[0].sealer(fresh).unwrap();
+    sender.publications[0].install_sealer(sealer).unwrap();
+    assert!(sender.send_sender_control_for(&mut halves, EndpointId(1), destination, &heartbeat));
+}
+
+/// ADR-0086 section 2: a bare SM for a local authenticated publication is
+/// dropped at the intake and never reaches the sender; an envelope for it
+/// goes to the sender undecoded.
+#[test]
+fn a_bare_sm_for_an_authenticated_publication_never_reaches_the_sender() {
+    use karyos_protocol::network::Receiver;
+
+    use super::super::control::ControlItem;
+
+    let (mut sender, mut role) = receiver_with(AgentConfig::default());
+    role.authenticate_published(EndpointId(1), alias());
+    let (events, _keep) = event_ring();
+    let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let status = Control::Status(karyos_protocol::network::StatusMessage {
+        alias: alias(),
+        identity: identity(),
+        receiver: Receiver {
+            receiver_boot_id: [7, 8],
+            receiver_id: 66,
+        },
+        group_tag: 0,
+        lanes: Lanes::new(&[karyos_protocol::network::LaneStatus {
+            consumption: 0,
+            window: 65_536,
+        }])
+        .unwrap(),
+    });
+    let mut envelope = vec![0u8; 80];
+    envelope[6..8].copy_from_slice(&0x20u16.to_le_bytes());
+    envelope[12..16].copy_from_slice(&alias().session_id.to_le_bytes());
+    envelope[16..20].copy_from_slice(&alias().stream_id.to_le_bytes());
+    {
+        let mut intake = intake(&mut role, &events, 1);
+        intake.bytes_in(source, &encoded(&status));
+        intake.bytes_in(source, &envelope);
+    }
+    let counters = role.counters();
+    assert_eq!(counters.auth_bare, 1);
+    assert_eq!(counters.forwarded, 1, "only the envelope");
+    assert!(matches!(
+        sender.take_control(),
+        Some(ControlItem::Sealed { .. })
+    ));
+    assert!(sender.take_control().is_none());
+}
+
+/// ADR-0086 section 7: the binding is committed when the RSP_SETUP
+/// verifies, before the answer. When that answer cannot be sent, the
+/// receiver's retry of the same boot id and nonce installs the session
+/// sealer; another receiver's RSP_SETUP is refused with its own reason and
+/// counted, and replaces nothing.
+#[test]
+fn an_unsent_answer_is_recovered_by_the_receivers_retry() {
+    use karyos_protocol::network::{RspChallenge, SetupAnswer};
+
+    use super::publish_auth::PublicationAuth;
+    use crate::wire_auth::{ENVELOPE_LEN, Proof, ProofKind};
+
+    let (mut sender, _role) = receiver_with(AgentConfig::default());
+    let key = |name: &str, text: String| crate::wire_keys::parse(name, text.as_bytes()).unwrap();
+    let channel = key(
+        "3-1.key",
+        "format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=1\npurpose=channel\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=1111111111111111111111111111111111111111111111111111111111111111\nchannel_id=7\nstream_id=6\n".to_owned(),
+    );
+    let pairwise = |id: u32, receiver: u64, fill: char| {
+        let secret: String = core::iter::repeat_n(fill, 64).collect();
+        key(
+            &format!("{id}-1.key"),
+            format!(
+                "format=karyos-wire-key-v1\nkey_id={id}\nfile_epoch=1\npurpose=pairwise\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret={secret}\nreceiver_id={receiver}\npublisher_id=5\n"
+            ),
+        )
+    };
+    let ours = pairwise(9, 66, '2');
+    let theirs = pairwise(8, 67, '5');
+    let destination: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let (mut path, _log) = outbound(EndpointId(1), destination);
+    path.require_auth().unwrap();
+    sender.publications.push(path);
+    sender.sessions.add(publication(EndpointId(1))).unwrap();
+    sender.authenticate_publication(
+        PublicationAuth::new(EndpointId(1), alias(), identity(), 1, &channel, &[&ours]).unwrap(),
+    );
+    let challenge = |file: &crate::wire_keys::KeyFile, receiver_id: u64| {
+        let proof = Proof::new(
+            ProofKind::RspSetup { receiver_id },
+            alias(),
+            Some(file),
+            [file],
+            1,
+        )
+        .unwrap();
+        let control = Control::Challenge(RspChallenge {
+            alias: alias(),
+            identity: identity(),
+            challenge: ChallengeBlock {
+                receiver_boot_id: [7, 8],
+                nonce: [9, 9],
+            },
+        });
+        let mut bytes = vec![0u8; karyos_protocol::network::MAX_CONTROL_LENGTH + ENVELOPE_LEN];
+        let length = control.encode(&mut bytes).unwrap();
+        let length = proof.seal(&mut bytes, length).unwrap();
+        bytes.truncate(length);
+        bytes
+    };
+    let first = challenge(&ours, 66);
+    let (_, Some(binding)) = sender.open_sealed_for(EndpointId(1), &first).unwrap() else {
+        panic!("an establishment");
+    };
+    assert!(binding.bind);
+    // Its answer is never sent: no sealer.
+    assert_eq!(sender.publications[0].sealer_party(), None);
+    // Another receiver meanwhile: refused, counted, nothing replaced.
+    assert!(
+        sender
+            .open_sealed_for(EndpointId(1), &challenge(&theirs, 67))
+            .is_none()
+    );
+    assert_eq!(sender.counters().auth_other_receiver, 1);
+    // The receiver retries: the same establishment, now installed.
+    let (_, Some(retry)) = sender.open_sealed_for(EndpointId(1), &first).unwrap() else {
+        panic!("an establishment");
+    };
+    assert_eq!((retry.party, retry.bind), (binding.party, false));
+    let answer = Control::SetupAnswer(SetupAnswer {
+        alias: alias(),
+        identity: identity(),
+        term: publication(EndpointId(1)).term,
+        challenge: ChallengeBlock {
+            receiver_boot_id: [7, 8],
+            nonce: [9, 9],
+        },
+        joins: Lanes::new(&[0]).unwrap(),
+    });
+    sender.establish_for(EndpointId(1), &answer, retry);
+    assert_eq!(sender.publications[0].sealer_party(), Some(binding.party));
+    assert_eq!(sender.counters().auth_sealers_installed, 1);
+}
+
+/// The H8 invariants of the authenticated class (karyos#648).
+mod invariants;

@@ -6,7 +6,7 @@
 //!
 //! This module parses one key file's bytes into a [`KeyFile`] and derives
 //! the per-purpose MAC keys with HKDF-SHA-256 (RFC 5869), written over
-//! [`HmacKey`] so that the PRK, every padded key and every MAC output are
+//! `HmacKey` so that the PRK, every padded key and every MAC output are
 //! erased. [`store`] loads
 //! and reloads the key directory against the durable key state of
 //! [`state`] (design sections 2.1, 2.4 and 2.6).
@@ -18,7 +18,6 @@ pub mod state;
 pub mod store;
 
 use karyos_protocol::network::Identity;
-use karyos_protocol::protection::hmac_key::HmacKey;
 use karyos_protocol::protection::hmac_sha256::LABEL;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -106,7 +105,8 @@ pub struct KeyFile {
     pub file_epoch: u32,
     /// The purpose.
     pub purpose: Purpose,
-    /// 1 for the symmetric purposes, 4 for the authority purposes.
+    /// 1 (`authenticated`) or 16 (`encrypted`) for the symmetric purposes,
+    /// 4 for the authority purposes.
     pub profile_id: u8,
     /// Start of validity, seconds since the Unix epoch, UTC.
     pub not_before: i64,
@@ -158,6 +158,57 @@ pub enum KeyFileError {
     /// The authority public key is refused.
     #[error("refused authority public key")]
     PublicKey(AuthorityKeyError),
+}
+
+/// The protection class a `channel` or `pairwise` file serves, by its
+/// `profile_id` (design section 2.2, "One class per file"; ADR-0114
+/// section 4a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Class {
+    /// `profile_id=1`: `authenticated` channels only (ADR-0086).
+    Authenticated,
+    /// `profile_id=16`: `encrypted` channels only (ADR-0114).
+    Encrypted,
+}
+
+impl Class {
+    /// The `profile_id` of the class.
+    #[must_use]
+    pub const fn profile_id(self) -> u8 {
+        match self {
+            Self::Authenticated => 1,
+            Self::Encrypted => 16,
+        }
+    }
+}
+
+impl KeyFile {
+    /// The class a symmetric file serves; `None` for the authority
+    /// purposes, which serve no channel class.
+    #[must_use]
+    pub fn class(&self) -> Option<Class> {
+        match (self.purpose, self.profile_id) {
+            (Purpose::Channel | Purpose::Pairwise, 1) => Some(Class::Authenticated),
+            (Purpose::Channel | Purpose::Pairwise, 16) => Some(Class::Encrypted),
+            _ => None,
+        }
+    }
+
+    /// Checks that a channel configuration of `class` may name this file
+    /// as its `purpose` key.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyFileError::ProfileMismatch`] for a file of the other class or
+    /// another purpose: a wrong-class configuration is refused, never
+    /// served.
+    pub fn serves(&self, class: Class, purpose: Purpose) -> Result<(), KeyFileError> {
+        if self.purpose == purpose && self.class() == Some(class) {
+            Ok(())
+        } else {
+            Err(KeyFileError::ProfileMismatch)
+        }
+    }
 }
 
 /// Parses a key file name, `<key_id>-<file_epoch>.key`.
@@ -273,16 +324,15 @@ pub fn parse(name: &str, bytes: &[u8]) -> Result<KeyFile, KeyFileError> {
         .filter(|v| *v >= 1)
         .ok_or(KeyFileError::Value { line: 3 })?;
     let profile = number(4)?;
-    let expected_profile: u8 = match purpose {
-        Purpose::Channel | Purpose::Pairwise => 1,
-        Purpose::AuthoritySigning | Purpose::AuthorityPublic => 4,
-    };
     // Compared before any narrowing, so `256` is a mismatch, not a range
-    // error (design section 2.2).
-    if profile != u64::from(expected_profile) {
-        return Err(KeyFileError::ProfileMismatch);
-    }
-    let profile_id = expected_profile;
+    // error (design section 2.2). A symmetric file serves one class: 1
+    // `authenticated` or 16 `encrypted` (ADR-0114 section 4a).
+    let profile_id = match (purpose, profile) {
+        (Purpose::Channel | Purpose::Pairwise, 1) => Class::Authenticated.profile_id(),
+        (Purpose::Channel | Purpose::Pairwise, 16) => Class::Encrypted.profile_id(),
+        (Purpose::AuthoritySigning | Purpose::AuthorityPublic, 4) => 4,
+        _ => return Err(KeyFileError::ProfileMismatch),
+    };
     let not_before = timestamp(value(5)).ok_or(KeyFileError::Value { line: 6 })?;
     let not_after = timestamp(value(6)).ok_or(KeyFileError::Value { line: 7 })?;
     let bound = match purpose {
@@ -684,22 +734,17 @@ impl Context {
     /// nothing; the result is erased on drop.
     #[must_use]
     pub fn derive(&self, secret: &[u8; KEY_LEN]) -> Zeroizing<[u8; KEY_LEN]> {
-        // HKDF-SHA-256 (RFC 5869) for one 32-byte block, over `HmacKey`
-        // so every intermediate is erased: the padded salt and PRK, the PRK
-        // itself and each MAC output, whose `Zeroizing` buffers erase on
-        // drop, as do the SHA-256 states (`sha2` feature `zeroize`).
+        // HKDF-SHA-256 (RFC 5869) for one 32-byte block, through the
+        // workspace's one erasing HKDF over `HmacKey`
+        // (`karyos_protocol::protection::hkdf`): every intermediate is
+        // erased. A context without a salt uses 32 zero bytes, the RFC's
+        // default for SHA-256.
         let info = self.info();
-        let salt = info.salt.unwrap_or([0_u8; 32]);
-        let mut extract = HmacKey::new(&salt).mac();
-        extract.update(secret);
-        let prk = extract.finalize();
-        let mut expand = HmacKey::new(prk.as_slice()).mac();
-        expand.update(info.bytes());
-        expand.update(&[1]);
-        let out = expand.finalize();
-        let mut okm = Zeroizing::new([0_u8; KEY_LEN]);
-        okm.copy_from_slice(out.as_slice());
-        okm
+        karyos_protocol::protection::hkdf::hkdf_sha256::<KEY_LEN>(
+            info.salt.as_ref().map(|salt| salt.as_slice()),
+            secret,
+            &[info.bytes()],
+        )
     }
 }
 

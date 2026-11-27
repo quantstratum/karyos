@@ -725,6 +725,45 @@ pub enum AgentCommand<O: SocketOps, T: StreamTerms = HeapTerms> {
         /// the `min` strategy with no required or tagged receiver.
         roles: Option<Box<crate::membership::PublicationRoles>>,
     },
+    /// Bind an authenticated channel's keys and selectors, checked by the
+    /// conductor at admission, ahead of the publication or subscription
+    /// they key (karyos#648). Answer [`AgentEvent::Configured`]; refused
+    /// for the other agent's binding, or a control budget the receiver
+    /// cannot reserve.
+    Authenticate {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The binding.
+        binding: Box<roles::AuthBinding>,
+    },
+    /// An authenticated binding and the add it keys (`AddSubscription`,
+    /// `AddPublishedAlias` or `AddPublication`, which carries the reply),
+    /// as one command in one ring slot (karyos#648, H8 R3-5): the binding
+    /// is held only with the add, and a refused binding refuses it.
+    AddAuthenticated {
+        /// The binding.
+        binding: Box<roles::AuthBinding>,
+        /// The add, answered as it would be alone.
+        add: Box<AgentCommand<O, T>>,
+    },
+    /// An authenticated subscription's removal with the cleanup of its
+    /// installation, as one command (karyos#648, H8 R3-5).
+    RemoveAuthenticated {
+        /// The cleanup, naming its installation.
+        binding: Box<roles::AuthBinding>,
+        /// The `RemoveSubscription`, answered as it would be alone.
+        remove: Box<AgentCommand<O, T>>,
+    },
+    /// Apply the driver's key view to every live key of the role, as one
+    /// change (karyos#648; ADR-0086 section 7): posted to both agents in
+    /// the same conductor duty after each reload and expiry tick. Answer
+    /// [`AgentEvent::Configured`].
+    ApplyKeys {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The view.
+        keys: Arc<crate::net::wire::KeyView>,
+    },
     /// Set the agent's network trace hook, or remove it with `None`
     /// (P2.12 step 3). Journals still open close through the previous hook
     /// first. Answer [`AgentEvent::NetworkTraceSet`].
@@ -957,6 +996,45 @@ pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
         alias: karyos_protocol::network::Alias,
         /// Its registration.
         registration: u64,
+    },
+    /// Posted unsolicited, into a free slot and again each cycle until
+    /// posted: the SESSION_ABORT of the publication's incarnation ended,
+    /// acknowledged or, with `interrupted`, at its deadline
+    /// (guards-and-abort.md, Session abort, sender step 5). The conductor
+    /// retires the incarnation through its removal, which quarantines the
+    /// alias.
+    SenderAbortEnded {
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// Its alias.
+        alias: karyos_protocol::network::Alias,
+        /// The exact incarnation retired: a conductor entry of another
+        /// incarnation (a replacement) is not touched.
+        identity: karyos_protocol::network::Identity,
+        /// Whether no valid ACK arrived before the deadline.
+        interrupted: bool,
+        /// The receiver's per-lane delivered and unresolved ranges from
+        /// the first valid ACK, when one came.
+        lanes: Option<
+            karyos_protocol::network::Lanes<karyos_protocol::network::authenticated::AckLane>,
+        >,
+    },
+    /// The receiver applied a valid, authenticated SESSION_ABORT to an
+    /// image: posted once, at the transition (guards-and-abort.md, Session
+    /// abort, receiver).
+    ReceiverAbortApplied {
+        /// The endpoint it arrived on.
+        endpoint: EndpointId,
+        /// The image's alias.
+        alias: karyos_protocol::network::Alias,
+        /// The aborted incarnation.
+        identity: karyos_protocol::network::Identity,
+        /// Its reason; `None` for one this driver does not know (or
+        /// WRITER_ABORTED, never sent), applied all the same.
+        reason: Option<u16>,
+        /// Per lane, the contiguous delivered prefix and unresolved
+        /// range, the values its ACK carries.
+        lanes: karyos_protocol::network::Lanes<karyos_protocol::network::authenticated::AckLane>,
     },
     /// The answer to [`AgentCommand::ChangeDestination`].
     DestinationChanged {
@@ -1287,6 +1365,10 @@ impl<O: SocketOps, T: StreamTerms> AgentCore<O, T> {
                 | AgentCommand::RemoveSubscription { .. }
                 | AgentCommand::AddSubscription { .. }
                 | AgentCommand::AddPublishedAlias { .. }
+                | AgentCommand::Authenticate { .. }
+                | AgentCommand::AddAuthenticated { .. }
+                | AgentCommand::RemoveAuthenticated { .. }
+                | AgentCommand::ApplyKeys { .. }
                 | AgentCommand::SetNetworkTrace { .. }
                 | AgentCommand::OpenNetworkJournal { .. }
                 | AgentCommand::CloseNetworkJournal { .. }
@@ -1496,7 +1578,11 @@ pub(crate) const IMAGE_CELLS: [&str; 3] =
 /// (karyos#977) REGISTERs its per-`control` bucket held back, SETUPs
 /// dropped for not coming from `control`, and a gauge (0 or 1) for its
 /// counters' sticky `overflowed` flag.
-pub(crate) const RECEIVER_CELLS: [&str; 11] = [
+///
+/// Then (karyos#648) the guard alarms: marks a followed guard could not
+/// persist, followed guards latched by a rollback, and challenges a guard
+/// authority could not answer for an uncommitted state.
+pub(crate) const RECEIVER_CELLS: [&str; 14] = [
     "datagrams received",
     "datagrams dropped by backend",
     "invalid frames received",
@@ -1507,6 +1593,9 @@ pub(crate) const RECEIVER_CELLS: [&str; 11] = [
     "registration refusals received",
     "registers rate limited",
     "setup not from control",
+    "guard mark persist failures",
+    "guard rollbacks",
+    "guard authority commit failures",
     "receiver counters overflowed",
 ];
 
@@ -1565,6 +1654,9 @@ fn receiver_values(counters: &roles::ReceiverCounters) -> [u64; RECEIVER_CELLS.l
         counters.registration_refusals,
         counters.registers_rate_limited,
         counters.setup_not_from_control,
+        counters.guard_persist_failures,
+        counters.guard_rollbacks,
+        counters.authority_commit_failures,
         u64::from(counters.overflowed),
     ]
 }
@@ -1631,6 +1723,71 @@ impl AgentCells {
     pub(crate) fn take(&mut self) -> impl Iterator<Item = Counter> + '_ {
         self.stored.clear();
         self.cells.drain(..).flatten()
+    }
+}
+
+/// The authenticated state of the sender and the receiver role (tests;
+/// karyos#648).
+#[cfg(test)]
+pub(crate) type AuthState = ((usize, usize, usize), (usize, usize, usize));
+
+/// The authenticated state of each role (tests; karyos#648).
+#[cfg(test)]
+impl<O: SocketOps, T: StreamTerms> NetworkAgents<O, T> {
+    pub(crate) fn auth_state(&self) -> AuthState {
+        (
+            self.sender.role.auth_state(),
+            self.receiver.role.auth_state(),
+        )
+    }
+
+    pub(crate) fn published_bound(&self) -> usize {
+        self.receiver.role.published_bound()
+    }
+
+    pub(crate) fn registered_sessions(&self) -> (usize, usize) {
+        self.sender.role.registered_sessions()
+    }
+
+    pub(crate) fn auth_image(
+        &self,
+    ) -> Option<(
+        crate::sessions::receive::BindingKey,
+        karyos_protocol::network::Identity,
+        bool,
+    )> {
+        self.receiver.role.auth_image()
+    }
+
+    /// Hands the receiver `bytes` from `key`'s source on its endpoint at
+    /// `now`, as its socket would.
+    pub(crate) fn inject_received(
+        &mut self,
+        key: crate::sessions::receive::BindingKey,
+        bytes: &[u8],
+        now: u64,
+    ) {
+        let receiver = &mut self.receiver;
+        receiver
+            .role
+            .inject_datagram(&receiver.sessions, key.endpoint, key.source, bytes, now);
+    }
+
+    pub(crate) fn followed_guards(&self) -> usize {
+        self.receiver.role.followed_guards()
+    }
+
+    /// Whether the sender holds a session of `alias` on `endpoint`, and
+    /// whether the receiver still publishes it.
+    pub(crate) fn alias_held(
+        &self,
+        endpoint: EndpointId,
+        alias: karyos_protocol::network::Alias,
+    ) -> (bool, bool) {
+        (
+            self.sender.role.has_session(endpoint, alias),
+            self.receiver.role.publishes(endpoint, alias),
+        )
     }
 }
 
@@ -1793,6 +1950,16 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         self.role.outbound(index).map(data::Outbound::counters)
     }
 
+    /// Whether its `index`-th publication was admitted behind a guard
+    /// gate, and how many of its incarnations that gate aborted (tests).
+    #[cfg(test)]
+    pub(crate) fn guard_aborts(&self, index: usize) -> Option<u64> {
+        self.role
+            .outbound(index)
+            .and_then(data::Outbound::guard_gate)
+            .map(|gate| gate.counts().aborted)
+    }
+
     /// What the etf drop ledger of its `index`-th publication counted, on
     /// the etf route (the Linux end to end tests).
     #[cfg(all(test, target_os = "linux"))]
@@ -1906,6 +2073,8 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         // A drained publication's report; a full ring asks again next
         // cycle.
         role.report_drained(|event| events.try_post(event).is_ok());
+        // An ended abort's report, likewise.
+        role.report_aborts(|event| events.try_post(event).is_ok());
         // A schedule violation's report, likewise.
         role.report_violations(|event| events.try_post(event).is_ok());
         role.report_deadlines(|event| events.try_post(event).is_ok());
@@ -2045,6 +2214,8 @@ impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
                 .try_post(AgentEvent::ResetRequested { endpoint, standing })
                 .is_ok()
         });
+        // An applied abort's report; a full ring asks again next cycle.
+        role.report_aborts(|event| events.try_post(event).is_ok());
         // Journals a retirement closed reach the conductor with their facts
         // (trace-network.md §4); a full ring keeps them for the next cycle.
         role.post_retired_journals(|event| match events.try_post(event) {
@@ -2219,6 +2390,13 @@ impl<O: SocketOps, T: StreamTerms> AgentLink<O, T> {
         self.stop.store(true, Ordering::Release);
     }
 
+    /// Posts `event` into the agent's event ring as the agent would
+    /// (tests): returns whether the ring took it.
+    #[cfg(test)]
+    pub(crate) fn post_event(&self, event: AgentEvent<O, T>) -> bool {
+        self.events.try_post(event).is_ok()
+    }
+
     /// Takes the agent's oldest event.
     #[must_use]
     pub fn take_event(&self) -> Option<AgentEvent<O, T>> {
@@ -2248,6 +2426,10 @@ pub struct AgentLinks<O: SocketOps, T: StreamTerms = HeapTerms> {
     pub receiver: AgentLink<O, T>,
     /// The session rings to the receiver ([`chain`]).
     pub sessions: chain::SessionLink<T>,
+    /// The key fence both roles check at every authenticated use (H8
+    /// R3-1): the conductor publishes each key view's number and the
+    /// view's freshness deadline here, with no ring in between.
+    pub key_fence: Arc<crate::wire_auth::KeyGeneration>,
 }
 
 /// Creates both agents and the conductor's links to them. Every ring is
@@ -2303,6 +2485,7 @@ pub fn network_agents_over<O: SocketOps, T: StreamTerms>(
     let (sender_core, sender_link) = make(AgentKind::Sender);
     let (receiver_core, receiver_link) = make(AgentKind::Receiver);
     let (sender_role, receiver_role) = roles::roles(&config)?;
+    let key_fence = sender_role.key_fence();
     let (session_end, session_link) = chain::session_rings(session_command_capacity);
     Ok((
         NetworkAgents {
@@ -2322,6 +2505,7 @@ pub fn network_agents_over<O: SocketOps, T: StreamTerms>(
             sender: sender_link,
             receiver: receiver_link,
             sessions: session_link,
+            key_fence,
         },
     ))
 }

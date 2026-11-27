@@ -268,19 +268,19 @@ fn interfaces_and_paths_are_checked() {
     ));
 }
 
-/// Phase 2: only `trusted`.
+/// `trusted` and `encrypted` parse; `authenticated` is still refused.
 #[test]
-fn only_trusted_security_is_supported() {
+fn trusted_and_encrypted_parse_and_authenticated_is_refused() {
     assert_eq!(
         udp("karyos:udp?endpoint=10.0.0.5:1|security=trusted").security,
         Security::Trusted
     );
-    for class in ["authenticated", "encrypted"] {
-        assert_eq!(
-            refused(&format!("karyos:udp?endpoint=10.0.0.5:1|security={class}")),
-            ChannelError::SecurityUnsupported { class }
-        );
-    }
+    assert_eq!(
+        refused("karyos:udp?endpoint=10.0.0.5:1|security=authenticated"),
+        ChannelError::SecurityUnsupported {
+            class: "authenticated"
+        }
+    );
     assert!(matches!(
         refused("karyos:udp?endpoint=10.0.0.5:1|security=plain"),
         ChannelError::InvalidValue {
@@ -492,6 +492,21 @@ fn published_keys_keep_their_meaning() {
                 Some(EtfDeclaration {
                     priority: 3,
                     delta: Duration::from_micros(100),
+                })
+            ),
+            Key::ChannelKeyId
+            | Key::PairwiseKeyId
+            | Key::ReceiverId
+            | Key::ChannelId
+            | Key::PublisherId => assert_eq!(
+                udp("karyos:udp?endpoint=10.0.0.5:1|mtu=1408|security=encrypted|channel-key=3|pairwise-key=9|receiver-id=77|channel-id=7|publisher-id=5")
+                    .security,
+                Security::Encrypted(EncryptedChannel {
+                    channel_key_id: 3,
+                    pairwise_key_id: 9,
+                    receiver_id: 77,
+                    channel_id: 7,
+                    publisher_id: 5,
                 })
             ),
         }
@@ -1207,6 +1222,50 @@ fn path_skew_is_a_bounded_duration() {
     );
 }
 
+const ENC_KEYS: &str = "channel-key=3|pairwise-key=4|receiver-id=42|channel-id=7|publisher-id=5";
+
+/// ADR-0114 sections 6 and 11: an `encrypted` channel above `mtu` 1408 is
+/// refused at parse for its MTU, before anything else; at or below it the
+/// channel parses with its keys and receiver.
+#[test]
+fn an_encrypted_channel_takes_mtu_at_most_1408() {
+    for mtu in [1409, 1500, 8192] {
+        assert!(matches!(
+            refused(&format!(
+                "karyos:udp?endpoint=10.0.0.5:1|security=encrypted|mtu={mtu}|{ENC_KEYS}"
+            )),
+            ChannelError::InvalidValue { key: "mtu", .. }
+        ));
+        // Refused for the MTU even without its keys.
+        assert!(matches!(
+            refused(&format!(
+                "karyos:udp?endpoint=10.0.0.5:1|security=encrypted|mtu={mtu}"
+            )),
+            ChannelError::InvalidValue { key: "mtu", .. }
+        ));
+    }
+    for mtu in [256, 1408] {
+        let config = udp(&format!(
+            "karyos:udp?endpoint=10.0.0.5:1|security=encrypted|mtu={mtu}|{ENC_KEYS}"
+        ));
+        assert_eq!(
+            config.security,
+            Security::Encrypted(EncryptedChannel {
+                channel_key_id: 3,
+                pairwise_key_id: 4,
+                receiver_id: 42,
+                channel_id: 7,
+                publisher_id: 5,
+            })
+        );
+    }
+    // The same MTU is valid on a trusted channel.
+    assert!(
+        ChannelConfig::parse("karyos:udp?endpoint=10.0.0.5:1|security=trusted|mtu=8192").is_ok()
+    );
+    assert_eq!(MAX_ENCRYPTED_MTU, 1408);
+}
+
 /// ADR-0109 (#625): `etf-priority` and `etf-delta` go together, on a
 /// unicast `endpoint` with an `interface` address; the delta is positive
 /// and below 2^32 ns; a channel without them has no declaration.
@@ -1261,4 +1320,105 @@ fn the_etf_declaration_is_checked() {
             delta: Duration::from_nanos(u64::from(u32::MAX)),
         })
     );
+}
+
+/// ADR-0114 section 4a and the v1 scope: an `encrypted` channel requires
+/// each of its three key settings, nonzero and in range; serves one unicast
+/// `endpoint` only (multicast, `destinations`, `control` and `paths` are
+/// refused, never downgraded); and the key settings belong to it alone.
+#[test]
+fn an_encrypted_channel_needs_its_keys_and_one_unicast_receiver() {
+    let base = "karyos:udp?endpoint=10.0.0.5:1|security=encrypted";
+    for missing in [
+        "channel-key",
+        "pairwise-key",
+        "receiver-id",
+        "channel-id",
+        "publisher-id",
+    ] {
+        let keys: Vec<&str> = ENC_KEYS
+            .split('|')
+            .filter(|kv| !kv.starts_with(missing))
+            .collect();
+        assert_eq!(
+            refused(&format!("{base}|{}", keys.join("|"))),
+            ChannelError::InvalidValue {
+                key: KEYS.iter().find(|(name, _)| *name == missing).unwrap().0,
+                reason: "required on an `encrypted` channel"
+            },
+            "{missing}"
+        );
+    }
+    for bad in [
+        "channel-key=0|pairwise-key=4|receiver-id=42",
+        "channel-key=4294967296|pairwise-key=4|receiver-id=42",
+        "channel-key=3|pairwise-key=04|receiver-id=42",
+        "channel-key=3|pairwise-key=4|receiver-id=0",
+        "channel-key=3|pairwise-key=4|receiver-id=18446744073709551616",
+        "channel-key=3|pairwise-key=4|receiver-id=42|channel-id=0|publisher-id=5",
+        "channel-key=3|pairwise-key=4|receiver-id=42|channel-id=7|publisher-id=0",
+        "channel-key=3|pairwise-key=4|receiver-id=42|channel-id=07|publisher-id=5",
+        "channel-key=3|pairwise-key=4|receiver-id=42|channel-id=7|publisher-id=18446744073709551616",
+    ] {
+        assert!(
+            matches!(
+                refused(&format!("{base}|{bad}")),
+                ChannelError::InvalidValue { .. }
+            ),
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        udp(&format!(
+            "{base}|channel-key=4294967295|pairwise-key=1|receiver-id=18446744073709551615|channel-id=18446744073709551615|publisher-id=1"
+        ))
+        .security,
+        Security::Encrypted(EncryptedChannel {
+            channel_key_id: u32::MAX,
+            pairwise_key_id: 1,
+            receiver_id: u64::MAX,
+            channel_id: u64::MAX,
+            publisher_id: 1,
+        })
+    );
+    for other in [
+        "group=239.1.1.1:4000",
+        "destinations=10.0.0.5:1;10.0.0.6:1",
+        "control=10.0.0.5:1|control-mode=dynamic",
+        "endpoint=10.0.0.5:1|paths=10.0.0.1;10.0.0.2",
+        "paths=10.0.0.1@10.0.0.5:1;10.0.0.2@10.0.0.6:1",
+    ] {
+        assert_eq!(
+            refused(&format!("karyos:udp?{other}|security=encrypted|{ENC_KEYS}")),
+            ChannelError::InvalidValue {
+                key: "security",
+                reason: "`encrypted` on a channel other than one unicast `endpoint`"
+            },
+            "{other}"
+        );
+    }
+    for key in [
+        "channel-key=3",
+        "pairwise-key=4",
+        "receiver-id=42",
+        "channel-id=7",
+        "publisher-id=5",
+    ] {
+        let name = key.split('=').next().unwrap();
+        for class in ["", "|security=trusted"] {
+            assert_eq!(
+                refused(&format!("karyos:udp?endpoint=10.0.0.5:1{class}|{key}")),
+                ChannelError::NotApplicable {
+                    key: KEYS.iter().find(|(known, _)| *known == name).unwrap().0
+                },
+                "{key}{class}"
+            );
+        }
+        assert_eq!(
+            refused(&format!("karyos:ipc?{key}")),
+            ChannelError::NotApplicable {
+                key: KEYS.iter().find(|(known, _)| *known == name).unwrap().0
+            }
+        );
+    }
 }

@@ -1,0 +1,3 @@
+### Fixed
+
+- The `encrypted` class follows key rotation (karyos#650, ADR-0114 section 6): live sealers and openers admit a newly verifying file epoch from the key store, a sealer moves to the new key epoch at party epoch 0 with its sequence restarting under the new key (no key and nonce pair repeats), and an opener accepts the previous epoch for the 10 s overlap and refuses it after. Revoking an opener's previous epoch erases its key and keeps the slot as the spare, so a later rotation still promotes. A withdrawn opener reports its own rejection reason, `enc_withdrawn`, counted apart from epoch refusals.

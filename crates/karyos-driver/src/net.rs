@@ -450,6 +450,10 @@ pub(crate) struct SenderChannel {
     /// A `control-mode=dynamic` publication's registration policy
     /// (karyos#644); `None` otherwise.
     pub(crate) registration: Option<crate::sessions::register::RegistrationPolicy>,
+    /// An authenticated or encrypted channel's key ids, receiver and
+    /// authority, bound again for each incarnation (karyos#648, ADR-0114);
+    /// `None` for a trusted one.
+    pub(crate) auth: Option<wire::Protected>,
     /// The etf queue of a timed publication on the `etf` route (ADR-0109);
     /// `None` otherwise.
     pub(crate) etf: Option<karyos_io::backend::EtfQueue>,
@@ -587,6 +591,11 @@ struct NetSubscription {
     /// admitted. A second handle naming `nak-control` must ask for the same
     /// ones (karyos#1086 review).
     control_admitted: ControlAdmitted,
+    /// The authenticated or encrypted channel every handle of the key
+    /// shares (karyos#648, ADR-0114); `None` for a trusted one.
+    auth: Option<wire::Protected>,
+    /// Its binding's installation id, which its removal names (H8 R3-5).
+    auth_installation: u64,
     /// Handles of this key; the receiver's entry goes with the last.
     users: usize,
 }
@@ -905,6 +914,10 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     /// The receiver's `alias_quarantine` (ns): how long a reincarnating
     /// publication's alias waits after its old session's removal.
     alias_quarantine: u64,
+    /// Whether the receiver's challenge table is within the authenticated
+    /// profile's ceilings: a protected channel is refused otherwise
+    /// ([`crate::error::AuthRefusal::ChallengeCeiling`]; H8 R5-04).
+    auth_challenge_ceilings: bool,
     /// Publications between incarnations, at most one per tracked
     /// publication (allocated at start).
     reincarnations: Vec<Reincarnation>,
@@ -939,6 +952,10 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     /// validation).
     #[cfg(test)]
     fail_control_endpoint: bool,
+    /// Tests: IPv4 loopback data endpoints on port 0 bind a port outside
+    /// the ephemeral range instead ([`Self::pin_data_ports`]).
+    #[cfg(test)]
+    pin_data_ports: bool,
     /// Whether the backend isolates redundant path sockets.
     paths_isolated: bool,
     /// Channels with `paths` refused because they cannot be isolated.
@@ -962,6 +979,10 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     /// Conflated views built from now on are not attached (tests).
     #[cfg(test)]
     defer_view_attach: bool,
+    /// The driver's one wire key store, once started (karyos#648): its
+    /// reload and expiry tick run in [`Network::duty`], and each new view
+    /// goes to both agents in the same duty.
+    wire: Option<wire::WireKeys>,
 }
 
 impl<T: StreamTerms> Network<T> {
@@ -1054,6 +1075,7 @@ impl<T: StreamTerms> Network<T> {
             },
             publication_linger: config.stream_defaults.publication_linger,
             alias_quarantine: config.agents.sessions.alias_quarantine,
+            auth_challenge_ceilings: config.agents.sessions.within_auth_ceilings(),
             reincarnations: Vec::with_capacity(config.agents.publications),
             stale_overflows: 0,
             clock: karyos_sys::host_clock::host_monotonic_ns,
@@ -1087,6 +1109,8 @@ impl<T: StreamTerms> Network<T> {
             control_endpoint: config.control_endpoint,
             #[cfg(test)]
             fail_control_endpoint: false,
+            #[cfg(test)]
+            pin_data_ports: false,
             paths_isolated: <OsSocket as karyos_io::sockets::ops::SocketOps>::isolates_paths(),
             paths_refused: 0,
             path_failures: 0,
@@ -1105,7 +1129,290 @@ impl<T: StreamTerms> Network<T> {
             ),
             #[cfg(test)]
             defer_view_attach: false,
+            wire: None,
         })
+    }
+
+    /// Starts the driver's one wire key store over the key directory
+    /// `keys` and the state directory `state` at the wall `clock` (the
+    /// host's when `None`), and posts its first view to both agents.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::KeyStoreStart`] when the store cannot start, and
+    /// [`DriverError::InvalidConfig`] when one is started already.
+    pub(crate) fn start_wire_keys(
+        &mut self,
+        keys: wire::Dir,
+        state: wire::Dir,
+        clock: Option<fn() -> i64>,
+    ) -> Result<crate::wire_keys::store::Report, DriverError> {
+        if self.wire.is_some() {
+            return Err(DriverError::InvalidConfig);
+        }
+        let (keys, report) =
+            wire::WireKeys::start(keys, state, clock).map_err(DriverError::KeyStoreStart)?;
+        self.wire = Some(keys);
+        Ok(report)
+    }
+
+    /// The authenticated state of both roles of a shared runner
+    /// (tests): the sender's bound publications and installed sealers, the
+    /// receiver's bound subscriptions, authenticated images and withdrawn
+    /// image sealers.
+    #[cfg(test)]
+    pub(crate) fn auth_state(&self) -> Option<crate::agents::AuthState> {
+        match &self.agents {
+            Agents::Shared(agents) => Some(agents.auth_state()),
+            Agents::Threads(_) | Agents::Closed => None,
+        }
+    }
+
+    /// The remote guards the Shared receiver follows (tests).
+    #[cfg(test)]
+    pub(crate) fn followed_guards(&self) -> Option<usize> {
+        match &self.agents {
+            Agents::Shared(agents) => Some(agents.followed_guards()),
+            Agents::Threads(_) | Agents::Closed => None,
+        }
+    }
+
+    /// Fills the receiver's command ring with pings (tests); returns how
+    /// many it took.
+    #[cfg(test)]
+    pub(crate) fn fill_receiver_ring(&self) -> usize {
+        let mut posted = 0;
+        while self
+            .links
+            .receiver
+            .post(|reply| AgentCommand::Ping { reply, token: 0 })
+            .is_ok()
+        {
+            posted += 1;
+        }
+        posted
+    }
+
+    /// The local authenticated publication aliases the Shared receiver
+    /// holds bound (tests).
+    #[cfg(test)]
+    pub(crate) fn published_bound(&self) -> Option<usize> {
+        match &self.agents {
+            Agents::Shared(agents) => Some(agents.published_bound()),
+            Agents::Threads(_) | Agents::Closed => None,
+        }
+    }
+
+    /// The Shared sender's registered SETUP sessions and those deferred
+    /// while admission-pending (tests).
+    #[cfg(test)]
+    pub(crate) fn registered_sessions(&self) -> Option<(usize, usize)> {
+        match &self.agents {
+            Agents::Shared(agents) => Some(agents.registered_sessions()),
+            Agents::Threads(_) | Agents::Closed => None,
+        }
+    }
+
+    /// The Shared receiver's first authenticated image: its binding, its
+    /// incarnation and whether it was aborted (tests).
+    #[cfg(test)]
+    pub(crate) fn auth_image(
+        &self,
+    ) -> Option<(
+        crate::sessions::receive::BindingKey,
+        karyos_protocol::network::Identity,
+        bool,
+    )> {
+        match &self.agents {
+            Agents::Shared(agents) => agents.auth_image(),
+            Agents::Threads(_) | Agents::Closed => None,
+        }
+    }
+
+    /// Hands the Shared receiver `bytes` as a datagram from `key`'s source
+    /// on its endpoint, now, through the receiver's own intake (tests):
+    /// what a socket delivers from that source.
+    #[cfg(test)]
+    pub(crate) fn inject_received(
+        &mut self,
+        key: crate::sessions::receive::BindingKey,
+        bytes: &[u8],
+    ) {
+        let now = (self.clock)();
+        if let Agents::Shared(agents) = &mut self.agents {
+            agents.inject_received(key, bytes, now);
+        }
+    }
+
+    /// Fills the sender's command ring with pings (tests); returns how
+    /// many it took.
+    #[cfg(test)]
+    pub(crate) fn fill_sender_ring(&self) -> usize {
+        let mut posted = 0;
+        while self
+            .links
+            .sender
+            .post(|reply| AgentCommand::Ping { reply, token: 0 })
+            .is_ok()
+        {
+            posted += 1;
+        }
+        posted
+    }
+
+    /// Posts `count` pings to the receiver (tests).
+    #[cfg(test)]
+    pub(crate) fn ping_receiver(&self, count: usize) {
+        for _ in 0..count {
+            let _ = self
+                .links
+                .receiver
+                .post(|reply| AgentCommand::Ping { reply, token: 0 });
+        }
+    }
+
+    /// Posts `binding` to the receiver directly, as a cleanup a full ring
+    /// held back would arrive late (tests).
+    #[cfg(test)]
+    pub(crate) fn post_binding(&self, binding: crate::agents::roles::Binding) -> bool {
+        let binding = Box::new(crate::agents::roles::AuthBinding(binding));
+        self.links
+            .receiver
+            .post(|reply| AgentCommand::Authenticate { reply, binding })
+            .is_ok()
+    }
+
+    /// The installation id of the authenticated key of `stream_id`
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn auth_installation(&self, stream_id: i32) -> Option<(EndpointId, u64)> {
+        self.subscriptions
+            .iter()
+            .find(|entry| entry.stream_id == stream_id && entry.auth.is_some())
+            .map(|entry| (entry.endpoint, entry.auth_installation))
+    }
+
+    /// The driver's wire key store, once started.
+    pub(crate) fn wire_keys(&self) -> Option<&wire::WireKeys> {
+        self.wire.as_ref()
+    }
+
+    /// Posts `binding` to the receiver, or, when its ring is full, keeps it
+    /// for the next duty, counted: an unbind or unfollow is never lost.
+    fn post_receiver_binding(&mut self, binding: Box<crate::agents::roles::AuthBinding>) {
+        match self.links.receiver.prepare() {
+            Ok(prepared) => {
+                // Past the reservation only a gone agent fails, which
+                // fails the network.
+                let _ = self
+                    .links
+                    .receiver
+                    .commit(prepared, |reply| AgentCommand::Authenticate {
+                        reply,
+                        binding,
+                    });
+            }
+            Err(_) => {
+                if let Some(wire) = self.wire.as_mut() {
+                    wire.defer(binding);
+                }
+            }
+        }
+    }
+
+    /// Holds the guard authority's control endpoints open and posts the
+    /// authority to the receiver, which answers only on them. An endpoint
+    /// that cannot open releases those already held.
+    pub(crate) fn post_guard_authority(
+        &mut self,
+        authority: crate::guard_authority::GuardAuthority,
+        controls: &[SocketAddr],
+        view: Arc<wire::KeyView>,
+    ) -> Result<(), DriverError> {
+        let mut endpoints = Vec::with_capacity(controls.len());
+        for &control in controls {
+            match self.hold_send_endpoint(control) {
+                Ok(endpoint) => endpoints.push(endpoint),
+                Err(error) => {
+                    for endpoint in endpoints {
+                        release(&mut self.send_endpoints, endpoint);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let binding = Box::new(crate::agents::roles::AuthBinding(
+            crate::agents::roles::Binding::Authority {
+                authority: Box::new(authority),
+                endpoints: endpoints.clone(),
+                view,
+            },
+        ));
+        let posted = self
+            .links
+            .receiver
+            .post(|reply| AgentCommand::Authenticate { reply, binding });
+        if posted.is_err() {
+            for endpoint in endpoints {
+                release(&mut self.send_endpoints, endpoint);
+            }
+            return Err(DriverError::NetworkBusy);
+        }
+        Ok(())
+    }
+
+    /// Refuses a protected channel on a driver whose challenge table is
+    /// configured above the authenticated profile's ceilings (ADR-0086
+    /// section 6; H8 R5-04), before anything exists.
+    pub(crate) fn check_auth_challenge_ceilings(&self) -> Result<(), DriverError> {
+        if self.auth_challenge_ceilings {
+            Ok(())
+        } else {
+            Err(DriverError::AuthenticatedRefused {
+                reason: crate::error::AuthRefusal::ChallengeCeiling,
+            })
+        }
+    }
+
+    /// The driver's wire key store, once started, for admission.
+    pub(crate) fn wire_keys_mut(&mut self) -> Option<&mut wire::WireKeys> {
+        self.wire.as_mut()
+    }
+
+    /// The key store's duty (karyos#648): a reload every
+    /// [`crate::wire_keys::store::RELOAD_INTERVAL_S`] and the expiry tick;
+    /// a changed view is posted to both agents here, one after the other,
+    /// so both roles apply it in their next cycle. A view a ring refused
+    /// is posted to both again at the next duty.
+    fn wire_duty(&mut self) {
+        // Bindings a full ring deferred go first, in order.
+        let deferred = self
+            .wire
+            .as_mut()
+            .map_or_else(Vec::new, wire::WireKeys::take_deferred);
+        for binding in deferred {
+            self.post_receiver_binding(binding);
+        }
+        let Some(wire) = self.wire.as_mut() else {
+            return;
+        };
+        let Some(view) = wire.duty(&self.links.key_fence) else {
+            return;
+        };
+        let receiver = self
+            .links
+            .receiver
+            .post(|reply| AgentCommand::ApplyKeys {
+                reply,
+                keys: Arc::clone(&view),
+            })
+            .is_ok();
+        let sender = self
+            .links
+            .sender
+            .post(|reply| AgentCommand::ApplyKeys { reply, keys: view })
+            .is_ok();
+        wire.posted(receiver && sender);
     }
 
     /// The send endpoint bound to `bind`, opened on first use; one more
@@ -1119,6 +1426,19 @@ impl<T: StreamTerms> Network<T> {
         bind: SocketAddr,
     ) -> Result<EndpointId, DriverError> {
         self.hold_endpoint(bind, None)
+    }
+
+    /// Lets the publisher's `endpoint` move to a new ephemeral port when a
+    /// reset cannot bind its port again
+    /// ([`crate::agents::endpoints::Endpoints::allow_move`]).
+    pub(crate) fn allow_endpoint_move(&mut self, endpoint: EndpointId) {
+        self.endpoints.allow_move(endpoint);
+    }
+
+    /// Keeps `endpoint` at its address for good
+    /// ([`crate::agents::endpoints::Endpoints::pin`]).
+    pub(crate) fn pin_endpoint(&mut self, endpoint: EndpointId) {
+        self.endpoints.pin(endpoint);
     }
 
     /// [`Self::hold_send_endpoint`] for a path of a paired unicast paths
@@ -1222,7 +1542,12 @@ impl<T: StreamTerms> Network<T> {
         if self.endpoints.retiring_at(bind) {
             return Err((DriverError::NetworkBusy, None));
         }
-        let mut config = SocketsConfig::new(bind);
+        // The entry stays keyed by `bind`, so it is shared as before.
+        #[cfg(test)]
+        let local = self.pinned_bind(bind, multicast, purpose);
+        #[cfg(not(test))]
+        let local = bind;
+        let mut config = SocketsConfig::new(local);
         config.multicast = multicast;
         config.etf_route = matches!(purpose, EndpointPurpose::Etf { .. });
         config.tx_slots = self.endpoint_tables.tx_slots;
@@ -1283,6 +1608,10 @@ impl<T: StreamTerms> Network<T> {
     /// [`DriverError::ControlGroupConflict`] for a second handle whose
     /// channel names `nak-control` groups (`names_control`) other than
     /// those the key's paths joined.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the key's options, and its authenticated binding (karyos#648)"
+    )]
     pub(crate) fn add_subscription(
         &mut self,
         stream_id: i32,
@@ -1291,14 +1620,18 @@ impl<T: StreamTerms> Network<T> {
         max_term_length: u32,
         (reliable, own_port, names_control): (bool, bool, bool),
         (identity, conflated, register_at, path_skew): KeyOptions,
+        auth: Option<wire::SubscriptionGrant>,
     ) -> Result<NetworkSubscription, DriverError> {
         let group = multicast.is_some();
+        let channel_auth = auth.as_ref().map(wire::SubscriptionGrant::channel);
         // A URI subscription on port 0 (`own_port`) asks for an ephemeral
         // port of its own (karyos#656): never another's endpoint, which an
         // address with port 0 would otherwise match. The embedded calls
         // keep sharing a bind address's endpoint, port 0 included.
         let ephemeral = own_port && bind.port() == 0 && multicast.is_none();
         let endpoint = self.hold_for(bind, multicast, EndpointPurpose::Data, !ephemeral)?;
+        // Publishers send to its address: a reset never moves it.
+        self.endpoints.pin(endpoint);
         let handle = NetworkSubscription {
             endpoint,
             stream_id,
@@ -1338,6 +1671,14 @@ impl<T: StreamTerms> Network<T> {
             if entry.conflated != conflated {
                 release(&mut self.send_endpoints, endpoint);
                 return Err(DriverError::ConflationMismatch);
+            }
+            // Its images take one authenticated binding, or none: a second
+            // handle under other keys is ambiguous (karyos#648).
+            if entry.auth != channel_auth {
+                release(&mut self.send_endpoints, endpoint);
+                return Err(DriverError::AuthenticatedRefused {
+                    reason: crate::error::AuthRefusal::Ambiguous,
+                });
             }
             // It registers at one `control` address, or at none.
             if entry.register_at != register_at {
@@ -1433,10 +1774,39 @@ impl<T: StreamTerms> Network<T> {
         // A dynamic key's registration state, shared with its receiver.
         let registration = register_at
             .map(|_| std::sync::Arc::new(crate::sessions::register::RegistrationStatus::default()));
-        let posted = self
-            .links
-            .receiver
-            .post(|reply| AgentCommand::AddSubscription {
+        // An authenticated key's binding goes first, in the same ring, so
+        // the receiver never establishes an image of the key without it
+        // (karyos#648).
+        // In the same command as the add, one ring slot (H8 R3-5).
+        let auth_installation = auth
+            .as_ref()
+            .map_or(0, wire::SubscriptionGrant::installation);
+        let bound = match auth {
+            None => Ok(None),
+            Some(wire::SubscriptionGrant::Auth(channel, keys)) => {
+                Self::subscription_binding(endpoint, stream_id, channel, keys).map(Some)
+            }
+            Some(wire::SubscriptionGrant::Enc(channel, keys)) => {
+                wire::WireKeys::enc_subscription_binding(endpoint, stream_id, &channel, keys)
+                    .map(|binding| Some(Box::new(crate::agents::roles::AuthBinding(binding))))
+            }
+        };
+        let binding = match bound {
+            Ok(binding) => binding,
+            Err(error) => {
+                release(&mut self.send_endpoints, endpoint);
+                if let Some((control, _)) = control {
+                    release(&mut self.send_endpoints, control);
+                }
+                if let Some(solicit) = solicit {
+                    release(&mut self.send_endpoints, solicit);
+                }
+                return Err(error);
+            }
+        };
+        let authenticated = binding.is_some();
+        let posted = self.links.receiver.post(|reply| {
+            let add = AgentCommand::AddSubscription {
                 reply,
                 endpoint,
                 stream_id,
@@ -1449,8 +1819,19 @@ impl<T: StreamTerms> Network<T> {
                 solicit_from: solicit,
                 register_at: register_at.zip(registration.clone()),
                 path_skew,
-            });
+            };
+            match binding {
+                Some(binding) => AgentCommand::AddAuthenticated {
+                    binding,
+                    add: Box::new(add),
+                },
+                None => add,
+            }
+        });
         if posted.is_err() {
+            if authenticated && let Some(wire) = self.wire.as_mut() {
+                wire.count_busy();
+            }
             release(&mut self.send_endpoints, endpoint);
             if let Some((control, _)) = control {
                 release(&mut self.send_endpoints, control);
@@ -1486,6 +1867,7 @@ impl<T: StreamTerms> Network<T> {
                 self.count_path_failure();
                 continue;
             };
+            self.endpoints.pin(path);
             // A later path on an endpoint another subscription of the
             // stream already uses would merge their receiver entries, and
             // removing one would remove the other's: skipped, counted
@@ -1560,9 +1942,52 @@ impl<T: StreamTerms> Network<T> {
             later_routes,
             control_held,
             control_admitted,
+            auth: channel_auth,
+            auth_installation,
             users: 1,
         });
         Ok(handle)
+    }
+
+    /// Posts the receiver binding of the authenticated subscription to
+    /// `stream_id` on `endpoint`, its keys checked at admission.
+    fn subscription_binding(
+        endpoint: EndpointId,
+        stream_id: i32,
+        channel: karyos_protocol::channel::AuthenticatedChannel,
+        keys: wire::SubscriptionKeys,
+    ) -> Result<Box<crate::agents::roles::AuthBinding>, DriverError> {
+        use crate::agents::roles::{AuthBinding, Binding, BoundAuthority};
+
+        let alias = Alias {
+            session_id: 0,
+            stream_id,
+        };
+        let auth = crate::agents::roles::receive_auth::SubscriptionAuth::new(
+            endpoint,
+            alias,
+            &keys.channel,
+            &keys.pairwise,
+            channel.receiver_id,
+        )
+        .map_err(|_| DriverError::AuthenticatedRefused {
+            reason: crate::error::AuthRefusal::PairwiseKey,
+        })?;
+        let authority = channel.authority.map(|authority| BoundAuthority {
+            key_id: authority.key_id,
+            authority_id: authority.authority_id,
+            guard_id: authority.guard_id,
+            control: authority.control,
+        });
+        Ok(Box::new(AuthBinding(Binding::Subscription {
+            auth,
+            authority,
+            view: keys.view,
+            installation: keys.installation,
+            aborted: keys.aborted.map(|aborted| {
+                Box::new(aborted) as Box<dyn crate::remote_guard::AbortRecord + Send>
+            }),
+        })))
     }
 
     /// The registration state of `subscription`, a `control-mode=dynamic`
@@ -1877,6 +2302,65 @@ impl<T: StreamTerms> Network<T> {
             .filter_map(|endpoint| self.endpoints.local_address(endpoint))
     }
 
+    /// Tests: the address a new endpoint for `bind` binds: a port of
+    /// [`crate::test_ports`] for an IPv4 loopback data endpoint on port 0
+    /// once [`Self::pin_data_ports`] was called, `bind` otherwise.
+    #[cfg(test)]
+    fn pinned_bind(
+        &self,
+        bind: SocketAddr,
+        multicast: Option<MulticastConfig>,
+        purpose: EndpointPurpose,
+    ) -> SocketAddr {
+        let pinned = self.pin_data_ports
+            && purpose == EndpointPurpose::Data
+            && multicast.is_none()
+            && bind.port() == 0
+            && bind.ip() == IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        if pinned {
+            SocketAddr::new(bind.ip(), crate::test_ports::test_port())
+        } else {
+            bind
+        }
+    }
+
+    /// Tests: every later IPv4 loopback data endpoint on port 0 binds a
+    /// fixed port instead, from outside the ephemeral range
+    /// ([`crate::test_ports`]): a publisher of this driver is then a fixed
+    /// port one, which a reset whose port is taken fails rather than moves
+    /// (`Endpoints::allow_move`).
+    #[cfg(test)]
+    pub(crate) fn pin_data_ports(&mut self) {
+        self.pin_data_ports = true;
+    }
+
+    /// Tests: every later endpoint reset finds its address taken by
+    /// another socket between its close and its rebind
+    /// ([`crate::agents::endpoints::Endpoints::occupy_on_reset`]).
+    #[cfg(test)]
+    pub(crate) fn occupy_ports_on_reset(&mut self) {
+        self.endpoints.occupy_on_reset();
+    }
+
+    /// Endpoint resets that moved a publisher to a new port, for tests.
+    #[cfg(test)]
+    pub(crate) fn ports_moved(&self) -> u64 {
+        self.endpoints.counters().ports_moved
+    }
+
+    /// Endpoints that failed, for tests.
+    #[cfg(test)]
+    pub(crate) fn endpoints_failed(&self) -> u64 {
+        self.endpoints.counters().failed
+    }
+
+    /// Tests: the sockets that took reset endpoints' addresses
+    /// ([`Self::occupy_ports_on_reset`]), handed over.
+    #[cfg(test)]
+    pub(crate) fn take_occupied(&mut self) -> Vec<std::net::UdpSocket> {
+        self.endpoints.take_occupied()
+    }
+
     /// Tests: makes every later control endpoint creation fail (its e2e
     /// case is Linux only).
     #[cfg(all(test, target_os = "linux"))]
@@ -1913,6 +2397,14 @@ impl<T: StreamTerms> Network<T> {
             endpoint,
             stream_id,
         } = subscription;
+        // Each handle of an authenticated key reserved its authority's
+        // control peer at admission (karyos#648).
+        let peer = self
+            .subscriptions
+            .get(index)
+            .and_then(|entry| entry.auth)
+            .and_then(wire::Protected::authority)
+            .map(|authority| authority.control);
         match self.subscriptions.get_mut(index) {
             // Another handle still holds the receiver's entry.
             Some(entry) if entry.users > 1 => {
@@ -1937,12 +2429,34 @@ impl<T: StreamTerms> Network<T> {
                         })
                         .map_err(|_| DriverError::NetworkBusy)?;
                 }
+                // An authenticated key's cleanup goes in the same command,
+                // naming its installation (H8 R3-5).
+                let cleanup = self
+                    .subscriptions
+                    .get(index)
+                    .filter(|entry| entry.auth.is_some())
+                    .map(|entry| entry.auth_installation);
                 self.links
                     .receiver
-                    .post(|reply| AgentCommand::RemoveSubscription {
-                        reply,
-                        endpoint,
-                        stream_id,
+                    .post(|reply| {
+                        let remove = AgentCommand::RemoveSubscription {
+                            reply,
+                            endpoint,
+                            stream_id,
+                        };
+                        match cleanup {
+                            Some(installation) => AgentCommand::RemoveAuthenticated {
+                                binding: Box::new(crate::agents::roles::AuthBinding(
+                                    crate::agents::roles::Binding::Unbind {
+                                        endpoint,
+                                        stream_id,
+                                        installation,
+                                    },
+                                )),
+                                remove: Box::new(remove),
+                            },
+                            None => remove,
+                        }
                     })
                     .map_err(|_| DriverError::NetworkBusy)?;
                 let entry = self.subscriptions.swap_remove(index);
@@ -1960,6 +2474,9 @@ impl<T: StreamTerms> Network<T> {
                     release(&mut self.send_endpoints, control);
                 }
             }
+        }
+        if let (Some(peer), Some(wire)) = (peer, self.wire.as_mut()) {
+            wire.release(peer);
         }
         release(&mut self.send_endpoints, endpoint);
         Ok(true)
@@ -2401,6 +2918,10 @@ impl<T: StreamTerms> Network<T> {
     ///
     /// [`DriverError::NetworkBusy`] when an agent's ring is full; nothing
     /// is posted to the sender then.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the publication's parts, and its authenticated binding (karyos#648)"
+    )]
     pub(crate) fn add_publication(
         &mut self,
         registration: u64,
@@ -2412,6 +2933,7 @@ impl<T: StreamTerms> Network<T> {
         )>,
         roles: Option<Box<crate::membership::PublicationRoles>>,
         channel: SenderChannel,
+        auth: Option<wire::PublicationBinding>,
     ) -> Result<(), DriverError> {
         let (spec, guard_sender) = guard.map_or((None, None), |(spec, id)| (Some(spec), Some(id)));
         let frontier = spec
@@ -2543,14 +3065,43 @@ impl<T: StreamTerms> Network<T> {
         }
         let mut published = 0usize;
         for path in paths() {
-            let posted = self
-                .links
-                .receiver
-                .post(|reply| AgentCommand::AddPublishedAlias {
+            // An authenticated publication's alias is bound first, so its
+            // receivers' envelopes never reach the bare path (karyos#648).
+            // In one command with its add (H8 R3-5).
+            let authenticated = auth.is_some();
+            let encrypted = auth.as_ref().is_some_and(|binding| binding.encrypted);
+            let posted = self.links.receiver.post(|reply| {
+                let add = AgentCommand::AddPublishedAlias {
                     reply,
                     endpoint: path,
                     alias,
-                });
+                };
+                if authenticated {
+                    let published = if encrypted {
+                        crate::agents::roles::Binding::EncPublished {
+                            endpoint: path,
+                            alias,
+                        }
+                    } else {
+                        crate::agents::roles::Binding::Published {
+                            endpoint: path,
+                            alias,
+                        }
+                    };
+                    AgentCommand::AddAuthenticated {
+                        binding: Box::new(crate::agents::roles::AuthBinding(published)),
+                        add: Box::new(add),
+                    }
+                } else {
+                    add
+                }
+            });
+            if posted.is_err()
+                && authenticated
+                && let Some(wire) = self.wire.as_mut()
+            {
+                wire.count_busy();
+            }
             if posted.is_err() {
                 // The paths already published are stale now; the capacity
                 // check above leaves room for them.
@@ -2575,16 +3126,60 @@ impl<T: StreamTerms> Network<T> {
         self.stale_aliases.retain(|key| !mine(key));
         let admission = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
         outbound.set_admission_slot(std::sync::Arc::clone(&admission));
-        let posted = self
-            .links
-            .sender
-            .post(|reply| AgentCommand::AddPublication {
-                reply,
-                publication,
-                outbound,
-                guard: spec,
-                roles,
-            });
+        // Its remote guard is followed first, on the receiver; its keys
+        // and abort authority reach the sender in the same command as the
+        // publication, one ring slot (H8 R3-5).
+        let (sender_binding, follow) = match auth {
+            None => (None, None),
+            Some(binding) => (Some(binding.sender), binding.follow),
+        };
+        let authenticated = sender_binding.is_some();
+        let followed = follow.is_none_or(|(follow, _)| {
+            self.links
+                .receiver
+                .post(|reply| AgentCommand::Authenticate {
+                    reply,
+                    binding: Box::new(crate::agents::roles::AuthBinding(follow)),
+                })
+                .is_ok()
+        });
+        let posted = if followed {
+            self.links.sender.post(|reply| {
+                let add = AgentCommand::AddPublication {
+                    reply,
+                    publication,
+                    outbound,
+                    guard: spec,
+                    roles,
+                };
+                match sender_binding {
+                    Some(binding) => AgentCommand::AddAuthenticated {
+                        binding: Box::new(crate::agents::roles::AuthBinding(binding)),
+                        add: Box::new(add),
+                    },
+                    None => add,
+                }
+            })
+        } else {
+            Err(crate::agents::AgentError::Busy(
+                crate::agents::AgentKind::Receiver,
+            ))
+        };
+        if posted.is_err() && authenticated {
+            // A follow already posted is undone by its own installation
+            // id, deferred if the ring is full; nothing else of the
+            // refused admission was posted.
+            if let Some(wire) = self.wire.as_mut() {
+                wire.count_busy();
+            }
+            if let Some(unfollow) = self
+                .wire
+                .as_mut()
+                .and_then(|wire| wire.unfollow(registration))
+            {
+                self.post_receiver_binding(Box::new(crate::agents::roles::AuthBinding(unfollow)));
+            }
+        }
         if posted.is_err() {
             // The receiver learned the aliases: they are stale now. The
             // capacity check above leaves room for them.
@@ -2716,6 +3311,15 @@ impl<T: StreamTerms> Network<T> {
     ) -> bool {
         // A reincarnation ends with its publication: nothing is added.
         let reincarnating = self.end_reincarnation(registration);
+        // The last publication guarded by a remote guard unfollows it
+        // (karyos#648).
+        if let Some(unfollow) = self
+            .wire
+            .as_mut()
+            .and_then(|wire| wire.unfollow(registration))
+        {
+            self.post_receiver_binding(Box::new(crate::agents::roles::AuthBinding(unfollow)));
+        }
         let Some(entry) = self
             .publications
             .iter_mut()
@@ -3059,6 +3663,60 @@ impl<T: StreamTerms> Network<T> {
             .unwrap_or_default()
     }
 
+    /// Posts the sender's `SenderAbortEnded` for incarnation `incarnation`
+    /// of the publication `registration` into the sender agent's event
+    /// ring, where the conductor's duty takes it as any agent event
+    /// (tests): returns whether the ring took it.
+    #[cfg(test)]
+    pub(crate) fn post_abort_ended(&self, registration: u64, incarnation: u64) -> bool {
+        let Some(entry) = self
+            .publications
+            .iter()
+            .find(|entry| entry.registration == registration)
+        else {
+            return false;
+        };
+        self.links.sender.post_event(AgentEvent::SenderAbortEnded {
+            endpoint: entry.endpoint,
+            alias: entry.alias,
+            identity: karyos_protocol::network::Identity {
+                driver_id: entry.traced.driver,
+                registration_id: registration,
+                incarnation,
+            },
+            interrupted: true,
+            lanes: None,
+        })
+    }
+
+    /// The endpoint and alias of the publication `registration` (tests).
+    #[cfg(test)]
+    pub(crate) fn key_of(&self, registration: u64) -> Option<(EndpointId, Alias)> {
+        self.publications
+            .iter()
+            .find(|entry| entry.registration == registration)
+            .map(|entry| (entry.endpoint, entry.alias))
+    }
+
+    /// Whether the Shared sender holds a session of `alias` on
+    /// `endpoint`, and whether its receiver still publishes it (tests).
+    #[cfg(test)]
+    pub(crate) fn alias_held(&self, endpoint: EndpointId, alias: Alias) -> Option<(bool, bool)> {
+        match &self.agents {
+            Agents::Shared(agents) => Some(agents.alias_held(endpoint, alias)),
+            Agents::Threads(_) | Agents::Closed => None,
+        }
+    }
+
+    /// The incarnation of the publication `registration` (tests).
+    #[cfg(test)]
+    pub(crate) fn incarnation_of(&self, registration: u64) -> Option<u64> {
+        self.publications
+            .iter()
+            .find(|entry| entry.registration == registration)
+            .map(|entry| entry.traced.incarnation)
+    }
+
     pub(crate) fn publication_state(&self, registration: u64) -> Option<NetworkPublicationState> {
         if self
             .reincarnations
@@ -3091,6 +3749,7 @@ impl<T: StreamTerms> Network<T> {
         if let Some(agent) = self.failed {
             return Err(DriverError::NetworkAgent { agent });
         }
+        self.wire_duty();
         let work = match &mut self.agents {
             // The receiver first, as on a shared runner thread.
             Agents::Shared(agents) => guarded(AgentKind::Receiver, || agents.receiver.do_work(now))
@@ -3691,6 +4350,19 @@ fn release(table: &mut [SendEndpoint], endpoint: EndpointId) {
     }
 }
 
+/// Retires an active publication whose incarnation's SESSION_ABORT ended:
+/// it is removed with no linger (its gate sends nothing more, no EOS is
+/// due), and its alias goes to quarantine with the removal. Returns
+/// whether it was active.
+fn retire_aborted(entry: &mut NetPublication) -> bool {
+    if entry.state != NetworkPublicationState::Active {
+        return false;
+    }
+    entry.state = NetworkPublicationState::Removing;
+    entry.linger = Some(0);
+    true
+}
+
 /// Posts `RemovePublication`, with the `linger`, for every publication
 /// being removed that is not posted yet, after its sender journals'
 /// closes; then `RemoveSenderSession` for every one whose linger is over,
@@ -3954,6 +4626,27 @@ fn publication_answer<T: StreamTerms>(
                 entry.drained = true;
             }
         }
+        // An authenticated incarnation's SESSION_ABORT ended (acknowledged
+        // or interrupted): the incarnation is retired through its removal,
+        // with no linger since its gate sends nothing more, and its alias
+        // goes to quarantine as for any retired session (guards-and-abort.md,
+        // Session abort, sender step 5). A publication already being removed
+        // or reincarnated keeps that course.
+        // Only its exact incarnation: a report delayed across a
+        // replacement retires nothing else (H8).
+        AgentEvent::SenderAbortEnded {
+            endpoint,
+            alias,
+            identity,
+            ..
+        } => {
+            if let Some(entry) = find(publications, endpoint, alias, identity.registration_id)
+                .and_then(|index| publications.get_mut(index))
+                && entry.traced.incarnation == identity.incarnation
+            {
+                retire_aborted(entry);
+            }
+        }
         // A late etf drop report: counted for the publication it names,
         // and kept for the error log while there is room.
         AgentEvent::EtfLateDropReport {
@@ -4196,6 +4889,7 @@ pub mod control_group;
 mod publish;
 mod subscribe;
 pub(crate) mod trace;
+pub mod wire;
 
 #[cfg(test)]
 mod e2e;
