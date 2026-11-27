@@ -848,6 +848,22 @@ pub trait ConsensusCore: Sized {
         Err(InstallRefused::Unsupported)
     }
 
+    /// Whether [`ConsensusCore::install`] would take a snapshot at
+    /// `base`: the admission a node checks before it publishes the
+    /// snapshot over its service and log, with no other call to the core
+    /// in between, so the install it then reports is never refused (C6,
+    /// karyos#681).
+    ///
+    /// # Errors
+    ///
+    /// As [`ConsensusCore::install`]: [`InstallRefused::Unsupported`], the
+    /// default; [`InstallRefused::Stale`] for a core that leads or already
+    /// committed the base.
+    fn can_install(&self, base: SnapshotBase) -> Result<(), InstallRefused> {
+        let _ = base;
+        Err(InstallRefused::Unsupported)
+    }
+
     /// Hands the leadership over to `to`, which leads the next term once
     /// it holds the whole log (W5's leader change).
     ///

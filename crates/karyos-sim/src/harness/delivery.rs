@@ -77,7 +77,9 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         ) {
             Ok(node) => node,
             Err(NodeError::Log(error)) => return Err(error),
-            Err(error @ (NodeError::Config(_) | NodeError::Snapshot(_))) => {
+            Err(
+                error @ (NodeError::Config(_) | NodeError::Snapshot(_) | NodeError::Restore(_)),
+            ) => {
                 panic!("a session table the harness can hold: {error:?}")
             }
         };
@@ -139,6 +141,14 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
     #[must_use]
     pub fn with_hold(mut self, hold: Box<dyn HoldSource>) -> Self {
         self.node = self.node.with_hold(hold);
+        self
+    }
+
+    /// As [`ClusterNode::with_stop_after_publish`].
+    #[cfg(feature = "test-hooks")]
+    #[must_use]
+    pub fn with_stop_after_publish(mut self) -> Self {
+        self.node = self.node.with_stop_after_publish();
         self
     }
 

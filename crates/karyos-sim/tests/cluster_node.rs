@@ -13,7 +13,11 @@
 //!   the node refuses every such message;
 //! - the log compacts through the snapshot store, a restart stands on the
 //!   latest snapshot, a follower behind the purge installs the leader's,
-//!   and no prefix purge crosses the Archive's hold (A2's purge floor).
+//!   and no prefix purge crosses the Archive's hold (A2's purge floor);
+//! - an install keeps the snapshot the node stands on until it is durable,
+//!   waits out the Archive's hold without publishing, and a node without a
+//!   snapshot store refuses a snapshot and keeps running; a node an
+//!   earlier process left reopens from its log and snapshots.
 
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
@@ -22,6 +26,7 @@ use karyos_archive::segment::Geometry;
 use karyos_cluster::DedupConfig;
 use karyos_cluster::custom::Custom;
 use karyos_cluster::driver::ConsensusCore;
+use karyos_cluster::node::Storage;
 use karyos_cluster::service::{ContainerConfig, ServiceSnapshot};
 use karyos_cluster::snapshot::SnapshotConfig;
 use karyos_sim::cluster::ClusterSim;
@@ -29,6 +34,7 @@ use karyos_sim::disk::{SimDisk, Survives};
 use karyos_sim::harness::delivery::{
     Answer, AppendService, Delivery, DeliveryClient, DeliveryMember, DeliveryServer,
 };
+use karyos_sim::harness::node::{LOG_DIR, SNAPSHOT_DIR};
 use karyos_sim::net::{LinkConfig, NodeId};
 use karyos_sim::scenarios;
 
@@ -61,7 +67,10 @@ fn cluster(
     seed: u64,
     servers: u32,
     clients: Vec<Vec<Vec<u8>>>,
-    make: impl Fn(DeliveryServer<Custom, AppendService>) -> DeliveryServer<Custom, AppendService>,
+    make: impl Fn(
+        NodeId,
+        DeliveryServer<Custom, AppendService>,
+    ) -> DeliveryServer<Custom, AppendService>,
 ) -> (Sim, Vec<NodeId>) {
     let mut sim = Sim::new("cluster-node", seed, LinkConfig::default()).unwrap();
     for id in 0..servers {
@@ -75,7 +84,7 @@ fn cluster(
             config(),
         )
         .unwrap();
-        let member = Member::Server(Box::new(make(server)));
+        let member = Member::Server(Box::new(make(id, server)));
         assert_eq!(sim.add_node(member, 0, 0).unwrap(), id);
     }
     let ids = clients
@@ -158,7 +167,7 @@ fn test_cluster_node_requests_are_applied_and_answered_on_3_and_5_servers() {
                 seed,
                 servers,
                 vec![values(&[10, 20, 30]), values(&[40])],
-                |server| server,
+                |_, server| server,
             );
             run_until(&mut sim, "every client answered", |sim| {
                 all_done(sim, &clients)
@@ -194,7 +203,7 @@ fn test_cluster_node_the_same_seed_gives_the_same_run() {
                 0xC6,
                 servers,
                 vec![values(&[1, 2, 3]), values(&[4, 5])],
-                |server| server,
+                |_, server| server,
             );
             run_until(&mut sim, "every client answered", |sim| {
                 all_done(sim, &clients)
@@ -217,7 +226,7 @@ fn test_cluster_node_the_same_seed_gives_the_same_run() {
 fn test_cluster_node_a_rejoining_follower_disrupts_no_leader() {
     for servers in [3, 5] {
         for seed in scenarios::seeds() {
-            let (mut sim, clients) = cluster(seed, servers, vec![values(&[7])], |server| server);
+            let (mut sim, clients) = cluster(seed, servers, vec![values(&[7])], |_, server| server);
             run_until(&mut sim, "every client answered", |sim| {
                 all_done(sim, &clients)
             });
@@ -252,7 +261,7 @@ fn test_cluster_node_refuses_what_a_driver_releases_before_it_is_durable() {
     use karyos_cluster::driver::DriveFault;
 
     for servers in [3, 5] {
-        let (mut sim, _clients) = cluster(0xC6, servers, vec![values(&[1, 2])], |server| {
+        let (mut sim, _clients) = cluster(0xC6, servers, vec![values(&[1, 2])], |_, server| {
             server.with_drive_fault(DriveFault::ReleaseEarly)
         });
         run_until(&mut sim, "an early release refused", |sim| {
@@ -289,7 +298,9 @@ fn applied_all(sim: &Sim, servers: u32, count: usize) -> bool {
 fn test_cluster_node_compacts_through_the_snapshot_store_and_restarts_from_it() {
     for servers in [3, 5] {
         for seed in scenarios::seeds() {
-            let (mut sim, clients) = cluster(seed, servers, vec![many(24)], compacting);
+            let (mut sim, clients) = cluster(seed, servers, vec![many(24)], |_, server| {
+                compacting(server)
+            });
             run_until(&mut sim, "every client answered", |sim| {
                 all_done(sim, &clients)
             });
@@ -327,7 +338,7 @@ fn test_cluster_node_compacts_through_the_snapshot_store_and_restarts_from_it() 
 #[test]
 fn test_cluster_node_never_purges_across_the_archive_hold() {
     for hold in [HoldState::Held, HoldState::Pending, HoldState::Unknown] {
-        let (mut sim, clients) = cluster(0xC6, 3, vec![many(16)], |server| {
+        let (mut sim, clients) = cluster(0xC6, 3, vec![many(16)], |_, server| {
             compacting(server).with_hold(Box::new(hold))
         });
         run_until(&mut sim, "every client answered", |sim| {
@@ -351,7 +362,9 @@ fn test_cluster_node_never_purges_across_the_archive_hold() {
 fn test_cluster_node_a_follower_behind_the_purge_installs_the_leaders_snapshot() {
     for servers in [3, 5] {
         for seed in scenarios::seeds() {
-            let (mut sim, clients) = cluster(seed, servers, vec![values(&[1])], compacting);
+            let (mut sim, clients) = cluster(seed, servers, vec![values(&[1])], |_, server| {
+                compacting(server)
+            });
             run_until(&mut sim, "the first answer", |sim| all_done(sim, &clients));
             let (leader_id, _) = leader(&sim, servers).unwrap();
             let lagging = (leader_id + 1) % servers;
@@ -378,4 +391,303 @@ fn test_cluster_node_a_follower_behind_the_purge_installs_the_leaders_snapshot()
             replicas_agree(&sim, servers);
         }
     }
+}
+
+/// `server` compacting at `config`, with the parts of each snapshot.
+fn compacting_at(
+    server: DeliveryServer<Custom, AppendService>,
+    config: SnapshotConfig,
+) -> DeliveryServer<Custom, AppendService> {
+    server
+        .with_snapshots(config, ServiceSnapshot::new(4096, 4))
+        .unwrap()
+}
+
+/// Crashes the follower after the leader, lets the others apply `more`
+/// values and purge what it needs next, and returns it with the leader.
+fn lag_behind_the_purge(sim: &mut Sim, servers: u32, more: u64) -> (NodeId, NodeId) {
+    let (leader_id, _) = leader(sim, servers).unwrap();
+    let lagging = (leader_id + 1) % servers;
+    sim.crash(lagging).unwrap();
+    let client = sim
+        .add_node(
+            Member::Client(DeliveryClient::new(next_id(sim), leader_id, many(more))),
+            0,
+            0,
+        )
+        .unwrap();
+    run_until(sim, "the second client answered", |sim| {
+        all_done(sim, &[client])
+    });
+    assert!(server(sim, leader_id).first_index().unwrap() > 2);
+    (leader_id, lagging)
+}
+
+/// The id the next node added gets.
+fn next_id(sim: &Sim) -> NodeId {
+    NodeId::try_from(sim.ids().len()).unwrap()
+}
+
+/// The values its container holds.
+fn held(sim: &Sim, id: NodeId) -> usize {
+    server(sim, id).container().service().values.len()
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn test_cluster_node_a_crash_after_publishing_an_install_restarts_on_the_snapshot_it_stood_on() {
+    // One snapshot kept: without the pin, publishing the leader's would
+    // remove the one the lagging server's log stands on.
+    let config = SnapshotConfig::default()
+        .with_every_entries(4)
+        .with_allowance(0)
+        .with_keep(1);
+    let (mut sim, clients) = cluster(0xC6, 3, vec![many(10)], |_, server| {
+        compacting_at(server, config).with_stop_after_publish()
+    });
+    run_until(&mut sim, "the first answers", |sim| all_done(sim, &clients));
+    run_until(&mut sim, "every replica applied", |sim| {
+        applied_all(sim, 3, 10)
+    });
+    let (_, lagging) = lag_behind_the_purge(&mut sim, 3, 20);
+    let stood_on = server(&sim, lagging).snapshots().to_vec();
+    assert_eq!(stood_on.len(), 1);
+    sim.restart(lagging).unwrap();
+    run_until(&mut sim, "the install published and stopped", |sim| {
+        !server(sim, lagging).is_up()
+    });
+    // The crash the stop stands for, then the restart: the node stands on
+    // the snapshot it had, with its state, not on an empty container.
+    sim.crash(lagging).unwrap();
+    sim.restart(lagging).unwrap();
+    let node = server(&sim, lagging);
+    assert!(node.is_up());
+    assert_eq!(node.base().map(|base| base.index), Some(stood_on[0].index));
+    assert!(held(&sim, lagging) >= 1, "the state it stood on");
+}
+
+/// The Archive's hold one node reads, switched by the test.
+#[derive(Clone)]
+struct Switch(std::rc::Rc<std::cell::Cell<HoldState>>);
+
+impl karyos_cluster::log::HoldSource for Switch {
+    fn hold_state(&self) -> HoldState {
+        self.0.get()
+    }
+}
+
+#[test]
+fn test_cluster_node_an_install_under_the_archive_hold_is_taken_once_the_hold_clears() {
+    let switches: Vec<Switch> = (0..3)
+        .map(|_| Switch(std::rc::Rc::new(std::cell::Cell::new(HoldState::None))))
+        .collect();
+    let (mut sim, clients) = cluster(0xC6, 3, vec![values(&[1])], |id, server| {
+        compacting(server).with_hold(Box::new(switches[id as usize].clone()))
+    });
+    run_until(&mut sim, "the first answer", |sim| all_done(sim, &clients));
+    let (_, lagging) = lag_behind_the_purge(&mut sim, 3, 20);
+    let before = server(&sim, lagging).snapshots().to_vec();
+    switches[lagging as usize].0.set(HoldState::Held);
+    sim.restart(lagging).unwrap();
+    sim.run_for(3_000).unwrap();
+    // Held: nothing published, nothing installed, still up.
+    let node = server(&sim, lagging);
+    assert!(node.is_up());
+    assert_eq!(node.snapshots(), &before[..]);
+    assert_eq!(held(&sim, lagging), 1);
+    switches[lagging as usize].0.set(HoldState::None);
+    run_until(&mut sim, "the install once the hold cleared", |sim| {
+        held(sim, lagging) == 21
+    });
+    replicas_agree(&sim, 3);
+}
+
+#[test]
+fn test_cluster_node_without_a_snapshot_store_refuses_a_snapshot_and_keeps_running() {
+    // A snapshot from a compacting run, past everything the other run
+    // applies.
+    let (mut source, clients) = cluster(0xC6, 3, vec![many(30)], |_, server| compacting(server));
+    run_until(&mut source, "every client answered", |sim| {
+        all_done(sim, &clients)
+    });
+    let (base, sections) = server(&source, 0).latest_snapshot().unwrap();
+    let (mut sim, clients) = cluster(0xC6, 3, vec![values(&[1])], |_, server| server);
+    run_until(&mut sim, "the first answer", |sim| all_done(sim, &clients));
+    let (leader_id, _) = leader(&sim, 3).unwrap();
+    let follower = (leader_id + 1) % 3;
+    sim.send(leader_id, follower, Delivery::Snapshot { base, sections })
+        .unwrap();
+    sim.run_for(200).unwrap();
+    assert!(server(&sim, follower).is_up());
+    let client = sim
+        .add_node(
+            Member::Client(DeliveryClient::new(next_id(&sim), leader_id, values(&[2]))),
+            0,
+            0,
+        )
+        .unwrap();
+    run_until(&mut sim, "the next request", |sim| all_done(sim, &[client]));
+    run_until(&mut sim, "the follower applied it", |sim| {
+        held(sim, follower) == 2
+    });
+}
+
+#[test]
+fn test_cluster_node_opens_the_log_and_snapshots_an_earlier_process_left() {
+    let policy = SnapshotConfig::default()
+        .with_every_entries(4)
+        .with_allowance(0);
+    let (mut sim, clients) = cluster(0xC6, 3, vec![many(24)], |_, server| {
+        compacting_at(server, policy)
+    });
+    run_until(&mut sim, "every client answered", |sim| {
+        all_done(sim, &clients)
+    });
+    run_until(&mut sim, "every replica applied", |sim| {
+        applied_all(sim, 3, 24)
+    });
+    sim.crash(2).unwrap();
+    let disk = server(&sim, 2).disk().clone();
+    let at = (disk.clone(), std::path::Path::new(LOG_DIR));
+    // A new log over it is refused: the directory holds one.
+    assert!(
+        karyos_cluster::node::ClusterNode::<Custom, AppendService, SimDisk>::new(
+            2,
+            vec![0, 1, 2],
+            at.clone(),
+            Geometry::new(4096, 4096).unwrap(),
+            AppendService::default(),
+            config(),
+        )
+        .is_err()
+    );
+    let mut opened = karyos_cluster::node::ClusterNode::<Custom, AppendService, SimDisk>::open(
+        2,
+        vec![0, 1, 2],
+        at,
+        Geometry::new(4096, 4096).unwrap(),
+        AppendService::default(),
+        config(),
+        Storage {
+            snapshots: Some((
+                std::path::Path::new(SNAPSHOT_DIR),
+                policy,
+                ServiceSnapshot::new(4096, 4),
+            )),
+            hold: None,
+        },
+    )
+    .unwrap();
+    assert!(opened.is_up());
+    assert!(opened.base().is_some(), "it stands on its latest snapshot");
+    let mut out = Vec::new();
+    for now in 1..=50 {
+        opened.tick(now, &mut out);
+    }
+    assert_eq!(
+        opened.container().service().values,
+        (1..=24).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_cluster_node_a_follower_holding_the_snapshot_base_keeps_its_log_after_it() {
+    // A snapshot after every entry, and no purge.
+    let policy = SnapshotConfig::default()
+        .with_every_entries(1)
+        .with_allowance(u64::MAX);
+    let (mut sim, clients) = cluster(0xC6, 3, vec![values(&[1])], |_, server| {
+        compacting_at(server, policy)
+    });
+    run_until(&mut sim, "the first answer", |sim| all_done(sim, &clients));
+    run_until(&mut sim, "every replica applied", |sim| {
+        applied_all(sim, 3, 1)
+    });
+    let (leader_id, _) = leader(&sim, 3).unwrap();
+    let follower = (leader_id + 1) % 3;
+    let other = (leader_id + 2) % 3;
+    let client = sim
+        .add_node(
+            Member::Client(DeliveryClient::new(next_id(&sim), leader_id, values(&[2]))),
+            0,
+            0,
+        )
+        .unwrap();
+    // The follower holds the request's entry, and has not learned it
+    // committed: then the leader's messages to it stop.
+    let core = |sim: &Sim, id| {
+        let core = server(sim, id).core().unwrap();
+        (core.received(), core.committed())
+    };
+    for _ in 0..PATIENCE {
+        let (received, committed) = core(&sim, follower);
+        // The leader took the request: its entry is the last there is.
+        if server(&sim, leader_id).pending_requests() > 0
+            && received.is_some()
+            && received == core(&sim, leader_id).0
+            && committed < received
+        {
+            break;
+        }
+        sim.step().unwrap();
+    }
+    let (received, committed) = core(&sim, follower);
+    assert!(committed < received, "{committed:?} {received:?}");
+    sim.net_mut().cut(leader_id, follower);
+    run_until(&mut sim, "the leader answered", |sim| {
+        all_done(sim, &[client])
+    });
+    let (base, sections) = server(&sim, leader_id).latest_snapshot().unwrap();
+    assert_eq!(
+        Some(base.index),
+        received,
+        "the snapshot's base is the follower's last entry"
+    );
+    let before = (
+        server(&sim, follower).base(),
+        server(&sim, follower).snapshots().to_vec(),
+    );
+    // A delayed snapshot at the base its log holds: no install, which
+    // would cut the entries after the base the leader may count.
+    sim.send(other, follower, Delivery::Snapshot { base, sections })
+        .unwrap();
+    sim.run_for(50).unwrap();
+    let node = server(&sim, follower);
+    assert!(node.is_up());
+    assert_eq!(node.first_index(), Some(1));
+    assert_eq!((node.base(), node.snapshots().to_vec()), before);
+    sim.net_mut().heal();
+    run_until(&mut sim, "every replica applied", |sim| {
+        applied_all(sim, 3, 2)
+    });
+    replicas_agree(&sim, 3);
+}
+
+#[test]
+fn test_cluster_node_a_leader_refuses_a_snapshot_past_its_commit_unchanged() {
+    // A snapshot from a run that applied more than this one ever does.
+    let (mut source, clients) = cluster(0xC6, 3, vec![many(30)], |_, server| compacting(server));
+    run_until(&mut source, "every client answered", |sim| {
+        all_done(sim, &clients)
+    });
+    let (base, sections) = server(&source, 0).latest_snapshot().unwrap();
+    let (mut sim, clients) = cluster(0xC6, 3, vec![values(&[1])], |_, server| compacting(server));
+    run_until(&mut sim, "the first answer", |sim| all_done(sim, &clients));
+    let (leader_id, term) = leader(&sim, 3).unwrap();
+    let before = (
+        server(&sim, leader_id).first_index(),
+        server(&sim, leader_id).base(),
+        held(&sim, leader_id),
+    );
+    let follower = (leader_id + 1) % 3;
+    sim.send(follower, leader_id, Delivery::Snapshot { base, sections })
+        .unwrap();
+    sim.run_for(50).unwrap();
+    let node = server(&sim, leader_id);
+    assert!(node.is_up());
+    assert_eq!(leader(&sim, 3), Some((leader_id, term)));
+    assert_eq!(
+        (node.first_index(), node.base(), held(&sim, leader_id)),
+        before
+    );
 }

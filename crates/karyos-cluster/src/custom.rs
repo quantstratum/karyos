@@ -1228,6 +1228,12 @@ impl ConsensusCore for Custom {
         Ok(())
     }
 
+    fn can_install(&self, base: SnapshotBase) -> Result<(), InstallRefused> {
+        self.core
+            .can_install(base.index)
+            .map_err(|_| InstallRefused::Stale)
+    }
+
     fn install(&mut self, base: SnapshotBase, log: &mut LogView<'_>) -> Result<(), InstallRefused> {
         self.core
             .can_install(base.index)

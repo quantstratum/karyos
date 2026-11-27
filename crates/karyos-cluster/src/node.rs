@@ -55,7 +55,7 @@ use crate::driver::{
 use crate::log::HoldSource;
 use crate::service::{
     Applied, ApplyError, ClusteredService, ContainerConfig, Envelope, NotLeader, Propose,
-    ProposeRefused, ServiceContainer, ServiceSnapshot, SessionBounds,
+    ProposeRefused, RestoreError, ServiceContainer, ServiceSnapshot, SessionBounds,
 };
 use crate::snapshot::{
     Section, SectionKind, SectionRead, SnapshotConfig, SnapshotError, SnapshotInfo, SnapshotStore,
@@ -80,6 +80,20 @@ pub enum NodeError {
     /// The snapshot store's refusal to open.
     #[error("the node's snapshot store: {0}")]
     Snapshot(#[from] SnapshotError),
+    /// The container's refusal to restore the snapshot the log stands on.
+    #[error("the node's snapshot restore: {0}")]
+    Restore(#[from] RestoreError),
+}
+
+/// What [`ClusterNode::open`] reopens beside the log: the snapshot store
+/// (its directory, policy and the service's parts, as
+/// [`ClusterNode::with_snapshots`] takes them) and the Archive's hold.
+#[derive(Default)]
+pub struct Storage<'a> {
+    /// The snapshot store, for a node that compacts.
+    pub snapshots: Option<(&'a Path, SnapshotConfig, ServiceSnapshot)>,
+    /// The Archive's hold on the log.
+    pub hold: Option<Box<dyn HoldSource>>,
 }
 
 /// The version of the node's consensus section: the core's last applied
@@ -396,6 +410,9 @@ pub struct ClusterNode<C: ConsensusCore, S, D: Disk + Clone> {
     held_purges: u64,
     /// The core's last applied configuration entry (karyos#711).
     configuration: Option<Vec<u8>>,
+    /// Stops right after an installed snapshot is published (tests).
+    #[cfg(feature = "test-hooks")]
+    stop_after_publish: bool,
 }
 
 impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode<C, S, D> {
@@ -418,14 +435,72 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
         let container = ServiceContainer::new(service.clone(), config)?;
         let mut log = RaftLog::create(disk.clone(), dir, geometry, 1)?;
         let core = C::recover(id, &peers, &mut LogView::new(&mut log));
-        Ok(Self {
+        let mut node = Self::down(
+            id,
+            peers,
+            (disk, dir),
+            geometry,
+            (service, container),
+            config,
+        );
+        node.running = Some((core, log));
+        Ok(node)
+    }
+
+    /// Server `id` of `peers` over the log in `dir` on `disk` that an
+    /// earlier process left, with `service`: the snapshot store and the
+    /// Archive's hold of `storage` are opened as
+    /// [`ClusterNode::with_snapshots`] and [`ClusterNode::with_hold`] set
+    /// them, then the node starts as a restart does, from the latest
+    /// snapshot its log stands on and the entries after it.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError`]: the store, the log, the container configuration or
+    /// the snapshot's restore refused.
+    pub fn open(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        (disk, dir): (D, &Path),
+        geometry: Geometry,
+        service: S,
+        config: ContainerConfig,
+        storage: Storage<'_>,
+    ) -> Result<Self, NodeError> {
+        let container = ServiceContainer::new(service.clone(), config)?;
+        let mut node = Self::down(
+            id,
+            peers,
+            (disk, dir),
+            geometry,
+            (service, container),
+            config,
+        );
+        node.hold = storage.hold;
+        if let Some((snapshots, config, parts)) = storage.snapshots {
+            node = node.with_snapshots(snapshots, config, parts)?;
+        }
+        node.start()?;
+        Ok(node)
+    }
+
+    /// A node that is not running yet.
+    fn down(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        (disk, dir): (D, &Path),
+        geometry: Geometry,
+        (service, container): (S, ServiceContainer<S>),
+        config: ContainerConfig,
+    ) -> Self {
+        Self {
             id,
             peers,
             geometry,
             disk,
             dir: dir.to_path_buf(),
             seal_interval: DEFAULT_SEAL_INTERVAL,
-            running: Some((core, log)),
+            running: None,
             container,
             fresh: service,
             config,
@@ -464,7 +539,35 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
             hold: None,
             held_purges: 0,
             configuration: None,
-        })
+            #[cfg(feature = "test-hooks")]
+            stop_after_publish: false,
+        }
+    }
+
+    /// Stops right after an installed snapshot is published, before the
+    /// log stands on it, as a crash there would (the `test-hooks`
+    /// feature): the node goes down until a restart.
+    #[cfg(feature = "test-hooks")]
+    #[must_use]
+    pub fn with_stop_after_publish(mut self) -> Self {
+        self.stop_after_publish = true;
+        self
+    }
+
+    /// Its latest snapshot and its sections, as a leader sends it to a
+    /// follower its log no longer serves.
+    #[must_use]
+    pub fn latest_snapshot(&self) -> Option<(SnapshotBase, Vec<SectionRead>)> {
+        let snapshots = self.snapshots.as_ref()?;
+        let info = snapshots.store.latest()?;
+        let sections = snapshots.store.read(&info).ok()?;
+        Some((
+            SnapshotBase {
+                index: info.index,
+                term: info.term,
+            },
+            sections,
+        ))
     }
 
     /// Compacts its log through a snapshot store in `dir` on its disk, at
@@ -1037,91 +1140,120 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
 
     /// Sends `to` its latest snapshot, which its core asked for.
     fn send_snapshot(&self, to: NodeId, out: &mut Outbox<Delivery<C::Message>>) {
-        let Some(snapshots) = self.snapshots.as_ref() else {
-            return;
-        };
-        let Some(info) = snapshots.store.latest() else {
-            return;
-        };
-        let Ok(sections) = snapshots.store.read(&info) else {
-            return;
-        };
-        out.push((
-            to,
-            Delivery::Snapshot {
-                base: SnapshotBase {
-                    index: info.index,
-                    term: info.term,
-                },
-                sections,
-            },
-        ));
+        if let Some((base, sections)) = self.latest_snapshot() {
+            out.push((to, Delivery::Snapshot { base, sections }));
+        }
     }
 
     /// Installs a leader's snapshot at `base`: it goes to the store, a
     /// fresh container restores it, the log starts after it, and the core
-    /// is told. A stale or refused one changes nothing; a log the install
-    /// fails stops the node until a restart.
+    /// is told. A node without a snapshot store, or one the snapshot does
+    /// not move, keeps running unchanged; a log the install fails stops
+    /// the node until a restart, which recovers from what is durable.
     fn install(&mut self, base: SnapshotBase, sections: &[SectionRead]) {
-        if self
-            .container
-            .applied()
-            .is_some_and(|applied| applied >= base.index)
+        if self.snapshots.is_none()
+            || self
+                .container
+                .applied()
+                .is_some_and(|applied| applied >= base.index)
         {
             return;
         }
-        let (Some(snapshots), Some((mut core, mut log))) =
-            (self.snapshots.as_mut(), self.running.take())
-        else {
+        let Some((mut core, mut log)) = self.running.take() else {
             return;
         };
-        let restored = ServiceContainer::new(self.fresh.clone(), self.config)
+        if self.install_into(&mut core, &mut log, base, sections) {
+            self.running = Some((core, log));
+        }
+    }
+
+    /// [`ClusterNode::install`] over the node's core and log: whether the
+    /// node keeps running.
+    fn install_into(
+        &mut self,
+        core: &mut C,
+        log: &mut RaftLog<D>,
+        base: SnapshotBase,
+        sections: &[SectionRead],
+    ) -> bool {
+        // A log that holds the base's entry keeps the entries after it,
+        // which the leader may already count (Raft's figure 13, step 6):
+        // it installs nothing, and the entries apply as they commit.
+        if log.term(base.index) == Some(base.term) {
+            return true;
+        }
+        // The core's admission before anything changes, with no other call
+        // to it until the install it then reports (a leader, or a commit at
+        // the base, refuses).
+        if core.can_install(base).is_err() {
+            return true;
+        }
+        // The Archive's hold before anything is published: the leader asks
+        // again, and the same snapshot installs once the hold clears.
+        let hold = Hold(self.hold.as_deref());
+        if hold.hold_state() != HoldState::None {
+            return true;
+        }
+        let Some(container) = ServiceContainer::new(self.fresh.clone(), self.config)
             .ok()
             .and_then(|mut container| {
                 container.restore(base.index, sections).ok()?;
                 Some(container)
+            })
+        else {
+            return true;
+        };
+        let Some(snapshots) = self.snapshots.as_mut() else {
+            return true;
+        };
+        // Published unless an earlier attempt published it, keeping the
+        // snapshot the node stands on until the install is durable.
+        let published = snapshots
+            .store
+            .latest()
+            .is_some_and(|info| info.index == base.index && info.term == base.term);
+        if !published {
+            let pin = self.base.and_then(|active| {
+                snapshots
+                    .store
+                    .snapshots()
+                    .iter()
+                    .find(|kept| kept.index == active.index && kept.term == active.term)
+                    .map(|kept| kept.id)
             });
-        let written = restored.is_some() && {
-            let borrowed: Vec<Section<'_>> = sections
-                .iter()
-                .map(|section| Section::new(section.kind, section.version, &section.bytes))
-                .collect();
-            snapshots
-                .store
-                .write(base.index, base.term, &borrowed)
-                .is_ok()
-        };
-        let (Some(container), true) = (restored, written) else {
-            self.running = Some((core, log));
-            return;
-        };
-        match log.install_under(
-            base.index,
-            base.term,
-            &snapshots.store,
-            &Hold(self.hold.as_deref()),
-        ) {
-            Ok(()) => {}
-            // Held: the log stays as it is, and the leader asks again.
-            Err(LogError::ArchiveHeld { .. }) => {
-                self.running = Some((core, log));
-                return;
+            if publish(&mut snapshots.store, base, sections, pin).is_err() {
+                return true;
             }
+        }
+        #[cfg(feature = "test-hooks")]
+        if self.stop_after_publish {
+            return false;
+        }
+        match log.install_under(base.index, base.term, &snapshots.store, &hold) {
+            Ok(()) => {}
+            // Refused whole, changing nothing: the leader asks again.
+            Err(
+                LogError::ArchiveHeld { .. }
+                | LogError::InstallStale { .. }
+                | LogError::InstallUnverified { .. },
+            ) => return true,
             // The log is poisoned: down until a restart.
-            Err(_) => return,
+            Err(_) => return false,
         }
         self.container = container;
         self.configuration = consensus_section(sections);
         self.base = Some(base);
         self.since = (base.index, 0);
-        let _ = core.install(
+        // Admitted above, so never refused; were it, the core would not
+        // stand on the log, and a restart recovers both from the disk.
+        core.install(
             base,
-            &mut LogView::new(&mut log)
+            &mut LogView::new(log)
                 .with_base(Some(base))
                 .with_base_time(Some(self.container.sessions().log_time()))
                 .with_base_configuration(self.configuration.clone()),
-        );
-        self.running = Some((core, log));
+        )
+        .is_ok()
     }
 
     fn apply(&mut self, entry: &Entry, out: &mut Outbox<Delivery<C::Message>>) {
@@ -1216,41 +1348,36 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
     /// and rebuilds the container from the entries it hands out again.
     pub fn restart(&mut self, disk: D) {
         self.disk = disk;
-        self.start();
+        // A node that cannot start stays down: what failed is durable, and
+        // the next restart tries again.
+        let _ = self.start();
     }
 
     /// Opens the snapshot store and the log, restores the container from
     /// the snapshot the log stands on, recovers the core and rebuilds the
     /// container from the entries it hands out again.
-    fn start(&mut self) {
+    fn start(&mut self) -> Result<(), NodeError> {
         if let Some(snapshots) = self.snapshots.as_mut() {
             // A store a crash cut short reopens without what it left
             // unpublished.
-            match SnapshotStore::open(
+            snapshots.store = SnapshotStore::open(
                 self.disk.clone(),
                 &snapshots.dir,
                 self.geometry,
                 snapshots.config,
-            ) {
-                Ok(opened) => snapshots.store = opened.store,
-                Err(_) => return,
-            }
+            )?
+            .store;
         }
         let store = self.snapshots.as_ref().map(|snapshots| &snapshots.store);
-        let Ok(opened) = RaftLog::open_with_under(
+        let opened = RaftLog::open_with_under(
             self.disk.clone(),
             &self.dir,
             self.geometry,
             store,
             &Hold(self.hold.as_deref()),
-        ) else {
-            return;
-        };
+        )?;
         let mut log = opened.log;
-        // Validated at `new`: the same configuration is held again.
-        let Ok(mut container) = ServiceContainer::new(self.fresh.clone(), self.config) else {
-            return;
-        };
+        let mut container = ServiceContainer::new(self.fresh.clone(), self.config)?;
         // The snapshot the log stands on: the newest its commit reaches.
         // One past the commit is an install a crash cut short.
         let commit = log.hard_state().and_then(|state| state.commit);
@@ -1266,9 +1393,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
         let mut base = None;
         let mut configuration = None;
         if let Some((info, sections)) = active {
-            if container.restore(info.index, &sections).is_err() {
-                return;
-            }
+            container.restore(info.index, &sections)?;
             base = Some(SnapshotBase {
                 index: info.index,
                 term: info.term,
@@ -1294,6 +1419,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone, D: Disk + Clone> ClusterNode
         self.deferred.clear();
         self.halted = None;
         self.running = Some((core, log));
+        Ok(())
     }
 }
 
@@ -1364,6 +1490,29 @@ fn durable(release: &Release) -> bool {
 
 /// The core's configuration entry a snapshot's consensus section holds:
 /// none when it is empty or missing (the bootstrap configuration).
+/// Publishes a leader's snapshot at `base` from its `sections`, keeping
+/// the kept snapshot `pin` from the purge (the one the node stands on
+/// until the new one is installed). An unfinished one is abandoned.
+fn publish<D: Disk + Clone>(
+    store: &mut SnapshotStore<D>,
+    base: SnapshotBase,
+    sections: &[SectionRead],
+    pin: Option<u64>,
+) -> Result<SnapshotInfo, SnapshotError> {
+    let mut pending = store.begin(base.index, base.term)?;
+    let written = sections.iter().try_for_each(|section| {
+        let length = u64::try_from(section.bytes.len()).map_err(|_| SnapshotError::Failed)?;
+        pending.section(section.kind, section.version, length)?;
+        pending.write(&section.bytes)
+    });
+    if let Err(error) = written {
+        let _ = store.abandon(pending);
+        return Err(error);
+    }
+    let sealed = store.seal(pending)?;
+    store.publish_sealed(sealed, pin)
+}
+
 fn consensus_section(sections: &[SectionRead]) -> Option<Vec<u8>> {
     sections
         .iter()
