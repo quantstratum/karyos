@@ -249,8 +249,12 @@ fn inv_r6_marks_only_rise_and_an_unknown_format_fails_closed() {
 /// abort that applies: the genuine in-scope SESSION_ABORT is verified,
 /// applied (the image closes) and its digest inserted; the identical
 /// datagram again is a cache hit, answered with the ACK resend and no
-/// verification; past the retention it is verified again and its entry
-/// replaces the expired one, so the cache holds one entry. No intake
+/// verification; past the retention it is verified again, and since its
+/// image is already closed it applies nothing, so it inserts nothing: the
+/// cache holds at most the one expired entry. Replacement itself, of an
+/// expired entry and of the oldest at capacity, is
+/// `signed_control::tests::the_digest_cache_replaces_an_expired_entry_and_the_oldest_at_capacity_without_allocating`
+/// (H8 review 6, R5-08). No intake
 /// step allocates, nor do the agents' duties after the hit and the
 /// expiry; the receiver duties right after the first application, which
 /// close and retire the aborted image, are outside the cache and not
@@ -307,7 +311,7 @@ fn inv_r6_the_digest_cache_inserts_hits_and_replaces_without_allocating() {
         "a hit resends the ACK"
     );
     assert_eq!((allocations, opens), (0, 0), "hit");
-    // Expiry: verified again; the expired entry is replaced in place.
+    // Expiry: verified again; the abort applies nothing more.
     rig.now += CACHE_RETENTION_NS;
     let (allocations, opens, around) = inject(&mut rig);
     assert_eq!(around, [0; 3], "the duties after an expiry allocated");
@@ -842,5 +846,142 @@ fn inv_r6_a_third_file_epoch_retires_the_first_at_once_and_epochs_never_go_back(
     assert!(
         !opens(&mut rig, b, source, slot, &mut old),
         "epoch 1 never again"
+    );
+}
+
+thread_local! {
+    /// The wall clock of [`store_at`]'s store, moved by the test.
+    static WALL: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+fn wall() -> i64 {
+    WALL.with(std::cell::Cell::get)
+}
+
+/// [`store_of`] whose store reads the wall clock [`WALL`].
+fn store_at(files: &[(&str, &str)], now: i64) -> (crate::net::wire::WireKeys, MemDir) {
+    use crate::wire_keys::store::KeyStore;
+
+    WALL.with(|clock| clock.set(now));
+    let (keys_dir, state_dir) = (MemDir::default(), MemDir::default());
+    for (name, text) in files {
+        keys_dir.put(name, text);
+    }
+    KeyStore::<MemDir, MemDir>::initialise(&state_dir, zeroize::Zeroizing::new([7; 32])).unwrap();
+    let _ = state_dir.names().unwrap();
+    let (wire, _) = crate::net::wire::WireKeys::start(
+        Box::new(keys_dir.clone()),
+        Box::new(state_dir),
+        Some(wall),
+    )
+    .unwrap();
+    (wire, keys_dir)
+}
+
+/// INV-ROT-1, the file-epoch deadline (ADR-0086 section 7; WK 2.3), a real
+/// key store across both agents on its wall clock (H8 review 6, R5-07):
+/// with epochs 1 and 2 of the channel loaded, DATA sealed under epoch 1
+/// still opens one second before epoch 1's deadline (epoch 2's
+/// `not_before` plus 24 hours, less the 60 s skew), and from the deadline
+/// the reload retires it: the same DATA is refused, only epoch 2 verifies.
+/// The in-band overlap (`inv_r6_the_previous_in_band_epoch_...`) is a
+/// different, 10 s bound.
+#[test]
+fn inv_r6_a_file_epoch_verifies_for_at_most_its_24_hour_overlap() {
+    use crate::wire_auth::Sealer;
+    use crate::wire_keys::store::{OVERLAP_S, SKEW_S};
+
+    // C2's `not_before`, 2026-11-20T00:00:00Z.
+    const C2_NOT_BEFORE: i64 = 1_795_132_800;
+    let deadline = C2_NOT_BEFORE + OVERLAP_S - SKEW_S;
+    let (mut wire, keys_dir) = store_at(&[("3-1.key", C1), ("9-1.key", P1)], rotation_wall());
+    let (mut rig, b, channel) = authenticated_rig();
+    let slot = established(&mut rig);
+    reload_and_apply(&mut rig, &mut wire, 0);
+    assert!(send_one(&mut rig, 200) >= 1);
+    let party = bound_party(&rig).unwrap();
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let reload_s = u64::try_from(crate::wire_keys::store::RELOAD_INTERVAL_S).unwrap();
+    let mut old = Sealer::new(&channel, party, alias()).unwrap();
+    old.jump_to(0, 1 << 20);
+
+    keys_dir.put("3-2.key", C2);
+    keys_dir.put("9-2.key", P2);
+    reload_and_apply(&mut rig, &mut wire, reload_s);
+    assert_eq!(verifying(&wire, 3), [1, 2]);
+    assert!(opens(&mut rig, b, source, slot, &mut old), "in the overlap");
+
+    WALL.with(|clock| clock.set(deadline - 1));
+    reload_and_apply(&mut rig, &mut wire, reload_s);
+    assert_eq!(verifying(&wire, 3), [1, 2], "a second before the deadline");
+    assert!(opens(&mut rig, b, source, slot, &mut old));
+
+    WALL.with(|clock| clock.set(deadline));
+    reload_and_apply(&mut rig, &mut wire, reload_s);
+    assert_eq!(verifying(&wire, 3), [2], "retired at the deadline");
+    assert!(
+        !opens(&mut rig, b, source, slot, &mut old),
+        "epoch 1 refused past its 24 hours"
+    );
+    assert!(send_one(&mut rig, 200) >= 1, "epoch 2 flows");
+}
+
+/// INV-ROT-4 (WK 2.3) at the agents with a verify-only side (H8 review 6,
+/// R5-07), through the real key store: receiver 77's pairwise epoch 2 is
+/// admitted while its `not_before` is still ahead, so the lineage's
+/// current epoch is 2 while only the retiring epoch 1 verifies, and there
+/// is no current key to verify under. Applied to the publication, a
+/// CHALLENGE verified under epoch 1 is refused as `PreviousEpoch`: no
+/// sealer is installed under the retiring key and nothing binds.
+#[test]
+fn inv_r6_a_verify_only_publication_never_binds_under_the_retiring_key() {
+    use crate::agents::roles::publish_auth::PublicationAuth;
+    use crate::agents::roles::receive_auth::{AuthReason, SubscriptionAuth};
+    use crate::wire_auth::KeySet as _;
+
+    const P2_AHEAD: &str = "format=karyos-wire-key-v1\nkey_id=9\nfile_epoch=2\npurpose=pairwise\nprofile_id=1\nnot_before=2026-12-01T00:00:00Z\nnot_after=2027-02-17T00:00:00Z\nsecret=4444444444444444444444444444444444444444444444444444444444444444\nreceiver_id=77\npublisher_id=5\n";
+    let (mut wire, keys_dir) = store_at(&[("3-1.key", C1), ("9-1.key", P1)], rotation_wall());
+    let (mut rig, b) = Rig::new(Setup {
+        auth: true,
+        reliable: true,
+        identity: Some(identity_77(0)),
+        ..Setup::default()
+    });
+    let (channel, previous) = auth_keys(77);
+    let a = rig.publisher;
+    rig.agents.receiver.role.authenticate_published(a, alias());
+    rig.agents.receiver.role.authenticate_subscription(
+        SubscriptionAuth::new(b, alias(), &channel, &previous, 77).unwrap(),
+    );
+    rig.agents.sender.role.authenticate_publication(
+        PublicationAuth::new(a, alias(), identity(), 2, &channel, &[&previous]).unwrap(),
+    );
+    reload_and_apply(&mut rig, &mut wire, 0);
+    keys_dir.put("9-2.key", P2_AHEAD);
+    let reload_s = u64::try_from(crate::wire_keys::store::RELOAD_INTERVAL_S).unwrap();
+    reload_and_apply(&mut rig, &mut wire, reload_s);
+    assert_eq!(wire.view().current_epoch(9), Some(2), "epoch 2 admitted");
+    assert_eq!(verifying(&wire, 9), [1], "only the retiring epoch verifies");
+    let b_at = rig.endpoints.local_address(b).unwrap();
+    let installed = rig.agents.sender.role.counters().auth_sealers_installed;
+    let before = refused_for(&rig, AuthReason::PreviousEpoch);
+    challenge_a(
+        &mut rig,
+        b_at,
+        &rsp_challenge(&previous, 77, [0xE0, 1], [1, 1]),
+        20,
+    );
+    // The injected CHALLENGE, and the receiver's own, sealed under its
+    // epoch 1 signing key, are each refused.
+    assert!(
+        refused_for(&rig, AuthReason::PreviousEpoch) > before,
+        "{:?}",
+        rig.agents.sender.role.publication_rejections(a, alias())
+    );
+    assert_eq!(bound_party(&rig), None, "nothing bound");
+    assert_eq!(
+        rig.agents.sender.role.counters().auth_sealers_installed,
+        installed,
+        "no sealer under the retiring key"
     );
 }
