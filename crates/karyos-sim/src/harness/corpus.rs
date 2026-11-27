@@ -144,8 +144,9 @@ pub struct Summary {
     pub errors: u64,
     /// Runs whose case needs a capability the core does not have.
     pub not_demonstrated: u64,
-    /// Per workload and fault kind: the runs in which it fell before the
-    /// first leader commit, during replication and after the last.
+    /// Per workload and fault kind: the seeds in which it fell before the
+    /// first leader commit, during replication and after the last, each
+    /// seed once however many of the workload's cases reached it.
     pub coverage: BTreeMap<(String, String), [u64; 3]>,
 }
 
@@ -383,6 +384,10 @@ fn corpus<C: ConsensusCore>(
     let mut summary = Summary::default();
     for seed in seeds {
         for (workload, cases) in workloads {
+            // A seed counts once per fault kind and phase in its workload,
+            // however many of its cases (W4's survival modes) or times in
+            // one run reach that kind there: the manifest counts seeds.
+            let mut counted = std::collections::BTreeSet::new();
             for case in &cases(seed) {
                 let mut faults = Vec::new();
                 let mut trace = None;
@@ -432,12 +437,8 @@ fn corpus<C: ConsensusCore>(
                 if bound {
                     summary.step_bound = summary.step_bound.saturating_add(1);
                 }
-                // Each run counts once per fault kind and phase, however
-                // many times its schedule applies that kind there: the
-                // manifest counts seeds, not observations.
-                let mut counted = std::collections::BTreeSet::new();
                 for fault in &faults {
-                    if !counted.insert((fault.kind(), fault.phase.name())) {
+                    if !counted.insert((fault.kind().to_owned(), fault.phase.name())) {
                         continue;
                     }
                     let slot = summary

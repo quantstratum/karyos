@@ -926,6 +926,18 @@ impl FaultPhase {
     }
 }
 
+/// The [`Observation::Triggered`] of an [`Action::Leader`]: the action's
+/// own mark, taken when it acted, covers it ([`phases`]).
+const LEADER_TRIGGERS: [&str; 7] = [
+    "leader crash",
+    "leader isolate",
+    "leader mute",
+    "leader split",
+    "leader remove",
+    "follower remove",
+    "leader restart",
+];
+
 /// Each fault's phase: `marks` are the faults with the number of
 /// observations recorded when each acted.
 fn phases(observations: &[Observation], marks: &[(u64, String, usize)]) -> Vec<FaultPhase> {
@@ -939,6 +951,7 @@ fn phases(observations: &[Observation], marks: &[(u64, String, usize)]) -> Vec<F
     for (at, observation) in observations.iter().enumerate() {
         if let Observation::Triggered { what, at: step, .. } = observation
             && *what != "deadline"
+            && !LEADER_TRIGGERS.contains(what)
         {
             faults.push((*step, format!("Triggered:{what}"), at));
         }
@@ -1159,6 +1172,35 @@ struct Stepping<'a> {
     recorder: &'a Shared,
     ensuring: Ensuring,
     done: u64,
+    /// The servers whose flushes fail ([`Case::failing_flushes`]), each
+    /// with the failures already recorded.
+    flushing: Vec<(NodeId, usize)>,
+}
+
+/// Records each planned flush failure of a failing server since the last
+/// look, at step `at`, as `Triggered:failed_flush`: a fault the coverage
+/// counts by its phase, as a scheduled action's.
+fn note_failed_flushes<C: ConsensusCore>(sim: &Sim<C>, stepping: &mut Stepping<'_>, at: u64) {
+    for (id, seen) in &mut stepping.flushing {
+        let failed = sim
+            .node(*id)
+            .and_then(Member::server)
+            .map_or(*seen, |server| server.disk().failed_syncs());
+        while *seen < failed {
+            *seen = seen.saturating_add(1);
+            stepping
+                .recorder
+                .borrow_mut()
+                .observations
+                .push(Observation::Triggered {
+                    what: "failed_flush",
+                    node: *id,
+                    client: 0,
+                    at,
+                    request: None,
+                });
+        }
+    }
 }
 
 /// Sends `change` from the operator to every server that is up.
@@ -1248,6 +1290,7 @@ fn advance<C: ConsensusCore>(
         }
         sim.run_for(1).map_err(RunError::Sim)?;
         stepping.done = step;
+        note_failed_flushes(sim, stepping, step);
     }
     Ok(())
 }
@@ -1472,6 +1515,7 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         recorder: &recorder,
         ensuring: Ensuring::default(),
         done: 0,
+        flushing: case.failing_flushes.iter().map(|id| (*id, 0)).collect(),
     };
     // What the last leader-relative action acted on, and whom it crashed.
     let mut acted: Option<(NodeId, u64)> = None;
@@ -1481,11 +1525,16 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         if let Some(steps) = step.checked_sub(stepping.done).filter(|steps| *steps > 0) {
             advance(&mut sim, steps, &mut stepping, &joined)?;
         }
-        marks.push((
-            step,
-            format!("{action:?}"),
-            recorder.borrow().observations.len(),
-        ));
+        // A leader-relative action may wait for a leader: it is marked
+        // where it acts, below, not where it was scheduled.
+        let mut label = Some(format!("{action:?}"));
+        if !matches!(action, Action::Leader(act) if act != LeaderAction::RestartCrashed) {
+            marks.push((
+                step,
+                label.take().unwrap_or_default(),
+                recorder.borrow().observations.len(),
+            ));
+        }
         match action {
             Action::Ensure(change) => stepping.ensuring.queue.push_back(change),
             Action::Leader(LeaderAction::RestartCrashed) => {
@@ -1570,6 +1619,11 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                     }
                     LeaderAction::RestartCrashed => "leader restart",
                 };
+                marks.push((
+                    stepping.done,
+                    label.take().unwrap_or_default(),
+                    recorder.borrow().observations.len(),
+                ));
                 recorder
                     .borrow_mut()
                     .observations
@@ -1910,6 +1964,9 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         sim.restart(id).map_err(RunError::Node)?;
     }
     sim.run_for(case.quiet).map_err(RunError::Sim)?;
+    // A flush that failed in the quiet period, stamped at its end.
+    let quiet_end = stepping.done.max(done).saturating_add(case.quiet);
+    note_failed_flushes(&sim, &mut stepping, quiet_end);
     let recorded = recorder.borrow();
     // A core that lacks a capability the case needs: not demonstrated.
     if recorded

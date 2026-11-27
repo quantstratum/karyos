@@ -3394,6 +3394,12 @@ impl<C: ConsensusCore> ServerNode<C> {
         self.running.as_ref().map(|(core, _)| core)
     }
 
+    /// Its disk: the one a restart found, after a crash.
+    #[must_use]
+    pub fn disk(&self) -> &SimDisk {
+        &self.disk
+    }
+
     /// The test service.
     #[must_use]
     pub fn service(&self) -> &TestService {

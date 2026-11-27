@@ -403,3 +403,60 @@ fn a_handover_refuses_what_it_cannot_hand_over_to() {
         }
     )));
 }
+
+/// Codex review of #1291: a W4 failed flush is a fault the run records
+/// where it happens, with its phase, so the coverage counts it.
+#[test]
+fn a_failed_flush_is_recorded_where_it_happens() {
+    for case in W4::skeleton(1)
+        .cases()
+        .into_iter()
+        .filter(|case| !case.failing_flushes.is_empty())
+    {
+        let outcome = workloads::run::<Reference>(&case, 1).unwrap();
+        let failed: Vec<_> = outcome
+            .faults
+            .iter()
+            .filter(|fault| fault.kind() == "Triggered:failed_flush")
+            .collect();
+        assert!(!failed.is_empty(), "{}: {:?}", case.name, outcome.faults);
+        for fault in failed {
+            let recorded = outcome.observations.iter().any(|observation| {
+                matches!(
+                    observation,
+                    Observation::Triggered { what: "failed_flush", node, at, .. }
+                        if *at == fault.step && case.failing_flushes.contains(node)
+                )
+            });
+            assert!(recorded, "{}: {fault:?}", case.name);
+        }
+    }
+}
+
+/// Codex review of #1291: a leader-relative action scheduled before any
+/// leader waits for one, and its fault is the step it acted at, once,
+/// not the step it was scheduled at and again as its trigger.
+#[test]
+fn a_leader_action_is_marked_where_it_acts() {
+    use karyos_sim::harness::workloads::LeaderAction;
+    let mut case = W1::skeleton().cases()[0].clone();
+    case.schedule = vec![(0, Action::Leader(LeaderAction::Isolate))];
+    // The custom core elects; the reference starts with its leader.
+    let outcome = workloads::run::<karyos_sim::harness::custom::Custom>(&case, 1).unwrap();
+    let acted = outcome
+        .observations
+        .iter()
+        .find_map(|observation| match observation {
+            Observation::Triggered {
+                what: "leader isolate",
+                at,
+                ..
+            } => Some(*at),
+            _ => None,
+        })
+        .unwrap();
+    assert!(acted > 0, "the action waited for no leader");
+    assert_eq!(outcome.faults.len(), 1, "{:?}", outcome.faults);
+    assert_eq!(outcome.faults[0].step, acted, "{:?}", outcome.faults);
+    assert_eq!(outcome.faults[0].kind(), "Leader", "{:?}", outcome.faults);
+}

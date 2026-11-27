@@ -190,6 +190,34 @@ fn every_fault_is_covered_by_its_phase() {
     );
 }
 
+/// Codex review of #1291: the summary counts seeds, so a fault kind that
+/// several cases of one workload reach in the same phase under one seed
+/// (W4's crash under its four survival modes) counts that seed once.
+#[test]
+fn a_seed_counts_once_however_many_cases_reach_a_fault() {
+    use crate::harness::workloads::Action;
+    let mut case = W1::skeleton().cases()[0].clone();
+    case.schedule = vec![(1, Action::Crash(2))];
+    let mut again = case.clone();
+    again.name.push_str(" again");
+    let cases = vec![case, again];
+    let both = |_seed: u64| cases.clone();
+    let mut out = Vec::new();
+    let summary = run_corpus::<Reference>(
+        "reference",
+        Evidence::HarnessValidation,
+        &[("W1", &both)],
+        (1..=2, 1),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(summary.runs, 4);
+    assert_eq!(
+        summary.coverage[&("W1".to_owned(), "Crash".to_owned())],
+        [2, 0, 0]
+    );
+}
+
 /// A named seed carries its run's full trace; another seed does not.
 #[test]
 fn a_named_seed_carries_its_trace() {

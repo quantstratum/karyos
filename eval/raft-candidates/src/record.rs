@@ -266,6 +266,9 @@ fn observation_line(stamp: u64, observation: &Observation) -> Option<Line> {
             .number(*term)
             .number(*generation)
             .number(*at),
+        Observation::Leading { node, term } => {
+            Line::new(stamp, "leading").number(id(node)).number(*term)
+        }
         Observation::Commit {
             node,
             term,
@@ -564,6 +567,10 @@ fn observation(tag: &str, fields: &mut Fields<'_>) -> Option<Observation> {
             term: fields.number()?,
             generation: fields.number()?,
             at: fields.number()?,
+        },
+        "leading" => Observation::Leading {
+            node: fields.node()?,
+            term: fields.number()?,
         },
         "commit" => Observation::Commit {
             node: fields.node()?,
@@ -884,10 +891,36 @@ mod tests {
                 generation: 1,
             },
             Observation::CorePanicked { node: 1 },
+            Observation::Leading { node: 2, term: 4 },
             Observation::Healed,
         ] {
             round_trip(Item::Observation(observation));
         }
+    }
+
+    /// Codex review of #1291: a process records each term its core leads
+    /// and the record keeps it, so two leaders of one term in a process
+    /// run's merged history fail its safety, as they fail a simulated
+    /// run's.
+    #[test]
+    fn two_process_leaders_of_one_term_fail_the_safety_checks() {
+        let decoded = |line: &str| decode(line).unwrap();
+        let recorder = merge(vec![
+            vec![decoded("5 leading 0 3")],
+            vec![decoded("6 leading 1 3")],
+        ]);
+        let case = crate::process::cases().into_iter().next().unwrap();
+        let outcome =
+            karyos_sim::harness::workloads::outcome(&case, &recorder, Ok(()), Vec::new(), 0)
+                .unwrap();
+        assert_eq!(
+            outcome.safety,
+            Err(karyos_sim::harness::check::Violation::TwoLeaders {
+                term: 3,
+                first: 0,
+                second: 1,
+            })
+        );
     }
 
     #[test]

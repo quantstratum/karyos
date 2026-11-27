@@ -730,6 +730,17 @@ mod w1 {
             case.name,
             ran.states
         );
+        // The processes record each term a core leads (Codex review of
+        // #1291), so `check::one_leader_per_term` judges a real election.
+        let outcome = ran.outcome.as_ref().unwrap();
+        assert!(
+            outcome
+                .observations
+                .iter()
+                .any(|observation| matches!(observation, Observation::Leading { .. })),
+            "{core} {}: no leadership recorded",
+            case.name
+        );
         assert!(
             ran.probes.iter().any(|probe| probe.entries > 0),
             "{core} {}: the probe measured no entry: {:?}",

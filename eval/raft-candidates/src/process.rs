@@ -712,6 +712,9 @@ struct Serving<M> {
     /// Requests it took, by client and sequence: it answers them.
     pending: Pending,
     commit: Option<u64>,
+    /// The highest term its core was seen to lead, as `ServerNode` keeps
+    /// it ([`Observation::Leading`]).
+    led: Option<u64>,
     configuration: Option<karyos_sim::harness::core::Configuration>,
     /// The core's configuration stamp when it was last asked, as
     /// `ServerNode` keeps it (karyos#711).
@@ -1049,6 +1052,15 @@ impl<M> Serving<M> {
             });
             self.configuration = Some(configuration);
         }
+        // Each term it leads, the first time, as `ServerNode` records it:
+        // `check::one_leader_per_term` reads these.
+        if core.leads() && self.led < Some(core.term()) {
+            self.led = Some(core.term());
+            self.observe(Observation::Leading {
+                node,
+                term: core.term(),
+            });
+        }
         let committed = core.committed();
         if committed > self.commit
             && let Some(index) = committed
@@ -1258,6 +1270,7 @@ pub fn run_server<C: Wire>(config: &NodeConfig) -> Result<Served, ProcessError> 
         response: Vec::with_capacity(bounds.response_bytes()),
         pending: Pending::prefilled(pending_room(&bounds)),
         commit: core.committed(),
+        led: None,
         configuration: None,
         configuration_stamp: None,
         positions: None,
