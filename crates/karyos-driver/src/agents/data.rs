@@ -1296,6 +1296,26 @@ impl<T: StreamTerms> Outbound<T> {
         self.guard.as_deref()
     }
 
+    /// Charges a control frame of `frame_type` and `length` bytes it is
+    /// about to send to its guard's control budget at `now` (R-CORE-21,
+    /// karyos#1021): the control bucket when the gate holds a reserve,
+    /// never the publication's tokens. `NotControl` when unguarded, which
+    /// charges nothing.
+    pub(crate) fn admit_control(
+        &mut self,
+        frame_type: karyos_sys::frame::FrameType,
+        length: u64,
+        now: u64,
+    ) -> crate::guard_gate::ControlAdmission {
+        match self.guard.as_deref_mut() {
+            Some(gate) => {
+                gate.set_now(now);
+                gate.admit_control(frame_type, length)
+            }
+            None => crate::guard_gate::ControlAdmission::NotControl,
+        }
+    }
+
     /// Its repair path, if enabled.
     #[must_use]
     pub fn repair(&self) -> Option<&RepairPath> {

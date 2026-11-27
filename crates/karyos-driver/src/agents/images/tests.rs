@@ -8101,6 +8101,17 @@ fn guarded_abort_rig_tuned(
     signs: bool,
     tune: Option<fn(&mut AgentConfig)>,
 ) -> (Rig, std::sync::Arc<karyos_client::HeapWords>, EndpointId) {
+    guarded_abort_rig_with(trusted, signs, tune, None)
+}
+
+/// [`guarded_abort_rig_tuned`] whose guard's policy and control reserve
+/// are both `limit` when given (karyos#1021).
+fn guarded_abort_rig_with(
+    trusted: bool,
+    signs: bool,
+    tune: Option<fn(&mut AgentConfig)>,
+    limit: Option<karyos_sys::rate_limit::Rate>,
+) -> (Rig, std::sync::Arc<karyos_client::HeapWords>, EndpointId) {
     use std::sync::Arc;
 
     use crate::agents::roles::publish_auth::{AbortAuthority, PublicationAuth};
@@ -8122,8 +8133,11 @@ fn guarded_abort_rig_tuned(
             cell: Arc::new(AppliedEpoch::new()),
             epoch: 2,
             empty_since: None,
-            rate: None,
-            reserve: None,
+            rate: limit.map(|messages| karyos_sys::rate_limit::RatePolicy {
+                messages,
+                bytes: None,
+            }),
+            reserve: limit,
             policy: None,
             frontier: Default::default(),
         }),
@@ -8163,6 +8177,61 @@ fn guarded_abort_rig_tuned(
     rig.agents.sender.role.set_abort_guard(a, alias(), 11);
     let _slot = established(&mut rig);
     (rig, word, b)
+}
+
+/// karyos#1021 (karyos#840 through the data agent): the guard's policy and
+/// control reserve are both one message a second, burst one. Ordinary
+/// traffic spends the publication's bucket; the guard's close still sends
+/// its SESSION_ABORT at once, from the control bucket. The receiver never
+/// acknowledges it (it does not trust the authority), so its resends run
+/// past the reserve: they wait for the control bucket's refill, are held
+/// and counted, never dropped, and the publication's tokens are never
+/// borrowed.
+#[test]
+fn an_abort_pays_from_the_control_reserve_and_its_resends_wait_for_its_refill() {
+    let one = karyos_sys::rate_limit::Rate {
+        per_second: 1,
+        burst: 1,
+    };
+    let (mut rig, word, _b) = guarded_abort_rig_with(false, true, None, Some(one));
+    // Ordinary traffic spends the publication's bucket.
+    for _ in 0..3 {
+        let _ = send_one(&mut rig, 100);
+    }
+    let gate = |rig: &Rig| {
+        let gate = rig.agents.sender.role.outbound(0).unwrap().guard_gate().unwrap();
+        (gate.message_tokens(), gate.control_message_tokens())
+    };
+    assert_eq!(gate(&rig).0, Some(0), "the publication's bucket is spent");
+    close_guard(&mut rig, &word);
+    for _ in 0..50 {
+        rig.round(true);
+        if rig.agents.sender.role.counters().aborts_sent == 1 {
+            break;
+        }
+    }
+    let sender = rig.agents.sender.role.counters();
+    assert_eq!(sender.aborts_sent, 1, "sent at once: {sender:?}");
+    // The resends, from 10 ms on, are past the reserve within the second.
+    for _ in 0..500 {
+        rig.round(true);
+    }
+    let sender = rig.agents.sender.role.counters();
+    assert_eq!(sender.aborts_resent, 0, "{sender:?}");
+    assert!(sender.aborts_held > 0, "held, not dropped: {sender:?}");
+    assert_eq!(sender.aborts_interrupted, 0);
+    // The second earns one control token: one resend leaves.
+    for _ in 0..600 {
+        rig.round(true);
+    }
+    let sender = rig.agents.sender.role.counters();
+    assert!(sender.aborts_resent >= 1, "{sender:?}");
+    assert!(
+        sender.aborts_resent <= 2,
+        "never past the reserve: {sender:?}"
+    );
+    let held = rig.agents.sender.role.outbound(0).unwrap().guard_gate().unwrap().counts().control_held;
+    assert!(held > 0);
 }
 
 /// Closes the local guard and appends, so the gate applies the close.

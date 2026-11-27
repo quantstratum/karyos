@@ -552,6 +552,9 @@ pub struct SenderCounters {
     pub repairs_cancelled: u64,
     /// Due abort attempts the duty's control budget deferred.
     pub aborts_deferred: u64,
+    /// SESSION_ABORT sends held by the publication guard's control reserve
+    /// until its bucket refills (karyos#1021).
+    pub aborts_held: u64,
     /// SETUP ANNOUNCEs or ANSWERs of an authenticated publication not sent:
     /// the fence held, admission pending, or its incarnation aborting.
     pub setup_blocked: u64,
@@ -9045,6 +9048,7 @@ impl<T: StreamTerms> SenderRole<T> {
                 pending.first.is_some(),
             );
             let mut submitted = false;
+            let mut held = false;
             for index in 0..self.bindings.len() {
                 let Some(binding) = self.bindings.get(index) else {
                     break;
@@ -9053,6 +9057,25 @@ impl<T: StreamTerms> SenderRole<T> {
                     continue;
                 }
                 let destination = binding.source();
+                // Each frame pays from its guard's control budget, never
+                // the publication's (karyos#1021, R-CORE-21); past the
+                // reserve it waits for the control bucket's refill.
+                let length = u64::try_from(bytes.get().len()).unwrap_or(u64::MAX);
+                let admission = self
+                    .publications
+                    .iter_mut()
+                    .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+                    .map(|outbound| {
+                        outbound.admit_control(
+                            karyos_sys::frame::FrameType::SessionAbort,
+                            length,
+                            now,
+                        )
+                    });
+                if admission == Some(crate::guard_gate::ControlAdmission::Held) {
+                    held = true;
+                    break;
+                }
                 if self
                     .send_raw(halves, endpoint, destination, bytes.get())
                     .submitted()
@@ -9063,6 +9086,12 @@ impl<T: StreamTerms> SenderRole<T> {
                 {
                     self.last_abort = Some((endpoint, destination, bytes));
                 }
+            }
+            if held && !submitted {
+                // Held by the control reserve: it keeps its schedule and is
+                // tried again at the next duty, never dropped.
+                self.count(|c| &mut c.aborts_held);
+                continue;
             }
             if submitted {
                 if resend {
