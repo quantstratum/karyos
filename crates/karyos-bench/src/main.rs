@@ -389,9 +389,12 @@ fn enc_cost_command(args: &[String]) -> Result<String, String> {
     let (Some(point), Some(profile)) = (point, profile) else {
         return Err("enc-cost needs --point and --profile".to_string());
     };
+    karyos_bench::enc_cost::timing_build(cfg!(feature = "alloc-count")).map_err(|e| e.0)?;
     let result = run(point, profile, warmup, samples).map_err(|e| e.0)?;
     let mut out = String::new();
     if header {
+        out.push_str(&karyos_bench::enc_cost::build_identity());
+        out.push('\n');
         out.push_str(Run::HEADER);
         out.push('\n');
     }

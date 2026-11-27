@@ -306,7 +306,8 @@ fn the_encrypted_class_refusal_vectors_are_refused() {
 // was printed by `enc_vectors2.py`, a second implementation written from
 // the frozen encodings only (Python `cryptography` and `hmac`), and is
 // copied from its output `enc_vectors2-output.txt`; none comes from this
-// implementation's output.
+// implementation's output. Both are tracked in karyos-protocol
+// `tests/vectors`, and an `h5_*` test ties every literal to that output.
 //
 // The script parses each file with a parser of wire-key-files.md 2.2
 // written from that text (its Ed25519 checks by RFC 8032 point decoding)
@@ -588,4 +589,35 @@ fn h5_the_key_file_vectors_match_the_independent_script() {
     for (label, name, bytes) in PY_REFUSED {
         assert!(parse(name, &hex(bytes)).is_err(), "{label}");
     }
+}
+
+/// The tracked output of the independent script (karyos-protocol
+/// `tests/vectors`).
+const PY2: &str = include_str!("../../../karyos-protocol/tests/vectors/enc_vectors2-output.txt");
+
+/// Gate H5 provenance: every key file vector embedded above is, byte for
+/// byte and with its fields, a line of the tracked output of
+/// `enc_vectors2.py`, and every key file vector of that output is
+/// embedded.
+#[test]
+fn h5_the_embedded_key_file_vectors_are_the_tracked_output() {
+    let lines: Vec<&str> = PY2.lines().collect();
+    for (label, name, bytes, fields) in PY_VALID {
+        let line = format!("keyfile valid {label} {name} {bytes} {fields}");
+        assert!(lines.contains(&line.as_str()), "{label}");
+    }
+    for (label, name, bytes) in PY_REFUSED {
+        let prefix = format!("keyfile refused {label} {name} {bytes} (");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with(&prefix))
+                .count(),
+            1,
+            "{label}"
+        );
+    }
+    let count = |prefix: &str| lines.iter().filter(|line| line.starts_with(prefix)).count();
+    assert_eq!(count("keyfile valid "), PY_VALID.len());
+    assert_eq!(count("keyfile refused "), PY_REFUSED.len());
 }

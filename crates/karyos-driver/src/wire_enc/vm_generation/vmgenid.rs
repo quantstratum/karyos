@@ -8,7 +8,8 @@
 //! `VMGENCTR` or `_CID` `VM_GEN_COUNTER` (QEMU: `QEMUVGID` with `_CID`
 //! `VM_Gen_Counter`; Hyper-V: `Hyper_V_Gen_Counter_V1`), or, since 6.10, a
 //! devicetree node compatible with `microsoft,vmgenid` bound to the
-//! `vmgenid` platform driver. The driver reads the 128-bit id from guest
+//! `vmgenid` platform driver (the node is a platform device whether or not
+//! the driver is loaded or bound). The driver reads the 128-bit id from guest
 //! memory and hands it to the kernel's random number generator only: it
 //! creates no sysfs attribute (the id is not readable from user space on
 //! any mainline kernel), and the `NEW_VMGENID=1` uevent of ad6bcdad2b67
@@ -17,8 +18,9 @@
 //! is not: a host with the device is a virtual machine whose generation
 //! can change without the process seeing it, and the deployment rule of
 //! section 10 alone protects it. [`detect`] tells the three cases apart
-//! so that the driver states which one holds; a sysfs it cannot read is
-//! never taken for "no device".
+//! so that the driver states which one holds; a sysfs it cannot read, or
+//! a root that is no sysfs (no `bus` directory), is never taken for "no
+//! device".
 
 use std::io::ErrorKind;
 use std::path::Path;
@@ -29,15 +31,19 @@ pub const SYSFS: &str = "/sys";
 /// What sysfs says about the VM Generation ID device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmGenIdDevice {
-    /// No device: bare metal, or a hypervisor that offers none (or not
-    /// Linux). A generation change cannot happen unseen by the platform's
-    /// own interface, and none is signalled.
+    /// No device is visible in a readable sysfs: bare metal, a hypervisor
+    /// that offers none, or a guest that hides it. This is no evidence
+    /// that the generation cannot change: a hypervisor without the device
+    /// can still restore a snapshot unseen, which the deployment rule of
+    /// section 10 alone covers.
     Absent,
     /// A device is present: the host is a virtual machine whose
     /// generation can change, and Linux gives user space no signal of it.
     Present,
-    /// sysfs exists but could not be read: a device may be present. It is
-    /// reported as such, never as [`VmGenIdDevice::Absent`].
+    /// sysfs could not be observed (the root or its `bus` directory is
+    /// missing or unreadable, or an entry could not be read): a device may
+    /// be present. It is reported as such, never as
+    /// [`VmGenIdDevice::Absent`].
     Unreadable,
 }
 
@@ -47,18 +53,32 @@ pub enum VmGenIdDevice {
 const ACPI_IDS: [&str; 2] = ["VMGENCTR", "VM_GEN_COUNTER"];
 /// The platform driver's name (ACPI since 6.10, devicetree).
 const DRIVER: &str = "vmgenid";
+/// The devicetree compatible string the driver matches.
+const COMPATIBLE: &str = "microsoft,vmgenid";
 
 /// What sysfs under `root` says about the VM Generation ID device: an ACPI
-/// device whose `hid` or `modalias` names one of the driver's ids, or a
-/// device bound to the `vmgenid` platform driver.
+/// device whose `hid` or `modalias` names one of the driver's ids, a
+/// platform device whose devicetree node is compatible with
+/// `microsoft,vmgenid` (bound or not), or a device bound to the `vmgenid`
+/// platform driver. A missing bus directory means no such bus only once
+/// the root is shown to be a sysfs: a missing or unreadable root, or one
+/// without a readable `bus` directory, is [`VmGenIdDevice::Unreadable`].
 #[must_use]
 pub fn detect(root: &Path) -> VmGenIdDevice {
-    let acpi = acpi_device(&root.join("bus/acpi/devices"));
-    let platform = bound_device(&root.join("bus/platform/drivers").join(DRIVER));
-    match (acpi, platform) {
-        (Some(true), _) | (_, Some(true)) => VmGenIdDevice::Present,
-        (Some(false), Some(false)) => VmGenIdDevice::Absent,
-        _ => VmGenIdDevice::Unreadable,
+    if std::fs::read_dir(root.join("bus")).is_err() {
+        return VmGenIdDevice::Unreadable;
+    }
+    let probes = [
+        acpi_device(&root.join("bus/acpi/devices")),
+        devicetree_device(&root.join("bus/platform/devices")),
+        bound_device(&root.join("bus/platform/drivers").join(DRIVER)),
+    ];
+    if probes.contains(&Some(true)) {
+        VmGenIdDevice::Present
+    } else if probes.iter().all(|probe| *probe == Some(false)) {
+        VmGenIdDevice::Absent
+    } else {
+        VmGenIdDevice::Unreadable
     }
 }
 
@@ -97,6 +117,60 @@ fn names_vmgenid(text: &str) -> bool {
         .any(|id| ACPI_IDS.iter().any(|known| id.eq_ignore_ascii_case(known)))
 }
 
+/// Whether a platform device's devicetree node is compatible with
+/// `microsoft,vmgenid`, read from its `of_node/compatible` or its
+/// `modalias`, independently of any driver binding; `None` if unreadable.
+/// A missing directory (no platform bus) is `Some(false)`.
+fn devicetree_device(devices: &Path) -> Option<bool> {
+    let entries = match std::fs::read_dir(devices) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    let mut readable = true;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            readable = false;
+            continue;
+        };
+        let path = entry.path();
+        match std::fs::read(path.join("of_node/compatible")) {
+            Ok(bytes) if compatible_names_vmgenid(&bytes) => return Some(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => readable = false,
+        }
+        match std::fs::read_to_string(path.join("modalias")) {
+            Ok(text) if of_modalias_names_vmgenid(&text) => return Some(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => readable = false,
+        }
+    }
+    readable.then_some(false)
+}
+
+/// Whether a devicetree `compatible` property (NUL-separated strings)
+/// lists `microsoft,vmgenid`.
+fn compatible_names_vmgenid(bytes: &[u8]) -> bool {
+    bytes
+        .split(|byte| *byte == 0)
+        .any(|name| name == COMPATIBLE.as_bytes())
+}
+
+/// Whether a devicetree `modalias` (`of:N<name>T<type>C<compatible>...`,
+/// each compatible after a `C`) lists `microsoft,vmgenid`.
+fn of_modalias_names_vmgenid(text: &str) -> bool {
+    let Some(text) = text.trim().strip_prefix("of:") else {
+        return false;
+    };
+    let tag = format!("C{COMPATIBLE}");
+    text.match_indices(&tag).any(|(at, _)| {
+        text.get(at + tag.len()..)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('C'))
+    })
+}
+
 /// Whether the platform driver directory holds a bound device (a link
 /// other than the driver's own `bind`, `unbind`, `uevent` and `module`);
 /// `None` if unreadable. A missing directory (module not loaded, or no
@@ -132,14 +206,32 @@ mod tests {
 
     use super::*;
 
-    /// A fresh fake sysfs root under the target directory.
+    /// A fresh fake sysfs root under the target directory, with its `bus`
+    /// directory and no bus in it.
     fn root(name: &str) -> PathBuf {
+        let root = bare(name);
+        std::fs::create_dir_all(root.join("bus")).unwrap();
+        root
+    }
+
+    /// A fresh empty directory under the target directory.
+    fn bare(name: &str) -> PathBuf {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/vmgenid-fake-sysfs")
             .join(format!("{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    /// A platform device `name` (its `of_node` and `modalias`, as Linux
+    /// creates them whether or not a driver binds it).
+    fn platform(root: &Path, name: &str, compatible: &[u8], modalias: &str) -> PathBuf {
+        let dir = root.join("bus/platform/devices").join(name);
+        std::fs::create_dir_all(dir.join("of_node")).unwrap();
+        std::fs::write(dir.join("of_node/compatible"), compatible).unwrap();
+        std::fs::write(dir.join("modalias"), format!("{modalias}\n")).unwrap();
+        dir
     }
 
     fn acpi(root: &Path, device: &str, hid: &str, modalias: &str) -> PathBuf {
@@ -150,11 +242,43 @@ mod tests {
         dir
     }
 
+    /// A missing sysfs, or a root without its `bus` directory, is no
+    /// observation: unreadable, never absent.
     #[test]
-    fn no_sysfs_and_no_device_are_absent() {
+    fn a_missing_sysfs_is_unreadable_not_absent() {
+        let root = bare("missing");
+        assert_eq!(detect(&root.join("missing")), VmGenIdDevice::Unreadable);
+        assert_eq!(detect(&root), VmGenIdDevice::Unreadable, "no bus");
+        std::fs::write(root.join("bus"), "").unwrap();
+        assert_eq!(
+            detect(&root),
+            VmGenIdDevice::Unreadable,
+            "bus not a directory"
+        );
+        std::fs::remove_file(root.join("bus")).unwrap();
+        std::fs::create_dir(root.join("bus")).unwrap();
+        assert_eq!(
+            detect(&root),
+            VmGenIdDevice::Absent,
+            "a sysfs without these buses"
+        );
+    }
+
+    #[test]
+    fn no_device_is_absent() {
         let root = root("absent");
-        assert_eq!(detect(&root.join("missing")), VmGenIdDevice::Absent);
         assert_eq!(detect(&root), VmGenIdDevice::Absent);
+        platform(
+            &root,
+            "serial@9000000",
+            b"arm,pl011\0arm,primecell\0",
+            "of:Npl011T(null)Carm,pl011Carm,primecell",
+        );
+        assert_eq!(
+            detect(&root),
+            VmGenIdDevice::Absent,
+            "other devicetree devices"
+        );
         acpi(&root, "PNP0A08:00", "PNP0A08", "acpi:PNP0A08:PNP0A03:");
         assert_eq!(detect(&root), VmGenIdDevice::Absent);
         let driver = root.join("bus/platform/drivers/vmgenid");
@@ -189,6 +313,37 @@ mod tests {
         std::fs::create_dir_all(driver.join("vmgenid@0")).unwrap();
         std::fs::write(driver.join("bind"), "").unwrap();
         assert_eq!(detect(&root), VmGenIdDevice::Present);
+    }
+
+    /// A devicetree node compatible with `microsoft,vmgenid` is detected
+    /// with the driver neither loaded nor bound, from its `compatible` or
+    /// from its `modalias` alone.
+    #[test]
+    fn an_unbound_devicetree_device_is_detected() {
+        let root = root("unbound");
+        let device = platform(
+            &root,
+            "vmgenid@1000",
+            b"microsoft,vmgenid\0",
+            "of:NvmgenidT(null)Cmicrosoft,vmgenid",
+        );
+        assert!(!root.join("bus/platform/drivers/vmgenid").exists());
+        assert_eq!(detect(&root), VmGenIdDevice::Present, "both");
+        std::fs::remove_file(device.join("modalias")).unwrap();
+        assert_eq!(detect(&root), VmGenIdDevice::Present, "compatible alone");
+        std::fs::remove_dir_all(device.join("of_node")).unwrap();
+        std::fs::write(
+            device.join("modalias"),
+            "of:NvmgenidT(null)Cvendor,otherCmicrosoft,vmgenid\n",
+        )
+        .unwrap();
+        assert_eq!(detect(&root), VmGenIdDevice::Present, "modalias alone");
+        std::fs::write(
+            device.join("modalias"),
+            "of:NvmgenidT(null)Cmicrosoft,vmgenid-v2\n",
+        )
+        .unwrap();
+        assert_eq!(detect(&root), VmGenIdDevice::Absent, "another compatible");
     }
 
     /// Unreadable sysfs is reported as such, never as no device. Needs a

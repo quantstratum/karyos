@@ -225,6 +225,13 @@ fn the_rfc_8452_vectors_pass_through_the_detached_in_place_api() {
     }
 }
 
+/// The pairwise trailer key's `info` and key of `enc_vectors.py`.
+const PAIRWISE_INFO: &str = "6b6172796f732d776972652d656e632d76303100706175746800000009000000282726252423222138373635343332312a00000000000000080706050403020118171615141312110700000000000000030000000000000010";
+const PAIRWISE_KEY: &str = "6fb8900d3b80b16283414c0752992f3b56480163473ced4879e361ec4739118e";
+/// The same at the next pairwise file epoch, 10, of `enc_vectors2.py`.
+const PAIRWISE_10_INFO: &str = "6b6172796f732d776972652d656e632d7630310070617574680000000a000000282726252423222138373635343332312a00000000000000080706050403020118171615141312110700000000000000030000000000000010";
+const PAIRWISE_10_KEY: &str = "001dbe035764ae11e22ed5f6aada8a96f4a273a1cb0f763fb9023ea73260410b";
+
 /// `(name, context, info, key)` of the Python script.
 fn kdf_vectors() -> [(&'static str, KeyContext, &'static str, &'static str); 7] {
     [
@@ -281,12 +288,7 @@ fn the_kdf_of_every_domain_matches_the_independent_vectors() {
         assert_eq!(context.derive(&IKM).to_vec(), hex(key), "{name} key");
     }
     let info = pairwise_info(PAIRWISE_EPOCH, &receiver(), &publication());
-    assert_eq!(
-        info.to_vec(),
-        hex(
-            "6b6172796f732d776972652d656e632d76303100706175746800000009000000282726252423222138373635343332312a00000000000000080706050403020118171615141312110700000000000000030000000000000010"
-        )
-    );
+    assert_eq!(info.to_vec(), hex(PAIRWISE_INFO));
     assert_eq!(
         derive_pairwise(
             &PAIRWISE_SECRET,
@@ -295,7 +297,7 @@ fn the_kdf_of_every_domain_matches_the_independent_vectors() {
             &publication()
         )
         .to_vec(),
-        hex("6fb8900d3b80b16283414c0752992f3b56480163473ced4879e361ec4739118e")
+        hex(PAIRWISE_KEY)
     );
 }
 
@@ -1431,7 +1433,8 @@ fn set_pairwise_keeps_the_sequence_and_the_window() {
 // was printed by `enc_vectors2.py`, a second implementation written from
 // the frozen encodings only (Python `cryptography` and `hmac`), and is
 // copied from its output `enc_vectors2-output.txt`; none comes from this
-// implementation's output.
+// implementation's output. Both are tracked in karyos-protocol
+// `tests/vectors`, and an `h5_*` test ties every literal to that output.
 
 /// One epoch transition vector: name, domain, `(key_epoch, party_epoch,
 /// salted, pairwise file epoch, envelope_seq)`, the frames `(len, mul,
@@ -1555,12 +1558,72 @@ fn h5_the_epoch_transition_vectors_match_the_independent_script() {
     // The pairwise key of the next pairwise file epoch.
     assert_eq!(
         pairwise_info(10, &receiver(), &publication()).to_vec(),
-        hex(
-            "6b6172796f732d776972652d656e632d7630310070617574680000000a000000282726252423222138373635343332312a00000000000000080706050403020118171615141312110700000000000000030000000000000010"
-        )
+        hex(PAIRWISE_10_INFO)
     );
     assert_eq!(
         derive_pairwise(&PAIRWISE_SECRET, 10, &receiver(), &publication()).to_vec(),
-        hex("001dbe035764ae11e22ed5f6aada8a96f4a273a1cb0f763fb9023ea73260410b")
+        hex(PAIRWISE_10_KEY)
     );
+}
+
+/// The tracked outputs of the independent scripts (`tests/vectors`).
+const PY1: &str = include_str!("../../../tests/vectors/enc_vectors-output.txt");
+const PY2: &str = include_str!("../../../tests/vectors/enc_vectors2-output.txt");
+
+/// Asserts that a line of `output` starting with `prefix` carries `value`
+/// as one of its words, and returns how many lines start with `prefix`.
+fn tracked(output: &str, prefix: &str, value: &str) -> usize {
+    let lines: Vec<&str> = output
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .collect();
+    assert!(
+        !lines.is_empty(),
+        "no line {prefix:?} in the tracked output"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.split_whitespace().any(|word| word == value)),
+        "{prefix:?}: {value} is not the tracked output"
+    );
+    lines.len()
+}
+
+/// How many lines of `output` start with `prefix`.
+fn lines_of(output: &str, prefix: &str) -> usize {
+    output
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .count()
+}
+
+/// Gate H5 provenance: every expected value the vectors above embed is the
+/// value the tracked output of its script prints for that vector, and
+/// every vector of those outputs is embedded.
+#[test]
+fn h5_every_embedded_vector_is_the_tracked_output() {
+    let kdf = kdf_vectors();
+    for (name, _, info, key) in &kdf {
+        tracked(PY1, &format!("kdf {name}: "), info);
+        tracked(PY1, &format!("kdf {name}: "), key);
+    }
+    assert_eq!(lines_of(PY1, "kdf "), kdf.len());
+    tracked(PY1, "pairwise: ", PAIRWISE_INFO);
+    tracked(PY1, "pairwise: ", PAIRWISE_KEY);
+    let envelopes = envelope_vectors();
+    for (name, _, _, _, datagram) in &envelopes {
+        tracked(PY1, &format!("envelope {name}: "), datagram);
+    }
+    assert_eq!(lines_of(PY1, "envelope "), envelopes.len());
+    for (name, _, (_, _, _, _, seq), _, info, key, datagram) in EPOCH_VECTORS {
+        let prefix = format!("epoch {name}: ");
+        tracked(PY2, &prefix, info);
+        tracked(PY2, &prefix, key);
+        tracked(PY2, &prefix, datagram);
+        tracked(PY2, &prefix, &seq.to_string());
+    }
+    tracked(PY2, "epoch pairwise 10: ", PAIRWISE_10_INFO);
+    tracked(PY2, "epoch pairwise 10: ", PAIRWISE_10_KEY);
+    assert_eq!(lines_of(PY2, "epoch "), 2 * EPOCH_VECTORS.len() + 1);
 }

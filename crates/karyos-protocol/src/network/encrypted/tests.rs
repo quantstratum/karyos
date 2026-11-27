@@ -269,3 +269,45 @@ fn h5_the_enc_answer_transcript_in_domain_5_matches_the_independent_script() {
         "the answer's key_epoch is the envelope's"
     );
 }
+
+/// The tracked output of the independent script (`tests/vectors`).
+const PY2: &str = include_str!("../../../tests/vectors/enc_vectors2-output.txt");
+
+/// Asserts that a line of `output` starting with `prefix` carries `value`
+/// as one of its words, and returns how many lines start with `prefix`.
+fn tracked(output: &str, prefix: &str, value: &str) -> usize {
+    let lines: Vec<&str> = output
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .collect();
+    assert!(
+        !lines.is_empty(),
+        "no line {prefix:?} in the tracked output"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.split_whitespace().any(|word| word == value)),
+        "{prefix:?}: {value} is not the tracked output"
+    );
+    lines.len()
+}
+
+/// How many lines of `output` start with `prefix`.
+fn lines_of(output: &str, prefix: &str) -> usize {
+    output
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .count()
+}
+
+/// Gate H5 provenance: the ENC ANSWER values embedded above are the
+/// values the tracked output of `enc_vectors2.py` prints.
+#[test]
+fn h5_the_embedded_enc_answer_is_the_tracked_output() {
+    tracked(PY2, "enc answer plaintext (128): ", PY_ENC_ANSWER);
+    tracked(PY2, "enc answer setup info: ", PY_SETUP_INFO);
+    tracked(PY2, "enc answer setup key: ", PY_SETUP_KEY);
+    tracked(PY2, "enc answer sealed seq 4 (212): ", PY_ENC_ANSWER_SEALED);
+    assert_eq!(lines_of(PY2, "enc answer "), 4);
+}

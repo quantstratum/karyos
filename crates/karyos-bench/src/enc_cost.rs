@@ -389,9 +389,78 @@ pub fn overhead(domain: Domain) -> usize {
     }
 }
 
+/// Refuses the allocation build (`alloc-count`, M-9) as `measure` does:
+/// its counting allocator is never timed, so `enc-cost` measures only in a
+/// timing build. `alloc_count` is whether this binary is one.
+///
+/// # Errors
+///
+/// The refusal, when `alloc_count` holds.
+pub fn timing_build(alloc_count: bool) -> Result<(), BenchError> {
+    if alloc_count {
+        return Err(BenchError(
+            "this is the allocation build (alloc-count): it never measures timing".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The build identity the CSV header is preceded by, as a `#` comment
+/// line: the crate version, the build ([`crate::wire::stage::BUILD`]:
+/// timing or alloc-count, synthetic or not), whether `test-hooks` is on,
+/// the optimisation, the target and the CPU's AES instructions the
+/// AES-GCM-SIV backend selects at run time (`aes-ni+pclmulqdq` or
+/// `armv8-aes` for the hardware backend, else `soft`).
+#[must_use]
+pub fn build_identity() -> String {
+    format!(
+        "# karyos-bench {} enc-cost build={} test-hooks={} opt={} target={}-{} cpu-aes={}",
+        env!("CARGO_PKG_VERSION"),
+        crate::wire::stage::BUILD,
+        cfg!(feature = "test-hooks"),
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        cpu_aes(),
+    )
+}
+
+/// The AES instructions of this CPU the backend can use.
+fn cpu_aes() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("aes")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+    {
+        return "aes-ni+pclmulqdq";
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("aes") {
+        return "armv8-aes";
+    }
+    "soft"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_allocation_build_never_times_and_the_identity_names_the_build() {
+        assert!(timing_build(true).is_err());
+        assert!(timing_build(false).is_ok());
+        let identity = build_identity();
+        assert!(identity.starts_with("# karyos-bench "), "{identity}");
+        assert!(
+            identity.contains(&format!(" build={} ", crate::wire::stage::BUILD)),
+            "{identity}"
+        );
+        assert!(identity.contains(" cpu-aes="), "{identity}");
+        assert!(!identity.contains('\n'), "{identity}");
+    }
 
     #[test]
     fn every_point_runs_under_both_profiles() -> Result<(), BenchError> {

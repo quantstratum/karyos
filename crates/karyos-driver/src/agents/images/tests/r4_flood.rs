@@ -9,10 +9,18 @@
 //! genuine context and frames, invalid tag) reach the receiver's real
 //! intake at 10% or 100% of the valid rate. Each run states the
 //! allocations of the forged intake and of each agent's duties, the
-//! receiver's duty cycle percentiles, what was delivered and in which
-//! order, the rejection counters and the state the flood left. Ignored:
+//! percentiles of the receiver's complete intake interval (the forged
+//! datagrams of the iteration verified and refused, then the receiver's
+//! duty cycle) and of its duty cycle alone, what was delivered and in
+//! which order, the rejection counters and the state the flood left.
+//! A run that does not sustain its load is refused: at least
+//! [`MIN_LOAD_PERCENT`] of the scheduled valid and forged datagrams,
+//! a schedule lag within [`MAX_LAG_NS`] and [`MIN_SAMPLES_PER_SECOND`]
+//! intake samples per second. Ignored:
 //! run explicitly in release (`cargo test --release -p karyos-driver
-//! --lib r4_ -- --ignored`); each run writes `target/evB-r4/r4-<p>.txt`.
+//! --lib r4_ -- --ignored --nocapture`); each run prints its report, and
+//! writes it to `r4-<p>.txt` in the directory `KARYOS_R4_OUT` names, when
+//! set.
 
 use std::fmt::Write as _;
 use std::time::Instant;
@@ -32,6 +40,15 @@ const SECONDS: u64 = 10;
 const POOL: u64 = 4_096;
 /// Receiver duties timed at most.
 const MAX_SAMPLES: usize = 1 << 24;
+/// The share of the scheduled valid and forged datagrams a run must
+/// inject, or it is refused as underloaded.
+const MIN_LOAD_PERCENT: u64 = 95;
+/// The longest the valid load may fall behind its schedule: 10 ms, 1 000
+/// messages at [`RATE`].
+const MAX_LAG_NS: u64 = 10_000_000;
+/// Intake intervals a run must time per second, at least (one per 1 ms on
+/// average).
+const MIN_SAMPLES_PER_SECOND: u64 = 1_000;
 
 /// The `q` quantile of sorted `samples`.
 fn quantile(samples: &[u64], q: f64) -> u64 {
@@ -61,6 +78,33 @@ fn percentiles(label: &str, samples: &mut [u64], report: &mut String) {
         quantile(samples, 0.9999),
         samples.last().copied().unwrap_or(0),
     );
+}
+
+/// Whether a run at `invalid_percent` sustained its load: at least
+/// [`MIN_LOAD_PERCENT`] of the scheduled valid and forged datagrams, a
+/// schedule lag within [`MAX_LAG_NS`] and enough intake samples.
+fn sustained(
+    appended: u64,
+    forged: u64,
+    invalid_percent: u64,
+    late_ns: u64,
+    samples: usize,
+) -> Result<(), String> {
+    let valid_target = RATE * SECONDS;
+    let forged_target = valid_target * invalid_percent / 100;
+    if appended * 100 < valid_target * MIN_LOAD_PERCENT {
+        return Err(format!("underloaded: {appended} valid of {valid_target}"));
+    }
+    if forged * 100 < forged_target * MIN_LOAD_PERCENT {
+        return Err(format!("underloaded: {forged} forged of {forged_target}"));
+    }
+    if late_ns > MAX_LAG_NS {
+        return Err(format!("schedule lag {late_ns}ns over {MAX_LAG_NS}ns"));
+    }
+    if u64::try_from(samples).unwrap_or(u64::MAX) < MIN_SAMPLES_PER_SECOND * SECONDS {
+        return Err(format!("{samples} intake samples"));
+    }
+    Ok(())
 }
 
 /// One R4 run at `invalid_percent` of the valid rate; returns the report
@@ -118,6 +162,7 @@ fn r4(invalid_percent: u64) -> String {
     let committed_before = rig.agents.receiver.counters().data_committed;
 
     let mut duties: Vec<u64> = Vec::with_capacity(MAX_SAMPLES);
+    let mut intakes: Vec<u64> = Vec::with_capacity(MAX_SAMPLES);
     let mut busy: Vec<u64> = Vec::with_capacity(MAX_SAMPLES);
     let mut out = vec![0_u8; 65_536];
     let mut allocating: Vec<(u64, u64, String)> = Vec::with_capacity(32);
@@ -158,20 +203,6 @@ fn r4(invalid_percent: u64) -> String {
             }
         }
         late_ns = late_ns.max((due - appended) * 1_000_000_000 / RATE);
-        // The flood, at its share of the scheduled valid rate.
-        let forged_due = due * invalid_percent / 100;
-        let receiver = &mut rig.agents.receiver;
-        let ((), allocations) = count_allocations(|| {
-            while forged < forged_due {
-                #[allow(clippy::cast_possible_truncation, reason = "below POOL")]
-                let bytes = &pool[(forged % POOL) as usize];
-                receiver
-                    .role
-                    .inject_datagram(&receiver.sessions, b, source, bytes, now);
-                forged += 1;
-            }
-        });
-        forged_allocs += allocations;
         if let Some(log) = rig.log.as_mut() {
             for conductor in &mut log.conductors {
                 let _ = conductor.duty_cycle().unwrap();
@@ -183,16 +214,34 @@ fn r4(invalid_percent: u64) -> String {
         let (result, allocations) = count_allocations(|| sender.do_work(now));
         result.unwrap();
         sender_allocs += allocations;
+        // The receiver's intake: the flood at its share of the scheduled
+        // valid rate, verified and refused, then the receiver's duty cycle.
+        // The interval times both; the duty is also timed alone.
+        let forged_due = due * invalid_percent / 100;
         let receiver = &mut rig.agents.receiver;
+        let intake = Instant::now();
+        let ((), allocations) = count_allocations(|| {
+            while forged < forged_due {
+                #[allow(clippy::cast_possible_truncation, reason = "below POOL")]
+                let bytes = &pool[(forged % POOL) as usize];
+                receiver
+                    .role
+                    .inject_datagram(&receiver.sessions, b, source, bytes, now);
+                forged += 1;
+            }
+        });
+        forged_allocs += allocations;
         let timed = Instant::now();
         let (work, allocations) = count_allocations(|| receiver.do_work(now));
         let duty = u64::try_from(timed.elapsed().as_nanos()).unwrap();
+        let interval = u64::try_from(intake.elapsed().as_nanos()).unwrap();
         receiver_allocs += allocations;
         if allocations > 0 && allocating.len() < allocating.capacity() {
             allocating.push((elapsed, allocations, counters_of(&rig)));
         }
         if duties.len() < MAX_SAMPLES {
             duties.push(duty);
+            intakes.push(interval);
         }
         if work.unwrap() > 0 && busy.len() < MAX_SAMPLES {
             busy.push(duty);
@@ -263,13 +312,23 @@ fn r4(invalid_percent: u64) -> String {
         "state: new challenge entries={new_challenges} epochs before={epochs:?} after={:?}",
         rig.agents.receiver.role.enc_epochs(slot)
     );
-    let _ = writeln!(report, "receiver duties: iterations={iterations}");
+    let _ = writeln!(
+        report,
+        "receiver duties: iterations={iterations} (refused below {} per second)",
+        MIN_SAMPLES_PER_SECOND
+    );
     for (at, allocations, counters) in &allocating {
         let _ = writeln!(
             report,
             "allocating duty at {at}ns: {allocations} ({counters})"
         );
     }
+    let samples = intakes.len();
+    percentiles(
+        "receiver intake (forged verification + duty), every poll",
+        &mut intakes,
+        &mut report,
+    );
     percentiles("receiver duty, every poll", &mut duties, &mut report);
     percentiles("receiver duty, polls that did work", &mut busy, &mut report);
     // The report goes to stdout (run with --nocapture), and to a file in
@@ -281,8 +340,16 @@ fn r4(invalid_percent: u64) -> String {
         std::fs::write(dir.join(format!("r4-{invalid_percent}.txt")), &report).unwrap();
     }
 
+    // The load was sustained: an underloaded run measures nothing.
+    if let Err(why) = sustained(appended, forged, invalid_percent, late_ns, samples) {
+        panic!(
+            "{why}
+{report}"
+        );
+    }
     assert_eq!(forged_allocs, 0, "{report}");
     assert_eq!(receiver_allocs, 0, "{report}");
+    assert_eq!(sender_allocs, 0, "{report}");
     assert_eq!(
         after.get(EncRejection::Tag) - before.get(EncRejection::Tag),
         forged,
@@ -310,4 +377,22 @@ fn r4_encrypted_invalid_tags_at_10_percent() {
 #[ignore = "H10 R4 measurement: run explicitly in release"]
 fn r4_encrypted_invalid_tags_at_100_percent() {
     let _ = r4(100);
+}
+
+#[test]
+fn an_underloaded_r4_run_is_refused() {
+    let full = RATE * SECONDS;
+    let samples = usize::try_from(MIN_SAMPLES_PER_SECOND * SECONDS).unwrap();
+    assert_eq!(sustained(full, full / 10, 10, 0, samples), Ok(()));
+    assert_eq!(
+        sustained(full * 95 / 100, full * 95 / 100, 100, MAX_LAG_NS, samples),
+        Ok(())
+    );
+    // A stall before the first iteration: nothing injected at all.
+    assert!(sustained(0, 0, 10, 0, 0).is_err());
+    assert!(sustained(full * 94 / 100, full, 100, 0, samples).is_err());
+    assert!(sustained(full, full * 94 / 100, 100, 0, samples).is_err());
+    assert!(sustained(full, full / 10 * 94 / 100, 10, 0, samples).is_err());
+    assert!(sustained(full, full, 100, MAX_LAG_NS + 1, samples).is_err());
+    assert!(sustained(full, full, 100, 0, samples - 1).is_err());
 }
