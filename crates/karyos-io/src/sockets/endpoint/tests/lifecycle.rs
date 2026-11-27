@@ -88,10 +88,10 @@ fn open_rejects_invalid_configuration_and_protection() {
     // Review P3-7: the pools against the memory cap (4.5). 8 slots of 256
     // bytes and a 257 byte RX buffer need 2,305 bytes.
     check(
-        |cfg| cfg.memory_cap = std::num::NonZeroU64::new(2304).unwrap(),
+        |cfg| cfg.memory_cap = std::num::NonZeroU64::new(18495).unwrap(),
         OpenError::InvalidConfig {
             field: "memory_cap",
-            value: 2305,
+            value: 18496,
         },
     );
     // The largest pool (32 MiB) exceeds the provisional default cap.
@@ -102,7 +102,7 @@ fn open_rejects_invalid_configuration_and_protection() {
         },
         OpenError::InvalidConfig {
             field: "memory_cap",
-            value: 4096 * 8192 + 8193,
+            value: 4096 * 8192 + 64 * 8193,
         },
     );
     // S3 review P3: a buffer request the C `int` of `SO_SNDBUF` or
@@ -152,7 +152,8 @@ fn buffer_requests_up_to_a_c_int_are_valid() {
 #[test]
 fn memory_cap_admits_pools_at_the_cap() {
     let mut cfg = config();
-    cfg.memory_cap = std::num::NonZeroU64::new(2305).unwrap();
+    // 8 TX slots of 256 bytes and 64 RX batch slots of 257.
+    cfg.memory_cap = std::num::NonZeroU64::new(18496).unwrap();
     assert_eq!(cfg.validate(), Ok(()), "the cap is inclusive");
     cfg.tx_slots = nz(MAX_TX_SLOTS);
     cfg.max_datagram = nz(MAX_DATAGRAM);
@@ -195,6 +196,8 @@ fn snapshot_records_the_baseline() {
     assert_eq!(snapshot.queue_assignment, QueueAssignment::KernelSelected);
     assert_eq!(snapshot.max_datagram, 256);
     let library = CapabilityState::Unavailable(Reason::LibraryApi);
+    // The probes' RX batching: the scripted loop is not a batch.
+    assert_eq!(snapshot.rx_batch, default_probes(&config()).rx_batch);
     for capability in [
         Capability::RxBatch,
         Capability::Gso,
@@ -262,6 +265,35 @@ fn required_capability_loss() {
     let snapshot = *endpoint.reopen(&cfg).unwrap();
     assert_eq!(snapshot.epoch.get().get(), 2);
     assert_eq!(snapshot.tx_batch, CapabilityState::Active);
+    retire_all(&mut endpoint);
+}
+
+/// RX batching is the probes' state: required, it opens when the backend
+/// batches and is refused, closing the socket, when it does not.
+#[test]
+fn rx_batching_follows_the_probes() {
+    let mut cfg = config();
+    cfg.require = CapabilitySet::EMPTY.with(Capability::RxBatch);
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    assert_eq!(
+        SocketsEndpoint::open(&cfg, InstanceId::FIRST, socket).unwrap_err(),
+        OpenError::RequiredCapability {
+            capability: Capability::RxBatch,
+            state: CapabilityState::Unavailable(Reason::LibraryApi),
+        }
+    );
+    assert_eq!(observer.live_descriptors(), 0);
+    let socket = ScriptedSocket::new();
+    let mut probes = default_probes(&cfg);
+    probes.rx_batch = CapabilityState::Active;
+    socket.observer().push_open(Ok(probes));
+    let mut endpoint = SocketsEndpoint::open(&cfg, InstanceId::FIRST, socket).unwrap();
+    assert_eq!(endpoint.capabilities().rx_batch, CapabilityState::Active);
+    assert_eq!(
+        endpoint.capabilities().state(Capability::RxBatch),
+        CapabilityState::Active
+    );
     retire_all(&mut endpoint);
 }
 

@@ -99,8 +99,10 @@ pub struct ScriptedSocket {
 }
 
 /// The probes an unscripted [`SocketOps::open`] returns: the address of
-/// the configuration, every probed capability `Active` and each buffer
-/// request met.
+/// the configuration, every probed capability `Active` except RX batching
+/// and each buffer request met. The scripted `recv_batch` is the default
+/// loop of single receives, not a batch, so RX batching is
+/// `Unavailable(LibraryApi)`: the scripted library has no batched receive.
 #[must_use]
 pub fn default_probes(config: &SocketsConfig) -> SocketProbes {
     let buffer = |requested: Option<std::num::NonZeroU32>| match requested {
@@ -116,6 +118,7 @@ pub fn default_probes(config: &SocketsConfig) -> SocketProbes {
         interface: None,
         dont_fragment: CapabilityState::Active,
         tx_batch: CapabilityState::Active,
+        rx_batch: CapabilityState::Unavailable(Reason::LibraryApi),
         send_buffer: buffer(config.send_buffer),
         recv_buffer: buffer(config.recv_buffer),
         multicast: config

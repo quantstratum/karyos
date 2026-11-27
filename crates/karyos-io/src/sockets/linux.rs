@@ -19,12 +19,15 @@
 //!   anything else is [`SendResult::OutOfAbi`].
 //! - Receive (4.4): one `recvmsg` with `MSG_TRUNC` per call, the source
 //!   address and the true length of a datagram that fills or exceeds the
-//!   buffer.
+//!   buffer; the batched receive the endpoint uses is one `recvmmsg` with
+//!   the same flag and the same result per message, through the `libc`
+//!   wrapper of `crate::linux_sys` (`rustix` 1.1.5 has no `recvmmsg`).
 //! - `split` duplicates with `fcntl_dupfd_cloexec` (3.10); `add_route`
 //!   measures `IP_MTU` or `IPV6_MTU` on a temporary connected socket (4.5).
 //! - Probes (8.2): `sendmmsg` with zero messages, the buffer and don't
-//!   fragment read backs. The capabilities `rustix` 1.1.5 has no API for
-//!   (`recvmmsg`, GSO, GRO, `SO_TIMESTAMPING`, `SO_BUSY_POLL`) are reported
+//!   fragment read backs. RX batching is `Active`: every batched receive
+//!   is one `recvmmsg`. The capabilities `rustix` 1.1.5 has no API for
+//!   (GSO, GRO, `SO_TIMESTAMPING`, `SO_BUSY_POLL`) are reported
 //!   `Unavailable(LibraryApi)` by the snapshot (decision O-3);
 //!   `IP_PKTINFO` is not set. `IP_MULTICAST_ALL` (or `IPV6_MULTICAST_ALL`)
 //!   is set off on every socket that joins a group, through the one safe
@@ -42,7 +45,7 @@
 //! from creation and every send and receive also passes `MSG_DONTWAIT`.
 //! The system calls the backend needs, for a seccomp profile, are
 //! `socket`, `bind`, `connect`, `getsockname`, `setsockopt`, `getsockopt`,
-//! `fcntl`, `sendmsg`, `sendmmsg`, `recvmsg` and `close` (8.2).
+//! `fcntl`, `sendmsg`, `sendmmsg`, `recvmsg`, `recvmmsg` and `close` (8.2).
 
 #![forbid(unsafe_code)]
 
@@ -65,6 +68,7 @@ use super::errqueue::ErrEntry;
 use super::etf::EtfSocket;
 use super::ops::{Errno, RecvResult, RouteAddr, SendResult, SocketOps, SocketProbes};
 use crate::backend::{CapabilityState, EtfQueue, OpenError, Reason};
+use crate::linux_sys::{RECV_BATCH, RecvMessage};
 
 /// Entries of one `sendmmsg`: the stack arrays of one exposure, equal to
 /// [`SOCKETS_MAX_BATCH`] (checked below without a cast).
@@ -416,6 +420,8 @@ fn configure(config: &SocketsConfig) -> Result<(OwnedFd, SocketProbes), OpenErro
         interface,
         dont_fragment,
         tx_batch,
+        // `recv_batch` is always one `recvmmsg` (`crate::linux_sys`).
+        rx_batch: CapabilityState::Active,
         send_buffer,
         recv_buffer,
         multicast,
@@ -562,6 +568,41 @@ impl SocketOps for LinuxSocket {
                 }
             }
             Err(error) => RecvResult::Error(errno(error)),
+        }
+    }
+
+    /// One `recvmmsg` with `MSG_TRUNC` (`crate::linux_sys::recv_batch`),
+    /// each message mapped as [`recv`](SocketOps::recv) maps its one.
+    fn recv_batch(&mut self, slab: &mut [u8], stride: usize, results: &mut [RecvResult]) -> usize {
+        let Some(fd) = self.fd.as_ref() else {
+            return results.first_mut().map_or(0, |first| {
+                *first = RecvResult::Error(Errno::BADF);
+                1
+            });
+        };
+        let mut messages = [RecvMessage::EMPTY; RECV_BATCH];
+        let want = results.len().min(RECV_BATCH);
+        let Some(messages) = messages.get_mut(..want) else {
+            return 0;
+        };
+        match crate::linux_sys::recv_batch(std::os::fd::AsFd::as_fd(fd), slab, stride, messages) {
+            Ok(received) => {
+                for (result, message) in results.iter_mut().zip(messages.iter()).take(received) {
+                    // As in `recv`: a datagram that fills the buffer reports
+                    // its length too (4.4).
+                    let truncated = message.truncated || message.bytes >= stride;
+                    *result = RecvResult::Datagram {
+                        len: message.bytes.min(stride),
+                        truncated: truncated.then_some(message.bytes),
+                        source: message.source,
+                    };
+                }
+                received
+            }
+            Err(raw) => results.first_mut().map_or(0, |first| {
+                *first = RecvResult::Error(Errno::from_raw(raw));
+                1
+            }),
         }
     }
 

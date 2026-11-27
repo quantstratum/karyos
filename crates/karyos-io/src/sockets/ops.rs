@@ -205,6 +205,31 @@ pub trait SocketOps: Sized {
     /// Receives one datagram into `buffer`.
     fn recv(&mut self, buffer: &mut [u8]) -> RecvResult;
 
+    /// Receives up to `results.len()` datagrams, the `i`th into the `i`th
+    /// `stride` bytes of `slab`, and returns how many results it wrote,
+    /// from the first. Each result is exactly what [`recv`](Self::recv)
+    /// into a buffer of `stride` bytes returns; an `Error` is always the
+    /// last result written. Writes at least one result unless `results`
+    /// is empty, `stride` is 0 or `slab` holds less than one `stride`.
+    ///
+    /// The default, used by the portable and scripted backends, is single
+    /// receives in order stopping after the first error; the Linux backend
+    /// makes one `recvmmsg`. Neither allocates.
+    fn recv_batch(&mut self, slab: &mut [u8], stride: usize, results: &mut [RecvResult]) -> usize {
+        if stride == 0 {
+            return 0;
+        }
+        let mut written: usize = 0;
+        for (buffer, result) in slab.chunks_exact_mut(stride).zip(results.iter_mut()) {
+            *result = self.recv(buffer);
+            written = written.saturating_add(1);
+            if matches!(result, RecvResult::Error(_)) {
+                break;
+            }
+        }
+        written
+    }
+
     /// Whether the sockets of a channel's redundant paths are isolated per
     /// interface: a datagram arriving on one path's interface is never
     /// received by another path's socket (`quantstratum-docs:
@@ -321,6 +346,11 @@ pub struct SocketProbes {
     /// The `sendmmsg` probe. `Active` means every
     /// [`SocketOps::send`] of the epoch is one `sendmmsg` call.
     pub tx_batch: CapabilityState,
+    /// Batched receive. `Active` means every [`SocketOps::recv_batch`] of
+    /// the epoch is one `recvmmsg` call; a backend whose `recv_batch` is
+    /// single receives in a loop reports it `Unavailable`, since a loop of
+    /// receive calls is not a batch.
+    pub rx_batch: CapabilityState,
     /// The send buffer request and its read back.
     pub send_buffer: BufferSize,
     /// The receive buffer request and its read back.

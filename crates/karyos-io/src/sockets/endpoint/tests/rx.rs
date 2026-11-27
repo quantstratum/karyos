@@ -210,7 +210,9 @@ fn rx_failed_stops_the_half() {
     let mut handler = Recorder::default();
     assert_eq!(h.rx.poll_rx(budget(8), &mut handler).stop, invariant);
     assert_eq!(h.rx.poll_rx(budget(8), &mut handler).stop, invariant);
-    assert_eq!(h.socket.recv_calls(), 1);
+    // The batched receive read ahead once (EAGAIN); the stopped half makes
+    // no further call.
+    assert_eq!(h.socket.recv_calls(), 2);
 }
 
 #[test]
@@ -279,4 +281,202 @@ fn a_counter_overflow_is_counted_not_wrapped() {
     let h = Harness::new();
     assert_eq!((h.tx.counter_overflows(), h.rx.counter_overflows()), (0, 0));
     assert!(h.shutdown().is_empty());
+}
+
+use crate::sockets::ops::SocketOps as _;
+
+/// The batched receive of the scripted backend: single receives in order,
+/// each result exactly what `recv` returns, stopping after the first error.
+#[test]
+fn scripted_recv_batch_is_single_receives_in_order() {
+    let mut socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    socket.open(&config()).unwrap();
+    let other = SocketAddr::from((Ipv4Addr::LOCALHOST, 7002));
+    observer
+        .push_recv_datagram(b"one", Some(peer()))
+        .push_recv_datagram(&payload(2, 300), Some(other))
+        .push_recv_datagram(b"three", None)
+        .push_recv_datagram(b"four", Some(peer()));
+    let stride = 257;
+    let mut slab = vec![0_u8; stride * 8];
+    let mut results = [RecvResult::Error(Errno::INVAL); 8];
+    // A partial batch: three slots, three datagrams, no error.
+    assert_eq!(socket.recv_batch(&mut slab, stride, &mut results[..3]), 3);
+    assert_eq!(
+        results[..3],
+        [
+            RecvResult::Datagram {
+                len: 3,
+                truncated: None,
+                source: Some(peer()),
+            },
+            RecvResult::Datagram {
+                len: 257,
+                truncated: Some(300),
+                source: Some(other),
+            },
+            RecvResult::Datagram {
+                len: 5,
+                truncated: None,
+                source: None,
+            },
+        ]
+    );
+    assert_eq!(&slab[..3], b"one");
+    assert_eq!(&slab[stride..2 * stride], &payload(2, 257)[..]);
+    assert_eq!(&slab[2 * stride..2 * stride + 5], b"three");
+    // The rest, then the error that ends the batch.
+    assert_eq!(socket.recv_batch(&mut slab, stride, &mut results), 2);
+    assert_eq!(
+        results[..2],
+        [
+            RecvResult::Datagram {
+                len: 4,
+                truncated: None,
+                source: Some(peer()),
+            },
+            RecvResult::Error(Errno::AGAIN),
+        ]
+    );
+    assert_eq!(observer.recv_calls(), 5);
+    // Nothing to fill: no call.
+    assert_eq!(socket.recv_batch(&mut slab, stride, &mut []), 0);
+    assert_eq!(socket.recv_batch(&mut slab, 0, &mut results), 0);
+    assert_eq!(observer.recv_calls(), 5);
+    socket.close();
+}
+
+/// A handler that stops in the middle of a batch leaves the rest pending:
+/// the next poll delivers it, in order, before any new receive call, and
+/// the budget still counts one op and one datagram per result.
+#[test]
+fn rx_results_of_a_batch_stay_pending_across_polls() {
+    let mut h = Harness::new();
+    let other = SocketAddr::from((Ipv4Addr::LOCALHOST, 7002));
+    for at in 0..5_u8 {
+        let source = if at % 2 == 0 { peer() } else { other };
+        h.socket.push_recv_datagram(&[at; 10], Some(source));
+    }
+    h.socket.push_recv_datagram(&payload(9, 400), Some(peer()));
+    let mut handler = Recorder {
+        stop_after: Some(2),
+        ..Recorder::default()
+    };
+    let outcome = h.rx.poll_rx(budget(8), &mut handler);
+    assert_eq!(outcome.stop, RxStop::HandlerStopped);
+    assert_eq!(
+        (
+            outcome.delivered,
+            outcome.spent.ops,
+            outcome.spent.datagrams
+        ),
+        (2, 2, 2)
+    );
+    // One batch read all six and the EAGAIN after them.
+    assert_eq!(h.socket.recv_calls(), 7);
+    handler.stop_after = None;
+    // A budget of two takes two pending results and makes no call.
+    let outcome = h.rx.poll_rx(budget(2), &mut handler);
+    assert_eq!((outcome.stop, outcome.delivered), (RxStop::Budget, 2));
+    assert_eq!(h.socket.recv_calls(), 7);
+    let outcome = h.rx.poll_rx(budget(8), &mut handler);
+    assert_eq!(outcome.stop, RxStop::WouldBlock);
+    assert_eq!((outcome.delivered, outcome.dropped), (1, 1));
+    assert_eq!(outcome.spent.ops, 3, "two datagrams and the EAGAIN");
+    let got: Vec<_> = handler
+        .datagrams
+        .iter()
+        .map(|(bytes, source)| (bytes[0], *source))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (0, peer()),
+            (1, other),
+            (2, peer()),
+            (3, other),
+            (4, peer())
+        ]
+    );
+    assert_eq!(handler.drops.len(), 1);
+    // The EAGAIN that stopped it was pending too: still no new call.
+    assert_eq!(h.socket.recv_calls(), 7);
+}
+
+/// Steady state of the scripted batched receive: once a warm-up batch has
+/// run, repeated batches, full and then on an empty script, allocate
+/// nothing.
+#[test]
+fn scripted_recv_batch_does_not_allocate_in_steady_state() {
+    let mut socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    socket.open(&config()).unwrap();
+    for at in 0..40_u8 {
+        observer.push_recv_datagram(&[at; 10], Some(peer()));
+    }
+    let stride = 257;
+    let mut slab = vec![0_u8; stride * 8];
+    let mut results = [RecvResult::Error(Errno::INVAL); 8];
+    assert_eq!(socket.recv_batch(&mut slab, stride, &mut results), 8);
+    let (filled, allocations) = karyos_sys::alloc_count::count(|| {
+        let mut filled = 0;
+        for _ in 0..4 {
+            filled += socket.recv_batch(&mut slab, stride, &mut results);
+        }
+        for _ in 0..4 {
+            assert_eq!(socket.recv_batch(&mut slab, stride, &mut results), 1);
+            assert_eq!(results[0], RecvResult::Error(Errno::AGAIN));
+        }
+        filled
+    });
+    assert_eq!((filled, allocations), (32, 0));
+    assert_eq!(
+        &slab[..10],
+        &[32_u8; 10],
+        "the last full batch starts at 32"
+    );
+    socket.close();
+}
+
+/// Steady state of the RX path: once a warm-up poll has run, polls that
+/// drive `recv_batch`, through full batches, pending results and the empty
+/// queue, allocate nothing.
+#[test]
+fn rx_batched_polls_do_not_allocate_in_steady_state() {
+    struct Count(u32);
+    impl RxHandler for Count {
+        fn datagram(&mut self, datagram: RxDatagram<'_>) -> ControlFlow<()> {
+            assert_eq!(datagram.bytes().len(), 10);
+            self.0 += 1;
+            ControlFlow::Continue(())
+        }
+        fn dropped(&mut self, _: RxDrop) {}
+    }
+    let mut h = Harness::new();
+    for at in 0..48_u8 {
+        h.socket.push_recv_datagram(&[at; 10], Some(peer()));
+    }
+    // Warm the clock and the scripted lock on the control path.
+    let _ = karyos_sys::host_clock::host_monotonic_ns();
+    let _ = h.socket.recv_calls();
+    let mut handler = Count(0);
+    let outcome = h.rx.poll_rx(budget(8), &mut handler);
+    assert_eq!(outcome.delivered, 8);
+    let (delivered, allocations) = karyos_sys::alloc_count::count(|| {
+        let mut delivered = 0;
+        // Budgets of 3 split batches, so results stay pending across polls.
+        for _ in 0..10 {
+            delivered += h.rx.poll_rx(budget(3), &mut handler).delivered;
+        }
+        for _ in 0..2 {
+            delivered += h.rx.poll_rx(budget(8), &mut handler).delivered;
+        }
+        for _ in 0..4 {
+            let outcome = h.rx.poll_rx(budget(8), &mut handler);
+            assert_eq!((outcome.stop, outcome.delivered), (RxStop::WouldBlock, 0));
+        }
+        delivered
+    });
+    assert_eq!((delivered, allocations, handler.0), (40, 0, 48));
 }
