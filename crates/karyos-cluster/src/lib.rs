@@ -34,6 +34,7 @@ pub mod hard_state;
 pub mod log;
 pub mod mark;
 pub mod membership;
+pub mod node;
 pub mod peer_frame;
 pub mod service;
 pub mod snapshot;
