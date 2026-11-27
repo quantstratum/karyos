@@ -60,6 +60,13 @@ pub const AA: [&str; 3] = ["trusted", "trusted-a", "trusted-b"];
 /// candidate.
 pub const SYNTHETIC_CHECK: [&str; 3] = ["trusted", "synthetic-500", "trusted-a"];
 
+/// The configurations of the encrypted cost plan (karyos#650): the
+/// encrypted profile between two `trusted` runs, interleaved per round.
+pub const ENCRYPTED_PLAN: [&str; 3] = ["trusted", "encrypted", "trusted-a"];
+
+/// The DATA envelope of the encrypted profile, `E_max` of its plan.
+pub const ENCRYPTED_E_MAX: u32 = crate::enc_cost::E;
+
 /// The assumed cost of one R1 message, for the runtime estimate only.
 const R1_ESTIMATE: Duration = Duration::from_micros(20);
 
@@ -121,6 +128,19 @@ impl PlanOptions {
         }
     }
 
+    /// `self` as the encrypted cost plan (karyos#650): [`ENCRYPTED_PLAN`] at
+    /// `E_max` = [`ENCRYPTED_E_MAX`], F1 only (multicast is refused for the
+    /// class, ADR-0114).
+    #[must_use]
+    pub fn with_encrypted(self) -> Self {
+        Self {
+            configurations: ENCRYPTED_PLAN.iter().map(ToString::to_string).collect(),
+            e_max: ENCRYPTED_E_MAX,
+            f2: false,
+            ..self
+        }
+    }
+
     /// Whether runs of this plan can reach a decision at all.
     #[must_use]
     pub fn sufficient(&self) -> bool {
@@ -176,12 +196,18 @@ pub struct Plan {
 }
 
 /// Why `point` cannot run yet; `None` when it can.
-fn skip_reason(point: &Point, f2: bool) -> Option<&'static str> {
+fn skip_reason(point: &Point, f2: bool, encrypted: bool) -> Option<&'static str> {
+    if matches!(point.fanout, Fanout::F2 { .. }) && encrypted {
+        return Some(
+            "F2: multicast is refused for the encrypted class (ADR-0114), Not demonstrated",
+        );
+    }
     if matches!(point.fanout, Fanout::F2 { .. }) && !f2 {
         return Some("F2 needs receivers sharing the group port (SO_REUSEADDR), Linux only");
     }
     match point.load {
         Load::R1 | Load::R2 { .. } => None,
+        Load::R5 { .. } if encrypted => None,
         Load::R5 { .. } => Some("R5 deferred: key epochs of a profile (5.4)"),
         Load::R3 | Load::R4 { .. } => Some("not a decision load"),
     }
@@ -233,12 +259,22 @@ pub fn expand(points: &[Point], options: &PlanOptions) -> Result<Plan, BenchErro
     let mut runs = Vec::new();
     let mut skipped = Vec::new();
     for point in points {
-        if let Some(reason) = skip_reason(point, options.f2) {
+        if let Some(reason) = skip_reason(
+            point,
+            options.f2,
+            options
+                .configurations
+                .iter()
+                .any(|c| c == crate::wire::profile::ENCRYPTED),
+        ) {
             skipped.push((*point, reason.to_string()));
             continue;
         }
         let load = match point.load {
             Load::R2 { rate } => StageLoad::Open {
+                rate: u64::from(rate),
+            },
+            Load::R5 { rate } => StageLoad::Rotation {
                 rate: u64::from(rate),
             },
             _ => StageLoad::Closed,
@@ -299,7 +335,7 @@ pub fn estimate(plan: &Plan) -> Option<Duration> {
         let messages =
             u128::from(planned.run.messages).checked_add(u128::from(planned.run.warmup))?;
         let traffic = match planned.run.load {
-            StageLoad::Open { rate } => messages
+            StageLoad::Open { rate } | StageLoad::Rotation { rate } => messages
                 .checked_mul(1_000_000_000)?
                 .checked_div(u128::from(rate))?,
             StageLoad::Closed => messages.checked_mul(R1_ESTIMATE.as_nanos())?,

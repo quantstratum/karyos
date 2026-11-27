@@ -51,7 +51,7 @@ use karyos_io::sockets::OsSocket;
 use karyos_io::sockets::endpoint::{
     InterfaceSel, MulticastConfig, SocketsConfig, SocketsEndpoint, SocketsRx, SocketsTx,
 };
-use karyos_protocol::protection::{Protection, Verdict};
+use karyos_protocol::protection::Protection;
 use karyos_protocol::sizing::TermLength;
 use karyos_sys::receive::{ImageParams, ValidatedDatagram};
 
@@ -81,7 +81,7 @@ pub const ACK_TIMEOUT: Duration = Duration::from_secs(1);
 pub fn receive_deadline(run: &StageRun) -> Result<Duration, BenchError> {
     let transfer = match run.load {
         StageLoad::Closed => Duration::ZERO,
-        StageLoad::Open { rate } => {
+        StageLoad::Open { rate } | StageLoad::Rotation { rate } => {
             let total = run
                 .warmup
                 .checked_add(run.messages)
@@ -112,6 +112,12 @@ pub enum StageLoad {
     Closed,
     /// R2: open loop at this many messages per second.
     Open {
+        /// Messages per second.
+        rate: u64,
+    },
+    /// R5: R2 at this rate across one in-band and one file epoch change of
+    /// the profile's key (karyos#650); scheduled as [`StageLoad::Open`].
+    Rotation {
         /// Messages per second.
         rate: u64,
     },
@@ -256,7 +262,7 @@ struct Slot {
 }
 
 /// The receiver: decides every datagram and timestamps each message.
-struct Receiver<'p, P: Protection> {
+struct Receiver<'p, P: crate::wire::profile::WireOpen> {
     protection: &'p P,
     template: &'p Template,
     params: ImageParams,
@@ -278,9 +284,11 @@ struct Receiver<'p, P: Protection> {
     allocations: u64,
     /// The condition that invalidated the run, if any.
     fault: Option<BenchError>,
+    /// Where a decrypting profile puts the frames it opens, sized once.
+    scratch: Vec<u8>,
 }
 
-impl<'p, P: Protection> Receiver<'p, P> {
+impl<'p, P: crate::wire::profile::WireOpen> Receiver<'p, P> {
     /// The receiver of `run`, sized up front: nothing it records
     /// reallocates inside a receive stage.
     fn new(run: &StageRun, prepared: &'p Prepared, protection: &'p P) -> Result<Self, BenchError> {
@@ -325,6 +333,7 @@ impl<'p, P: Protection> Receiver<'p, P> {
             drops: 0,
             allocations: 0,
             fault: None,
+            scratch: vec![0; crate::wire::profile::SCRATCH],
         })
     }
 
@@ -346,15 +355,12 @@ impl<'p, P: Protection> Receiver<'p, P> {
         batch: Instant,
         callback: Instant,
     ) -> Result<(), BenchError> {
-        let frames = match self.protection.open(bytes) {
-            Verdict::Accept { start, frames } => bytes.get(start..start.saturating_add(frames)),
-            Verdict::Reject(rejection) => {
-                return Err(BenchError(format!(
-                    "datagram rejected by the protection: {rejection:?}"
-                )));
-            }
-        }
-        .ok_or_else(|| BenchError("accepted frames past the datagram".into()))?;
+        let frames = self
+            .protection
+            .open_frames(bytes, &mut self.scratch)
+            .map_err(|rejection| {
+                BenchError(format!("datagram rejected by the protection: {rejection}"))
+            })?;
         ValidatedDatagram::parse(frames, &self.params)
             .map_err(|error| BenchError(format!("datagram rejected by the parser: {error:?}")))?;
         let decided = Instant::now();
@@ -430,7 +436,7 @@ impl<'p, P: Protection> Receiver<'p, P> {
     }
 }
 
-impl<P: Protection> RxHandler for Receiver<'_, P> {
+impl<P: crate::wire::profile::WireOpen> RxHandler for Receiver<'_, P> {
     fn datagram(&mut self, datagram: RxDatagram<'_>) -> ControlFlow<()> {
         let callback = Instant::now();
         let batch = *self.batch_start.get_or_insert(callback);
@@ -632,7 +638,7 @@ pub struct ReceiveControl<'a> {
 /// A failed half, an orphan sequence (M-11), a rejected or duplicate
 /// datagram, a saturated sample or the image parameters. The role stops
 /// at the first of them.
-pub fn receive_role<P: Protection>(
+pub fn receive_role<P: crate::wire::profile::WireOpen>(
     run: &StageRun,
     prepared: &Prepared,
     protection: &P,
@@ -841,7 +847,9 @@ pub fn send_role<P: Protection>(
     let mut ack_timeouts = 0_u64;
     let mut max_allocations = 0_u64;
     let schedule = match run.load {
-        StageLoad::Open { rate } => Some(Schedule::new(Instant::now(), rate)?),
+        StageLoad::Open { rate } | StageLoad::Rotation { rate } => {
+            Some(Schedule::new(Instant::now(), rate)?)
+        }
         StageLoad::Closed => None,
     };
     for sequence in 0..prepared.total {
@@ -986,7 +994,7 @@ impl Drop for SetOnDrop<'_> {
 ///
 /// The errors of [`send_role`] and [`receive_role`], and a role that
 /// panicked.
-pub fn run<P: Protection + Sync>(
+pub fn run<P: crate::wire::profile::WireOpen + Sync>(
     run: StageRun,
     protection: &P,
 ) -> Result<StageSamples, BenchError> {
