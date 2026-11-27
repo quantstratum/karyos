@@ -94,6 +94,11 @@
 //! driver's to keep with the snapshot and give back
 //! ([`Core::restore_membership`]); a restart replays the configuration
 //! entries its log holds through [`Core::configured`].
+//! A node takes an append of at least its own term from any sender, in
+//! its configuration or not, as from that term's leader, so a leader
+//! elected without this node's uncommitted change can truncate it
+//! (ADR-0125); every other message from outside the configuration is
+//! refused.
 
 use crate::hard_state::HardState;
 use crate::membership::{MAX_MEMBERS, Membership, MembershipChange};
@@ -1268,6 +1273,10 @@ impl Core {
     /// One message from member `from`; `terms` are the entry terms of an
     /// [`Message::Append`], empty otherwise.
     ///
+    /// Only members are heard, except an [`Message::Append`] whose term is
+    /// at least the node's own, which is stepped from any sender as from
+    /// that term's leader (ADR-0125).
+    ///
     /// # Errors
     ///
     /// [`StepError`] for a message the core refuses; its state is
@@ -1284,7 +1293,14 @@ impl Core {
         // A node outside its own membership (joining, or removed) follows
         // whoever leads: the voters it was started with may be gone.
         let joining = !self.members.contains(self.config.id);
-        if from == self.config.id || (!joining && !self.members.contains(from)) {
+        // An append of at least the node's term comes from that term's
+        // leader, in or out of the configuration the node has in effect: a
+        // leader elected under a configuration whose change this node holds
+        // uncommitted (or never received) must reach it to truncate that
+        // change (ADR-0125; Ongaro, section 4.1).
+        let current_leader =
+            matches!(message, Message::Append { term, .. } if term >= self.term_vote.term);
+        if from == self.config.id || (!joining && !current_leader && !self.members.contains(from)) {
             return Err(StepError::UnknownSender);
         }
         match message {
