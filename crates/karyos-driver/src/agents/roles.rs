@@ -6792,6 +6792,11 @@ struct PendingAbort {
     /// The per-lane ranges of the first valid ACK, which completed it.
     acked:
         Option<karyos_protocol::network::Lanes<karyos_protocol::network::authenticated::AckLane>>,
+    /// The binding a send round the control reserve held resumes at, so
+    /// every receiver gets its turn across refills (#1288 review).
+    cursor: usize,
+    /// Whether the current round submitted to some receiver already.
+    round_submitted: bool,
 }
 
 /// The alias of a frame a sender authenticates in domain 1 that names an
@@ -7698,6 +7703,8 @@ impl<T: StreamTerms> SenderRole<T> {
                 generation: self.key_generation.current(),
                 ended: None,
                 acked: None,
+                cursor: 0,
+                round_submitted: false,
             });
         }
     }
@@ -8856,6 +8863,8 @@ impl<T: StreamTerms> SenderRole<T> {
             generation: self.keys_applied,
             ended: None,
             acked: None,
+            cursor: 0,
+            round_submitted: false,
         });
         true
     }
@@ -9047,9 +9056,9 @@ impl<T: StreamTerms> SenderRole<T> {
                 pending.bytes,
                 pending.first.is_some(),
             );
-            let mut submitted = false;
-            let mut held = false;
-            for index in 0..self.bindings.len() {
+            let mut submitted = pending.round_submitted;
+            let mut held = None;
+            for index in pending.cursor..self.bindings.len() {
                 let Some(binding) = self.bindings.get(index) else {
                     break;
                 };
@@ -9073,7 +9082,7 @@ impl<T: StreamTerms> SenderRole<T> {
                         )
                     });
                 if admission == Some(crate::guard_gate::ControlAdmission::Held) {
-                    held = true;
+                    held = Some(index);
                     break;
                 }
                 if self
@@ -9087,11 +9096,22 @@ impl<T: StreamTerms> SenderRole<T> {
                     self.last_abort = Some((endpoint, destination, bytes));
                 }
             }
-            if held && !submitted {
-                // Held by the control reserve: it keeps its schedule and is
-                // tried again at the next duty, never dropped.
+            if let Some(index) = held {
+                // Held by the control reserve: the round resumes at this
+                // receiver at a later duty, never dropped, keeping its
+                // schedule; a held record takes no attempt slot from other
+                // publications' aborts (#1288 review).
+                if let Some(pending) = self.aborts.get_mut(at) {
+                    pending.cursor = index;
+                    pending.round_submitted = submitted;
+                }
+                attempts -= 1;
                 self.count(|c| &mut c.aborts_held);
                 continue;
+            }
+            if let Some(pending) = self.aborts.get_mut(at) {
+                pending.cursor = 0;
+                pending.round_submitted = false;
             }
             if submitted {
                 if resend {

@@ -691,7 +691,11 @@ fn the_current_epoch_is_the_newest_active_one_and_keeps_its_cutover() {
     let (mut store, _) = Store::start(keys.clone(), state, DEC_01).unwrap();
     keys.put("3-2.key", second().as_bytes());
     assert!(!store.reload(DEC_01).alarm());
-    assert_eq!(store.current_epoch(3, JAN_01 - 1), Some(1), "admitted ahead");
+    assert_eq!(
+        store.current_epoch(3, JAN_01 - 1),
+        Some(1),
+        "admitted ahead"
+    );
     assert_eq!(store.current_epoch(3, JAN_01), Some(2), "at its not_before");
     keys.remove("3-2.key");
     store.reload(JAN_01);

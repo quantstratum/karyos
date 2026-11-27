@@ -8199,7 +8199,14 @@ fn an_abort_pays_from_the_control_reserve_and_its_resends_wait_for_its_refill() 
         let _ = send_one(&mut rig, 100);
     }
     let gate = |rig: &Rig| {
-        let gate = rig.agents.sender.role.outbound(0).unwrap().guard_gate().unwrap();
+        let gate = rig
+            .agents
+            .sender
+            .role
+            .outbound(0)
+            .unwrap()
+            .guard_gate()
+            .unwrap();
         (gate.message_tokens(), gate.control_message_tokens())
     };
     assert_eq!(gate(&rig).0, Some(0), "the publication's bucket is spent");
@@ -8230,7 +8237,16 @@ fn an_abort_pays_from_the_control_reserve_and_its_resends_wait_for_its_refill() 
         sender.aborts_resent <= 2,
         "never past the reserve: {sender:?}"
     );
-    let held = rig.agents.sender.role.outbound(0).unwrap().guard_gate().unwrap().counts().control_held;
+    let held = rig
+        .agents
+        .sender
+        .role
+        .outbound(0)
+        .unwrap()
+        .guard_gate()
+        .unwrap()
+        .counts()
+        .control_held;
     assert!(held > 0);
 }
 
