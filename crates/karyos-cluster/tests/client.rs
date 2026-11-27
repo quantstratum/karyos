@@ -675,3 +675,40 @@ fn a_stale_registration_changes_nothing() {
     let sent = client.submit().unwrap();
     assert_eq!((sent.cluster, sent.key.epoch), (STANDBY, 3));
 }
+
+/// A same-generation answer of the old primary does not move the
+/// identity the client's requests name back from the standby it
+/// registered with (impl-a2's report against karyos#1283; seen in #720's
+/// S2 with slow answers).
+#[test]
+fn a_same_generation_answer_keeps_the_identity_requests_name() {
+    let accepted = Accepted {
+        primary: LIVE,
+        standby: Some(STANDBY),
+    };
+    let mut table = SessionTable::new(config(4)).unwrap();
+    let session = table.register(9, 1, 0).unwrap();
+    let mut client = ClusterClient::new(9, Some(OLD), accepted);
+    assert!(events(|sink| client.registered(session, live(1), sink).unwrap()).is_empty());
+    // The operator moves the client to the standby; its registration
+    // carries no higher generation yet.
+    let standby = SessionTable::new(config(4)).unwrap().register(9, 3, 0).unwrap();
+    let at_standby = Stamp {
+        cluster: STANDBY,
+        generation: 1,
+    };
+    let _ = events(|sink| client.registered(standby, at_standby, sink).unwrap());
+    // An answer stamped by the old primary, generation 1, for a request
+    // of this session.
+    let request = client.submit().unwrap();
+    let _ = events(|sink| {
+        client.replied(
+            request.key,
+            live(1),
+            Reply::Outcome(Answer::Applied),
+            sink,
+        )
+    });
+    let sent = client.submit().unwrap();
+    assert_eq!(sent.cluster, STANDBY, "still the standby it registered with");
+}
