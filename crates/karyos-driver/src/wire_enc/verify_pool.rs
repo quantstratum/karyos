@@ -6,24 +6,24 @@
 //! A receiving role hands the pure cryptographic step of an encrypted
 //! datagram, the AEAD open and the pairwise trailer, to a fixed pool of
 //! verifier threads; everything else stays on the role thread
-//! ([`super::EncOpener::prepare`] before, [`super::EncOpener::complete`]
+//! (`super::EncOpener::prepare` before, `super::EncOpener::complete`
 //! after). This module is the pool:
 //!
 //! - **A fixed slot table** (decision 4), made once at the first
 //!   encrypted subscription: a slot holds the datagram's bytes, the
-//!   plaintext buffer, the job's [`Lease`] and its outcome. It belongs to
-//!   the role from reservation ([`VerifyPool::dispatch`]), to a verifier
+//!   plaintext buffer, the job's `Lease` and its outcome. It belongs to
+//!   the role from reservation (`VerifyPool::dispatch`), to a verifier
 //!   while it runs, and back to the role, which consumes and frees it
-//!   ([`VerifyPool::take`]). A slot is never reused before it is freed.
+//!   (`VerifyPool::take`). A slot is never reused before it is freed.
 //!   When none is free the datagram is dropped before dispatch.
 //! - **Arrival order**: the role consumes results in the order it
 //!   dispatched them, one FIFO for the whole role, which orders every
 //!   binding and every source; a slot not yet done holds back the later
 //!   ones. There is no queue beyond the table.
 //! - **One terminal outcome per job**: verified, refused by the open, or
-//!   cancelled ([`Outcome`]), so the order always advances.
+//!   cancelled (`Outcome`), so the order always advances.
 //! - **Cancellation** (decision 5): the role cancels queued jobs
-//!   ([`VerifyPool::cancel_where`]), and a verifier reads the opener's
+//!   (`VerifyPool::cancel_where`), and a verifier reads the opener's
 //!   withdrawn mark before it opens and cancels instead.
 //! - **Leases**: each job's lease returns exactly once, when the role
 //!   consumes the job, or when the pool is dropped.
@@ -60,6 +60,17 @@ pub const DEFAULT_ENC_VERIFY_SLOTS: u16 = 256;
 pub const MAX_ENC_VERIFY_SLOTS: u16 = 4_096;
 /// Spins an idle verifier makes before it parks.
 const IDLE_SPINS: u32 = 1 << 12;
+
+/// Pools whose every verifier thread failed to start, so that their role
+/// opens inline instead ([`VerifyPool::new`]).
+static INLINE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// How many receiver roles fell back to opening on their own thread
+/// because none of their verifier threads could start.
+#[must_use]
+pub fn enc_verify_inline_fallbacks() -> u64 {
+    INLINE_FALLBACKS.load(Ordering::Relaxed)
+}
 
 /// Slot states.
 const FREE: u8 = 0;
@@ -298,8 +309,9 @@ pub(crate) struct VerifyPool<C> {
     /// Free slot indices, a stack of `free_len`.
     free: Box<[u32]>,
     free_len: usize,
-    /// The verifiers, to wake them.
-    threads: Box<[Thread]>,
+    /// The verifiers that started, each with its own index into
+    /// `sleeping`, to wake them.
+    threads: Box<[(usize, Thread)]>,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -314,12 +326,22 @@ impl<C> core::fmt::Debug for VerifyPool<C> {
 }
 
 impl<C: Copy + Send + 'static> VerifyPool<C> {
-    /// The pool of `config`, its table allocated now; with `spawn`, its
-    /// verifiers started (a thread that cannot start is left out: the role
-    /// runs a job itself whenever it waits for one). Without `spawn`
-    /// (tests) nothing verifies until the role waits, or a test runs a
-    /// job.
-    pub(crate) fn new(config: EncVerifyConfig, spawn: bool) -> Self {
+    /// The pool of `config`, its table allocated now and every slot's
+    /// mutex set up; with `spawn`, its verifiers started (a thread that
+    /// cannot start is left out: the role runs a job itself whenever it
+    /// waits for one). Without `spawn` (tests) nothing verifies until the
+    /// role waits, or a test runs a job.
+    ///
+    /// `None` when verifiers were asked for and none could start: the
+    /// role then opens inline, as with zero verifiers, and the fallback is
+    /// counted ([`enc_verify_inline_fallbacks`]).
+    pub(crate) fn new(config: EncVerifyConfig, spawn: bool) -> Option<Self> {
+        Self::start(config, spawn, |_| false)
+    }
+
+    /// [`Self::new`], with verifier `me` failing to start when `fails`
+    /// says so (tests).
+    fn start(config: EncVerifyConfig, spawn: bool, fails: impl Fn(usize) -> bool) -> Option<Self> {
         let slots = usize::from(config.slots.clamp(1, MAX_ENC_VERIFY_SLOTS));
         let verifiers = usize::from(config.verifiers.min(MAX_ENC_VERIFIERS));
         let shared = Arc::new(Shared {
@@ -341,23 +363,34 @@ impl<C: Copy + Send + 'static> VerifyPool<C> {
             stop: AtomicBool::new(false),
             sleeping: (0..verifiers).map(|_| AtomicBool::new(false)).collect(),
         });
+        // A platform whose mutex sets itself up on first use (a lazily
+        // boxed pthread mutex on macOS) would allocate at a slot's first
+        // dispatch: each is locked once now, before any verifier runs.
+        for cell in &*shared.cells {
+            drop(cell.lock());
+        }
         let mut handles = Vec::with_capacity(verifiers);
+        let mut threads = Vec::with_capacity(verifiers);
         if spawn {
             for me in 0..verifiers {
+                if fails(me) {
+                    continue;
+                }
                 let held = Arc::clone(&shared);
                 let started = std::thread::Builder::new()
                     .name(format!("karyos-enc-verify-{me}"))
                     .spawn(move || verifier(&held, me));
                 if let Ok(handle) = started {
+                    threads.push((me, handle.thread().clone()));
                     handles.push(handle);
                 }
             }
+            if verifiers > 0 && handles.is_empty() {
+                INLINE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
         }
-        let threads = handles
-            .iter()
-            .map(|handle| handle.thread().clone())
-            .collect();
-        Self {
+        Some(Self {
             shared,
             contexts: (0..slots).map(|_| None).collect(),
             order: (0..slots).map(|_| 0).collect(),
@@ -368,9 +401,9 @@ impl<C: Copy + Send + 'static> VerifyPool<C> {
                 .map(|index| u32::try_from(index).unwrap_or(u32::MAX))
                 .collect(),
             free_len: slots,
-            threads,
+            threads: threads.into_boxed_slice(),
             handles,
-        }
+        })
     }
 
     /// Jobs dispatched and not yet consumed.
@@ -448,8 +481,13 @@ impl<C: Copy + Send + 'static> VerifyPool<C> {
 
     /// Wakes one parked verifier, if any.
     fn wake(&self) {
-        for (sleeping, thread) in self.shared.sleeping.iter().zip(self.threads.iter()) {
-            if sleeping.swap(false, Ordering::SeqCst) {
+        for (me, thread) in &*self.threads {
+            if self
+                .shared
+                .sleeping
+                .get(*me)
+                .is_some_and(|sleeping| sleeping.swap(false, Ordering::SeqCst))
+            {
                 thread.unpark();
                 return;
             }
@@ -582,7 +620,7 @@ impl<C> Drop for VerifyPool<C> {
     /// one, go with the last reference to the table.
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        for thread in &*self.threads {
+        for (_, thread) in &*self.threads {
             thread.unpark();
         }
         for handle in self.handles.drain(..) {

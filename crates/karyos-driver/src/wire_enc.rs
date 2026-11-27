@@ -56,6 +56,7 @@ pub mod vm_generation;
 
 pub use verify_pool::{
     DEFAULT_ENC_VERIFY_SLOTS, EncVerifyConfig, MAX_ENC_VERIFIERS, MAX_ENC_VERIFY_SLOTS,
+    enc_verify_inline_fallbacks,
 };
 pub use vm_generation::{VmGenerationWatch, quiesced};
 
@@ -2200,6 +2201,11 @@ impl EncOpener {
         let header = header(datagram)?;
         let selected = self.select(&header, rate, now_ns)?;
         if selected == Selected::Next {
+            // One that could not be promoted is refused before its handler
+            // runs: a commit never reports a promotion it did not make.
+            if !self.can_promote() {
+                return Err(EncRejection::Epoch);
+            }
             let mut next = *self.current.key.context();
             next.key_epoch = header.key_epoch;
             next.party_epoch = header.party_epoch;
@@ -2255,7 +2261,9 @@ impl EncOpener {
         self.owns(pending)?;
         match self.committed_slot(pending.epochs, now_ns) {
             Some(key) => key.window().check(pending.seq).map_err(EncRejection::from),
-            None if self.is_next(pending.epochs.0, pending.epochs.1) => Ok(()),
+            None if self.is_next(pending.epochs.0, pending.epochs.1) && self.can_promote() => {
+                Ok(())
+            }
             None => Err(EncRejection::Epoch),
         }
     }
@@ -2300,7 +2308,7 @@ impl EncOpener {
             key.mark(pending.seq)?;
             return Ok(accepted(false));
         }
-        if !self.is_next(pending.epochs.0, pending.epochs.1) {
+        if !self.is_next(pending.epochs.0, pending.epochs.1) || !self.can_promote() {
             return Err(EncRejection::Epoch);
         }
         let mut next = *self.current.key.context();
@@ -2320,7 +2328,9 @@ impl EncOpener {
             .map_err(|_| EncRejection::Epoch)?;
         }
         self.scratch.mark(pending.seq)?;
-        self.promote(now_ns);
+        if !self.promote(now_ns) {
+            return Err(EncRejection::Epoch);
+        }
         Ok(accepted(true))
     }
 
@@ -2390,6 +2400,9 @@ impl EncOpener {
         if (key_epoch, party_epoch) == self.epochs() {
             return Ok(());
         }
+        if !self.can_promote() {
+            return Err(EncRejection::ResyncRefused);
+        }
         let mut next = *self.current.key.context();
         next.key_epoch = key_epoch;
         next.party_epoch = party_epoch;
@@ -2401,7 +2414,9 @@ impl EncOpener {
             false,
         )
         .map_err(|_| EncRejection::ResyncRefused)?;
-        self.promote(now_ns);
+        if !self.promote(now_ns) {
+            return Err(EncRejection::ResyncRefused);
+        }
         Ok(())
     }
 
@@ -2411,21 +2426,24 @@ impl EncOpener {
     /// recycled slot is erased in place first, so the dropped epoch's
     /// schedule survives nowhere (H8-16).
     ///
-    /// A previous key a verifier's lease still holds is not recycled: it is
-    /// left to its leases, erased when the last returns, and the spare is
-    /// taken instead (ADR-0126 decision 5).
-    fn promote(&mut self, now_ns: u64) {
-        let recycled = self
-            .previous
-            .take()
-            .map(|(slot, _)| slot.key)
-            .filter(|key| Arc::strong_count(key) == 1)
-            .or_else(|| self.spare.take());
+    /// A previous key a verifier's lease still holds is never recycled or
+    /// given up: the promotion waits for its last lease to return
+    /// (ADR-0126 decision 5). Returns whether it promoted: never false
+    /// after [`Self::can_promote`] held, since only the role thread takes
+    /// leases and a lease only ever returns.
+    fn promote(&mut self, now_ns: u64) -> bool {
+        if !self.can_promote() {
+            return false;
+        }
+        let recycled = match self.previous.take() {
+            Some((slot, _)) => Some(slot.key),
+            None => self.spare.take(),
+        };
         let Some(mut recycled) = recycled else {
-            return;
+            return false;
         };
         if !erase_shared(&mut recycled, self.erase) {
-            return;
+            return false;
         }
         let key = core::mem::replace(&mut self.scratch, recycled);
         let old = core::mem::replace(
@@ -2436,6 +2454,18 @@ impl EncOpener {
             },
         );
         self.previous = Some((old, now_ns.saturating_add(EPOCH_OVERLAP_NS)));
+        true
+    }
+
+    /// Whether a promotion now finds a slot to recycle, changing nothing:
+    /// the previous key once no lease holds it, or the spare when there is
+    /// no previous key. Checked before any next-epoch handler runs, so a
+    /// datagram that could not promote is refused without effects.
+    fn can_promote(&self) -> bool {
+        match &self.previous {
+            Some((slot, _)) => Arc::strong_count(&slot.key) == 1,
+            None => self.spare.is_some(),
+        }
     }
 
     /// Erases the previous epoch's key once its overlap has passed at
@@ -2444,11 +2474,18 @@ impl EncOpener {
     /// erased in place and kept as the spare, so the next promotion still
     /// constructs no key. Role maintenance calls it every duty. Allocates
     /// nothing.
+    ///
+    /// One a verifier's lease still holds stays in place, selectable by
+    /// nothing, until a duty after its last lease returns (ADR-0126
+    /// decision 5): its storage is never given up, so a later promotion
+    /// still finds a slot.
     pub fn expire_previous(&mut self, now_ns: u64) {
-        let Some((mut slot, _)) = self.previous.take_if(|(_, until)| now_ns >= *until) else {
+        let Some((mut slot, _)) = self
+            .previous
+            .take_if(|(slot, until)| now_ns >= *until && Arc::strong_count(&slot.key) == 1)
+        else {
             return;
         };
-        // One a lease still holds is left to it, erased at its return.
         if erase_shared(&mut slot.key, self.erase) && self.spare.is_none() {
             self.spare = Some(slot.key);
         }

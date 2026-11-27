@@ -632,8 +632,10 @@ impl ReceiverEnc {
             let (config, spawn) = TEST_VERIFY
                 .with(core::cell::Cell::get)
                 .unwrap_or((self.verify, true));
+            // None of its verifiers started: inline, as with none
+            // (counted by the pool).
             if config.verifiers > 0 || !spawn {
-                self.pool = Some(VerifyPool::new(config, spawn));
+                self.pool = VerifyPool::new(config, spawn);
             }
         }
         // It starts at the role's activation floor, not 0 (H8-17).

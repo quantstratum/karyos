@@ -16,7 +16,10 @@ use super::super::{
     COMMITTED_OPENS_PER_S, ChannelKeys, EncOpener, EncSealer, KEY_AGE_NS, KeyKind, MAX_SEALED,
     OpenRate, Prepared, SECOND_NS, Ticket,
 };
-use super::{Done, EncVerifyConfig, MAX_ENC_VERIFIERS, MAX_ENC_VERIFY_SLOTS, Outcome, VerifyPool};
+use super::{
+    Done, EncVerifyConfig, MAX_ENC_VERIFIERS, MAX_ENC_VERIFY_SLOTS, Outcome, VerifyPool,
+    enc_verify_inline_fallbacks,
+};
 use crate::wire_keys::{KEY_LEN, parse};
 
 thread_local! {
@@ -95,7 +98,7 @@ fn opener() -> EncOpener {
 type Job = (u32, Ticket);
 
 fn pool(slots: u16, verifiers: u16, spawn: bool) -> VerifyPool<Job> {
-    VerifyPool::new(EncVerifyConfig { verifiers, slots }, spawn)
+    VerifyPool::new(EncVerifyConfig { verifiers, slots }, spawn).unwrap()
 }
 
 /// Prepares `bytes` and dispatches it as job `tag`.
@@ -431,4 +434,71 @@ fn the_open_rate_is_one_aggregate_count_under_a_concurrent_flood() {
     let done = pool.take_waiting(&mut plain).unwrap();
     assert_eq!(finish(&mut opener, done), Err(EncRejection::Tag));
     set_now(clock() - SECOND_NS);
+}
+
+/// Review of #1298, finding 2: a verifier that starts after one that
+/// failed parks on its own index and is woken by each dispatch, so the
+/// role never runs a job itself; with no verifier started there is no
+/// pool and the role opens inline, counted.
+#[test]
+fn a_verifier_started_after_a_failed_one_is_woken() {
+    let mut opener = opener();
+    let mut rate = OpenRate::default();
+    let config = EncVerifyConfig {
+        verifiers: 3,
+        slots: 4,
+    };
+    let mut pool = VerifyPool::<Job>::start(config, true, |me| me != 2).unwrap();
+    assert_eq!(pool.verifiers(), 1);
+    let datagrams = sealed(0x11, 16);
+    let mut plain = [0_u8; MAX_PLAINTEXT];
+    let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(5);
+    for (tag, bytes) in (0_u32..).zip(&datagrams) {
+        let until = deadline();
+        while !pool.shared.sleeping[2].load(core::sync::atomic::Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < until, "the verifier parks");
+            std::thread::yield_now();
+        }
+        dispatch(&mut pool, &mut opener, &mut rate, bytes, tag).unwrap();
+        let until = deadline();
+        let done = loop {
+            if let Some(done) = pool.take(&mut plain) {
+                break done;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "job {tag}: the parked verifier was never woken"
+            );
+            std::thread::yield_now();
+        };
+        assert_eq!(finish(&mut opener, done), Ok(tag));
+    }
+    assert_eq!(opener.leases(), 0);
+    let before = enc_verify_inline_fallbacks();
+    assert!(VerifyPool::<Job>::start(config, true, |_| true).is_none());
+    assert!(enc_verify_inline_fallbacks() > before);
+}
+
+/// Review of #1298, finding 3: every slot's mutex is set up with the
+/// pool, so the first dispatch into each cold slot, its verification and
+/// its consumption allocate nothing (a lazily boxed pthread mutex on
+/// macOS would allocate at its first lock).
+#[test]
+fn every_cold_slot_is_used_without_allocating() {
+    let mut opener = opener();
+    let mut rate = OpenRate::default();
+    let mut pool = pool(64, 0, false);
+    let datagrams = sealed(0x11, 64);
+    let mut plain = [0_u8; MAX_PLAINTEXT];
+    let ((), allocations) = count_allocations(|| {
+        for (tag, bytes) in (0_u32..).zip(&datagrams) {
+            dispatch(&mut pool, &mut opener, &mut rate, bytes, tag).unwrap();
+        }
+        for expected in 0..64 {
+            let done = pool.take_waiting(&mut plain).unwrap();
+            assert_eq!(finish(&mut opener, done), Ok(expected));
+        }
+    });
+    assert_eq!(allocations, 0, "64 cold slots");
+    assert_eq!(opener.leases(), 0);
 }
