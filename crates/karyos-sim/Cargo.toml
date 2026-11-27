@@ -26,7 +26,7 @@ alloc-probe = ["karyos-sys/test-hooks"]
 # Fault injection around a real core: a faulty driver, service or client
 # (harness::workloads::Faults; karyos#1038). Tests only: enabled by the
 # Raft evaluation crate's dev-dependency, never in a shipped build.
-test-hooks = []
+test-hooks = ["karyos-cluster/test-hooks"]
 
 [dev-dependencies]
 # The scripted sockets of the timed scenarios (tests/timed.rs).

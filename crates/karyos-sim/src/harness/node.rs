@@ -67,8 +67,8 @@ use karyos_cluster::standby::{
 use karyos_cluster::{Entry, LogError, RaftLog};
 
 use super::core::{
-    Applying, Change, ChangeRefused, Configuration, ConsensusCore, DriveError, DriveFault, Limit,
-    Limits, LogView, NotLeader, ReadBudget, ReadyBuf, Refused, Release, SnapshotBase, Step,
+    Applying, Change, ChangeRefused, Configuration, ConsensusCore, Detail, DriveError, DriveFault,
+    Limit, Limits, LogView, NotLeader, ReadBudget, ReadyBuf, Refused, Release, SnapshotBase, Step,
     TransferRefused, Unsupported, drive_inner,
 };
 use super::failover::FailoverClient;
@@ -3471,7 +3471,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             &mut core,
             &mut log,
             &mut self.ready,
-            (budget, base, self.drive_fault),
+            (budget, base, self.drive_fault, Detail::Appended),
             &mut |to, message, release| {
                 if let Some(release) = release {
                     recorder
