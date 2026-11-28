@@ -682,7 +682,15 @@ mod w1 {
         }
         assert_eq!(probes.len(), case.servers);
         assert_eq!(states.len(), case.servers);
-        let diagnosis = diagnosis(case.servers, &processes, &texts, &stuck_processes);
+        let diagnosis = diagnosis(
+            case.servers,
+            &processes,
+            &texts,
+            &stuck_processes,
+            // One CLOCK_MONOTONIC for every process on Linux only:
+            // elsewhere each process stamps from its own origin.
+            cfg!(target_os = "linux"),
+        );
         let recorded = record::merge(processes);
         // As `workloads::run` takes them: the servers that are up.
         let up: Vec<&State> = states.iter().filter(|state| state.up).collect();
@@ -721,23 +729,40 @@ mod w1 {
     /// processes), the terms it led and when, its commit moves, its first
     /// and last commit and the longest wait between two; then each stuck
     /// client process's records, its last line included. Times are
-    /// milliseconds from the earliest stamp of the run.
-    fn diagnosis(
+    /// milliseconds from the earliest stamp of the run when every process
+    /// reads one clock (`shared`, Linux's `CLOCK_MONOTONIC`); otherwise
+    /// each process stamps from its own origin, so its times are from its
+    /// own first stamp and cannot be compared across processes, as the
+    /// header says (Codex review of #1302).
+    pub(super) fn diagnosis(
         servers: usize,
         processes: &[Vec<(u64, Item)>],
         texts: &[String],
         stuck: &[usize],
+        shared: bool,
     ) -> String {
         use std::fmt::Write as _;
-        let origin = processes
+        let first = |items: &[(u64, Item)]| items.iter().map(|(stamp, _)| *stamp).min();
+        let run_origin = processes
             .iter()
-            .flatten()
-            .map(|(stamp, _)| *stamp)
+            .filter_map(|items| first(items))
             .min()
             .unwrap_or(0);
-        let ms = |stamp: u64| stamp.saturating_sub(origin) as f64 / 1e6;
-        let mut out = String::new();
+        let origin_of = |process: usize| {
+            if shared {
+                run_origin
+            } else {
+                first(&processes[process]).unwrap_or(0)
+            }
+        };
+        let mut out = String::from(if shared {
+            "times in ms from the run's first stamp, one clock for every process\n"
+        } else {
+            "times in ms from each process's own first stamp: process-relative, not comparable across processes\n"
+        });
         for (process, items) in processes.iter().enumerate().take(servers) {
+            let origin = origin_of(process);
+            let ms = |stamp: u64| stamp.saturating_sub(origin) as f64 / 1e6;
             let leading: Vec<String> = items
                 .iter()
                 .filter_map(|(stamp, item)| match item {
@@ -788,6 +813,8 @@ mod w1 {
             out.push('\n');
         }
         for &process in stuck {
+            let origin = origin_of(process);
+            let ms = |stamp: u64| stamp.saturating_sub(origin) as f64 / 1e6;
             let _ = writeln!(out, "stuck client process {process}:");
             for (stamp, item) in &processes[process] {
                 let _ = writeln!(out, "  {:.1} {item:?}", ms(*stamp));
@@ -1427,4 +1454,30 @@ fn of_all(totals: &[(String, u64, u64)], name: &str) -> (u64, u64) {
         .find(|(other, _, _)| other == name)
         .map(|(_, allocated, freed)| (*allocated, *freed))
         .unwrap()
+}
+
+/// The diagnosis of a stall reads one timeline only where the processes
+/// share a clock; elsewhere each process's times start at its own first
+/// stamp, and the header says so (Codex review of #1302).
+#[test]
+fn a_stall_diagnosis_compares_times_only_on_a_shared_clock() {
+    use karyos_raft_eval::record::Item;
+    use karyos_sim::harness::node::Observation;
+
+    let leading = |stamp: u64| {
+        (
+            stamp,
+            Item::Observation(Observation::Leading { node: 0, term: 2 }),
+        )
+    };
+    // Two servers whose clocks start 5 s apart.
+    let processes = vec![vec![leading(1_000_000)], vec![leading(5_002_000_000)]];
+    let texts = vec![String::new(), String::new()];
+    let shared = w1::diagnosis(2, &processes, &texts, &[], true);
+    assert!(shared.contains("one clock"), "{shared}");
+    assert!(shared.contains("term 2 at 0.0"), "{shared}");
+    assert!(shared.contains("term 2 at 5001.0"), "{shared}");
+    let local = w1::diagnosis(2, &processes, &texts, &[], false);
+    assert!(local.contains("process-relative"), "{local}");
+    assert_eq!(local.matches("term 2 at 0.0").count(), 2, "{local}");
 }
