@@ -2449,21 +2449,15 @@ impl<T: StreamTerms> ReceiverRole<T> {
                     }
                 }
                 for (_, alias) in published.iter().filter(|(held, _)| *held == endpoint) {
-                    if snapshot.published.len() < snapshot.published.capacity() {
-                        snapshot.published.push(*alias);
-                    }
+                    snapshot.push_published(*alias);
                 }
                 for (_, alias, publication) in
                     verified.iter().filter(|(held, ..)| *held == endpoint)
                 {
-                    if snapshot.verified.len() < snapshot.verified.capacity() {
-                        snapshot.verified.push((*alias, *publication));
-                    }
+                    snapshot.push_verified(*alias, *publication);
                 }
                 for (identity, until) in sessions.quarantined_until() {
-                    if snapshot.retired.len() < snapshot.retired.capacity() {
-                        snapshot.retired.push((publication_of(&identity), until));
-                    }
+                    snapshot.push_retired(publication_of(&identity), until);
                 }
                 snapshot.complete = true;
                 for image in images.iter_mut().filter(|image| image.endpoint == endpoint) {
@@ -2614,8 +2608,12 @@ impl<T: StreamTerms> ReceiverRole<T> {
             .iter()
             .find(|held| held.endpoint == endpoint)?;
         let lanes = held.set.lanes();
+        let ended = held.set.take_ended();
         for _ in 0..held.set.take_backend_drops() {
             self.count(|c| &mut c.backend_drops);
+        }
+        for _ in 0..ended {
+            self.count(|c| &mut c.datagrams);
         }
         let mut buffer = core::mem::take(&mut self.enc.shard_buffer);
         let mut plain = [0_u8; MAX_PLAINTEXT];

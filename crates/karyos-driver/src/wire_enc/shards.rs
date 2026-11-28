@@ -250,6 +250,10 @@ pub(crate) struct Snapshot<B> {
     pub(crate) complete: bool,
     pub(crate) verified: Vec<(Alias, PublicationIdentity)>,
     pub(crate) retired: Vec<(PublicationIdentity, u64)>,
+    /// A local publication, verified target or retired identity did not
+    /// fit: the shards then decide nothing and hand every envelope to the
+    /// role, which holds the full tables.
+    pub(crate) partial: bool,
 }
 
 impl<B> Snapshot<B> {
@@ -262,6 +266,37 @@ impl<B> Snapshot<B> {
         self.complete = false;
         self.verified.clear();
         self.retired.clear();
+        self.partial = false;
+    }
+
+    /// Adds a local publication, or marks the snapshot partial when its
+    /// table is full.
+    pub(crate) fn push_published(&mut self, alias: Alias) {
+        if self.published.len() < self.published.capacity() {
+            self.published.push(alias);
+        } else {
+            self.partial = true;
+        }
+    }
+
+    /// Adds a target a verified SETUP named, or marks the snapshot
+    /// partial when its table is full.
+    pub(crate) fn push_verified(&mut self, alias: Alias, publication: PublicationIdentity) {
+        if self.verified.len() < self.verified.capacity() {
+            self.verified.push((alias, publication));
+        } else {
+            self.partial = true;
+        }
+    }
+
+    /// Adds a retired identity, or marks the snapshot partial when its
+    /// table is full.
+    pub(crate) fn push_retired(&mut self, publication: PublicationIdentity, until: u64) {
+        if self.retired.len() < self.retired.capacity() {
+            self.retired.push((publication, until));
+        } else {
+            self.partial = true;
+        }
     }
 }
 
@@ -632,6 +667,9 @@ struct ShardCounts {
     /// Oversize datagrams and ones with no source, dropped as the role's
     /// receive drops them: taken by the role into its own counter.
     backend_drops: AtomicU64,
+    /// Datagrams that ended on the shard (refused, or dropped by a full
+    /// ring): taken by the role into its datagram counter.
+    ended: AtomicU64,
     /// Receive calls that failed with something other than an empty queue.
     errors: AtomicU64,
     /// Receive calls that found nothing (decision 7, the quiet wait).
@@ -749,6 +787,7 @@ impl<B> SetShared<B> {
                 complete: false,
                 verified: Vec::with_capacity(parties),
                 retired: Vec::with_capacity(parties),
+                partial: false,
             }),
             lanes: (0..count)
                 .map(|_| Lane::new(slots))
@@ -808,7 +847,8 @@ impl<B: Copy> SetShared<B> {
         let Some(alias) = envelope_alias(bytes) else {
             return Step::Forward;
         };
-        if snapshot.published.contains(&alias)
+        if snapshot.partial
+            || snapshot.published.contains(&alias)
             || snapshot
                 .admits
                 .as_ref()
@@ -1212,11 +1252,14 @@ impl<B: Copy> SetShared<B> {
                         .is_some_and(|ring| ring.push(bytes, source))
                     {
                         counts.ring_full.fetch_add(1, Ordering::Relaxed);
+                        counts.ended.fetch_add(1, Ordering::Relaxed);
                     }
                     continue;
                 }
                 Step::Dispatched => dispatched = true,
-                Step::Refused => {}
+                Step::Refused => {
+                    counts.ended.fetch_add(1, Ordering::Relaxed);
+                }
             }
             #[cfg(test)]
             if len == self.watch.0.load(Ordering::Relaxed) {
@@ -1458,6 +1501,12 @@ impl<B> core::fmt::Debug for ShardSet<B> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Makes every verifier spawn of this thread's `ShardSet::new` fail.
+    static FAIL_VERIFIER_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl<B: Copy + Send + Sync + 'static> ShardSet<B> {
     /// The set of `receivers.len()` shards (each a duplicate of the
     /// endpoint's socket), each with a lane of `verify.slots` and a ring of
@@ -1468,7 +1517,8 @@ impl<B: Copy + Send + Sync + 'static> ShardSet<B> {
     /// to the role until the role publishes. Its shards and verifiers read
     /// `clock`. Control path: allocates the tables and starts the threads.
     ///
-    /// `None` when no shard could start: the role keeps receiving itself.
+    /// `None` when no verifier or no shard could start: the role keeps
+    /// receiving itself.
     pub(crate) fn new(
         config: EncShardConfig,
         verify: EncVerifyConfig,
@@ -1494,15 +1544,27 @@ impl<B: Copy + Send + Sync + 'static> ShardSet<B> {
         let mut threads = Vec::with_capacity(verifiers);
         for me in 0..verifiers {
             let held = Arc::clone(&set.shared);
-            let started = std::thread::Builder::new()
-                .name(format!("karyos-enc-shard-verify-{me}"))
-                .spawn(move || verifier(&held, me));
+            #[cfg(test)]
+            let refused = FAIL_VERIFIER_SPAWN.with(std::cell::Cell::get);
+            #[cfg(not(test))]
+            let refused = false;
+            let started = if refused {
+                Err(std::io::Error::other("verifier spawn refused (test)"))
+            } else {
+                std::thread::Builder::new()
+                    .name(format!("karyos-enc-shard-verify-{me}"))
+                    .spawn(move || verifier(&held, me))
+            };
             threads.push(started.as_ref().ok().map(|handle| handle.thread().clone()));
             if let Ok(handle) = started {
                 set.verifiers.push(handle);
             }
         }
         let _ = set.shared.verifier_threads.set(threads.into_boxed_slice());
+        if set.verifiers.is_empty() {
+            // No verifier would ever take a job: the role keeps receiving.
+            return None;
+        }
         for (me, mut socket) in receivers.into_iter().enumerate() {
             let held = Arc::clone(&set.shared);
             let mut slab = vec![0_u8; stride.saturating_mul(SHARD_BATCH)].into_boxed_slice();
@@ -1687,6 +1749,15 @@ impl<B: Copy + Send + Sync + 'static> ShardSet<B> {
             .counts
             .iter()
             .map(|counts| counts.backend_drops.swap(0, Ordering::AcqRel))
+            .sum()
+    }
+
+    /// The datagrams that ended on the shards since the last call, taken.
+    pub(crate) fn take_ended(&self) -> u64 {
+        self.shared
+            .counts
+            .iter()
+            .map(|counts| counts.ended.swap(0, Ordering::AcqRel))
             .sum()
     }
 

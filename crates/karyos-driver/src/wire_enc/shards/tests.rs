@@ -1176,3 +1176,108 @@ fn a_key_the_snapshot_does_not_hold_is_refused_on_the_shard_or_left_to_the_role(
     }
     assert_eq!(opener.leases(), 0);
 }
+
+/// A set whose verifiers all failed to start is not made: its shards would
+/// queue jobs no verifier ever takes until every lane refused as busy.
+/// The receivers are dropped and the role keeps receiving.
+#[test]
+fn a_set_without_a_verifier_is_not_made() {
+    let (handles, _address, closed) = sockets(2);
+    FAIL_VERIFIER_SPAWN.with(|fail| fail.set(true));
+    let set = ShardSet::<u32>::new(
+        EncShardConfig { shards: 2, ring: 4 },
+        EncVerifyConfig {
+            verifiers: 2,
+            slots: 4,
+        },
+        handles,
+        1408,
+        ((4, 4, 4), SetClock::new(published_only, clock())),
+    );
+    FAIL_VERIFIER_SPAWN.with(|fail| fail.set(false));
+    assert!(set.is_none(), "no set without a verifier");
+    assert!(closed.iter().all(|flag| flag.load(Ordering::SeqCst)));
+}
+
+/// A table that does not fit marks the snapshot partial, and a partial
+/// snapshot hands every envelope to the role: an omitted local
+/// publication's controls are never taken for subscription traffic.
+#[test]
+fn a_partial_snapshot_hands_every_envelope_to_the_role() {
+    let set = detached(1, 8, 8);
+    let mut opener = opener();
+    let rate = OpenRate::default();
+    let _counts = bind(&set, &mut opener, &rate);
+    let data = sealed(0x11, 1).remove(0);
+    assert!(matches!(shard_take(&set, 0, &data), Step::Dispatched));
+    let mut plain = [0_u8; MAX_PLAINTEXT];
+    let _ = set.cancel_all();
+    while set.take(0, &mut plain).is_some() {}
+    for table in 0..3_u32 {
+        set.publish(|snapshot| {
+            snapshot.partial = false;
+            snapshot.published.clear();
+            snapshot.verified.clear();
+            snapshot.retired.clear();
+            for n in 0..5_u32 {
+                let other = Alias {
+                    session_id: 100 + i32::try_from(n).unwrap(),
+                    stream_id: 6,
+                };
+                match table {
+                    0 => snapshot.push_published(other),
+                    1 => snapshot.push_verified(other, context().publication),
+                    _ => snapshot.push_retired(context().publication, u64::from(n)),
+                }
+            }
+            assert!(snapshot.partial, "table {table} overflowed");
+        });
+        assert!(
+            matches!(shard_take(&set, 0, &data), Step::Forward),
+            "table {table}: to the role"
+        );
+    }
+    assert_eq!(set.in_flight(), 0);
+    assert_eq!(rate.charged(KeyKind::Committed), 1, "only the first");
+    assert_eq!(opener.leases(), 0);
+}
+
+/// Every datagram a shard ends (refused, or dropped by a full ring) is
+/// taken by the role into its datagram counter, once.
+#[test]
+fn datagrams_that_end_on_a_shard_reach_the_role_counter() {
+    let set = detached(1, 8, 1);
+    let mut opener = opener();
+    let rate = OpenRate::default();
+    let counts = bind(&set, &mut opener, &rate);
+    let mut behind = sealed(0x11, 1).remove(0);
+    behind[12..16].copy_from_slice(&0_u32.to_le_bytes());
+    let len = behind.len();
+    let results = [
+        RecvResult::Datagram {
+            len,
+            truncated: None,
+            source: Some(source()),
+        },
+        RecvResult::Datagram {
+            len: 40,
+            truncated: None,
+            source: Some(source()),
+        },
+        RecvResult::Datagram {
+            len: 40,
+            truncated: None,
+            source: Some(source()),
+        },
+    ];
+    let stride = set.shared.stride;
+    let mut slab = vec![0_u8; stride * 3];
+    slab[..len].copy_from_slice(&behind);
+    slab[stride..stride + 40].fill(1);
+    slab[2 * stride..2 * stride + 40].fill(2);
+    assert_eq!(set.shared.batch(0, &slab, &results), 3);
+    assert_eq!(counted(&counts, EncRejection::Epoch), 1);
+    assert_eq!(set.stats().ring_full, 1);
+    assert_eq!(set.take_ended(), 2, "the refused one and the dropped one");
+    assert_eq!(set.take_ended(), 0, "taken once");
+}
