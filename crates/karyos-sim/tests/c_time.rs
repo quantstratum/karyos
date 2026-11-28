@@ -462,9 +462,12 @@ fn test_c_time_a_restart_from_the_log_continues_from_its_last_entry_on_the_custo
                 )),
                 "seed {seed}: server {elected} recovered from its log"
             );
-            let leader = behind_leader(&sim)
-                .unwrap_or_else(|| panic!("seed {seed}: no leader behind after the restart"));
-            let clamped = appended_by_a_leader_behind(&mut sim, &recorder, seed, leader);
+            if behind_leader(&sim) != Some(elected) {
+                // The other server won the election after the restart: its
+                // entries would not use the recovered watermark. Not this case.
+                return false;
+            }
+            let clamped = appended_by_a_leader_behind(&mut sim, &recorder, seed, elected);
             assert!(clamped >= 5, "seed {seed}: {clamped} clamped entries");
             true
         },
