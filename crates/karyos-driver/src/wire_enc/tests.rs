@@ -160,6 +160,7 @@ fn every_rejection_reason_has_its_own_counter() {
         R::BeforeJoin,
         R::VmGeneration,
         R::Withdrawn,
+        R::VerifyBusy,
     ];
     assert_eq!(all.len(), ENC_REASONS);
     let mut seen = [false; ENC_REASONS];
@@ -2234,4 +2235,90 @@ fn h3_a_group_key_holder_cannot_forge_guard_or_session_abort() {
             "{domain:?}"
         );
     }
+}
+
+/// ADR-0126 decision 5 (review of #1298, finding 1): a previous key a
+/// verifier's lease holds when its overlap ends keeps its storage. A
+/// next-epoch datagram that could not promote while it is out is refused
+/// before its handler; once the lease returns, the next epoch promotes
+/// from the reclaimed slot and its replay is refused.
+#[test]
+fn a_leased_previous_key_past_its_overlap_keeps_its_slot() {
+    let start = clock();
+    let mut sealer = sender();
+    let mut opener = opener();
+    let mut channel = EncChannel::default();
+    assert!(open(&mut opener, &mut channel, &seal(&mut sealer, &frame(DATA))).is_ok());
+    let old = seal(&mut sealer, &frame(DATA));
+    sealer.roll_now();
+    let first = seal(&mut sealer, &frame(DATA));
+    assert!(open(&mut opener, &mut channel, &first).unwrap().promoted);
+    assert_eq!(opener.epochs(), (1, 1));
+    // A previous-epoch job dispatched just before its overlap ends.
+    set_now(start + EPOCH_OVERLAP_NS - 1);
+    let Ok(Prepared::Dispatch(_, lease)) = opener.prepare(&old, &mut channel.rate, clock()) else {
+        panic!("dispatched under the previous key");
+    };
+    set_now(start + EPOCH_OVERLAP_NS + 1);
+    opener.expire_previous(clock());
+    sealer.roll_now();
+    let next = seal(&mut sealer, &frame(DATA));
+    let mut handled = 0;
+    let mut out = [0_u8; MAX_PLAINTEXT];
+    // While the lease is out, no slot is free: refused before the handler.
+    let refused = opener.verify(&next, &mut out, &mut channel.rate, clock(), |_| {
+        handled += 1;
+        Ok(())
+    });
+    assert_eq!(refused.map(|_| ()), Err(EncRejection::Epoch));
+    assert_eq!(handled, 0, "no handler effect");
+    assert_eq!(opener.epochs(), (1, 1));
+    drop(lease);
+    opener.expire_previous(clock());
+    assert_eq!(opener.leases(), 0);
+    let accepted = open(&mut opener, &mut channel, &next).unwrap();
+    assert!(accepted.promoted);
+    assert_eq!(opener.epochs(), (1, 2), "promoted from the reclaimed slot");
+    assert!(opener.unused_erased());
+    assert_eq!(
+        open(&mut opener, &mut channel, &next),
+        Err(EncRejection::Duplicate)
+    );
+}
+
+/// A promotion while the previous key is leased waits for the lease: the
+/// next-epoch datagram is refused before its handler, then promotes from
+/// the previous key's own slot once the lease returns.
+#[test]
+fn a_promotion_over_a_leased_previous_key_waits_for_it() {
+    let mut sealer = sender();
+    let mut opener = opener();
+    let mut channel = EncChannel::default();
+    assert!(open(&mut opener, &mut channel, &seal(&mut sealer, &frame(DATA))).is_ok());
+    sealer.roll_now();
+    let one = seal(&mut sealer, &frame(DATA));
+    let one_late = seal(&mut sealer, &frame(DATA));
+    sealer.roll_now();
+    let two = seal(&mut sealer, &frame(DATA));
+    assert!(open(&mut opener, &mut channel, &one).unwrap().promoted);
+    assert!(open(&mut opener, &mut channel, &two).unwrap().promoted);
+    let Ok(Prepared::Dispatch(_, lease)) = opener.prepare(&one_late, &mut channel.rate, clock())
+    else {
+        panic!("dispatched under the previous key");
+    };
+    sealer.roll_now();
+    let three = seal(&mut sealer, &frame(DATA));
+    assert_eq!(
+        open(&mut opener, &mut channel, &three),
+        Err(EncRejection::Epoch)
+    );
+    assert_eq!(opener.epochs(), (1, 2));
+    drop(lease);
+    assert!(open(&mut opener, &mut channel, &three).unwrap().promoted);
+    assert_eq!(opener.epochs(), (1, 3));
+    assert_eq!(
+        open(&mut opener, &mut channel, &three),
+        Err(EncRejection::Duplicate)
+    );
+    assert!(opener.unused_erased());
 }

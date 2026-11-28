@@ -36,7 +36,8 @@
 //! after construction: every slot is inline and every key is derived into
 //! one.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use karyos_protocol::frame::FrameType;
 use karyos_protocol::protection::aes_gcm_siv::{
@@ -50,8 +51,13 @@ use zeroize::Zeroizing;
 
 use crate::wire_keys::{Class, KEY_LEN, KeyFile, Material, Purpose, Scope};
 
+pub mod verify_pool;
 pub mod vm_generation;
 
+pub use verify_pool::{
+    DEFAULT_ENC_VERIFY_SLOTS, EncVerifyConfig, MAX_ENC_VERIFIERS, MAX_ENC_VERIFY_SLOTS,
+    enc_verify_inline_fallbacks,
+};
 pub use vm_generation::{VmGenerationWatch, quiesced};
 
 /// Nanoseconds in a second: the open rate interval.
@@ -88,7 +94,7 @@ pub const PAIRWISE_FILES: usize = 4;
 pub(crate) const RETIRED_BOOTS: usize = 8;
 
 /// The reasons [`EncRejections`] counts, one per [`EncRejection`].
-pub const ENC_REASONS: usize = 32;
+pub const ENC_REASONS: usize = 33;
 
 /// The counter index of `reason`. Exhaustive: a new reason does not
 /// compile until it has its own counter.
@@ -127,6 +133,7 @@ pub const fn reason_index(reason: EncRejection) -> usize {
         EncRejection::BeforeJoin => 29,
         EncRejection::VmGeneration => 30,
         EncRejection::Withdrawn => 31,
+        EncRejection::VerifyBusy => 32,
     }
 }
 
@@ -1564,10 +1571,128 @@ impl DatagramSeal for EncSealer {
     }
 }
 
-/// A committed key slot and when it was committed.
+/// A committed key slot and when it was committed. The key is shared:
+/// a verifier's job holds it under a [`Lease`] while it opens (ADR-0126
+/// decision 5), and nothing re-keys or erases it in place while a lease
+/// holds it.
 struct Slot {
-    key: AesGcmSiv,
+    key: Arc<KeyCell>,
     committed_ns: u64,
+}
+
+/// A shared key on cache lines of its own: the reference counts its
+/// [`Arc`] keeps in front of it, which the role thread changes at every
+/// dispatch and consumption, are not on the lines a verifier reads the
+/// key schedule from (ADR-0126).
+#[repr(align(128))]
+pub(crate) struct KeyCell(AesGcmSiv);
+
+impl core::ops::Deref for KeyCell {
+    type Target = AesGcmSiv;
+
+    fn deref(&self) -> &AesGcmSiv {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for KeyCell {
+    fn deref_mut(&mut self) -> &mut AesGcmSiv {
+        &mut self.0
+    }
+}
+
+/// Erases the key `slot` holds in place when nothing else holds it, and
+/// returns whether it did. A key a [`Lease`] still holds is left to its
+/// leases: it is erased when the last one returns, on drop (ADR-0126
+/// decision 5, erasure only at zero).
+fn erase_shared(slot: &mut Arc<KeyCell>, context: KeyContext) -> bool {
+    match Arc::get_mut(slot) {
+        Some(key) => {
+            erase(key, context);
+            true
+        }
+        None => false,
+    }
+}
+
+/// What one opener instance shares with the verifier threads of its jobs
+/// (ADR-0126 decision 5): the withdrawn mark a verifier reads before it
+/// opens, and the count of leases out.
+#[derive(Debug, Default)]
+pub(crate) struct OpenerShare {
+    withdrawn: AtomicBool,
+    /// On a cache line of its own: the role changes it, a verifier reads
+    /// only the mark.
+    leases: LeaseCount,
+}
+
+/// The lease count of an [`OpenerShare`], away from its withdrawn mark.
+#[derive(Debug, Default)]
+#[repr(align(128))]
+struct LeaseCount(AtomicU32);
+
+/// One job's hold on the immutable key material of one committed slot
+/// (ADR-0126 decision 5): taken at dispatch, before the job is queued,
+/// and returned exactly once, when it is dropped, whatever the job's
+/// outcome. While it is out the key is neither re-keyed nor erased; once
+/// the last one of a dropped key returns, the key is erased on drop.
+pub(crate) struct Lease {
+    share: Arc<OpenerShare>,
+    key: Arc<KeyCell>,
+}
+
+impl Lease {
+    /// Whether its opener instance was withdrawn: a verifier that reads it
+    /// before an open cancels instead.
+    pub(crate) fn is_withdrawn(&self) -> bool {
+        self.share.withdrawn.load(Ordering::Acquire)
+    }
+
+    /// The key it holds.
+    pub(crate) fn key(&self) -> &AesGcmSiv {
+        &self.key
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let returned = self.share.leases.0.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(returned > 0, "a lease returns exactly once");
+    }
+}
+
+impl core::fmt::Debug for Lease {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Lease")
+            .field("context", self.key.context())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The context a job is bound to at dispatch (ADR-0126 decision 2): the
+/// opener instance, the epoch pair of the key slot it selected, the
+/// sequence, the VM generation, and the authenticated header and length
+/// of the datagram. Its result is checked against it again before any
+/// handler runs ([`EncOpener::complete`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Ticket {
+    opener: u64,
+    epochs: (u32, u16),
+    seq: u64,
+    generation: u64,
+    len: usize,
+    header: [u8; HEADER_LEN],
+}
+
+/// What [`EncOpener::prepare`] decided for a datagram.
+#[derive(Debug)]
+pub(crate) enum Prepared {
+    /// Under the next epoch, a scratch derivation: opened on the role
+    /// thread, as without verifiers.
+    Inline,
+    /// Every check before the open passed and the open rate is charged:
+    /// the job's context and its lease, for a verifier.
+    Dispatch(Ticket, Lease),
 }
 
 /// Which key a datagram selects (section 8 steps 2 and 4).
@@ -1630,11 +1755,15 @@ pub struct EncOpener {
     current: Slot,
     previous: Option<(Slot, u64)>,
     /// The scratch slot: made at construction and re-keyed in place for
-    /// each next-epoch attempt, so the data path constructs no key.
-    scratch: AesGcmSiv,
+    /// each next-epoch attempt, so the data path constructs no key. Never
+    /// leased: a next-epoch open runs on the role thread.
+    scratch: Arc<KeyCell>,
     /// A second key made at construction: the first promotion's recycled
-    /// slot, before any previous epoch exists to recycle.
-    spare: Option<AesGcmSiv>,
+    /// slot, before any previous epoch exists to recycle. Never leased.
+    spare: Option<Arc<KeyCell>>,
+    /// The withdrawn mark and lease count its verifiers' jobs share
+    /// (ADR-0126 decision 5).
+    share: Arc<OpenerShare>,
     /// The checked context its keys are erased under on withdrawal.
     erase: KeyContext,
     /// Withdrawn by a key reload (H8 finding 4): checked first by every
@@ -1645,6 +1774,16 @@ pub struct EncOpener {
     generation: u64,
     /// This opener's instance, named by each [`Pending`] it verifies.
     instance: u64,
+}
+
+impl Drop for EncOpener {
+    /// A dropped opener (its binding removed, its role stopped) is
+    /// withdrawn for its verifiers: a job still queued is cancelled
+    /// instead of opened, and every key a lease holds is erased once the
+    /// last returns (ADR-0126 decision 5).
+    fn drop(&mut self) {
+        self.share.withdrawn.store(true, Ordering::Release);
+    }
 }
 
 impl core::fmt::Debug for EncOpener {
@@ -1689,12 +1828,13 @@ impl EncOpener {
             keys: keys.clone(),
             pairwise: pairwise.cloned(),
             current: Slot {
-                key,
+                key: Arc::new(KeyCell(key)),
                 committed_ns: now_ns,
             },
             previous: None,
-            scratch,
-            spare: Some(spare),
+            scratch: Arc::new(KeyCell(scratch)),
+            spare: Some(Arc::new(KeyCell(spare))),
+            share: Arc::new(OpenerShare::default()),
             erase: erase_with,
             withdrawn: false,
             generation: vm_generation::generation(),
@@ -1707,14 +1847,34 @@ impl EncOpener {
     /// erased on drop; every later open is refused with
     /// [`EncRejection::Withdrawn`] and every resynchronisation with
     /// [`EncRejection::ResyncRefused`].
+    ///
+    /// A key a verifier's job still holds under a lease is left to it
+    /// (ADR-0126 decision 5): the verifier reads the withdrawn mark before
+    /// it opens, and the key is erased once its last lease returns.
     pub fn withdraw(&mut self) {
         self.withdrawn = true;
+        self.share.withdrawn.store(true, Ordering::Release);
         self.keys.clear();
         self.pairwise = None;
         self.previous = None;
         self.spare = None;
-        erase(&mut self.current.key, self.erase);
-        erase(&mut self.scratch, self.erase);
+        let _ = erase_shared(&mut self.scratch, self.erase);
+        if !erase_shared(&mut self.current.key, self.erase) {
+            self.current.key = Arc::clone(&self.scratch);
+        }
+    }
+
+    /// The leases its verifiers' jobs hold (ADR-0126 decision 5; tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn leases(&self) -> u32 {
+        self.share.leases.0.load(Ordering::Acquire)
+    }
+
+    /// The current key, weakly (tests: whether it is still held).
+    #[cfg(test)]
+    pub(crate) fn current_key(&self) -> std::sync::Weak<KeyCell> {
+        Arc::downgrade(&self.current.key)
     }
 
     /// Whether it was withdrawn.
@@ -1745,14 +1905,19 @@ impl EncOpener {
         if let Some(pairwise) = self.pairwise.as_mut() {
             pairwise.retain(keys);
         }
+        // A key a lease holds is never changed in place: its role takes
+        // every lease back before it applies a key set (ADR-0126 decision
+        // 5), so one still out fails closed.
         if self.keys.ikm(self.epochs().0).is_none()
-            || refresh_pairwise(&mut self.current.key, self.pairwise.as_ref(), false).is_err()
+            || Arc::get_mut(&mut self.current.key)
+                .is_none_or(|key| refresh_pairwise(key, self.pairwise.as_ref(), false).is_err())
         {
             self.withdraw();
             return;
         }
         if let Some((slot, _)) = self.previous.as_mut()
-            && refresh_pairwise(&mut slot.key, self.pairwise.as_ref(), false).is_err()
+            && Arc::get_mut(&mut slot.key)
+                .is_none_or(|key| refresh_pairwise(key, self.pairwise.as_ref(), false).is_err())
         {
             self.withdraw();
             return;
@@ -1764,19 +1929,18 @@ impl EncOpener {
         if let Some((mut slot, _)) = self
             .previous
             .take_if(|(slot, _)| keys_held.ikm(slot.key.context().key_epoch).is_none())
+            && erase_shared(&mut slot.key, self.erase)
+            && self.spare.is_none()
         {
-            erase(&mut slot.key, self.erase);
-            if self.spare.is_none() {
-                self.spare = Some(slot.key);
-            }
+            self.spare = Some(slot.key);
         }
         // The cached copies (H8-05): the scratch slot and the spare hold
         // keys derived from earlier files, their pairwise HMAC states
         // included. Both are re-keyed before any use, so each is erased in
         // place now and no rotated or retired file's schedule survives.
-        erase(&mut self.scratch, self.erase);
+        let _ = erase_shared(&mut self.scratch, self.erase);
         if let Some(spare) = self.spare.as_mut() {
-            erase(spare, self.erase);
+            let _ = erase_shared(spare, self.erase);
         }
         // Rotation (section 6): a newly admitted file epoch is the next
         // epoch at `party_epoch` 0; the first datagram fully accepted under
@@ -1790,7 +1954,7 @@ impl EncOpener {
             self.scratch.pairwise_epochs(),
             self.spare
                 .as_ref()
-                .map_or([None, None], AesGcmSiv::pairwise_epochs),
+                .map_or([None, None], |spare| spare.pairwise_epochs()),
         ]
     }
 
@@ -1824,6 +1988,30 @@ impl EncOpener {
         rate: &mut OpenRate,
         now_ns: u64,
     ) -> Result<Selected, EncRejection> {
+        let selected = self.selection(header, now_ns)?;
+        if header.seq >= header.domain.seq_cap() {
+            return Err(EncRejection::SequenceCap);
+        }
+        let kind = match selected {
+            Selected::Current | Selected::Previous => KeyKind::Committed,
+            Selected::Next => KeyKind::Scratch,
+        };
+        rate.charge(kind, now_ns)?;
+        let committed_ns = match selected {
+            Selected::Current | Selected::Next => self.current.committed_ns,
+            Selected::Previous => self
+                .previous
+                .as_ref()
+                .map_or(0, |(slot, _)| slot.committed_ns),
+        };
+        if now_ns.saturating_sub(committed_ns) > KEY_AGE_NS {
+            return Err(EncRejection::KeyAge);
+        }
+        Ok(selected)
+    }
+
+    /// Step 2 alone: which key the epoch pair selects. Changes nothing.
+    fn selection(&self, header: &Header, now_ns: u64) -> Result<Selected, EncRejection> {
         if header.domain != self.current.key.context().domain {
             return Err(EncRejection::Domain);
         }
@@ -1844,25 +2032,122 @@ impl EncOpener {
         } else {
             return Err(EncRejection::Epoch);
         };
-        if header.seq >= header.domain.seq_cap() {
-            return Err(EncRejection::SequenceCap);
+        Ok(selected)
+    }
+
+    /// ADR-0126 decision 2, on the role thread: every check of section 8
+    /// that comes before the open, the open rate charged here so the
+    /// channel keeps one aggregate count, the replay precheck included;
+    /// then the job's context is recorded and a lease taken on the
+    /// selected committed key, before the job is queued. A datagram of the
+    /// next epoch needs a scratch derivation and is opened inline
+    /// ([`Prepared::Inline`]), with nothing charged yet. Changes only the
+    /// rate counter and the lease count. Allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// The first [`EncRejection`] that applies, as [`Self::verify`].
+    pub(crate) fn prepare(
+        &mut self,
+        datagram: &[u8],
+        rate: &mut OpenRate,
+        now_ns: u64,
+    ) -> Result<Prepared, EncRejection> {
+        if self.generation != vm_generation::generation() {
+            return Err(EncRejection::VmGeneration);
         }
-        let kind = match selected {
-            Selected::Current | Selected::Previous => KeyKind::Committed,
-            Selected::Next => KeyKind::Scratch,
-        };
-        rate.charge(kind, now_ns)?;
-        let committed_ns = match selected {
-            Selected::Current | Selected::Next => self.current.committed_ns,
+        if self.withdrawn {
+            return Err(EncRejection::Withdrawn);
+        }
+        let header = header(datagram)?;
+        if self.selection(&header, now_ns)? == Selected::Next {
+            return Ok(Prepared::Inline);
+        }
+        let key = match self.select(&header, rate, now_ns)? {
+            Selected::Current => &self.current.key,
             Selected::Previous => self
                 .previous
                 .as_ref()
-                .map_or(0, |(slot, _)| slot.committed_ns),
+                .map(|(slot, _)| &slot.key)
+                .ok_or(EncRejection::Epoch)?,
+            Selected::Next => return Ok(Prepared::Inline),
         };
-        if now_ns.saturating_sub(committed_ns) > KEY_AGE_NS {
+        let seq = key.check_before_open(datagram)?;
+        let mut head = [0_u8; HEADER_LEN];
+        head.copy_from_slice(datagram.get(..HEADER_LEN).ok_or(EncRejection::Short)?);
+        self.share.leases.0.fetch_add(1, Ordering::AcqRel);
+        let lease = Lease {
+            share: Arc::clone(&self.share),
+            key: Arc::clone(key),
+        };
+        Ok(Prepared::Dispatch(
+            Ticket {
+                opener: self.instance,
+                epochs: (header.key_epoch, header.party_epoch),
+                seq,
+                generation: self.generation,
+                len: datagram.len(),
+                header: head,
+            },
+            lease,
+        ))
+    }
+
+    /// ADR-0126 decision 3, on the role thread, when a verifier's result
+    /// comes back: every predicate [`Self::prepare`] checked is evaluated
+    /// again against the current state, changing nothing. The opener is
+    /// still the job's instance, not withdrawn and of the job's VM
+    /// generation; the verified header, length and sequence are the
+    /// job's; the epoch pair still selects a committed key at `now_ns`,
+    /// the very key the job's lease holds; that key is within its age; and
+    /// the sequence is still outside the window. Then the result is a
+    /// [`Pending`] verified at `now_ns`, which its handler decides and
+    /// [`Self::commit`] marks, as in ADR-0124: no second open is needed.
+    /// Allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// The [`EncRejection`] of the first predicate that changed; nothing
+    /// changes.
+    pub(crate) fn complete(
+        &self,
+        ticket: &Ticket,
+        lease: &Lease,
+        opened: &karyos_protocol::protection::aes_gcm_siv::Opened,
+        (header, len): (&[u8; HEADER_LEN], usize),
+        now_ns: u64,
+    ) -> Result<Pending, EncRejection> {
+        if self.generation != vm_generation::generation() || ticket.generation != self.generation {
+            return Err(EncRejection::VmGeneration);
+        }
+        if self.withdrawn || lease.is_withdrawn() {
+            return Err(EncRejection::Withdrawn);
+        }
+        if ticket.opener != self.instance {
+            return Err(EncRejection::Epoch);
+        }
+        if *header != ticket.header || len != ticket.len || opened.seq != ticket.seq {
+            return Err(EncRejection::Binding);
+        }
+        let slot = self
+            .committed_entry(ticket.epochs, now_ns)
+            .filter(|slot| Arc::ptr_eq(&slot.key, &lease.key))
+            .ok_or(EncRejection::Epoch)?;
+        if now_ns.saturating_sub(slot.committed_ns) > KEY_AGE_NS {
             return Err(EncRejection::KeyAge);
         }
-        Ok(selected)
+        slot.key
+            .window()
+            .check(ticket.seq)
+            .map_err(EncRejection::from)?;
+        Ok(Pending {
+            frames: opened.frames,
+            epochs: ticket.epochs,
+            seq: ticket.seq,
+            opener: self.instance,
+            at: now_ns,
+            generation: self.generation,
+        })
     }
 
     /// Opens `datagram` and commits it at once, as an accepting handler
@@ -1916,6 +2201,11 @@ impl EncOpener {
         let header = header(datagram)?;
         let selected = self.select(&header, rate, now_ns)?;
         if selected == Selected::Next {
+            // One that could not be promoted is refused before its handler
+            // runs: a commit never reports a promotion it did not make.
+            if !self.can_promote() {
+                return Err(EncRejection::Epoch);
+            }
             let mut next = *self.current.key.context();
             next.key_epoch = header.key_epoch;
             next.party_epoch = header.party_epoch;
@@ -1923,15 +2213,15 @@ impl EncOpener {
                 &self.keys,
                 self.pairwise.as_ref(),
                 next,
-                &mut self.scratch,
+                Arc::get_mut(&mut self.scratch).ok_or(EncRejection::Epoch)?,
                 false,
             )
             .map_err(|_| EncRejection::Epoch)?;
         }
         let key = match selected {
-            Selected::Current => Some(&self.current.key),
-            Selected::Previous => self.previous.as_ref().map(|(slot, _)| &slot.key),
-            Selected::Next => Some(&self.scratch),
+            Selected::Current => Some(&*self.current.key),
+            Selected::Previous => self.previous.as_ref().map(|(slot, _)| &*slot.key),
+            Selected::Next => Some(&*self.scratch),
         }
         .ok_or(EncRejection::Epoch)?;
         let opened = key.open_into(datagram, out)?;
@@ -1971,7 +2261,9 @@ impl EncOpener {
         self.owns(pending)?;
         match self.committed_slot(pending.epochs, now_ns) {
             Some(key) => key.window().check(pending.seq).map_err(EncRejection::from),
-            None if self.is_next(pending.epochs.0, pending.epochs.1) => Ok(()),
+            None if self.is_next(pending.epochs.0, pending.epochs.1) && self.can_promote() => {
+                Ok(())
+            }
             None => Err(EncRejection::Epoch),
         }
     }
@@ -2016,7 +2308,7 @@ impl EncOpener {
             key.mark(pending.seq)?;
             return Ok(accepted(false));
         }
-        if !self.is_next(pending.epochs.0, pending.epochs.1) {
+        if !self.is_next(pending.epochs.0, pending.epochs.1) || !self.can_promote() {
             return Err(EncRejection::Epoch);
         }
         let mut next = *self.current.key.context();
@@ -2030,13 +2322,15 @@ impl EncOpener {
                 &self.keys,
                 self.pairwise.as_ref(),
                 next,
-                &mut self.scratch,
+                Arc::get_mut(&mut self.scratch).ok_or(EncRejection::Epoch)?,
                 false,
             )
             .map_err(|_| EncRejection::Epoch)?;
         }
         self.scratch.mark(pending.seq)?;
-        self.promote(now_ns);
+        if !self.promote(now_ns) {
+            return Err(EncRejection::Epoch);
+        }
         Ok(accepted(true))
     }
 
@@ -2057,8 +2351,14 @@ impl EncOpener {
     /// The committed key of `epochs` at `now_ns`: the current one, or the
     /// previous one inside its overlap.
     fn committed_slot(&self, epochs: (u32, u16), now_ns: u64) -> Option<&AesGcmSiv> {
+        self.committed_entry(epochs, now_ns).map(|slot| &**slot.key)
+    }
+
+    /// The committed slot of `epochs` at `now_ns`, as
+    /// [`Self::committed_slot`].
+    fn committed_entry(&self, epochs: (u32, u16), now_ns: u64) -> Option<&Slot> {
         if epochs == self.epochs() {
-            return Some(&self.current.key);
+            return Some(&self.current);
         }
         self.previous
             .as_ref()
@@ -2070,7 +2370,7 @@ impl EncOpener {
                     )
                     && now_ns < *until
             })
-            .map(|(slot, _)| &slot.key)
+            .map(|(slot, _)| slot)
     }
 
     /// Moves the binding to the epoch pair of an accepted
@@ -2100,6 +2400,9 @@ impl EncOpener {
         if (key_epoch, party_epoch) == self.epochs() {
             return Ok(());
         }
+        if !self.can_promote() {
+            return Err(EncRejection::ResyncRefused);
+        }
         let mut next = *self.current.key.context();
         next.key_epoch = key_epoch;
         next.party_epoch = party_epoch;
@@ -2107,11 +2410,13 @@ impl EncOpener {
             &self.keys,
             self.pairwise.as_ref(),
             next,
-            &mut self.scratch,
+            Arc::get_mut(&mut self.scratch).ok_or(EncRejection::ResyncRefused)?,
             false,
         )
         .map_err(|_| EncRejection::ResyncRefused)?;
-        self.promote(now_ns);
+        if !self.promote(now_ns) {
+            return Err(EncRejection::ResyncRefused);
+        }
         Ok(())
     }
 
@@ -2120,16 +2425,26 @@ impl EncOpener {
     /// the dropped previous epoch's, or the spare: keys only move. The
     /// recycled slot is erased in place first, so the dropped epoch's
     /// schedule survives nowhere (H8-16).
-    fn promote(&mut self, now_ns: u64) {
-        let recycled = self
-            .previous
-            .take()
-            .map(|(slot, _)| slot.key)
-            .or_else(|| self.spare.take());
-        let Some(mut recycled) = recycled else {
-            return;
+    ///
+    /// A previous key a verifier's lease still holds is never recycled or
+    /// given up: the promotion waits for its last lease to return
+    /// (ADR-0126 decision 5). Returns whether it promoted: never false
+    /// after [`Self::can_promote`] held, since only the role thread takes
+    /// leases and a lease only ever returns.
+    fn promote(&mut self, now_ns: u64) -> bool {
+        if !self.can_promote() {
+            return false;
+        }
+        let recycled = match self.previous.take() {
+            Some((slot, _)) => Some(slot.key),
+            None => self.spare.take(),
         };
-        erase(&mut recycled, self.erase);
+        let Some(mut recycled) = recycled else {
+            return false;
+        };
+        if !erase_shared(&mut recycled, self.erase) {
+            return false;
+        }
         let key = core::mem::replace(&mut self.scratch, recycled);
         let old = core::mem::replace(
             &mut self.current,
@@ -2139,6 +2454,18 @@ impl EncOpener {
             },
         );
         self.previous = Some((old, now_ns.saturating_add(EPOCH_OVERLAP_NS)));
+        true
+    }
+
+    /// Whether a promotion now finds a slot to recycle, changing nothing:
+    /// the previous key once no lease holds it, or the spare when there is
+    /// no previous key. Checked before any next-epoch handler runs, so a
+    /// datagram that could not promote is refused without effects.
+    fn can_promote(&self) -> bool {
+        match &self.previous {
+            Some((slot, _)) => Arc::strong_count(&slot.key) == 1,
+            None => self.spare.is_some(),
+        }
     }
 
     /// Erases the previous epoch's key once its overlap has passed at
@@ -2147,12 +2474,19 @@ impl EncOpener {
     /// erased in place and kept as the spare, so the next promotion still
     /// constructs no key. Role maintenance calls it every duty. Allocates
     /// nothing.
+    ///
+    /// One a verifier's lease still holds stays in place, selectable by
+    /// nothing, until a duty after its last lease returns (ADR-0126
+    /// decision 5): its storage is never given up, so a later promotion
+    /// still finds a slot.
     pub fn expire_previous(&mut self, now_ns: u64) {
-        let Some((mut slot, _)) = self.previous.take_if(|(_, until)| now_ns >= *until) else {
+        let Some((mut slot, _)) = self
+            .previous
+            .take_if(|(slot, until)| now_ns >= *until && Arc::strong_count(&slot.key) == 1)
+        else {
             return;
         };
-        erase(&mut slot.key, self.erase);
-        if self.spare.is_none() {
+        if erase_shared(&mut slot.key, self.erase) && self.spare.is_none() {
             self.spare = Some(slot.key);
         }
     }
