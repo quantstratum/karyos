@@ -366,3 +366,169 @@ fn test_c_time_a_restart_from_a_snapshot_with_an_empty_log_continues_from_its_lo
         assert!(clamped >= 6, "seed {seed}: {clamped} clamped entries");
     }
 }
+
+// ---------------------------------------------------------------------
+// The shipped core (quantstratum/karyos#681): `ClusterNode` runs the
+// custom core, so the restarts above also run on it. It has no
+// leadership handover (`transfer_leadership` is `Unsupported`): a leader
+// change on it is an election, here after server 0, the one ahead,
+// crashes. Each test takes seeds whose first leader is server 0, every
+// committed entry its own.
+// ---------------------------------------------------------------------
+
+/// The custom core, server 0 (ahead) leading after its first run and the
+/// first client done, every committed entry stamped by it; `None` for a
+/// seed that elects another server first. `prepare` runs before the
+/// start.
+fn custom_led_by_0(
+    seed: u64,
+    compaction: Option<Compaction>,
+    prepare: impl FnOnce(&mut Sim<Custom>),
+) -> Option<(Sim<Custom>, Shared)> {
+    let (mut sim, recorder) = build::<Custom>(seed, 0, compaction);
+    prepare(&mut sim);
+    sim.run_for(1_500).unwrap();
+    if !leads(&sim, 0) || !done(&sim, SERVERS) {
+        return None;
+    }
+    let own = history(&recorder)
+        .values()
+        .all(|&(_, event_time)| event_time >= AHEAD);
+    own.then_some((sim, recorder))
+}
+
+/// The server that leads now, among those behind; `None` when none does.
+fn behind_leader(sim: &Sim<Custom>) -> Option<NodeId> {
+    (1..SERVERS).find(|&server| leads(sim, server))
+}
+
+/// Runs `check` on seeds of `0..60` that [`custom_led_by_0`] accepts
+/// until two of them pass it (`check` returns `false` for a seed whose
+/// election did not give the case it needs).
+fn on_two_seeds(
+    compaction: Option<Compaction>,
+    prepare: impl Fn(&mut Sim<Custom>),
+    mut check: impl FnMut(u64, Sim<Custom>, Shared) -> bool,
+) {
+    let mut checked = 0;
+    for seed in 0..60 {
+        if let Some((sim, recorder)) = custom_led_by_0(seed, compaction, &prepare)
+            && check(seed, sim, recorder)
+        {
+            checked += 1;
+            if checked == 2 {
+                return;
+            }
+        }
+    }
+    panic!("only {checked} seeds gave the case");
+}
+
+/// Server 0 is gone for good; a server behind is elected and the second
+/// client's five appends go through it.
+fn appended_by_a_leader_behind(
+    sim: &mut Sim<Custom>,
+    recorder: &Shared,
+    seed: u64,
+    leader: NodeId,
+) -> usize {
+    let ahead = first_term(&history(recorder));
+    let client = second_client(sim, recorder, leader, 5);
+    sim.run_for(3_000).unwrap();
+    assert!(done(sim, client), "seed {seed}: the second client is done");
+    assert_c_time(&history(recorder), ahead)
+}
+
+#[test]
+fn test_c_time_a_restart_from_the_log_continues_from_its_last_entry_on_the_custom_core() {
+    on_two_seeds(
+        None,
+        |_| {},
+        |seed, mut sim, recorder| {
+            sim.crash(0).unwrap();
+            sim.run_for(1_500).unwrap();
+            let Some(elected) = behind_leader(&sim) else {
+                panic!("seed {seed}: no leader behind after server 0 crashed");
+            };
+            // The leader behind restarts from its log.
+            sim.crash(elected).unwrap();
+            sim.restart(elected).unwrap();
+            sim.run_for(3_000).unwrap();
+            assert!(
+                recorder.borrow().observations.iter().any(|o| matches!(
+                    o,
+                    Observation::Recovered { node, entries, .. }
+                        if *node == elected && !entries.is_empty()
+                )),
+                "seed {seed}: server {elected} recovered from its log"
+            );
+            if behind_leader(&sim) != Some(elected) {
+                // The other server won the election after the restart: its
+                // entries would not use the recovered watermark. Not this case.
+                return false;
+            }
+            let clamped = appended_by_a_leader_behind(&mut sim, &recorder, seed, elected);
+            assert!(clamped >= 5, "seed {seed}: {clamped} clamped entries");
+            true
+        },
+    );
+}
+
+#[test]
+fn test_c_time_a_restart_from_a_snapshot_with_an_empty_log_continues_on_the_custom_core() {
+    // The custom leader commits a no-op before the first client's
+    // appends: a snapshot every FIRST + 1 entries covers all of them.
+    let compaction = Compaction {
+        every: u64::from(FIRST) + 1,
+        keep: 0,
+        frame: 1,
+        every_bytes: None,
+    };
+    // Server 2 is down while server 0 commits and compacts the first
+    // client's appends; it then installs server 0's snapshot, restarts
+    // over it with an empty log, and is elected once server 0 crashes.
+    on_two_seeds(
+        Some(compaction),
+        |sim| sim.crash(2).unwrap(),
+        |seed, mut sim, recorder| {
+            sim.restart(2).unwrap();
+            sim.run_for(1_500).unwrap();
+            assert!(
+                recorder.borrow().observations.iter().any(|o| matches!(
+                    o,
+                    Observation::Installed { node: 2, base, .. }
+                        if base.index > u64::from(FIRST)
+                )),
+                "seed {seed}: server 2 installed the snapshot"
+            );
+            sim.crash(2).unwrap();
+            sim.restart(2).unwrap();
+            sim.run_for(1_500).unwrap();
+            let recovered: Vec<Vec<(u64, u64)>> = recorder
+                .borrow()
+                .observations
+                .iter()
+                .filter_map(|o| match o {
+                    Observation::Recovered {
+                        node: 2, entries, ..
+                    } => Some(entries.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                recovered.last(),
+                Some(&Vec::new()),
+                "seed {seed}: server 2's log was empty after its snapshot"
+            );
+            sim.crash(0).unwrap();
+            sim.run_for(1_500).unwrap();
+            if behind_leader(&sim) != Some(2) {
+                // Server 1 won the election: not this case.
+                return false;
+            }
+            let clamped = appended_by_a_leader_behind(&mut sim, &recorder, seed, 2);
+            assert!(clamped >= 5, "seed {seed}: {clamped} clamped entries");
+            true
+        },
+    );
+}
