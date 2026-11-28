@@ -27,7 +27,9 @@
 //! too (karyos#713): `quorum_of_voters` a core that reports its learners
 //! as voters, `configuration_from_log` a core that restarts under its
 //! bootstrap configuration (M8), and `learner_caught_up` a core that
-//! promotes a lagging learner (M5).
+//! promotes a lagging learner (M5). The same check catches a core
+//! that reports one configuration entry as two configurations
+//! (`ConfigurationConflict`, karyos#1038).
 
 #![allow(
     clippy::unwrap_used,
@@ -329,6 +331,10 @@ const FROZEN: u8 = 3;
 const AS_VOTERS: u8 = 4;
 const NO_LAG: u8 = 5;
 const BOOTSTRAP: u8 = 6;
+const CONFLICT: u8 = 7;
+
+/// The learner a [`CONFLICT`] core adds: no server of any case.
+const PHANTOM: NodeId = 99;
 
 /// The custom core with rule `KIND` broken:
 ///
@@ -338,22 +344,27 @@ const BOOTSTRAP: u8 = 6;
 /// - [`AS_VOTERS`]: it reports its learners as voters;
 /// - [`NO_LAG`]: it answers a promotion refused as lagging as taken;
 /// - [`BOOTSTRAP`]: restarted over a log that holds a configuration
-///   entry, it reports the bootstrap voters instead.
+///   entry, it reports the bootstrap voters instead;
+/// - [`CONFLICT`]: on node 0, every configuration of a log entry carries
+///   an extra learner, [`PHANTOM`], so the entry (same index and term)
+///   is reported as one configuration there and another elsewhere.
 #[derive(Debug)]
 struct Mutant<const KIND: u8> {
     inner: Custom,
+    id: NodeId,
     led: Cell<bool>,
     first: Option<Configuration>,
     bootstrap: Configuration,
 }
 
 impl<const KIND: u8> Mutant<KIND> {
-    fn of(inner: Custom, peers: &[NodeId]) -> Self {
+    fn of(inner: Custom, id: NodeId, peers: &[NodeId]) -> Self {
         let first = inner.configuration();
         let mut voters = peers.to_vec();
         voters.sort_unstable();
         Self {
             inner,
+            id,
             led: Cell::new(false),
             first,
             bootstrap: Configuration {
@@ -370,7 +381,7 @@ impl<const KIND: u8> ConsensusCore for Mutant<KIND> {
     type Message = <Custom as ConsensusCore>::Message;
 
     fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
-        Self::of(Custom::recover(id, peers, log), peers)
+        Self::of(Custom::recover(id, peers, log), id, peers)
     }
 
     fn recover_with(
@@ -379,7 +390,7 @@ impl<const KIND: u8> ConsensusCore for Mutant<KIND> {
         limits: &Limits,
         log: &mut LogView<'_>,
     ) -> Result<Self, Unsupported> {
-        Custom::recover_with(id, peers, limits, log).map(|inner| Self::of(inner, peers))
+        Custom::recover_with(id, peers, limits, log).map(|inner| Self::of(inner, id, peers))
     }
 
     fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), Refused> {
@@ -443,6 +454,14 @@ impl<const KIND: u8> ConsensusCore for Mutant<KIND> {
             let learners = std::mem::take(&mut configuration.learners);
             configuration.voters.extend(learners);
             configuration.voters.sort_unstable();
+        }
+        if KIND == CONFLICT
+            && self.id == 0
+            && let Some(configuration) = configuration.as_mut()
+            && configuration.index.is_some()
+        {
+            configuration.learners.push(PHANTOM);
+            configuration.learners.sort_unstable();
         }
         configuration
     }
@@ -601,6 +620,48 @@ fn learner_caught_up_catches_a_lagging_promotion() {
         &warmed(membership::m5()),
         |violation| { matches!(violation, Violation::LearnerBehind { .. }) }
     ));
+}
+
+/// A core that reports one configuration entry as two configurations:
+/// node 0 adds [`PHANTOM`] as a learner to every entry it reports, the
+/// other servers report the entry as written. The removal of M2 is an
+/// entry every server reports, so the run reaches the conflict; the
+/// same seed without the mutant passes.
+#[test]
+fn configuration_from_log_catches_one_entry_reported_as_two_configurations() {
+    let case = membership::m2();
+    let seed = CORPUS[0];
+    passing::<Custom>(&case, seed);
+    let outcome = workloads::run::<Mutant<CONFLICT>>(&case, seed).unwrap();
+    // The scenario is reached: node 0 and another server both report a
+    // configuration of the same log entry.
+    let entry = |node: NodeId| {
+        outcome
+            .observations
+            .iter()
+            .filter_map(move |observation| match observation {
+                Observation::Configuration {
+                    node: reporter,
+                    configuration,
+                    entry_term: Some(term),
+                } if *reporter == node => configuration.index.map(|index| (index, *term)),
+                _ => None,
+            })
+    };
+    let ours: Vec<(u64, u64)> = entry(0).collect();
+    let shared = (1..5).any(|node| entry(node).any(|key| ours.contains(&key)));
+    assert!(
+        shared,
+        "seed {seed:#x}: no entry reported by node 0 and another server"
+    );
+    assert!(
+        matches!(
+            workloads::pass(&case, &outcome),
+            Err(Failed::Safety(violation))
+                if matches!(*violation, Violation::ConfigurationConflict { .. })
+        ),
+        "seed {seed:#x}: the entry reported as two configurations was not caught"
+    );
 }
 
 // Hand-built records: each new check catches its violation.
