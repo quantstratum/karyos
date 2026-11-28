@@ -2619,8 +2619,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
         }
         let mut buffer = core::mem::take(&mut self.enc.shard_buffer);
         let mut plain = [0_u8; MAX_PLAINTEXT];
-        // Each lane's turn takes the next job in dispatch order, whichever
-        // lane holds it (decision 5); each ring is served in its own turn.
+        // Each lane's turn takes the oldest job of a lane the replay window
+        // allows (decision 5); each ring is served in its own turn.
         let served = serve_round(lanes.saturating_mul(2), budget, |input| {
             if input % 2 == 0 {
                 self.enc_shard_job(endpoint, None, sessions, now, &mut plain)
@@ -2633,10 +2633,11 @@ impl<T: StreamTerms> ReceiverRole<T> {
         Some(served)
     }
 
-    /// The next result of `endpoint`'s shards in dispatch order across
-    /// their lanes (decision 5), decided as a pool's
-    /// ([`Intake::enc_verified`]): with `limit`, waiting for it while fewer
-    /// than `limit` are consumed. Whether one was consumed.
+    /// A result of `endpoint`'s shards, the oldest of a lane, that the
+    /// replay window allows now (decision 5), decided as a pool's
+    /// ([`Intake::enc_verified`]): with `limit`, the oldest in dispatch
+    /// order, waiting for it while a job numbered below `limit` is still to
+    /// be consumed. Whether one was consumed.
     fn enc_shard_job(
         &mut self,
         endpoint: EndpointId,

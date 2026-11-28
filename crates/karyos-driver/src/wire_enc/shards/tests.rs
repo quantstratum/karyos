@@ -424,13 +424,13 @@ fn key_age_crossing_while_work_is_queued_is_refused_without_an_open() {
     assert_eq!(opener.leases(), 0, "every lease back once");
 }
 
-/// Decision 5 and ADR-0126 decisions 4 and 5 across shards: results are
-/// consumed in dispatch order across the lanes, so a delayed job holds
-/// back every later one, of its own lane and of the others; cancellation
-/// ends the queued ones in every lane, and every lease returns exactly
-/// once.
+/// Decision 5 and ADR-0126 decisions 4 and 5 across shards: each lane is
+/// consumed in its own order, so a delayed job holds back its lane's later
+/// ones, while another lane's verified job inside the delayed one's replay
+/// window is consumed ahead of it; cancellation ends the queued ones in
+/// every lane, and every lease returns exactly once.
 #[test]
-fn delayed_completion_and_cancellation_hold_in_dispatch_order_across_shards() {
+fn delayed_completion_and_cancellation_hold_each_lane_in_order() {
     let set = detached(2, 8, 4);
     let mut opener = opener();
     let rate = OpenRate::default();
@@ -450,22 +450,25 @@ fn delayed_completion_and_cancellation_hold_in_dispatch_order_across_shards() {
     assert!(run(set.shared.lanes[1].cell(0).unwrap(), clock_word));
     let mut plain = [0_u8; MAX_PLAINTEXT];
     assert!(set.take(0, &mut plain).is_none(), "held back by its first");
+    let ahead = set
+        .take(1, &mut plain)
+        .expect("inside the replay window of lane 0's earlier dispatch");
     assert!(
-        set.take(1, &mut plain).is_none(),
-        "held back by lane 0's earlier dispatch"
+        matches!(ahead, Done { ref context, outcome: Outcome::Verified(_), .. } if context.ticket.seq == 3)
     );
+    drop(ahead);
     assert!(set.take_next(&mut plain).is_none());
     // Cancellation: lane 0's first and third, lane 1's second.
     assert_eq!(set.cancel_all(), 3);
-    let outcomes: Vec<_> = core::iter::from_fn(|| set.take_next(&mut plain))
+    let mut outcomes: Vec<_> = core::iter::from_fn(|| set.take_next(&mut plain))
         .map(|done| (done.context.ticket.seq, done.outcome))
         .collect();
-    assert_eq!(outcomes.len(), 5);
+    outcomes.sort_by_key(|(seq, _)| *seq);
+    assert_eq!(outcomes.len(), 4);
     assert_eq!(outcomes[0], (0, Outcome::Cancelled));
     assert!(matches!(outcomes[1], (1, Outcome::Verified(_))));
     assert_eq!(outcomes[2], (2, Outcome::Cancelled));
-    assert!(matches!(outcomes[3], (3, Outcome::Verified(_))));
-    assert_eq!(outcomes[4], (4, Outcome::Cancelled));
+    assert_eq!(outcomes[3], (4, Outcome::Cancelled));
     assert_eq!(opener.leases(), 0, "each lease returned exactly once");
     assert_eq!(set.in_flight(), 0);
 }
@@ -493,8 +496,9 @@ fn decide(opener: &mut EncOpener, done: Done<ShardJob<u32>>) -> Result<u64, EncR
 
 /// Decision 5, rolling: one lane holds sequence 0 unverified while another
 /// lane's jobs, 1 onwards, are verified and replenished over and over,
-/// well past twice the window. None is committed before sequence 0; the
-/// in-flight cap then drops the rest before their open, counted. Once
+/// well past twice the window. Those inside sequence 0's window commit
+/// ahead of it; none a window or more ahead does, and once those fill the
+/// in-flight cap the rest are dropped before their open, counted. Once
 /// sequence 0 completes, it and every later one pass the real replay
 /// check and commit: the older datagram in flight was never pushed out of
 /// the window by newer ones another lane completed.
@@ -517,28 +521,95 @@ fn an_older_job_in_flight_is_never_pushed_out_of_the_replay_window() {
             committed.push(decide(&mut opener, done));
         }
     }
-    assert!(
-        committed.is_empty(),
-        "decided past sequence 0 in flight: {} of them",
-        committed.len()
+    let reach = u64::try_from(window).unwrap();
+    assert_eq!(
+        committed,
+        (1..reach).map(Ok).collect::<Vec<_>>(),
+        "only those inside sequence 0's window are decided ahead of it"
     );
     assert_eq!(set.in_flight(), ENC_SHARD_IN_FLIGHT as usize);
     assert_eq!(
         counted(&counts, EncRejection::VerifyBusy),
-        u64::try_from(total - ENC_SHARD_IN_FLIGHT as usize).unwrap()
+        u64::try_from(total - (window - 1) - ENC_SHARD_IN_FLIGHT as usize).unwrap()
     );
     // Sequence 0 completes last, still inside the window.
     assert!(set.shared.lanes[0].run_one(&set.shared.clock.0));
     let first = set.take_next(&mut plain).unwrap();
     assert_eq!(decide(&mut opener, first), Ok(0));
+    committed.clear();
     while let Some(done) = set.take_next(&mut plain) {
         committed.push(decide(&mut opener, done));
     }
     assert_eq!(
         committed,
-        (1..u64::from(ENC_SHARD_IN_FLIGHT))
+        (reach..reach + u64::from(ENC_SHARD_IN_FLIGHT) - 1)
             .map(Ok)
             .collect::<Vec<_>>()
+    );
+    assert_eq!(set.in_flight(), 0);
+    assert_eq!(opener.leases(), 0);
+}
+
+/// Decision 5 without head-of-line blocking: with sequence 0 delayed in
+/// one lane, a verified job a whole window ahead of it waits, in its lane,
+/// while another lane's verified job inside the window and a refused one
+/// (it commits nothing) are consumed past it. A job numbered after one a
+/// shard has not published yet waits for it. Every decision passes the
+/// real replay check.
+#[test]
+fn a_slow_job_holds_back_only_what_would_push_it_out_of_the_window() {
+    let set = detached(3, 8, 4);
+    let mut opener = opener();
+    let rate = OpenRate::default();
+    let _counts = bind(&set, &mut opener, &rate);
+    let window = usize::try_from(karyos_protocol::protection::replay::WINDOW).unwrap();
+    let genuine = sealed(0x11, window + 2);
+    let forged = sealed(0x22, window + 2);
+    assert!(matches!(shard_take(&set, 0, &genuine[0]), Step::Dispatched));
+    assert!(matches!(
+        shard_take(&set, 1, &genuine[window]),
+        Step::Dispatched
+    ));
+    assert!(matches!(
+        shard_take(&set, 2, &genuine[window - 1]),
+        Step::Dispatched
+    ));
+    assert!(matches!(
+        shard_take(&set, 2, &forged[window + 1]),
+        Step::Dispatched
+    ));
+    while set.shared.lanes[1].run_one(&set.shared.clock.0) {}
+    while set.shared.lanes[2].run_one(&set.shared.clock.0) {}
+    let mut plain = [0_u8; MAX_PLAINTEXT];
+    assert!(
+        set.take(1, &mut plain).is_none(),
+        "a window ahead of sequence 0"
+    );
+    let inside = set.take(2, &mut plain).unwrap();
+    assert_eq!(
+        decide(&mut opener, inside),
+        Ok(u64::try_from(window).unwrap() - 1)
+    );
+    let refused = set.take(2, &mut plain).unwrap();
+    assert_eq!(refused.outcome, Outcome::Failed(EncRejection::Tag));
+    drop(refused);
+    assert!(set.take_next(&mut plain).is_none());
+    // Sequence 0 verifies; meanwhile shard 2 is numbering a job below
+    // lane 1's.
+    assert!(set.shared.lanes[0].run_one(&set.shared.clock.0));
+    set.shared.pending[2].0.store(0, Ordering::Release);
+    assert!(
+        set.take(1, &mut plain).is_none(),
+        "an earlier number unpublished"
+    );
+    let first = set.take(0, &mut plain).unwrap();
+    assert_eq!(decide(&mut opener, first), Ok(0));
+    assert!(set.take(1, &mut plain).is_none(), "still unpublished");
+    set.shared.pending[2].0.store(u64::MAX, Ordering::Release);
+    let last = set.take_next(&mut plain).unwrap();
+    assert_eq!(
+        decide(&mut opener, last),
+        Ok(u64::try_from(window).unwrap())
     );
     assert_eq!(set.in_flight(), 0);
     assert_eq!(opener.leases(), 0);

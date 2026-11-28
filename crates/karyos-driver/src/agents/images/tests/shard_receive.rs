@@ -41,7 +41,12 @@ struct InFlight {
 /// delivered, then one more sent while the role holds results: its jobs
 /// are in a shard lane, dispatched under the image's key.
 fn in_flight() -> InFlight {
-    let (mut rig, b) = with_enc_shards(SHARDS, VERIFY, encrypted_rig);
+    in_flight_on(encrypted_rig)
+}
+
+/// [`in_flight`] on the rig `rig` builds.
+fn in_flight_on(rig: fn() -> (Rig, EndpointId)) -> InFlight {
+    let (mut rig, b) = with_enc_shards(SHARDS, VERIFY, rig);
     let slot = established(&mut rig);
     let (conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
     let first: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; 100]).collect();
@@ -337,6 +342,11 @@ fn a_promotion_rechecked_by_the_role_always_commits() {
 fn stopping_the_receiver_joins_its_shards_before_it_is_handed_back() {
     use crate::agents::{AgentRunner, ThreadingMode, YieldThenSleep};
 
+    // The rig runs on a virtual clock from zero; the runner's duties on
+    // the host's monotonic clock, days later. A duty that ran before the
+    // stop flag was seen would find the image silent past its liveness
+    // timeout and retire it, which returns its leases itself. Images that
+    // never expire keep the image, and its leases, to the stop.
     let InFlight {
         rig,
         b,
@@ -344,7 +354,12 @@ fn stopping_the_receiver_joins_its_shards_before_it_is_handed_back() {
         _conductor: _keep_conductor,
         _subscriber: _keep_subscriber,
         ..
-    } = in_flight();
+    } = in_flight_on(|| {
+        encrypted_rig_tuned(Some(|config| {
+            config.image_liveness_timeout = u64::MAX / 4;
+            config.idle_image_timeout = u64::MAX / 4;
+        }))
+    });
     assert!(rig.agents.receiver.role.enc_shard_stats(b).is_some());
     let Rig {
         agents,

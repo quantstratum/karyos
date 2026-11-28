@@ -296,6 +296,7 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
             .unwrap()
     };
     let before = refusals(&rig);
+    let unmatched_before = unmatched_replies(&rig, slot);
     let epochs = rig.agents.receiver.role.enc_epochs(slot);
     let challenges = rig.agents.receiver.role.posted_challenges().len();
     let committed_before = rig.agents.receiver.counters().data_committed;
@@ -490,6 +491,7 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
         }
     }
     let after = refusals(&rig);
+    let unmatched = unmatched_replies(&rig, slot) - unmatched_before;
     let forged = rig.agents.receiver.role.watched_in();
     let drops = forged_sent.saturating_sub(forged);
     let new_challenges = rig.agents.receiver.role.posted_challenges().len() - challenges;
@@ -646,7 +648,21 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     let tags = after.get(EncRejection::Tag) - before.get(EncRejection::Tag);
     let busy = after.get(EncRejection::VerifyBusy) - before.get(EncRejection::VerifyBusy);
     assert!(tags <= forged && tags + busy >= forged, "{report}");
-    assert_eq!(after.total() - before.total(), tags + busy, "{report}");
+    // A valid datagram its handler refused is a sender's genuine ERR
+    // NAK_REPLY echoing a NAK no longer outstanding: a retried NAK the
+    // sender answered RANGE_UNAVAILABLE after an earlier repair had filled
+    // the hole (H8-34). Each is an unmatched reply of the repair state,
+    // never committed; nothing else is refused.
+    let inner = after.get(EncRejection::InnerRejected) - before.get(EncRejection::InnerRejected);
+    assert!(
+        inner <= unmatched,
+        "{inner} > {unmatched} unmatched NAK_REPLYs\n{report}"
+    );
+    assert_eq!(
+        after.total() - before.total(),
+        tags + busy + inner,
+        "{report}"
+    );
     assert_eq!(delivered, appended, "{report}");
     assert_eq!(out_of_order, 0, "{report}");
     assert!(new_challenges <= 1, "{report}");
@@ -656,6 +672,16 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
         "{report}"
     );
     report
+}
+
+/// The ERR NAK_REPLYs the repair state of the image at `slot` found
+/// echoing no outstanding NAK.
+fn unmatched_replies(rig: &Rig, slot: SlotRef) -> u64 {
+    rig.agents
+        .receiver
+        .role
+        .loss_counters(slot)
+        .map_or(0, |counters| counters.replies_unmatched)
 }
 
 #[test]

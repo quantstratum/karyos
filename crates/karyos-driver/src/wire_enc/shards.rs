@@ -25,13 +25,15 @@
 //!   stays the role's commit.
 //! - **One lane per shard** (decision 5): a ring of job slots the shard
 //!   fills in its receive order, verifiers run (the key age checked again
-//!   just before the open, against a live clock), and the role consumes.
-//!   Every job carries its dispatch number across the set's lanes, and the
-//!   role consumes, and so commits, strictly in that order: no job is
-//!   decided while an earlier dispatched one is still in flight, so an
-//!   older datagram is never pushed out of the replay window by later ones
-//!   another lane completed. At most [`ENC_SHARD_IN_FLIGHT`] jobs, the
-//!   replay window, are in flight across the lanes of a set.
+//!   just before the open, against a live clock), and the role consumes in
+//!   that order. Every job carries its dispatch number across the set's
+//!   lanes, its replay context and its sequence: the role takes a verified
+//!   job ahead of an earlier dispatched one of another lane only while that
+//!   one stays inside the replay window of their shared context, so an
+//!   older datagram is never pushed out of the window by later ones another
+//!   lane completed, and a slow job holds back only what would push it
+//!   out. At most [`ENC_SHARD_IN_FLIGHT`] jobs, the replay window, are in
+//!   flight across the lanes of a set.
 //! - **One ring per shard for everything else** (decision 6): datagrams
 //!   that are not encrypted for this endpoint's subscriptions (control,
 //!   other classes, a local publication's envelopes), and those only the
@@ -49,7 +51,9 @@
 //!
 //! Nothing a shard, a verifier or the role does per datagram allocates.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
+use core::sync::atomic::{
+    AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::thread::{JoinHandle, Thread};
@@ -74,12 +78,11 @@ use crate::wire_keys::KEY_LEN;
 /// Receive shards an encrypted endpoint may run at most.
 pub const MAX_ENC_SHARDS: u16 = 8;
 /// Jobs in flight across the lanes of one endpoint's shards at most: the
-/// replay window (decision 5). With the role consuming in dispatch order
-/// across the lanes, nothing dispatched after a job still in flight is
-/// committed before it, so an older datagram still in flight is never more
-/// than the window behind the newest committed sequence of its context:
-/// whatever is committed meanwhile was received before it, exactly as on
-/// one receive thread.
+/// replay window (decision 5). The role commits nothing dispatched after a
+/// job still in flight that would move their context's newest committed
+/// sequence a window past it, so an older datagram still in flight is
+/// never more than the window behind the newest committed sequence of its
+/// context.
 pub const ENC_SHARD_IN_FLIGHT: u32 = 1_024;
 const _: () = assert!(ENC_SHARD_IN_FLIGHT as u64 == karyos_protocol::protection::replay::WINDOW);
 /// Datagrams each shard's ring for the role holds by default.
@@ -374,7 +377,19 @@ struct LaneCell<B> {
     /// The job's dispatch number across the set's lanes (decision 5),
     /// written before the job is published.
     number: AtomicU64,
+    /// The job's replay context ([`replay_context`]) and sequence,
+    /// written before the job is published (decision 5).
+    window: [AtomicU64; 2],
+    /// Whether its open verified: written before it is marked done.
+    verified: AtomicBool,
     job: Mutex<LaneJob<B>>,
+}
+
+/// A digest of the replay context of a job under `opener`'s keys of
+/// `epochs`: one replay window each. Two contexts sharing a digest only
+/// hold each other back more.
+fn replay_context(opener: u64, (key_epoch, party_epoch): (u32, u16)) -> u64 {
+    opener.rotate_left(32) ^ (u64::from(key_epoch) << 16) ^ u64::from(party_epoch)
 }
 
 impl<B> LaneCell<B> {
@@ -403,6 +418,8 @@ impl<B> Lane<B> {
                 Some(LaneCell {
                     state: AtomicU8::new(FREE),
                     number: AtomicU64::new(u64::MAX),
+                    window: [AtomicU64::new(0), AtomicU64::new(0)],
+                    verified: AtomicBool::new(false),
                     job: Mutex::new(LaneJob {
                         bytes: [0; MAX_DATAGRAM],
                         len: 0,
@@ -507,8 +524,10 @@ fn run<B>(cell: &LaneCell<B>, clock: &SetClock) -> bool {
         }
         _ => Outcome::Cancelled,
     };
+    let verified = matches!(*outcome, Outcome::Verified(_));
     guard.forget();
     drop(guard);
+    cell.verified.store(verified, Ordering::Relaxed);
     cell.state.store(DONE, Ordering::Release);
     true
 }
@@ -632,9 +651,12 @@ struct SetShared<B> {
     cap: u32,
     /// Dispatch numbers given out: the next job's (decision 5).
     issued: Padded<AtomicU64>,
-    /// The dispatch number the role consumes next: jobs are consumed, and
-    /// committed, in dispatch order across the lanes.
-    next: Padded<AtomicU64>,
+    /// Per shard, while it numbers and publishes a job: at most that job's
+    /// dispatch number, otherwise `u64::MAX`. The role takes no verified
+    /// job numbered after it meanwhile: the earlier one is not visible yet.
+    pending: Box<[Padded<AtomicU64>]>,
+    /// The lane the role's next [`ShardSet::take_next`] starts from.
+    cursor: Padded<AtomicUsize>,
     /// What the shards and the verifiers check the rate intervals,
     /// overlaps and key ages against.
     clock: Padded<SetClock>,
@@ -738,7 +760,10 @@ impl<B> SetShared<B> {
             in_flight: Padded(AtomicU32::new(0)),
             cap: ENC_SHARD_IN_FLIGHT,
             issued: Padded::default(),
-            next: Padded::default(),
+            pending: (0..count)
+                .map(|_| Padded(AtomicU64::new(u64::MAX)))
+                .collect(),
+            cursor: Padded::default(),
             clock: Padded(clock),
             stride,
             max_datagram,
@@ -1078,6 +1103,7 @@ impl<B: Copy> SetShared<B> {
             self.in_flight.0.fetch_sub(1, Ordering::AcqRel);
             return busy;
         };
+        let window;
         {
             let mut held = cell.lock();
             if let Some(Derivation {
@@ -1111,15 +1137,32 @@ impl<B: Copy> SetShared<B> {
             held.lease = Some(lease);
             held.outcome = Outcome::Cancelled;
             held.deadline = deadline;
+            window = (
+                replay_context(job.ticket.opener, job.ticket.epochs),
+                job.ticket.seq,
+            );
             held.context = Some(job);
         }
         // Nothing fails from here on: every number given out is published.
+        // Until it is, the shard's pending mark is at most that number.
+        let pending = self.pending.get(me);
+        if let Some(pending) = pending {
+            pending
+                .0
+                .store(self.issued.0.load(Ordering::Relaxed), Ordering::Release);
+        }
         let number = self.issued.0.fetch_add(1, Ordering::AcqRel);
         cell.number.store(number, Ordering::Relaxed);
+        cell.window[0].store(window.0, Ordering::Relaxed);
+        cell.window[1].store(window.1, Ordering::Relaxed);
+        cell.verified.store(false, Ordering::Relaxed);
         cell.state.store(QUEUED, Ordering::Release);
         lane.produced
             .0
             .store(produced.wrapping_add(1), Ordering::Release);
+        if let Some(pending) = pending {
+            pending.0.store(u64::MAX, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -1244,17 +1287,74 @@ impl<B: Copy> SetShared<B> {
         true
     }
 
-    /// The lane whose oldest job is the next in dispatch order (decision
-    /// 5), once its shard has published it.
-    fn next_lane(&self) -> Option<usize> {
-        let next = self.next.0.load(Ordering::Relaxed);
-        self.lanes.iter().position(|lane| {
-            let consumed = lane.consumed.0.load(Ordering::Relaxed);
-            consumed < lane.produced.0.load(Ordering::Acquire)
-                && lane
-                    .cell(consumed)
-                    .is_some_and(|cell| cell.number.load(Ordering::Relaxed) == next)
-        })
+    /// Whether the role may consume `cell`, the oldest job of lane `lane`
+    /// (decision 5): it is done, and either it did not verify (it commits
+    /// nothing, so it moves no window) or no earlier dispatched job of
+    /// another lane still in flight, that may yet commit, is a window or
+    /// more behind it in their shared replay context, and no earlier number
+    /// is still to be published.
+    fn may_consume(&self, lane: usize, cell: &LaneCell<B>) -> bool {
+        if cell.state.load(Ordering::Acquire) != DONE {
+            return false;
+        }
+        if !cell.verified.load(Ordering::Relaxed) {
+            return true;
+        }
+        let number = cell.number.load(Ordering::Relaxed);
+        // The marks first: a number published after this read is seen in
+        // its lane below.
+        if self
+            .pending
+            .iter()
+            .any(|pending| pending.0.load(Ordering::Acquire) < number)
+        {
+            return false;
+        }
+        let (context, seq) = (
+            cell.window[0].load(Ordering::Relaxed),
+            cell.window[1].load(Ordering::Relaxed),
+        );
+        let window = karyos_protocol::protection::replay::WINDOW;
+        self.lanes
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| *at != lane)
+            .all(|(_, other)| {
+                let from = other.consumed.0.load(Ordering::Relaxed);
+                let to = other.produced.0.load(Ordering::Acquire);
+                (from..to)
+                    .map_while(|at| {
+                        other
+                            .cell(at)
+                            .filter(|older| older.number.load(Ordering::Relaxed) < number)
+                    })
+                    .all(|older| {
+                        older.window[0].load(Ordering::Relaxed) != context
+                            || seq
+                                < older.window[1]
+                                    .load(Ordering::Relaxed)
+                                    .saturating_add(window)
+                            || (older.state.load(Ordering::Acquire) == DONE
+                                && !older.verified.load(Ordering::Relaxed))
+                    })
+            })
+    }
+
+    /// The oldest published job of any lane by dispatch number, and its
+    /// lane.
+    fn oldest(&self) -> Option<(u64, usize)> {
+        self.lanes
+            .iter()
+            .enumerate()
+            .filter_map(|(at, lane)| {
+                let consumed = lane.consumed.0.load(Ordering::Relaxed);
+                if consumed >= lane.produced.0.load(Ordering::Acquire) {
+                    return None;
+                }
+                lane.cell(consumed)
+                    .map(|cell| (cell.number.load(Ordering::Relaxed), at))
+            })
+            .min()
     }
 }
 
@@ -1464,12 +1564,13 @@ impl<B: Copy + Send + Sync + 'static> ShardSet<B> {
         self.shared.issued.0.load(Ordering::Acquire)
     }
 
-    /// The oldest job of lane `lane`, if it is the next in dispatch order
-    /// across the lanes (decision 5) and done: consumed and its slot
-    /// freed, its plaintext copied to `plain` when it verified. `None`
-    /// while it is not done (it holds back every later one, of any lane),
-    /// while an earlier dispatched job of another lane is still to be
-    /// consumed, or when the lane is empty. Allocates nothing.
+    /// The oldest job of lane `lane`, if it is done and may be consumed
+    /// now (decision 5): consumed and its slot freed, its plaintext copied
+    /// to `plain` when it verified. `None` while it is not done (it holds
+    /// back its lane's later ones), while it verified and an earlier
+    /// dispatched job of another lane still in flight is a replay window
+    /// or more behind it in their context, or when the lane is empty.
+    /// Allocates nothing.
     pub(crate) fn take(
         &self,
         lane: usize,
@@ -1481,11 +1582,7 @@ impl<B: Copy + Send + Sync + 'static> ShardSet<B> {
             return None;
         }
         let cell = held.cell(consumed)?;
-        let next = self.shared.next.0.load(Ordering::Relaxed);
-        if cell.number.load(Ordering::Relaxed) != next {
-            return None;
-        }
-        if cell.state.load(Ordering::Acquire) != DONE {
+        if !self.shared.may_consume(lane, cell) {
             return None;
         }
         let done = {
@@ -1515,39 +1612,55 @@ impl<B: Copy + Send + Sync + 'static> ShardSet<B> {
         held.consumed
             .0
             .store(consumed.wrapping_add(1), Ordering::Release);
-        self.shared
-            .next
-            .0
-            .store(next.wrapping_add(1), Ordering::Release);
         self.shared.in_flight.0.fetch_sub(1, Ordering::AcqRel);
         done
     }
 
-    /// The next job in dispatch order across the lanes, if it is done
-    /// ([`Self::take`]). Allocates nothing.
+    /// The oldest job of a lane that may be consumed now ([`Self::take`]),
+    /// the lanes tried in turn from the one after the last taken from.
+    /// Allocates nothing.
     pub(crate) fn take_next(&self, plain: &mut [u8; MAX_PLAINTEXT]) -> Option<Done<ShardJob<B>>> {
-        let lane = self.shared.next_lane()?;
-        self.take(lane, plain)
+        let lanes = self.shared.lanes.len().max(1);
+        let from = self.shared.cursor.0.load(Ordering::Relaxed);
+        (0..lanes)
+            .map(|offset| from.wrapping_add(offset) % lanes)
+            .find_map(|lane| {
+                let done = self.take(lane, plain)?;
+                self.shared
+                    .cursor
+                    .0
+                    .store(lane.wrapping_add(1) % lanes, Ordering::Relaxed);
+                Some(done)
+            })
     }
 
-    /// [`Self::take_next`], waiting for the next job while fewer than
-    /// `limit` jobs are consumed; while it waits the role runs that job
-    /// itself if no verifier has claimed it, so it never waits on a
-    /// verifier that is not running. `None` once `limit` jobs are
-    /// consumed.
+    /// The oldest job in dispatch order across the lanes, waiting for it
+    /// while a job numbered below `limit` is still to be consumed; while it
+    /// waits the role runs that job itself if no verifier has claimed it,
+    /// so it never waits on a verifier that is not running. `None` once
+    /// every job numbered below `limit` is consumed.
     pub(crate) fn take_waiting(
         &self,
         limit: u64,
         plain: &mut [u8; MAX_PLAINTEXT],
     ) -> Option<Done<ShardJob<B>>> {
         loop {
-            if self.shared.next.0.load(Ordering::Acquire) >= limit {
-                return None;
-            }
-            // A number given out is published by its shard straight after.
-            let Some(lane) = self.shared.next_lane() else {
-                core::hint::spin_loop();
-                continue;
+            // The marks first: a number below `limit` published after this
+            // read is seen in its lane next.
+            let unpublished = self
+                .shared
+                .pending
+                .iter()
+                .any(|pending| pending.0.load(Ordering::Acquire) < limit);
+            let lane = match self.shared.oldest() {
+                Some((number, lane)) if number < limit => lane,
+                // A number given out is published by its shard straight
+                // after.
+                _ if unpublished => {
+                    core::hint::spin_loop();
+                    continue;
+                }
+                _ => return None,
             };
             if let Some(done) = self.take(lane, plain) {
                 return Some(done);
