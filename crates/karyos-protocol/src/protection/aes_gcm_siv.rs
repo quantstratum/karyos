@@ -1246,6 +1246,20 @@ impl AesGcmSiv {
         self.precheck(datagram).map(|(seq, _)| seq)
     }
 
+    /// The fixed fields of section 8 steps 1 to 3 against this key's
+    /// context, without the replay window, changing nothing: what a
+    /// receive shard checks before it hands the open to a verifier
+    /// (`quantstratum-docs: karyos/adr/0127-encrypted-sharded-receive-per-endpoint.md`
+    /// decision 2; the replay precheck moves to the role's re-check).
+    /// Takes no lock. Returns the sequence.
+    ///
+    /// # Errors
+    ///
+    /// The first [`EncRejection`] that applies.
+    pub fn check_fields(&self, datagram: &[u8]) -> Result<u64, EncRejection> {
+        self.precheck_fields(datagram).map(|(seq, _)| seq)
+    }
+
     /// [`Self::open_into`] without the replay precheck: the fixed fields,
     /// the AEAD and the pairwise trailer only, the pure step a verifier
     /// thread runs (ADR-0126 decision 1). Its caller ran

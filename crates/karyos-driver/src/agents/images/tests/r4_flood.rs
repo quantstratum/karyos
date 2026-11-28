@@ -8,7 +8,7 @@
 //! and 1 000 000 messages/s) for a fixed time in wall-clock time, while
 //! datagrams forged under a wrong key (the genuine context, an invalid
 //! tag) are sent at 10% or 100% of the valid rate from up to
-//! [`FORGERS`] other threads, each over a real UDP socket that shares the publisher's address and port
+//! [`r4_forgers`] other threads, each over a real UDP socket that shares the publisher's address and port
 //! (a duplicate of its descriptor: the source a spoofing attacker
 //! names), to the receiver's bound endpoint. They reach the receiver
 //! through its polled transport, as an attacker's datagrams would. Each
@@ -44,10 +44,16 @@ use crate::wire_enc::{
     ChannelKeys, DEFAULT_ENC_VERIFY_SLOTS, EncSealer, EncVerifyConfig, MAX_SEALED,
 };
 
-/// Verifier threads of the receiver's pool (ADR-0126) by default;
-/// `KARYOS_R4_VERIFIERS` overrides it, 0 running every open on the
-/// receiver's own thread.
-const VERIFIERS: u16 = 3;
+/// Verifier threads by default, of the receiver's pool (ADR-0126) and of
+/// its receive shards (ADR-0127); `KARYOS_R4_VERIFIERS` overrides it, 0
+/// running every pool open on the receiver's own thread (the shards then
+/// run one verifier).
+const VERIFIERS: u16 = 4;
+
+/// Receive shards of the encrypted endpoint by default (ADR-0127);
+/// `KARYOS_R4_SHARDS` overrides it, 0 receiving on the receiver's own
+/// thread.
+const SHARDS: u16 = 2;
 
 /// The receiver's verifier pool of a run: [`VERIFIERS`] threads and
 /// [`DEFAULT_ENC_VERIFY_SLOTS`] slots, or `KARYOS_R4_VERIFIERS` and
@@ -65,6 +71,20 @@ fn r4_pool() -> EncVerifyConfig {
     }
 }
 
+/// The receiver's receive shards per encrypted endpoint (ADR-0127):
+/// `KARYOS_R4_SHARDS`, or [`SHARDS`], 0 receiving on the receiver's own
+/// thread; with shards, their verifiers are the pool's count (at least
+/// one), each lane of `KARYOS_R4_SLOTS` slots.
+fn r4_shards() -> crate::wire_enc::EncShardConfig {
+    crate::wire_enc::EncShardConfig {
+        shards: std::env::var("KARYOS_R4_SHARDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(SHARDS),
+        ..crate::wire_enc::EncShardConfig::default()
+    }
+}
+
 /// R2's lower valid rate (manifest 6.1), messages/s.
 const RATE_LOW: u64 = 100_000;
 /// R2's higher valid rate (manifest 6.1), messages/s.
@@ -79,10 +99,20 @@ const POOL: u64 = 4_096;
 const FORGED_PAD: usize = 3;
 /// Forged datagrams per send call at most.
 const SEND_BATCH: usize = 32;
-/// Threads sending the flood, each on its own duplicate of the
+/// Threads sending the flood by default, each on its own duplicate of the
 /// publisher's socket and its share of the schedule: one loopback sender
 /// alone tops out near 450 000 datagrams/s on xaskar.
 const FORGERS: u64 = 4;
+
+/// Threads sending the flood at most: `KARYOS_R4_FORGERS`, at least 1, or
+/// [`FORGERS`].
+fn r4_forgers() -> u64 {
+    std::env::var("KARYOS_R4_FORGERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(FORGERS)
+        .max(1)
+}
 /// Forged datagrams per second one sending thread is given at most.
 const PER_FORGER: u64 = 300_000;
 /// The share of the forged datagrams sent that UDP may lose before the
@@ -205,8 +235,10 @@ fn sustained(rate: u64, invalid_percent: u64, load: Load) -> Result<(), String> 
 #[allow(clippy::too_many_lines, reason = "one measured run, read top down")]
 fn r4(rate: u64, invalid_percent: u64) -> String {
     let verify = r4_pool();
-    let (mut rig, b) =
-        crate::agents::roles::receive_enc::with_enc_verifiers(verify, true, encrypted_rig);
+    let shards = r4_shards();
+    let (mut rig, b) = crate::agents::roles::receive_enc::with_enc_shards(shards, verify, || {
+        crate::agents::roles::receive_enc::with_enc_verifiers(verify, true, encrypted_rig)
+    });
     assert_eq!(
         rig.agents.receiver.role.enc_verifiers(),
         (verify.verifiers > 0).then_some(usize::from(verify.verifiers)),
@@ -264,6 +296,7 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
             .unwrap()
     };
     let before = refusals(&rig);
+    let unmatched_before = unmatched_replies(&rig, slot);
     let epochs = rig.agents.receiver.role.enc_epochs(slot);
     let challenges = rig.agents.receiver.role.posted_challenges().len();
     let committed_before = rig.agents.receiver.counters().data_committed;
@@ -287,7 +320,8 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     let go = Arc::new(AtomicBool::new(false));
     // The flood, on its own thread, on its own schedule from the start
     // both loads share: forged sent, send calls refused, largest lag.
-    let forgers = forged_rate.div_ceil(PER_FORGER).clamp(1, FORGERS);
+    let max_forgers = r4_forgers();
+    let forgers = forged_rate.div_ceil(PER_FORGER).clamp(1, max_forgers);
     let floods: Vec<_> = (0..forgers)
         .map(|share| {
             let go = Arc::clone(&go);
@@ -457,6 +491,7 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
         }
     }
     let after = refusals(&rig);
+    let unmatched = unmatched_replies(&rig, slot) - unmatched_before;
     let forged = rig.agents.receiver.role.watched_in();
     let drops = forged_sent.saturating_sub(forged);
     let new_challenges = rig.agents.receiver.role.posted_challenges().len() - challenges;
@@ -467,6 +502,25 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
         "R4 encrypted (W1 L=32, F1 unicast, loopback): valid {rate}/s for {SECONDS} s, \
          invalid tags at {invalid_percent}% ({} /s)",
         rate * invalid_percent / 100
+    );
+    let _ = writeln!(
+        report,
+        "forger threads: {forgers} (KARYOS_R4_FORGERS at most {max_forgers}, \
+         {PER_FORGER}/s each at most)"
+    );
+    let shard_stats = rig.agents.receiver.role.enc_shard_stats(b);
+    let _ = writeln!(
+        report,
+        "effective configuration: shards={} (KARYOS_R4_SHARDS, running {}) verifiers={} \
+         (KARYOS_R4_VERIFIERS; pool {:?}, shard verifiers running {}) slots={} \
+         (KARYOS_R4_SLOTS) ring={} forgers={forgers}",
+        shards.shards,
+        shard_stats.map_or(0, |stats| stats.shards),
+        verify.verifiers,
+        rig.agents.receiver.role.enc_verifiers(),
+        shard_stats.map_or(0, |stats| stats.verifiers),
+        verify.slots,
+        shards.ring,
     );
     #[allow(clippy::cast_precision_loss, reason = "a reported rate")]
     let achieved = (
@@ -505,6 +559,12 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
         verify.slots,
         after.get(EncRejection::VerifyBusy) - before.get(EncRejection::VerifyBusy),
         rig.agents.receiver.role.enc_in_flight()
+    );
+    let _ = writeln!(
+        report,
+        "receive shards (ADR-0127): shards={} {:?}",
+        shards.shards,
+        rig.agents.receiver.role.enc_shard_stats(b)
     );
     let _ = writeln!(
         report,
@@ -574,13 +634,35 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     }
     assert_eq!(receiver_allocs, 0, "{report}");
     assert_eq!(sender_allocs, 0, "{report}");
+    // With shards configured, the receiver used them: they ran and
+    // received the endpoint's traffic, dispatching the bound datagrams.
+    if shards.shards > 0 {
+        let stats = shard_stats.expect("the receiver runs receive shards");
+        assert_eq!(stats.shards, usize::from(shards.shards), "{report}");
+        assert!(stats.verifiers >= 1, "{report}");
+        assert!(stats.received > stats.forwarded, "{report}");
+    }
     // Every forged datagram read is refused for its tag, or dropped before
     // its open when no verification slot was free (ADR-0126 decision 4,
     // which drops valid datagrams too: those are repaired).
     let tags = after.get(EncRejection::Tag) - before.get(EncRejection::Tag);
     let busy = after.get(EncRejection::VerifyBusy) - before.get(EncRejection::VerifyBusy);
     assert!(tags <= forged && tags + busy >= forged, "{report}");
-    assert_eq!(after.total() - before.total(), tags + busy, "{report}");
+    // A valid datagram its handler refused is a sender's genuine ERR
+    // NAK_REPLY echoing a NAK no longer outstanding: a retried NAK the
+    // sender answered RANGE_UNAVAILABLE after an earlier repair had filled
+    // the hole (H8-34). Each is an unmatched reply of the repair state,
+    // never committed; nothing else is refused.
+    let inner = after.get(EncRejection::InnerRejected) - before.get(EncRejection::InnerRejected);
+    assert!(
+        inner <= unmatched,
+        "{inner} > {unmatched} unmatched NAK_REPLYs\n{report}"
+    );
+    assert_eq!(
+        after.total() - before.total(),
+        tags + busy + inner,
+        "{report}"
+    );
     assert_eq!(delivered, appended, "{report}");
     assert_eq!(out_of_order, 0, "{report}");
     assert!(new_challenges <= 1, "{report}");
@@ -590,6 +672,16 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
         "{report}"
     );
     report
+}
+
+/// The ERR NAK_REPLYs the repair state of the image at `slot` found
+/// echoing no outstanding NAK.
+fn unmatched_replies(rig: &Rig, slot: SlotRef) -> u64 {
+    rig.agents
+        .receiver
+        .role
+        .loss_counters(slot)
+        .map_or(0, |counters| counters.replies_unmatched)
 }
 
 #[test]

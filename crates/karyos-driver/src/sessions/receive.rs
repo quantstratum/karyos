@@ -673,6 +673,27 @@ impl ReceiveSessions {
         self.quarantined(identity, now)
     }
 
+    /// Every retired full identity and the end of its `alias_quarantine`
+    /// (ADR-0127: what a receive shard drops before any derivation).
+    pub(crate) fn quarantined_until(&self) -> impl Iterator<Item = (Identity, u64)> + '_ {
+        self.slots.iter().filter_map(|slot| match slot.state {
+            State::Retired {
+                identity,
+                retired_at,
+                ..
+            } => Some((
+                identity,
+                retired_at.saturating_add(self.config.alias_quarantine),
+            )),
+            _ => None,
+        })
+    }
+
+    /// Slots of the table: how many identities can be retired at once.
+    pub(crate) fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
     /// Puts `identity` in a free slot as retired at `now` (tests).
     #[cfg(test)]
     pub(crate) fn quarantine_for_test(&mut self, identity: Identity, now: u64) {

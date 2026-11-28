@@ -9000,12 +9000,18 @@ fn enc_keys(receiver_id: u64) -> (crate::wire_keys::KeyFile, crate::wire_keys::K
 /// are encrypted before any DATA. The class still fails at channel parse:
 /// only this test constructor makes them encrypted.
 fn encrypted_rig() -> (Rig, EndpointId) {
+    encrypted_rig_tuned(None)
+}
+
+/// [`encrypted_rig`] with its configuration changed by `tune`.
+fn encrypted_rig_tuned(tune: Option<fn(&mut AgentConfig)>) -> (Rig, EndpointId) {
     use crate::agents::roles::publish_enc::PublicationEnc;
     use crate::agents::roles::receive_enc::SubscriptionEnc;
 
     let (mut rig, b) = Rig::new(Setup {
         reliable: true,
         identity: Some(identity_77(0)),
+        tune,
         ..Setup::default()
     });
     let (channel, pairwise) = enc_keys(77);
@@ -11435,6 +11441,8 @@ mod invariants_r4;
 /// H10 R4 evidence for the encrypted class: timed, ignored (manifest 7).
 mod r4_flood;
 #[cfg(test)]
+mod shard_receive;
+#[cfg(test)]
 mod verify_workers;
 
 /// `record` sealed again, byte for byte as it went out: AES-GCM-SIV is
@@ -12750,8 +12758,17 @@ fn a_next_epoch_nak_reply_echoing_no_outstanding_nak_marks_nothing() {
             .role
             .inject_datagram(&receiver.sessions, b, source, bytes, rig.now);
     };
+    let unmatched = |rig: &Rig| {
+        rig.agents
+            .receiver
+            .role
+            .loss_counters(slot)
+            .unwrap()
+            .replies_unmatched
+    };
     let epochs = rig.agents.receiver.role.enc_epochs(slot);
     let before = refused(&rig);
+    let unmatched_before = unmatched(&rig);
     inject(&mut rig, &next_epoch(&data, reply(0, 64), 0));
     assert_eq!(
         rig.agents.receiver.role.enc_epochs(slot),
@@ -12783,6 +12800,10 @@ fn a_next_epoch_nak_reply_echoing_no_outstanding_nak_marks_nothing() {
     );
     inject(&mut rig, &next_epoch(&data, reply(0, 64), 1));
     assert_eq!(refused(&rig), before + 3, "answered: no longer outstanding");
+    // Each refusal is an unmatched reply of the repair state too: the
+    // genuine late echo of a NAK a repair already answered (R4 under
+    // overload) is told from a forgery by that counter (H8-34).
+    assert_eq!(unmatched(&rig), unmatched_before + 3);
 }
 
 /// H8-35 (ADR-0114 sections 8 and 9): a heartbeat is committed only once

@@ -41,6 +41,7 @@
 //! made encrypted by its admission binding (`Binding::EncSubscription`).
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use karyos_protocol::network::encrypted::{EncAnswer, EncSetup, decode_setup};
 use karyos_protocol::network::{
@@ -57,15 +58,24 @@ use super::{BindingKey, Intake, ReceiverRole, SessionEnd, SlotRef, sender_frame_
 use crate::agents::EndpointId;
 use crate::embedded::StreamTerms;
 use crate::sessions::NonceSource;
+use crate::wire_enc::shards::{
+    BindingView, ENC_SHARD_IN_FLIGHT, EncShardConfig, JobKind, ShardJob, ShardSet,
+    SharedRejections, StreamView, serve_round,
+};
 use crate::wire_enc::verify_pool::{Done, Outcome, VerifyPool};
 use crate::wire_enc::vm_generation;
 use crate::wire_enc::{
     ChannelKeys, EncChannel, EncKeyError, EncOpener, EncRejections, EncSealer, EncVerifyConfig,
-    Header, Lease, PairwiseFiles, Pending, Prepared, Ticket, VmGenerationWatch, check_matrix,
-    check_resync, header, id128, identity_of, is_envelope, monotonic_ns, open_bootstrap_in,
-    publication_of, quiesced,
+    Header, Lease, OpenerShare, PairwiseFiles, Pending, Prepared, Ticket, VmGenerationWatch,
+    bootstrap_complete, check_matrix, check_resync, header, id128, identity_of, is_envelope,
+    monotonic_ns, open_bootstrap_in, publication_of, quiesced,
 };
 use crate::wire_keys::KeyFile;
+
+/// How long an idle duty waits for an endpoint's receive shards to find
+/// their socket empty (ADR-0127): what was sent before the duty is then
+/// decided in it.
+const SHARD_QUIET: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Entries of the role's bounded SETUP bookkeeping: the ENC ANSWERs being
 /// installed and the (alias, publication) pairs a verified domain 5 SETUP
@@ -211,9 +221,22 @@ pub(crate) struct SubscriptionEnc {
     channel_key_id: u32,
     /// The channel's rate counters and rejections by reason.
     pub(crate) channel: EncChannel,
+    /// The rejections its receive shards count (ADR-0127), added to the
+    /// channel's.
+    shard_counts: Arc<SharedRejections>,
     /// The scratch slot of its domain 5 opens, made here and re-keyed for
     /// each SETUP: the data path constructs no key.
     bootstrap: Option<AesGcmSiv>,
+    /// The share its receive shards' domain 5 jobs are leased under
+    /// (ADR-0127 decision 2, step 4): withdrawn with the subscription, so
+    /// a queued SETUP of a dropped subscription is cancelled, not opened.
+    setup_share: Arc<OpenerShare>,
+}
+
+impl Drop for SubscriptionEnc {
+    fn drop(&mut self) {
+        self.setup_share.withdraw();
+    }
 }
 
 impl SubscriptionEnc {
@@ -262,7 +285,9 @@ impl SubscriptionEnc {
             receiver_id,
             channel_key_id,
             channel: EncChannel::default(),
+            shard_counts: Arc::new(SharedRejections::default()),
             bootstrap: Some(bootstrap),
+            setup_share: Arc::new(OpenerShare::default()),
         })
     }
 }
@@ -326,6 +351,43 @@ pub(crate) fn with_enc_verifiers<R>(
     run()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The receive shards the next role made on this thread starts on
+    /// each encrypted endpoint, and their verifier pool (tests:
+    /// [`with_enc_shards`]).
+    static TEST_SHARDS: core::cell::Cell<Option<(EncShardConfig, EncVerifyConfig)>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// Runs `run` with every role made on this thread receiving each
+/// encrypted endpoint on the receive shards of `config`, verified by a
+/// pool of `verify` (tests: the encrypted suite with shards).
+#[cfg(test)]
+pub(crate) fn with_enc_shards<R>(
+    config: EncShardConfig,
+    verify: EncVerifyConfig,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Reset(Option<(EncShardConfig, EncVerifyConfig)>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_SHARDS.with(|cell| cell.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_SHARDS.with(|cell| cell.replace(Some((config, verify)))));
+    run()
+}
+
+/// The receive shards of one encrypted endpoint (ADR-0127), started at the
+/// endpoint's capability epoch `epoch`.
+#[derive(Debug)]
+struct EndpointShards {
+    endpoint: EndpointId,
+    epoch: karyos_io::backend::BackendEpoch,
+    set: ShardSet<SlotRef>,
+}
+
 /// The context a receiver role records for one domain 1 job at dispatch
 /// (ADR-0126 decision 2): where it came from, the binding it was
 /// dispatched for, the header's publication, the role's withdrawal fence
@@ -344,6 +406,35 @@ pub(super) struct EncJob {
 /// The encrypted class of a receiver role.
 #[derive(Debug, Default)]
 pub(crate) struct ReceiverEnc {
+    /// The receive shards of its encrypted endpoints (ADR-0127), started
+    /// by the duty when `shard_config` names any. First, so that they are
+    /// dropped first: every shard and its verifiers are joined, and every
+    /// lease returned, before anything else of the role goes.
+    shards: Vec<EndpointShards>,
+    /// The shards' configuration, and their verifier pool's (`verify`
+    /// below, at least one verifier).
+    shard_config: EncShardConfig,
+    /// The endpoints, at their epoch, whose shards could not start: the
+    /// role receives them itself.
+    shards_refused: Vec<(EndpointId, karyos_io::backend::BackendEpoch)>,
+    /// The shards' snapshots are to be published again.
+    shards_dirty: bool,
+    /// The shard settings of the [`with_enc_shards`] the role was made in
+    /// (tests).
+    #[cfg(test)]
+    test_shards: Option<(EncShardConfig, EncVerifyConfig)>,
+    /// A shard racing each promoting commit: a lease on the previous key
+    /// taken just before it, if a snapshot still holds one (tests).
+    #[cfg(test)]
+    pub(super) race_promotions: bool,
+    /// The promoting commits raced, and the leases the race took (tests).
+    #[cfg(test)]
+    pub(super) raced: (u32, u32),
+    /// When a previous key in a published snapshot leaves its overlap: the
+    /// snapshots are published again then, without it.
+    shards_refresh: u64,
+    /// A ring datagram while the role serves it, taken out meanwhile.
+    shard_buffer: Box<[u8]>,
     /// The verifier pool (ADR-0126), made at the first encrypted
     /// subscription when `verify` names verifiers. First, so that it is
     /// dropped first: its verifiers are joined and every lease returned
@@ -402,12 +493,55 @@ pub(crate) struct ReceiverEnc {
 }
 
 impl ReceiverEnc {
-    /// The encrypted class of a role whose verifier pool is `verify`.
-    pub(crate) fn new(verify: EncVerifyConfig) -> Self {
+    /// The encrypted class of a role whose verifier pool is `verify` and
+    /// whose encrypted endpoints run the receive shards of `shards`.
+    pub(crate) fn new(verify: EncVerifyConfig, shards: EncShardConfig) -> Self {
         Self {
             verify,
+            shard_config: shards,
+            #[cfg(test)]
+            test_shards: TEST_SHARDS.with(core::cell::Cell::get),
             ..Self::default()
         }
+    }
+
+    /// ADR-0127 decision 7: takes every shard snapshot back. Once this
+    /// returns no shard dispatches under any opener, and no snapshot holds
+    /// a key, so a key may change in place; the snapshots are published
+    /// again at the next duty.
+    pub(super) fn shards_take_back(&mut self) {
+        for held in &self.shards {
+            held.set.publish(crate::wire_enc::shards::Snapshot::clear);
+        }
+        for image in &mut self.images {
+            image.opener.shard_unpublished();
+        }
+        self.shards_dirty = true;
+    }
+
+    /// The shards' configuration and verifier pool of a role made now.
+    fn shard_settings(&self) -> (EncShardConfig, EncVerifyConfig) {
+        #[cfg(test)]
+        if let Some(settings) = self
+            .test_shards
+            .or_else(|| TEST_SHARDS.with(core::cell::Cell::get))
+        {
+            return settings;
+        }
+        (self.shard_config, self.verify)
+    }
+
+    /// The live clock source its shards and their verifiers read
+    /// (ADR-0127 decision 4): the host's monotonic clock, the network's
+    /// time base and so the role's and the key deadlines' (tests made
+    /// with [`with_enc_shards`] run on a virtual clock: the role's
+    /// published reading alone).
+    fn shard_clock(&self) -> fn() -> u64 {
+        #[cfg(test)]
+        if self.test_shards.is_some() || TEST_SHARDS.with(core::cell::Cell::get).is_some() {
+            return crate::wire_enc::shards::published_only;
+        }
+        karyos_sys::host_clock::host_monotonic_ns
     }
 
     /// ADR-0126 decision 5, for a key replacement or a VM generation
@@ -416,16 +550,49 @@ impl ReceiverEnc {
     /// refused (`enc_withdrawn`), so every lease is back, and no key a job
     /// held is changed or erased, before this returns. Allocates nothing.
     fn quiesce(&mut self) {
-        let Some(pool) = self.pool.as_mut() else {
-            return;
-        };
-        if pool.in_flight() == 0 {
-            return;
-        }
+        // ADR-0127 decision 7: the shards stop dispatching under every
+        // opener first; their jobs are withdrawn with the pool's.
+        self.shards_take_back();
         self.fence = self.fence.wrapping_add(1);
-        let _ = pool.cancel_where(|_| true);
         let mut plain = [0_u8; MAX_PLAINTEXT];
-        while let Some(done) = pool.take_waiting(&mut plain) {
+        let withdrawn = |enc: &mut Self, endpoint: EndpointId, alias: Alias| match enc
+            .subscriptions
+            .iter_mut()
+            .find(|subscription| {
+                (subscription.endpoint, subscription.stream_id) == (endpoint, alias.stream_id)
+            }) {
+            Some(subscription) => subscription
+                .channel
+                .rejections
+                .bump(EncRejection::Withdrawn),
+            None => enc.unattributed.bump(EncRejection::Withdrawn),
+        };
+        for at in 0..self.shards.len() {
+            let Some(held) = self.shards.get(at) else {
+                continue;
+            };
+            let endpoint = held.endpoint;
+            let _ = held.set.cancel_all();
+            // The snapshot is taken back: nothing more is dispatched.
+            let limit = held.set.issued();
+            while let Some(done) = self
+                .shards
+                .get(at)
+                .and_then(|held| held.set.take_waiting(limit, &mut plain))
+            {
+                withdrawn(self, endpoint, done.context.alias);
+                // Its lease returns here.
+                drop(done);
+            }
+        }
+        if let Some(pool) = self.pool.as_mut() {
+            let _ = pool.cancel_where(|_| true);
+        }
+        while let Some(done) = self
+            .pool
+            .as_mut()
+            .and_then(|pool| pool.take_waiting(&mut plain))
+        {
             let job = done.context;
             match self.subscriptions.iter_mut().find(|subscription| {
                 (subscription.endpoint, subscription.stream_id)
@@ -624,6 +791,12 @@ impl ReceiverEnc {
     /// key.
     pub(crate) fn subscribe(&mut self, mut subscription: SubscriptionEnc) {
         self.unsubscribe(subscription.endpoint, subscription.stream_id);
+        self.shards_dirty = true;
+        if self.shard_buffer.is_empty() {
+            self.shard_buffer =
+                vec![0; usize::from(karyos_io::sockets::endpoint::MAX_DATAGRAM) + 1]
+                    .into_boxed_slice();
+        }
         // The verifier pool (ADR-0126), made once on the control path.
         if self.pool.is_none() {
             #[cfg(not(test))]
@@ -662,6 +835,7 @@ impl ReceiverEnc {
     /// the boot (H8-01): a subscription made again for the same target
     /// continues their sequences, never restarts them.
     pub(crate) fn unsubscribe(&mut self, endpoint: EndpointId, stream_id: i32) {
+        self.shards_dirty = true;
         self.subscriptions
             .retain(|sub| (sub.endpoint, sub.stream_id) != (endpoint, stream_id));
         self.verified
@@ -775,6 +949,9 @@ impl ReceiverEnc {
         alias: Alias,
         publication: PublicationIdentity,
     ) {
+        // The shards hand DATA for this target to the role from their
+        // next snapshot on (ADR-0127).
+        self.shards_dirty = true;
         self.verified
             .retain(|(held, at, _)| (*held, *at) != (endpoint, alias));
         if self.verified.len() >= RSP_TARGETS {
@@ -809,6 +986,9 @@ impl ReceiverEnc {
     /// order and refused, and a key a lease still holds is erased once
     /// the last returns.
     pub(crate) fn retire_image(&mut self, slot: SlotRef) {
+        // ADR-0127 decision 7: no shard dispatches under it from here, and
+        // no snapshot keeps its keys.
+        self.shards_take_back();
         if let Some(pool) = self.pool.as_mut() {
             let _ = pool.cancel_where(|job| job.slot == slot);
         }
@@ -817,6 +997,7 @@ impl ReceiverEnc {
 
     /// Marks the local publication `alias` on `endpoint` encrypted.
     pub(crate) fn publish(&mut self, endpoint: EndpointId, alias: Alias) {
+        self.shards_dirty = true;
         if !self.published.contains(&(endpoint, alias)) {
             self.published.push((endpoint, alias));
         }
@@ -825,6 +1006,7 @@ impl ReceiverEnc {
     /// The local publication `alias` on `endpoint` is no longer encrypted
     /// (it went).
     pub(crate) fn unpublish(&mut self, endpoint: EndpointId, alias: Alias) {
+        self.shards_dirty = true;
         self.published.retain(|held| *held != (endpoint, alias));
     }
 
@@ -838,7 +1020,7 @@ impl ReceiverEnc {
         self.subscriptions
             .iter()
             .find(|sub| sub.endpoint == endpoint && sub.stream_id == stream_id)
-            .map(|sub| sub.channel.rejections)
+            .map(|sub| sub.shard_counts.merged(sub.channel.rejections))
     }
 
     fn subscription(&self, endpoint: EndpointId, stream_id: i32) -> Option<usize> {
@@ -924,6 +1106,30 @@ impl ReceiverEnc {
     fn redrawn(&mut self) {
         self.rsp.clear();
         self.floors.clear();
+    }
+}
+
+/// The check of a verified domain 5 SETUP's one frame on `alias` (an
+/// ANNOUNCE or ENC ANSWER of the envelope's own alias, identity and key
+/// epoch), before its effect.
+fn setup_names(alias: Alias) -> impl FnOnce(&Header, &[u8]) -> Result<(), EncRejection> {
+    move |head, frames| {
+        let (control_alias, identity, key_epoch) = match decode_setup(frames) {
+            Ok(EncSetup::Announce(announce)) => (announce.alias, announce.identity, head.key_epoch),
+            Ok(EncSetup::Answer(answer)) => (
+                answer.answer.alias,
+                answer.answer.identity,
+                answer.key_epoch,
+            ),
+            Err(_) => return Err(EncRejection::InnerRejected),
+        };
+        if control_alias != alias
+            || Some(publication_of(&identity)) != head.publication
+            || key_epoch != head.key_epoch
+        {
+            return Err(EncRejection::InnerRejected);
+        }
+        Ok(())
     }
 }
 
@@ -1238,6 +1444,17 @@ impl<T: StreamTerms> Intake<'_, T> {
             }
             Err(reason) => return Err(reason),
         };
+        // ADR-0127: the verification's check of a promotion could be
+        // overtaken by a shard leasing the previous key; it is checked
+        // again with the shards' snapshots taken back.
+        let promotes = image.opener.commit_promotes(&pending);
+        if promotes && !self.role.enc.shards.is_empty() {
+            self.role.enc.shards_take_back();
+            if let Err(reason) = self.enc_check(EncQueued { slot, pending }) {
+                zeroize::Zeroize::zeroize(&mut *out);
+                return Err(reason);
+            }
+        }
         let frames = out.get(..pending.frames).ok_or(EncRejection::Short)?;
         let data = data.ok_or(EncRejection::InnerRejected)?;
         self.enc_handle(source, alias, frames, EncQueued { slot, pending }, data)
@@ -1416,6 +1633,7 @@ impl<T: StreamTerms> Intake<'_, T> {
             .filter(|(slot, _, _)| *slot == job.slot)
             .ok_or(EncRejection::Binding)?;
         let live = self.role.sessions.is_active(slot) && !aborted;
+        self.enc_freeze(slot, job.ticket.epochs());
         let now = self.now;
         let pending = self
             .role
@@ -1467,6 +1685,7 @@ impl<T: StreamTerms> Intake<'_, T> {
                 self.drain_own_queue();
                 // The drain hands its queued datagrams to their handlers
                 // and commits them: this one is checked again after it.
+                self.enc_freeze(queued.slot, queued.pending.epochs);
                 self.enc_check(queued)?;
                 self.enc_sender_control(source, control)
             }
@@ -1476,6 +1695,52 @@ impl<T: StreamTerms> Intake<'_, T> {
             return Err(EncRejection::InnerRejected);
         }
         self.enc_commit(queued)
+    }
+
+    /// ADR-0127 decision 7 for a promotion: before the last check of a
+    /// datagram under an epoch pair that would be promoted (no committed
+    /// key holds it), every shard snapshot is taken back, and stays so
+    /// through the handler's decision and the commit; it is published
+    /// again after the commit, or at the next duty. No shard can then
+    /// lease the previous key between the check and the commit, so the
+    /// promotion the check found possible stays possible, and a datagram
+    /// its handler took always commits.
+    fn enc_freeze(&mut self, slot: SlotRef, epochs: (u32, u16)) {
+        let now = self.now;
+        let enc = &mut self.role.enc;
+        if !enc.shards.is_empty()
+            && enc
+                .images
+                .iter()
+                .find(|image| image.slot == slot)
+                .is_some_and(|image| image.opener.promotes(epochs, now))
+        {
+            enc.shards_take_back();
+        }
+    }
+
+    /// With [`ReceiverEnc::race_promotions`], before a promoting commit:
+    /// a lease on the previous key from every snapshot still holding one,
+    /// as a shard dispatching then would take, held through the commit
+    /// (tests).
+    #[cfg(test)]
+    fn race_previous(&mut self, promotes: bool) -> Vec<Lease> {
+        let enc = &mut self.role.enc;
+        if !enc.race_promotions || !promotes {
+            return Vec::new();
+        }
+        let raced: Vec<Lease> = enc
+            .shards
+            .iter()
+            .filter_map(|held| held.set.lease_previous())
+            .collect();
+        enc.raced = (
+            enc.raced.0.saturating_add(1),
+            enc.raced
+                .1
+                .saturating_add(u32::try_from(raced.len()).unwrap_or(u32::MAX)),
+        );
+        raced
     }
 
     /// Whether `queued` would still commit ([`EncOpener::check`]).
@@ -1496,6 +1761,20 @@ impl<T: StreamTerms> Intake<'_, T> {
     /// commits. A failure would leave its effects unmarked; none is
     /// reachable, so it is asserted, and counted by its reason.
     fn enc_commit(&mut self, queued: EncQueued) -> Result<(), EncRejection> {
+        // A promotion changes the keys in place: the shards' snapshots are
+        // taken back first and published again after (ADR-0127).
+        let promotes = self
+            .role
+            .enc
+            .images
+            .iter()
+            .find(|image| image.slot == queued.slot)
+            .is_some_and(|image| image.opener.commit_promotes(&queued.pending));
+        #[cfg(test)]
+        let _raced = self.race_previous(promotes);
+        if promotes && !self.role.enc.shards.is_empty() {
+            self.role.enc.shards_take_back();
+        }
         let committed = self
             .role
             .enc
@@ -1506,6 +1785,9 @@ impl<T: StreamTerms> Intake<'_, T> {
             .and_then(|image| image.opener.commit(queued.pending))
             .map(|_| ());
         debug_assert!(committed.is_ok(), "an accepted datagram commits");
+        if promotes && !self.role.enc.shards.is_empty() {
+            self.role.enc_shards_publish(self.now);
+        }
         committed
     }
 
@@ -1521,6 +1803,7 @@ impl<T: StreamTerms> Intake<'_, T> {
         queued: EncQueued,
     ) {
         let index = self.role.enc.subscription(self.endpoint, alias.stream_id);
+        self.enc_freeze(queued.slot, queued.pending.epochs);
         let result = self.enc_check(queued).and_then(|()| {
             if self.data(source, alias, bytes) {
                 self.enc_commit(queued)
@@ -1614,27 +1897,114 @@ impl<T: StreamTerms> Intake<'_, T> {
             out,
             &mut subscription.channel.rate,
             now,
-            |head, frames| {
-                let (control_alias, identity, key_epoch) = match decode_setup(frames) {
-                    Ok(EncSetup::Announce(announce)) => {
-                        (announce.alias, announce.identity, head.key_epoch)
-                    }
-                    Ok(EncSetup::Answer(answer)) => (
-                        answer.answer.alias,
-                        answer.answer.identity,
-                        answer.key_epoch,
-                    ),
-                    Err(_) => return Err(EncRejection::InnerRejected),
-                };
-                if control_alias != alias
-                    || Some(publication_of(&identity)) != head.publication
-                    || key_epoch != head.key_epoch
-                {
-                    return Err(EncRejection::InnerRejected);
-                }
-                Ok(())
-            },
+            setup_names(alias),
         )?;
+        self.enc_setup_decide(source, alias, index, opened, &out[..])
+    }
+
+    /// ADR-0127 decision 2: a domain 5 SETUP whose scratch key a receive
+    /// shard derived, under a lease on its subscription, and a verifier
+    /// opened. Every predicate is evaluated again, charging nothing (the
+    /// shard charged the scratch rate once): the withdrawal fence and the
+    /// lease, the VM generation, the key fence, the retired identities, the
+    /// subscription and the checks before the open
+    /// ([`bootstrap_complete`]); then it is decided as an inline one. Its
+    /// plaintext is erased after.
+    fn enc_shard_setup(
+        &mut self,
+        job: &ShardJob<SlotRef>,
+        (outcome, lease): (Outcome, Option<Lease>),
+        authenticated: (
+            &[u8; karyos_protocol::protection::aes_gcm_siv::HEADER_LEN],
+            usize,
+        ),
+        plain: &mut [u8; MAX_PLAINTEXT],
+    ) {
+        let index = self
+            .role
+            .enc
+            .subscription(self.endpoint, job.alias.stream_id);
+        let opened = match outcome {
+            Outcome::Verified(opened) => opened,
+            Outcome::Failed(reason) => return self.enc_reject(index, reason),
+            Outcome::Cancelled => return self.enc_reject(index, EncRejection::Withdrawn),
+        };
+        let decided = self.enc_setup_recheck(index, job, &opened, lease, authenticated, plain);
+        if let Some(frames) = plain.get_mut(..opened.frames) {
+            zeroize::Zeroize::zeroize(frames);
+        }
+        if let Err(reason) = decided {
+            self.enc_reject(index, reason);
+        }
+    }
+
+    /// The re-check and decision of [`Self::enc_shard_setup`].
+    fn enc_setup_recheck(
+        &mut self,
+        index: Option<usize>,
+        job: &ShardJob<SlotRef>,
+        opened: &karyos_protocol::protection::aes_gcm_siv::Opened,
+        lease: Option<Lease>,
+        authenticated: (
+            &[u8; karyos_protocol::protection::aes_gcm_siv::HEADER_LEN],
+            usize,
+        ),
+        plain: &[u8; MAX_PLAINTEXT],
+    ) -> Result<(), EncRejection> {
+        let lease = lease.ok_or(EncRejection::Withdrawn)?;
+        if lease.is_withdrawn() || job.fence != self.role.enc.fence {
+            return Err(EncRejection::Withdrawn);
+        }
+        if quiesced() {
+            return Err(EncRejection::VmGeneration);
+        }
+        if !self
+            .role
+            .key_generation
+            .admits_now(crate::wire_auth::Side::Receiver)
+        {
+            self.role.count(|c| &mut c.auth_rejected);
+            return Ok(());
+        }
+        if job.publication.is_some_and(|publication| {
+            self.role
+                .sessions
+                .is_quarantined(&identity_of(&publication), self.now)
+        }) {
+            return Err(EncRejection::RetiredParty);
+        }
+        let index = index.ok_or(EncRejection::Unexpected)?;
+        let subscription = self
+            .role
+            .enc
+            .subscriptions
+            .get(index)
+            .ok_or(EncRejection::Binding)?;
+        let opened = bootstrap_complete(
+            &subscription.keys,
+            (&job.ticket, &job.head),
+            opened,
+            authenticated,
+            plain,
+            setup_names(job.alias),
+        )?;
+        // Consumed: the lease returns.
+        drop(lease);
+        self.enc_setup_decide(job.source, job.alias, index, opened, plain)
+    }
+
+    /// A verified domain 5 SETUP decided: an ENC ANSWER for a bound
+    /// identity is its resynchronisation; otherwise, only under the current
+    /// file epoch, an ANNOUNCE or ENC ANSWER handed to its handler.
+    fn enc_setup_decide(
+        &mut self,
+        source: SocketAddr,
+        alias: Alias,
+        index: usize,
+        opened: crate::wire_enc::Bootstrap,
+        out: &[u8],
+    ) -> Result<(), EncRejection> {
+        let now = self.now;
         let setup = out
             .get(..opened.frames)
             .map(decode_setup)
@@ -1651,6 +2021,9 @@ impl<T: StreamTerms> Intake<'_, T> {
                 .any(|image| image.identity == answer.answer.identity)
         {
             let boot = self.role.sessions.boot_id();
+            // ADR-0127 decision 7: a resynchronisation moves the keys, which
+            // no shard snapshot may hold meanwhile.
+            self.role.enc.shards_take_back();
             return self.role.enc.resync(
                 index,
                 answer,
@@ -1784,6 +2157,12 @@ impl<T: StreamTerms> ReceiverRole<T> {
     /// redrawn, so the process fence releases. Each duty also erases every
     /// image's previous epoch key past its overlap (H8-16).
     pub(super) fn on_generation_change(&mut self, sessions: &SessionEnd<T>, now: u64) {
+        // A previous key past its overlap leaves the shards' snapshots
+        // first, so that no snapshot keeps it (ADR-0127).
+        if now >= self.enc.shards_refresh && !self.enc.shards.is_empty() {
+            self.enc.shards_dirty = true;
+            self.enc_shards_publish(now);
+        }
         for image in &mut self.enc.images {
             image.opener.expire_previous(now);
         }
@@ -1896,6 +2275,23 @@ impl<T: StreamTerms> ReceiverRole<T> {
         if self.enc.hold {
             return;
         }
+        // ADR-0127: with `wait`, every shard lane's jobs dispatched by now
+        // are decided too, each lane in its order.
+        if wait {
+            let mut plain = [0_u8; MAX_PLAINTEXT];
+            for at in 0..self.enc.shards.len() {
+                let Some((endpoint, limit)) = self
+                    .enc
+                    .shards
+                    .get(at)
+                    .map(|held| (held.endpoint, held.set.issued()))
+                else {
+                    continue;
+                };
+                while self.enc_shard_job(endpoint, Some(limit), sessions, now, &mut plain) {}
+            }
+            zeroize::Zeroize::zeroize(&mut plain);
+        }
         if self
             .enc
             .pool
@@ -1929,10 +2325,66 @@ impl<T: StreamTerms> ReceiverRole<T> {
         self.enc.hold = hold;
     }
 
-    /// Jobs in flight (tests).
+    /// Races every promoting commit with a shard's lease on the previous
+    /// key while `race` (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_race_promotions(&mut self, race: bool) {
+        self.enc.race_promotions = race;
+    }
+
+    /// The promoting commits raced, and the leases the race took (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_raced(&self) -> (u32, u32) {
+        self.enc.raced
+    }
+
+    /// Whether a shard snapshot holds a previous key a shard could lease
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_shards_hold_previous(&self) -> bool {
+        self.enc
+            .shards
+            .iter()
+            .any(|held| held.set.lease_previous().is_some())
+    }
+
+    /// Jobs in flight, in the pool and the shard lanes (tests).
     #[cfg(test)]
     pub(crate) fn enc_in_flight(&self) -> usize {
         self.enc.pool.as_ref().map_or(0, VerifyPool::in_flight)
+            + self
+                .enc
+                .shards
+                .iter()
+                .map(|held| held.set.in_flight())
+                .sum::<usize>()
+    }
+
+    /// What the receive shards of `endpoint` counted (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_shard_stats(
+        &self,
+        endpoint: EndpointId,
+    ) -> Option<crate::wire_enc::shards::ShardStats> {
+        self.enc
+            .shards
+            .iter()
+            .find(|held| held.endpoint == endpoint)
+            .map(|held| held.set.stats())
+    }
+
+    /// Counts the shard-handled datagrams of `length` (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_shards_watch(&self, length: usize) {
+        for held in &self.enc.shards {
+            held.set.watch_length(length);
+        }
+    }
+
+    /// The shard-handled datagrams of the watched length (tests).
+    #[cfg(test)]
+    pub(crate) fn enc_shards_watched(&self) -> u64 {
+        self.enc.shards.iter().map(|held| held.set.watched()).sum()
     }
 
     /// Verifier threads running (tests).
@@ -1945,6 +2397,432 @@ impl<T: StreamTerms> ReceiverRole<T> {
     #[cfg(test)]
     pub(crate) fn enc_verify_one(&self) -> bool {
         self.enc.pool.as_ref().is_some_and(VerifyPool::verify_one)
+            || self.enc.shards.iter().any(|held| held.set.verify_one())
+    }
+
+    /// ADR-0127: publishes every shard set's snapshot from the role's
+    /// state at `now`, under its write lock: the withdrawal fence, the key
+    /// fence, the endpoint's encrypted streams with their shared open-rate
+    /// counters, its local encrypted publications, and each bound
+    /// encrypted image's committed keys, by the founding source of its
+    /// binding. Refills tables reserved when the set was made: allocates
+    /// nothing.
+    pub(in crate::agents) fn enc_shards_publish(&mut self, now: u64) {
+        let ReceiverEnc {
+            shards,
+            images,
+            subscriptions,
+            published,
+            verified,
+            fence,
+            shards_dirty,
+            shards_refresh,
+            ..
+        } = &mut self.enc;
+        *shards_dirty = false;
+        *shards_refresh = u64::MAX;
+        let (sessions, keys) = (&self.sessions, &self.key_generation);
+        for image in images.iter_mut() {
+            image.opener.shard_unpublished();
+        }
+        for held in shards.iter() {
+            let endpoint = held.endpoint;
+            held.set.publish(|snapshot| {
+                snapshot.clear();
+                snapshot.fence = *fence;
+                snapshot.generation = vm_generation::generation();
+                if snapshot.admits.is_none() {
+                    snapshot.admits = Some(Arc::clone(keys));
+                }
+                for subscription in subscriptions
+                    .iter()
+                    .filter(|subscription| subscription.endpoint == endpoint)
+                {
+                    if snapshot.streams.len() < snapshot.streams.capacity() {
+                        snapshot.streams.push(StreamView {
+                            stream_id: subscription.stream_id,
+                            rate: subscription.channel.rate.clone(),
+                            counts: Arc::clone(&subscription.shard_counts),
+                            setup: subscription.keys.shard_setup(),
+                            setup_share: Arc::clone(&subscription.setup_share),
+                        });
+                    }
+                }
+                for (_, alias) in published.iter().filter(|(held, _)| *held == endpoint) {
+                    snapshot.push_published(*alias);
+                }
+                for (_, alias, publication) in
+                    verified.iter().filter(|(held, ..)| *held == endpoint)
+                {
+                    snapshot.push_verified(*alias, *publication);
+                }
+                for (identity, until) in sessions.quarantined_until() {
+                    snapshot.push_retired(publication_of(&identity), until);
+                }
+                snapshot.complete = true;
+                for image in images.iter_mut().filter(|image| image.endpoint == endpoint) {
+                    let (true, Some((key, _))) = (
+                        snapshot
+                            .streams
+                            .iter()
+                            .any(|stream| stream.stream_id == image.alias.stream_id),
+                        sessions.binding(image.slot),
+                    ) else {
+                        continue;
+                    };
+                    if snapshot.bindings.len() >= snapshot.bindings.capacity() {
+                        // Its datagrams go to the role.
+                        snapshot.complete = false;
+                        continue;
+                    }
+                    let Some(opener) = image.opener.shard_view(now) else {
+                        continue;
+                    };
+                    if let Some(previous) = opener.previous.as_ref() {
+                        *shards_refresh = (*shards_refresh).min(previous.until);
+                    }
+                    snapshot.bindings.push(BindingView {
+                        tag: image.slot,
+                        alias: image.alias,
+                        source: key.source,
+                        opener,
+                    });
+                }
+            });
+        }
+    }
+
+    /// ADR-0127 decision 1: starts the receive shards of `endpoint` from
+    /// `rx`'s socket when the role's configuration names shards, the
+    /// endpoint has an encrypted subscription and none run yet. Control
+    /// path, once per endpoint and epoch: duplicates the descriptor per
+    /// shard and starts the threads. When none can start, the role keeps
+    /// receiving the endpoint itself.
+    pub(in crate::agents) fn enc_shards_start<O: karyos_io::sockets::ops::SocketOps>(
+        &mut self,
+        endpoint: EndpointId,
+        rx: &karyos_io::sockets::endpoint::SocketsRx<O>,
+        now: u64,
+    ) {
+        let (config, verify) = self.enc.shard_settings();
+        let epoch = rx.capabilities().epoch;
+        if config.shards == 0
+            || self.enc.shards.iter().any(|held| held.endpoint == endpoint)
+            || self.enc.shards_refused.contains(&(endpoint, epoch))
+            || !self
+                .enc
+                .subscriptions
+                .iter()
+                .any(|subscription| subscription.endpoint == endpoint)
+        {
+            return;
+        }
+        let receivers: Vec<_> = (0..config.shards)
+            .map_while(|_| rx.share_recv().ok())
+            .collect();
+        let tables = (
+            self.enc.subscriptions.capacity().max(64),
+            self.images.capacity().max(64),
+            self.sessions.capacity().max(RSP_TARGETS),
+        );
+        // Decision 4: the shards and verifiers read a live clock in the
+        // role's time domain, from `now` on.
+        let clock = crate::wire_enc::shards::SetClock::new(self.enc.shard_clock(), now);
+        match ShardSet::new(
+            config,
+            verify,
+            receivers,
+            usize::from(rx.max_datagram()),
+            (tables, clock),
+        ) {
+            Some(set) => {
+                self.enc.shards.push(EndpointShards {
+                    endpoint,
+                    epoch,
+                    set,
+                });
+                self.enc_shards_publish(now);
+            }
+            None => self.enc.shards_refused.push((endpoint, epoch)),
+        }
+    }
+
+    /// ADR-0127 decision 7: stops the shards of every endpoint whose RX
+    /// half is gone or reopened, or that has no encrypted subscription
+    /// left. Their snapshots are taken back, their threads joined (and
+    /// their descriptors closed), and what they left in their lanes and
+    /// rings is decided before the set goes; the role then receives the
+    /// endpoint itself. Then the clock is published, and the snapshots
+    /// when they changed.
+    pub(in crate::agents) fn enc_shards_tend<O: karyos_io::sockets::ops::SocketOps>(
+        &mut self,
+        halves: &[(EndpointId, crate::agents::Half<O>)],
+        sessions: &SessionEnd<T>,
+        now: u64,
+    ) {
+        let mut at = 0;
+        while let Some(held) = self.enc.shards.get(at) {
+            let live = halves.iter().any(|(endpoint, half)| {
+                *endpoint == held.endpoint
+                    && matches!(half, crate::agents::Half::Rx(rx) if rx.capabilities().epoch == held.epoch)
+            }) && self
+                .enc
+                .subscriptions
+                .iter()
+                .any(|subscription| subscription.endpoint == held.endpoint);
+            if live {
+                at += 1;
+                continue;
+            }
+            let endpoint = held.endpoint;
+            if let Some(held) = self.enc.shards.get_mut(at) {
+                held.set.stop_shards();
+            }
+            self.enc.shards_take_back();
+            self.enc_drain_shards(endpoint, sessions, now);
+            drop(self.enc.shards.swap_remove(at));
+        }
+        for held in &self.enc.shards {
+            held.set.set_clock(now);
+        }
+        if self.enc.shards_dirty {
+            self.enc_shards_publish(now);
+        }
+    }
+
+    /// ADR-0127 decision 6: one poll of the inputs of `endpoint`'s shards,
+    /// round robin, each lane's results and each ring's datagrams in turn
+    /// with `budget` each, so a busy input never starves another. `None`
+    /// for an endpoint without shards, which the role receives itself.
+    /// Allocates nothing.
+    pub(in crate::agents) fn enc_serve_shards(
+        &mut self,
+        endpoint: EndpointId,
+        sessions: &SessionEnd<T>,
+        now: u64,
+        budget: u32,
+    ) -> Option<u32> {
+        let held = self
+            .enc
+            .shards
+            .iter()
+            .find(|held| held.endpoint == endpoint)?;
+        let lanes = held.set.lanes();
+        let ended = held.set.take_ended();
+        for _ in 0..held.set.take_backend_drops() {
+            self.count(|c| &mut c.backend_drops);
+        }
+        for _ in 0..ended {
+            self.count(|c| &mut c.datagrams);
+        }
+        let mut buffer = core::mem::take(&mut self.enc.shard_buffer);
+        let mut plain = [0_u8; MAX_PLAINTEXT];
+        // Each lane's turn takes the oldest job of a lane the replay window
+        // allows (decision 5); each ring is served in its own turn.
+        let served = serve_round(lanes.saturating_mul(2), budget, |input| {
+            if input % 2 == 0 {
+                self.enc_shard_job(endpoint, None, sessions, now, &mut plain)
+            } else {
+                self.enc_shard_other(endpoint, input / 2, &mut buffer, sessions, now)
+            }
+        });
+        self.enc.shard_buffer = buffer;
+        zeroize::Zeroize::zeroize(&mut plain);
+        Some(served)
+    }
+
+    /// A result of `endpoint`'s shards, the oldest of a lane, that the
+    /// replay window allows now (decision 5), decided as a pool's
+    /// ([`Intake::enc_verified`]): with `limit`, the oldest in dispatch
+    /// order, waiting for it while a job numbered below `limit` is still to
+    /// be consumed. Whether one was consumed.
+    fn enc_shard_job(
+        &mut self,
+        endpoint: EndpointId,
+        limit: Option<u64>,
+        sessions: &SessionEnd<T>,
+        now: u64,
+        plain: &mut [u8; MAX_PLAINTEXT],
+    ) -> bool {
+        #[cfg(test)]
+        if self.enc.hold {
+            return false;
+        }
+        let Some(held) = self
+            .enc
+            .shards
+            .iter()
+            .find(|held| held.endpoint == endpoint)
+        else {
+            return false;
+        };
+        let done = match limit {
+            Some(limit) => held.set.take_waiting(limit, plain),
+            None => held.set.take_next(plain),
+        };
+        let Some(Done {
+            context,
+            outcome,
+            lease,
+            header,
+            len,
+        }) = done
+        else {
+            return false;
+        };
+        self.count(|c| &mut c.datagrams);
+        let mut intake = Intake {
+            endpoint,
+            now,
+            role: self,
+            sessions,
+            work: 0,
+        };
+        let ShardJob {
+            tag,
+            kind,
+            source,
+            alias,
+            publication,
+            fence,
+            ticket,
+            ..
+        } = context;
+        let slot = match (kind, tag) {
+            (JobKind::Committed | JobKind::Next, Some(slot)) => slot,
+            _ => {
+                // A domain 5 SETUP (ADR-0127 decision 2, step 4).
+                intake.enc_shard_setup(&context, (outcome, lease), (&header, len), plain);
+                return true;
+            }
+        };
+        let done = Done {
+            context: EncJob {
+                endpoint,
+                source,
+                alias,
+                slot,
+                publication,
+                fence,
+                ticket,
+            },
+            outcome,
+            lease,
+            header,
+            len,
+        };
+        intake.enc_verified(done, plain);
+        true
+    }
+
+    /// The oldest datagram of ring `lane` of `endpoint`'s shards, handled
+    /// as the role's own receive would: whether there was one.
+    fn enc_shard_other(
+        &mut self,
+        endpoint: EndpointId,
+        lane: usize,
+        buffer: &mut [u8],
+        sessions: &SessionEnd<T>,
+        now: u64,
+    ) -> bool {
+        let Some((len, source)) = self
+            .enc
+            .shards
+            .iter()
+            .find(|held| held.endpoint == endpoint)
+            .and_then(|held| held.set.pop_other(lane, buffer))
+        else {
+            return false;
+        };
+        self.count(|c| &mut c.datagrams);
+        let mut intake = Intake {
+            endpoint,
+            now,
+            role: self,
+            sessions,
+            work: 0,
+        };
+        intake.bytes_in(source, buffer.get(..len).unwrap_or_default());
+        true
+    }
+
+    /// Decides everything `endpoint`'s shards have received: every ring
+    /// datagram and every lane job dispatched by now, each lane in its
+    /// order. Returns the datagrams decided.
+    fn enc_drain_shards(
+        &mut self,
+        endpoint: EndpointId,
+        sessions: &SessionEnd<T>,
+        now: u64,
+    ) -> u32 {
+        let mut served = 0_u32;
+        let mut plain = [0_u8; MAX_PLAINTEXT];
+        // Each ring and lane once: what arrives meanwhile waits for the
+        // next poll.
+        let bound = u32::try_from(usize::from(crate::wire_enc::MAX_ENC_SHARD_RING))
+            .unwrap_or(u32::MAX)
+            .saturating_add(ENC_SHARD_IN_FLIGHT);
+        served = served.saturating_add(
+            self.enc_serve_shards(endpoint, sessions, now, bound)
+                .unwrap_or(0),
+        );
+        let limit = self
+            .enc
+            .shards
+            .iter()
+            .find(|held| held.endpoint == endpoint)
+            .map_or(0, |held| held.set.issued());
+        while self.enc_shard_job(endpoint, Some(limit), sessions, now, &mut plain) {
+            served = served.saturating_add(1);
+        }
+        zeroize::Zeroize::zeroize(&mut plain);
+        served
+    }
+
+    /// ADR-0127 decision 7, when the receiver stops: every endpoint's
+    /// shards are stopped and joined (their descriptors closed), their
+    /// snapshots taken back, every queued job cancelled, and everything
+    /// they left in their lanes and rings decided (a cancelled job refused
+    /// as withdrawn, its lease returned); then each set goes, joining its
+    /// verifiers. Once this returns no thread of the role's shards runs and
+    /// no lease is out on their account, so the stopped agent handed back
+    /// to its caller holds no running work. Control path.
+    pub(in crate::agents) fn enc_shutdown(&mut self, sessions: &SessionEnd<T>, now: u64) {
+        if self.enc.shards.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.enc.hold = false;
+        }
+        for held in &mut self.enc.shards {
+            held.set.stop_shards();
+        }
+        self.enc.shards_take_back();
+        for held in &self.enc.shards {
+            let _ = held.set.cancel_all();
+        }
+        while let Some(endpoint) = self.enc.shards.last().map(|held| held.endpoint) {
+            self.enc_drain_shards(endpoint, sessions, now);
+            drop(self.enc.shards.pop());
+        }
+    }
+
+    /// ADR-0127, a duty that read nothing: waits, briefly, until each
+    /// sharded endpoint's shards have found their socket empty, then
+    /// decides everything they received. Returns the datagrams decided.
+    pub(in crate::agents) fn enc_quiet(&mut self, sessions: &SessionEnd<T>, now: u64) -> u32 {
+        let mut served = 0_u32;
+        for at in 0..self.enc.shards.len() {
+            let Some(endpoint) = self.enc.shards.get(at).map(|held| {
+                held.set.quiet(SHARD_QUIET);
+                held.endpoint
+            }) else {
+                continue;
+            };
+            served = served.saturating_add(self.enc_drain_shards(endpoint, sessions, now));
+        }
+        served
     }
 
     /// The leases out on the image at `slot`'s opener, and its current
@@ -2020,6 +2898,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             return Ok(None);
         };
         let images = &self.images;
+        self.enc.shards_dirty = true;
         self.enc
             .images
             .retain(|held| images.iter().any(|image| image.slot == held.slot));
@@ -2073,6 +2952,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             monotonic_ns,
         )
         .map_err(|_| EncRejection::Pairwise)?;
+        self.enc.shards_dirty = true;
         self.enc.images.push(ImageEnc {
             slot,
             endpoint: key.endpoint,

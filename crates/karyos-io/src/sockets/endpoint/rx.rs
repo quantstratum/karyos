@@ -120,6 +120,11 @@ impl RxCore {
         self.filled = 0;
     }
 
+    /// `max_datagram` of its configuration.
+    pub(super) fn max_datagram(&self) -> u16 {
+        self.max_datagram
+    }
+
     /// `ECONNREFUSED` results of receive calls (4.7).
     pub(super) fn peer_errors(&self) -> u64 {
         self.peer_errors

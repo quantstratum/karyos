@@ -738,6 +738,24 @@ impl<O: SocketOps> SocketsRx<O> {
     pub fn capabilities(&self) -> &CapabilitySnapshot {
         &self.snapshot
     }
+
+    /// A receive handle on a duplicate of its descriptor, for a receive
+    /// shard (ADR-0127 decision 1). While shards read the socket, the
+    /// half's owner does not poll it, so each datagram is received once.
+    ///
+    /// # Errors
+    ///
+    /// The OS error of the duplication, or `ENOSYS` for a backend that
+    /// cannot share its socket.
+    pub fn share_recv(&self) -> Result<Box<dyn super::ops::SharedRecv>, super::ops::Errno> {
+        self.ops.share_recv()
+    }
+
+    /// `max_datagram`: a longer datagram is dropped as oversize.
+    #[must_use]
+    pub fn max_datagram(&self) -> u16 {
+        self.core.max_datagram()
+    }
 }
 
 impl<O: SocketOps> RxBackend for SocketsRx<O> {

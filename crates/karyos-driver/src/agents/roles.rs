@@ -2473,7 +2473,7 @@ pub(super) fn roles<T: StreamTerms>(
             auth_unattributed: AuthRejections::default(),
             published_auth: Vec::new(),
             subscription_auth: Vec::new(),
-            enc: receive_enc::ReceiverEnc::new(config.enc_verify),
+            enc: receive_enc::ReceiverEnc::new(config.enc_verify, config.enc_shards),
             verified_setup: false,
             signed: None,
             authority_keys: Vec::new(),
@@ -3590,7 +3590,9 @@ impl<T: StreamTerms> ReceiverRole<T> {
     pub(super) fn reserve_test_logs(&mut self) {
         self.rx_offsets.reserve(96);
         self.debug_trace.reserve(160);
-        self.posted_naks.reserve(256);
+        // A sharded receive reorders across shards (ADR-0127), and more
+        // NAKs are posted.
+        self.posted_naks.reserve(1 << 16);
         self.posted_challenges.reserve(256);
         self.largest_in.reserve(8);
     }
@@ -3606,13 +3608,14 @@ impl<T: StreamTerms> ReceiverRole<T> {
     #[cfg(test)]
     pub(super) fn watch_length(&mut self, length: usize) {
         self.watched_in = (length, 0);
+        self.enc_shards_watch(length);
     }
 
     /// The datagrams of the watched length read since
     /// [`Self::watch_length`] (tests).
     #[cfg(test)]
     pub(super) fn watched_in(&self) -> u64 {
-        self.watched_in.1
+        self.watched_in.1 + self.enc_shards_watched()
     }
 
     /// The largest datagram `endpoint`'s intake has read (tests).
@@ -5100,12 +5103,26 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 self.rx_epoch(*endpoint, rx.capabilities().epoch);
             }
         }
+        // ADR-0127: the receive shards of encrypted endpoints whose half
+        // went are stopped, the others get the clock and the snapshot.
+        self.enc_shards_tend(halves, sessions, now);
         let mut read = 0_u32;
         for (endpoint, half) in halves.iter_mut() {
             let Half::Rx(rx) = half else {
                 continue;
             };
             if self.is_control_endpoint(*endpoint) {
+                continue;
+            }
+            // An encrypted endpoint with receive shards: they receive, and
+            // the role serves their lanes and rings instead (ADR-0127).
+            self.enc_shards_start(*endpoint, rx, now);
+            if let Some(served) =
+                self.enc_serve_shards(*endpoint, sessions, now, self.budget.datagrams())
+            {
+                work = work.checked_add(served).ok_or(overflow.clone())?;
+                read = read.saturating_add(served);
+                self.enc_collect(sessions, now);
                 continue;
             }
             let budget = self.budget;
@@ -5123,8 +5140,12 @@ impl<T: StreamTerms> ReceiverRole<T> {
             // order, while the rest are verified (ADR-0126 decision 4).
             self.enc_collect(sessions, now);
         }
-        // A duty that read nothing waits for every job still in flight.
+        // A duty that read nothing waits for every job still in flight,
+        // and for the receive shards to find their sockets empty.
         if read == 0 {
+            work = work
+                .checked_add(self.enc_quiet(sessions, now))
+                .ok_or(overflow.clone())?;
             self.enc_settle(sessions, now);
         }
         work = work
