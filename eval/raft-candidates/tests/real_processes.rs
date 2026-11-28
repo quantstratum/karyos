@@ -453,6 +453,12 @@ mod w1 {
         pub states: Vec<(NodeId, Option<u64>, u64, bool)>,
         /// Client sessions whose script did not complete.
         pub waiting: usize,
+        /// What a stall leaves to diagnose it (karyos#1301's flake): each
+        /// server's leadership and commit timeline, and every record of
+        /// each client process with a session that did not finish, in
+        /// milliseconds from the run's first stamp. Built on every run,
+        /// printed only when a check fails.
+        pub diagnosis: String,
     }
 
     /// Runs case `index` of `cases()` for variant `core` on processes, one
@@ -640,8 +646,9 @@ mod w1 {
         let mut states = Vec::new();
         let mut waiting = 0usize;
         let mut stuck: Vec<String> = Vec::new();
+        let mut stuck_processes: Vec<usize> = Vec::new();
         let mut traces = Vec::new();
-        for text in &texts {
+        for (process, text) in texts.iter().enumerate() {
             let mut items: Vec<(u64, Item)> = Vec::new();
             for line in text.lines() {
                 if line.starts_with("probe ") {
@@ -657,6 +664,7 @@ mod w1 {
                         let lines: Vec<&str> = text.lines().collect();
                         let tail = lines.len().saturating_sub(6);
                         stuck.push(lines[tail..].join(" | "));
+                        stuck_processes.push(process);
                     }
                 } else {
                     let decoded = record::decode(line);
@@ -674,6 +682,15 @@ mod w1 {
         }
         assert_eq!(probes.len(), case.servers);
         assert_eq!(states.len(), case.servers);
+        let diagnosis = diagnosis(
+            case.servers,
+            &processes,
+            &texts,
+            &stuck_processes,
+            // One CLOCK_MONOTONIC for every process on Linux only:
+            // elsewhere each process stamps from its own origin.
+            cfg!(target_os = "linux"),
+        );
         let recorded = record::merge(processes);
         // As `workloads::run` takes them: the servers that are up.
         let up: Vec<&State> = states.iter().filter(|state| state.up).collect();
@@ -702,9 +719,111 @@ mod w1 {
             pools,
             trace: traces.into_iter().map(|(_, item)| item).collect(),
             stuck,
+            diagnosis,
             states,
             waiting,
         })
+    }
+
+    /// [`Ran::diagnosis`]: for each server (the first `servers`
+    /// processes), the terms it led and when, its commit moves, its first
+    /// and last commit and the longest wait between two; then each stuck
+    /// client process's records, its last line included. Times are
+    /// milliseconds from the earliest stamp of the run when every process
+    /// reads one clock (`shared`, Linux's `CLOCK_MONOTONIC`); otherwise
+    /// each process stamps from its own origin, so its times are from its
+    /// own first stamp and cannot be compared across processes, as the
+    /// header says (Codex review of #1302).
+    pub(super) fn diagnosis(
+        servers: usize,
+        processes: &[Vec<(u64, Item)>],
+        texts: &[String],
+        stuck: &[usize],
+        shared: bool,
+    ) -> String {
+        use std::fmt::Write as _;
+        let first = |items: &[(u64, Item)]| items.iter().map(|(stamp, _)| *stamp).min();
+        let run_origin = processes
+            .iter()
+            .filter_map(|items| first(items))
+            .min()
+            .unwrap_or(0);
+        let origin_of = |process: usize| {
+            if shared {
+                run_origin
+            } else {
+                first(&processes[process]).unwrap_or(0)
+            }
+        };
+        let mut out = String::from(if shared {
+            "times in ms from the run's first stamp, one clock for every process\n"
+        } else {
+            "times in ms from each process's own first stamp: process-relative, not comparable across processes\n"
+        });
+        for (process, items) in processes.iter().enumerate().take(servers) {
+            let origin = origin_of(process);
+            let ms = |stamp: u64| stamp.saturating_sub(origin) as f64 / 1e6;
+            let leading: Vec<String> = items
+                .iter()
+                .filter_map(|(stamp, item)| match item {
+                    Item::Observation(Observation::Leading { term, .. }) => {
+                        Some(format!("term {term} at {:.1}", ms(*stamp)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let commits: Vec<(u64, u64, bool)> = items
+                .iter()
+                .filter_map(|(stamp, item)| match item {
+                    Item::Observation(Observation::Commit { index, leader, .. }) => {
+                        Some((*stamp, *index, *leader))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let gap = commits
+                .windows(2)
+                .map(|pair| (pair[1].0.saturating_sub(pair[0].0), pair[0].0, pair[0].1))
+                .max();
+            let _ = write!(
+                out,
+                "server process {process}: led [{}]; {} commit moves",
+                leading.join(", "),
+                commits.len()
+            );
+            if let (Some(first), Some(last)) = (commits.first(), commits.last()) {
+                let _ = write!(
+                    out,
+                    ", first {} at {:.1}, last {} at {:.1} (leader {})",
+                    first.1,
+                    ms(first.0),
+                    last.1,
+                    ms(last.0),
+                    last.2
+                );
+            }
+            if let Some((wait, after, index)) = gap {
+                let _ = write!(
+                    out,
+                    ", longest wait {:.1} after commit {index} at {:.1}",
+                    wait as f64 / 1e6,
+                    ms(after)
+                );
+            }
+            out.push('\n');
+        }
+        for &process in stuck {
+            let origin = origin_of(process);
+            let ms = |stamp: u64| stamp.saturating_sub(origin) as f64 / 1e6;
+            let _ = writeln!(out, "stuck client process {process}:");
+            for (stamp, item) in &processes[process] {
+                let _ = writeln!(out, "  {:.1} {item:?}", ms(*stamp));
+            }
+            if let Some(last) = texts[process].lines().last() {
+                let _ = writeln!(out, "  last line: {last}");
+            }
+        }
+        out
     }
 
     /// PR A's smoke run, kept on every platform (karyos#678, karyos#690,
@@ -723,8 +842,8 @@ mod w1 {
         let ran = run_case(core, index, &case);
         assert_eq!(
             ran.waiting, 0,
-            "{core} {}: clients unfinished: {:?}",
-            case.name, ran.stuck
+            "{core} {}: clients unfinished: {:?}\n{}",
+            case.name, ran.stuck, ran.diagnosis
         );
         assert_eq!(ran.states.len(), servers, "{core} {}", case.name);
         let (_, applied, digest, _) = ran.states[0];
@@ -1335,4 +1454,30 @@ fn of_all(totals: &[(String, u64, u64)], name: &str) -> (u64, u64) {
         .find(|(other, _, _)| other == name)
         .map(|(_, allocated, freed)| (*allocated, *freed))
         .unwrap()
+}
+
+/// The diagnosis of a stall reads one timeline only where the processes
+/// share a clock; elsewhere each process's times start at its own first
+/// stamp, and the header says so (Codex review of #1302).
+#[test]
+fn a_stall_diagnosis_compares_times_only_on_a_shared_clock() {
+    use karyos_raft_eval::record::Item;
+    use karyos_sim::harness::node::Observation;
+
+    let leading = |stamp: u64| {
+        (
+            stamp,
+            Item::Observation(Observation::Leading { node: 0, term: 2 }),
+        )
+    };
+    // Two servers whose clocks start 5 s apart.
+    let processes = vec![vec![leading(1_000_000)], vec![leading(5_002_000_000)]];
+    let texts = vec![String::new(), String::new()];
+    let shared = w1::diagnosis(2, &processes, &texts, &[], true);
+    assert!(shared.contains("one clock"), "{shared}");
+    assert!(shared.contains("term 2 at 0.0"), "{shared}");
+    assert!(shared.contains("term 2 at 5001.0"), "{shared}");
+    let local = w1::diagnosis(2, &processes, &texts, &[], false);
+    assert!(local.contains("process-relative"), "{local}");
+    assert_eq!(local.matches("term 2 at 0.0").count(), 2, "{local}");
 }
