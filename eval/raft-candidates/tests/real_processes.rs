@@ -453,6 +453,12 @@ mod w1 {
         pub states: Vec<(NodeId, Option<u64>, u64, bool)>,
         /// Client sessions whose script did not complete.
         pub waiting: usize,
+        /// What a stall leaves to diagnose it (karyos#1301's flake): each
+        /// server's leadership and commit timeline, and every record of
+        /// each client process with a session that did not finish, in
+        /// milliseconds from the run's first stamp. Built on every run,
+        /// printed only when a check fails.
+        pub diagnosis: String,
     }
 
     /// Runs case `index` of `cases()` for variant `core` on processes, one
@@ -640,8 +646,9 @@ mod w1 {
         let mut states = Vec::new();
         let mut waiting = 0usize;
         let mut stuck: Vec<String> = Vec::new();
+        let mut stuck_processes: Vec<usize> = Vec::new();
         let mut traces = Vec::new();
-        for text in &texts {
+        for (process, text) in texts.iter().enumerate() {
             let mut items: Vec<(u64, Item)> = Vec::new();
             for line in text.lines() {
                 if line.starts_with("probe ") {
@@ -657,6 +664,7 @@ mod w1 {
                         let lines: Vec<&str> = text.lines().collect();
                         let tail = lines.len().saturating_sub(6);
                         stuck.push(lines[tail..].join(" | "));
+                        stuck_processes.push(process);
                     }
                 } else {
                     let decoded = record::decode(line);
@@ -674,6 +682,7 @@ mod w1 {
         }
         assert_eq!(probes.len(), case.servers);
         assert_eq!(states.len(), case.servers);
+        let diagnosis = diagnosis(case.servers, &processes, &texts, &stuck_processes);
         let recorded = record::merge(processes);
         // As `workloads::run` takes them: the servers that are up.
         let up: Vec<&State> = states.iter().filter(|state| state.up).collect();
@@ -702,9 +711,92 @@ mod w1 {
             pools,
             trace: traces.into_iter().map(|(_, item)| item).collect(),
             stuck,
+            diagnosis,
             states,
             waiting,
         })
+    }
+
+    /// [`Ran::diagnosis`]: for each server (the first `servers`
+    /// processes), the terms it led and when, its commit moves, its first
+    /// and last commit and the longest wait between two; then each stuck
+    /// client process's records, its last line included. Times are
+    /// milliseconds from the earliest stamp of the run.
+    fn diagnosis(
+        servers: usize,
+        processes: &[Vec<(u64, Item)>],
+        texts: &[String],
+        stuck: &[usize],
+    ) -> String {
+        use std::fmt::Write as _;
+        let origin = processes
+            .iter()
+            .flatten()
+            .map(|(stamp, _)| *stamp)
+            .min()
+            .unwrap_or(0);
+        let ms = |stamp: u64| stamp.saturating_sub(origin) as f64 / 1e6;
+        let mut out = String::new();
+        for (process, items) in processes.iter().enumerate().take(servers) {
+            let leading: Vec<String> = items
+                .iter()
+                .filter_map(|(stamp, item)| match item {
+                    Item::Observation(Observation::Leading { term, .. }) => {
+                        Some(format!("term {term} at {:.1}", ms(*stamp)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let commits: Vec<(u64, u64, bool)> = items
+                .iter()
+                .filter_map(|(stamp, item)| match item {
+                    Item::Observation(Observation::Commit { index, leader, .. }) => {
+                        Some((*stamp, *index, *leader))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let gap = commits
+                .windows(2)
+                .map(|pair| (pair[1].0.saturating_sub(pair[0].0), pair[0].0, pair[0].1))
+                .max();
+            let _ = write!(
+                out,
+                "server process {process}: led [{}]; {} commit moves",
+                leading.join(", "),
+                commits.len()
+            );
+            if let (Some(first), Some(last)) = (commits.first(), commits.last()) {
+                let _ = write!(
+                    out,
+                    ", first {} at {:.1}, last {} at {:.1} (leader {})",
+                    first.1,
+                    ms(first.0),
+                    last.1,
+                    ms(last.0),
+                    last.2
+                );
+            }
+            if let Some((wait, after, index)) = gap {
+                let _ = write!(
+                    out,
+                    ", longest wait {:.1} after commit {index} at {:.1}",
+                    wait as f64 / 1e6,
+                    ms(after)
+                );
+            }
+            out.push('\n');
+        }
+        for &process in stuck {
+            let _ = writeln!(out, "stuck client process {process}:");
+            for (stamp, item) in &processes[process] {
+                let _ = writeln!(out, "  {:.1} {item:?}", ms(*stamp));
+            }
+            if let Some(last) = texts[process].lines().last() {
+                let _ = writeln!(out, "  last line: {last}");
+            }
+        }
+        out
     }
 
     /// PR A's smoke run, kept on every platform (karyos#678, karyos#690,
@@ -723,8 +815,8 @@ mod w1 {
         let ran = run_case(core, index, &case);
         assert_eq!(
             ran.waiting, 0,
-            "{core} {}: clients unfinished: {:?}",
-            case.name, ran.stuck
+            "{core} {}: clients unfinished: {:?}\n{}",
+            case.name, ran.stuck, ran.diagnosis
         );
         assert_eq!(ran.states.len(), servers, "{core} {}", case.name);
         let (_, applied, digest, _) = ran.states[0];
