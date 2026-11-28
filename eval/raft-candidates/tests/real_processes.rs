@@ -439,6 +439,9 @@ mod w1 {
         pub outcome: Result<Outcome, RunError>,
         /// Every server's probe line.
         pub probes: Vec<Probe>,
+        /// The custom core's pool line of every server, as printed
+        /// (`pool <id> PoolStats { .. }`); empty for the other cores.
+        pub pools: Vec<String>,
         /// The appends the servers sent and the acknowledgements they
         /// stepped, merged by stamp (W2's byte oracle).
         pub trace: Vec<Item>,
@@ -633,6 +636,7 @@ mod w1 {
         }
         let mut processes = Vec::new();
         let mut probes = Vec::new();
+        let mut pools = Vec::new();
         let mut states = Vec::new();
         let mut waiting = 0usize;
         let mut stuck: Vec<String> = Vec::new();
@@ -642,6 +646,8 @@ mod w1 {
             for line in text.lines() {
                 if line.starts_with("probe ") {
                     probes.push(probe_of(line));
+                } else if line.starts_with("pool ") {
+                    pools.push(line.to_owned());
                 } else if line.starts_with("state ") {
                     states.push(state_of(line));
                 } else if let Some(client) = line.strip_prefix("client ") {
@@ -693,6 +699,7 @@ mod w1 {
         Ok(Ran {
             outcome,
             probes,
+            pools,
             trace: traces.into_iter().map(|(_, item)| item).collect(),
             stuck,
             states,
@@ -767,9 +774,10 @@ mod w1 {
                 assert_eq!(
                     stage_total(&ran.probes, stage),
                     (0, 0),
-                    "{core} {}: stage {stage}: {:?}",
+                    "{core} {}: stage {stage}: {:?}; {:?}",
                     case.name,
-                    ran.probes
+                    ran.probes,
+                    ran.pools
                 );
             }
             // What the run record declares, capped near what was measured
@@ -798,23 +806,26 @@ mod w1 {
             let cap = 2 * entries * servers;
             assert!(
                 advance.0 <= cap && advance.1 <= cap,
-                "{core} {}: advance {advance:?} over {cap}: {:?}",
+                "{core} {}: advance {advance:?} over {cap}: {:?}; {:?}",
                 case.name,
-                ran.probes
+                ran.probes,
+                ran.pools
             );
             let propose = stage_total(&ran.probes, "propose");
             assert!(
                 propose.0 <= 3 * entries && propose.1 == 0,
-                "{core} {}: propose {propose:?}: {:?}",
+                "{core} {}: propose {propose:?}: {:?}; {:?}",
                 case.name,
-                ran.probes
+                ran.probes,
+                ran.pools
             );
             let encoding = stage_total(&ran.probes, "encoding");
             assert!(
                 encoding.0 == 0 && encoding.1 <= 3 * entries * (servers - 1),
-                "{core} {}: encoding {encoding:?}: {:?}",
+                "{core} {}: encoding {encoding:?}: {:?}; {:?}",
                 case.name,
-                ran.probes
+                ran.probes,
+                ran.pools
             );
         }
     }
