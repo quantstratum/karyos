@@ -474,6 +474,10 @@ impl SocketOps for ScriptedSocket {
         }
     }
 
+    fn share_recv(&self) -> Result<Box<dyn super::ops::SharedRecv>, Errno> {
+        Ok(Box::new(self.try_clone()?))
+    }
+
     fn try_clone(&self) -> Result<Self, Errno> {
         let mut script = self.lock();
         if !self.live {

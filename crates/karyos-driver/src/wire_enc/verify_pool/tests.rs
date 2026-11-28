@@ -402,11 +402,7 @@ fn the_open_rate_is_one_aggregate_count_under_a_concurrent_flood() {
     assert_eq!(pool.verifiers(), 3);
     let forged = sealed(0x99, 1_000);
     let mut plain = [0_u8; MAX_PLAINTEXT];
-    let mut rate = OpenRate {
-        interval: clock() / SECOND_NS,
-        committed: COMMITTED_OPENS_PER_S - 100,
-        ..OpenRate::default()
-    };
+    let mut rate = OpenRate::preset(KeyKind::Committed, clock(), COMMITTED_OPENS_PER_S - 100);
     let (mut dispatched, mut over, mut refused) = (0, 0, 0);
     for (tag, bytes) in (0_u32..).zip(&forged) {
         match dispatch(&mut pool, &mut opener, &mut rate, bytes, tag) {

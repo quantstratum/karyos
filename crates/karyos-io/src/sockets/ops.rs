@@ -178,6 +178,20 @@ mod codes {
     pub(super) const ENOSYS: i32 = 78;
 }
 
+/// A receive handle of its own for one thread (ADR-0127): the batched
+/// receive of [`SocketOps::recv_batch`] on a duplicate of a socket's
+/// descriptor. Never allocates.
+pub trait SharedRecv: Send {
+    /// As [`SocketOps::recv_batch`].
+    fn recv_batch(&mut self, slab: &mut [u8], stride: usize, results: &mut [RecvResult]) -> usize;
+}
+
+impl<O: SocketOps + Send> SharedRecv for O {
+    fn recv_batch(&mut self, slab: &mut [u8], stride: usize, results: &mut [RecvResult]) -> usize {
+        SocketOps::recv_batch(self, slab, stride, results)
+    }
+}
+
 /// The only place that performs socket system calls.
 ///
 /// The data calls, [`send`](Self::send) and [`recv`](Self::recv), are
@@ -265,6 +279,20 @@ pub trait SocketOps: Sized {
     ///
     /// Returns the OS error of the duplication.
     fn try_clone(&self) -> Result<Self, Errno>;
+
+    /// A duplicate of the descriptor that another thread receives from
+    /// (`quantstratum-docs: karyos/adr/0127-encrypted-sharded-receive-per-endpoint.md`
+    /// decision 1): several receive shards read one socket concurrently,
+    /// and the kernel hands each datagram to exactly one of them. Made on
+    /// the control path; closing it leaves the socket open. The default,
+    /// for a backend that cannot be shared, refuses with `ENOSYS`.
+    ///
+    /// # Errors
+    ///
+    /// The OS error of the duplication, or `ENOSYS`.
+    fn share_recv(&self) -> Result<Box<dyn SharedRecv>, Errno> {
+        Err(Errno::NOSYS)
+    }
 
     /// Measures the route MTU towards `route` (4.5): `IP_MTU` or
     /// `IPV6_MTU` on a connected temporary socket on Linux. `None` when it

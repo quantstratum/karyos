@@ -8,7 +8,7 @@
 //! and 1 000 000 messages/s) for a fixed time in wall-clock time, while
 //! datagrams forged under a wrong key (the genuine context, an invalid
 //! tag) are sent at 10% or 100% of the valid rate from up to
-//! [`FORGERS`] other threads, each over a real UDP socket that shares the publisher's address and port
+//! [`r4_forgers`] other threads, each over a real UDP socket that shares the publisher's address and port
 //! (a duplicate of its descriptor: the source a spoofing attacker
 //! names), to the receiver's bound endpoint. They reach the receiver
 //! through its polled transport, as an attacker's datagrams would. Each
@@ -65,6 +65,20 @@ fn r4_pool() -> EncVerifyConfig {
     }
 }
 
+/// The receiver's receive shards per encrypted endpoint (ADR-0127):
+/// `KARYOS_R4_SHARDS`, 0 (the default) receiving on the receiver's own
+/// thread; with shards, their verifiers are the pool's count, each lane
+/// of `KARYOS_R4_SLOTS` slots.
+fn r4_shards() -> crate::wire_enc::EncShardConfig {
+    crate::wire_enc::EncShardConfig {
+        shards: std::env::var("KARYOS_R4_SHARDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        ..crate::wire_enc::EncShardConfig::default()
+    }
+}
+
 /// R2's lower valid rate (manifest 6.1), messages/s.
 const RATE_LOW: u64 = 100_000;
 /// R2's higher valid rate (manifest 6.1), messages/s.
@@ -79,10 +93,20 @@ const POOL: u64 = 4_096;
 const FORGED_PAD: usize = 3;
 /// Forged datagrams per send call at most.
 const SEND_BATCH: usize = 32;
-/// Threads sending the flood, each on its own duplicate of the
+/// Threads sending the flood by default, each on its own duplicate of the
 /// publisher's socket and its share of the schedule: one loopback sender
 /// alone tops out near 450 000 datagrams/s on xaskar.
 const FORGERS: u64 = 4;
+
+/// Threads sending the flood at most: `KARYOS_R4_FORGERS`, at least 1, or
+/// [`FORGERS`].
+fn r4_forgers() -> u64 {
+    std::env::var("KARYOS_R4_FORGERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(FORGERS)
+        .max(1)
+}
 /// Forged datagrams per second one sending thread is given at most.
 const PER_FORGER: u64 = 300_000;
 /// The share of the forged datagrams sent that UDP may lose before the
@@ -205,8 +229,10 @@ fn sustained(rate: u64, invalid_percent: u64, load: Load) -> Result<(), String> 
 #[allow(clippy::too_many_lines, reason = "one measured run, read top down")]
 fn r4(rate: u64, invalid_percent: u64) -> String {
     let verify = r4_pool();
-    let (mut rig, b) =
-        crate::agents::roles::receive_enc::with_enc_verifiers(verify, true, encrypted_rig);
+    let shards = r4_shards();
+    let (mut rig, b) = crate::agents::roles::receive_enc::with_enc_shards(shards, verify, || {
+        crate::agents::roles::receive_enc::with_enc_verifiers(verify, true, encrypted_rig)
+    });
     assert_eq!(
         rig.agents.receiver.role.enc_verifiers(),
         (verify.verifiers > 0).then_some(usize::from(verify.verifiers)),
@@ -287,7 +313,8 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     let go = Arc::new(AtomicBool::new(false));
     // The flood, on its own thread, on its own schedule from the start
     // both loads share: forged sent, send calls refused, largest lag.
-    let forgers = forged_rate.div_ceil(PER_FORGER).clamp(1, FORGERS);
+    let max_forgers = r4_forgers();
+    let forgers = forged_rate.div_ceil(PER_FORGER).clamp(1, max_forgers);
     let floods: Vec<_> = (0..forgers)
         .map(|share| {
             let go = Arc::clone(&go);
@@ -468,6 +495,11 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
          invalid tags at {invalid_percent}% ({} /s)",
         rate * invalid_percent / 100
     );
+    let _ = writeln!(
+        report,
+        "forger threads: {forgers} (KARYOS_R4_FORGERS at most {max_forgers}, \
+         {PER_FORGER}/s each at most)"
+    );
     #[allow(clippy::cast_precision_loss, reason = "a reported rate")]
     let achieved = (
         appended as f64 / elapsed_s,
@@ -505,6 +537,12 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
         verify.slots,
         after.get(EncRejection::VerifyBusy) - before.get(EncRejection::VerifyBusy),
         rig.agents.receiver.role.enc_in_flight()
+    );
+    let _ = writeln!(
+        report,
+        "receive shards (ADR-0127): shards={} {:?}",
+        shards.shards,
+        rig.agents.receiver.role.enc_shard_stats(b)
     );
     let _ = writeln!(
         report,

@@ -350,7 +350,8 @@ fn a_sequence_at_the_cap_is_dropped_before_the_open() {
         .map(|_| ()),
         Err(EncRejection::SequenceCap)
     );
-    assert_eq!(rate, OpenRate::default());
+    assert_eq!(rate.charged(KeyKind::Committed), 0);
+    assert_eq!(rate.charged(KeyKind::Scratch), 0);
 }
 
 /// Section 6: the two fixed rate counters of a channel. A charge over a
@@ -363,11 +364,7 @@ fn the_open_rate_is_refused_over_its_limit_until_the_next_second() {
     let mut channel = EncChannel::default();
     let first = seal(&mut sealer, &frame(DATA));
     let second = clock() / SECOND_NS;
-    channel.rate = OpenRate {
-        interval: second,
-        committed: COMMITTED_OPENS_PER_S,
-        scratch: 0,
-    };
+    channel.rate = OpenRate::preset(KeyKind::Committed, clock(), COMMITTED_OPENS_PER_S);
     assert_eq!(
         open(&mut opener, &mut channel, &first),
         Err(EncRejection::OpenRate)
@@ -388,17 +385,22 @@ fn the_open_rate_is_refused_over_its_limit_until_the_next_second() {
     assert_eq!(channel.rate.charged(KeyKind::Committed), 1);
     assert_eq!(channel.rate.charged(KeyKind::Scratch), 0);
     // The scratch limit.
-    let mut rate = OpenRate {
-        interval: second + 1,
-        committed: 0,
-        scratch: SCRATCH_OPENS_PER_S,
-    };
+    let rate = OpenRate::preset(KeyKind::Scratch, clock(), SCRATCH_OPENS_PER_S);
     assert_eq!(
         rate.charge(KeyKind::Scratch, clock()),
         Err(EncRejection::OpenRate)
     );
     assert_eq!(rate.charge(KeyKind::Committed, clock()), Ok(()));
-    assert_eq!(core::mem::size_of::<OpenRate>(), 16, "fixed size");
+    // One shared pair of words (ADR-0127 decision 3): a clone charges the
+    // same counts.
+    assert_eq!(
+        core::mem::size_of::<OpenRate>(),
+        core::mem::size_of::<usize>(),
+        "fixed size"
+    );
+    let shared = rate.clone();
+    assert_eq!(shared.charge(KeyKind::Committed, clock()), Ok(()));
+    assert_eq!(rate.charged(KeyKind::Committed), 2);
 }
 
 /// Section 6: a committed key past 3660 s from its commit is not used, nor

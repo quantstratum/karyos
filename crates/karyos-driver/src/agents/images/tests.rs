@@ -11435,6 +11435,8 @@ mod invariants_r4;
 /// H10 R4 evidence for the encrypted class: timed, ignored (manifest 7).
 mod r4_flood;
 #[cfg(test)]
+mod shard_receive;
+#[cfg(test)]
 mod verify_workers;
 
 /// `record` sealed again, byte for byte as it went out: AES-GCM-SIV is

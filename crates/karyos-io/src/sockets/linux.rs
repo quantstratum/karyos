@@ -627,6 +627,10 @@ impl SocketOps for LinuxSocket {
         self.fd = None;
     }
 
+    fn share_recv(&self) -> Result<Box<dyn super::ops::SharedRecv>, Errno> {
+        Ok(Box::new(self.try_clone()?))
+    }
+
     fn try_clone(&self) -> Result<Self, Errno> {
         let fd = self.fd.as_ref().ok_or(Errno::BADF)?;
         let duplicate = retry_intr(|| rustix::io::fcntl_dupfd_cloexec(fd, 0)).map_err(errno)?;

@@ -366,6 +366,19 @@ pub struct AgentConfig {
     /// (`enc_verify_busy`); at least `rx_datagrams` slots keep one poll's
     /// datagrams from ever finding none.
     pub enc_verify: crate::wire_enc::EncVerifyConfig,
+    /// The receiver's receive shards per encrypted endpoint (ADR-0127):
+    /// `enc_shards.shards` threads (0 to [`crate::wire_enc::MAX_ENC_SHARDS`];
+    /// default 0, the receiver's own receive) read each endpoint that has
+    /// an encrypted subscription from duplicates of its socket, run the
+    /// checks before the open of its bound domain 1 traffic and dispatch
+    /// it to verifiers of their own (`enc_verify.verifiers` of them, at
+    /// least one, each shard with a lane of `enc_verify.slots` slots, at
+    /// most [`crate::wire_enc::ENC_SHARD_IN_FLIGHT`] jobs in flight per
+    /// endpoint). Everything else reaches the receiver through a ring of
+    /// `enc_shards.ring` datagrams per shard (1 to
+    /// [`crate::wire_enc::MAX_ENC_SHARD_RING`], default
+    /// [`crate::wire_enc::DEFAULT_ENC_SHARD_RING`], 8 KiB each).
+    pub enc_shards: crate::wire_enc::EncShardConfig,
 }
 
 impl Default for AgentConfig {
@@ -408,6 +421,7 @@ impl Default for AgentConfig {
             barrier_ack_timeout: conflated_gate::DEFAULT_BARRIER_ACK_TIMEOUT_NS,
             conductor_duty_period: conflated_gate::DEFAULT_CONDUCTOR_DUTY_PERIOD_NS,
             enc_verify: crate::wire_enc::EncVerifyConfig::default(),
+            enc_shards: crate::wire_enc::EncShardConfig::default(),
         }
     }
 }
@@ -476,6 +490,9 @@ impl AgentConfig {
             ));
         }
         self.enc_verify
+            .validate()
+            .map_err(AgentError::InvalidConfig)?;
+        self.enc_shards
             .validate()
             .map_err(AgentError::InvalidConfig)?;
         if self.max_endpoints == 0 {

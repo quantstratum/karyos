@@ -246,9 +246,14 @@ impl Shared {
         *outcome = match lease.as_ref() {
             Some(lease) if !lease.is_withdrawn() => {
                 let datagram = bytes.get(..*len).unwrap_or_default();
-                match lease.key().open_verified_into(datagram, plain) {
-                    Ok(opened) => Outcome::Verified(opened),
-                    Err(reason) => Outcome::Failed(reason),
+                match lease
+                    .key()
+                    .map(|key| key.open_verified_into(datagram, plain))
+                {
+                    Some(Ok(opened)) => Outcome::Verified(opened),
+                    Some(Err(reason)) => Outcome::Failed(reason),
+                    // The pool's jobs always hold a committed key.
+                    None => Outcome::Cancelled,
                 }
             }
             _ => Outcome::Cancelled,

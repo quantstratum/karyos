@@ -51,8 +51,13 @@ use zeroize::Zeroizing;
 
 use crate::wire_keys::{Class, KEY_LEN, KeyFile, Material, Purpose, Scope};
 
+pub mod shards;
 pub mod verify_pool;
 pub mod vm_generation;
+
+pub use shards::{
+    DEFAULT_ENC_SHARD_RING, ENC_SHARD_IN_FLIGHT, EncShardConfig, MAX_ENC_SHARD_RING, MAX_ENC_SHARDS,
+};
 
 pub use verify_pool::{
     DEFAULT_ENC_VERIFY_SLOTS, EncVerifyConfig, MAX_ENC_VERIFIERS, MAX_ENC_VERIFY_SLOTS,
@@ -188,54 +193,105 @@ pub enum KeyKind {
 /// The two fixed open rate counters of one channel (section 6): committed
 /// keys at most `COMMITTED_OPENS_PER_S` and scratch or bootstrap keys at
 /// most `SCRATCH_OPENS_PER_S` per one-second interval. A charge over the
-/// limit is refused until the next interval, when both counters restart
-/// from 0. The intervals are the whole seconds of the monotonic clock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// limit is refused until the next interval, when the counter restarts
+/// from 0. The intervals are the whole seconds of the clock it is charged
+/// with.
+///
+/// Each counter is one atomic word, the interval number in its high half
+/// and the count in its low half, shared by every clone: the receive
+/// shards and the role of one channel charge the same two aggregate
+/// counts (`quantstratum-docs:
+/// karyos/adr/0127-encrypted-sharded-receive-per-endpoint.md` decision 3).
+/// A charge is one compare-and-swap: it starts a new interval when the
+/// clock has moved past the stored one, and otherwise adds one while the
+/// count is below the budget. The two budgets stay separate.
+#[derive(Debug, Clone, Default)]
 pub struct OpenRate {
-    interval: u64,
-    committed: u32,
-    scratch: u32,
+    words: Arc<RateWords>,
 }
 
+/// The two words of an [`OpenRate`], each on cache lines of its own.
+#[derive(Debug, Default)]
+struct RateWords {
+    committed: RateWord,
+    scratch: RateWord,
+}
+
+/// One rate word: `interval << 32 | count`.
+#[derive(Debug, Default)]
+#[repr(align(128))]
+struct RateWord(AtomicU64);
+
+/// The low half of a rate word: the count.
+const RATE_COUNT: u64 = 0xFFFF_FFFF;
+
 impl OpenRate {
-    /// Charges one open of `kind` at `now_ns`.
+    fn word(&self, kind: KeyKind) -> (&AtomicU64, u32) {
+        match kind {
+            KeyKind::Committed => (&self.words.committed.0, COMMITTED_OPENS_PER_S),
+            KeyKind::Scratch => (&self.words.scratch.0, SCRATCH_OPENS_PER_S),
+        }
+    }
+
+    /// Charges one open of `kind` at `now_ns`. Lock free; allocates
+    /// nothing.
     ///
     /// # Errors
     ///
     /// [`EncRejection::OpenRate`] over the limit; nothing is charged.
-    pub fn charge(&mut self, kind: KeyKind, now_ns: u64) -> Result<(), EncRejection> {
-        let interval = now_ns / SECOND_NS;
-        if interval > self.interval {
-            *self = Self {
-                interval,
-                committed: 0,
-                scratch: 0,
+    pub fn charge(&self, kind: KeyKind, now_ns: u64) -> Result<(), EncRejection> {
+        let (word, limit) = self.word(kind);
+        let interval = (now_ns / SECOND_NS) & RATE_COUNT;
+        let mut seen = word.load(Ordering::Acquire);
+        loop {
+            let (held, count) = (seen >> 32, seen & RATE_COUNT);
+            let next = if interval > held {
+                (interval << 32) | 1
+            } else if count < u64::from(limit) {
+                seen.saturating_add(1)
+            } else {
+                return Err(EncRejection::OpenRate);
             };
+            match word.compare_exchange_weak(seen, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Ok(()),
+                Err(now) => seen = now,
+            }
         }
-        let (count, limit) = match kind {
-            KeyKind::Committed => (&mut self.committed, COMMITTED_OPENS_PER_S),
-            KeyKind::Scratch => (&mut self.scratch, SCRATCH_OPENS_PER_S),
-        };
-        if *count >= limit {
-            return Err(EncRejection::OpenRate);
-        }
-        *count = count.saturating_add(1);
-        Ok(())
     }
 
-    /// Opens charged to `kind` in the current interval.
+    /// Opens charged to `kind` in the newest interval either counter has
+    /// seen: 0 for a counter still in an older one.
     #[must_use]
     pub fn charged(&self, kind: KeyKind) -> u32 {
-        match kind {
-            KeyKind::Committed => self.committed,
-            KeyKind::Scratch => self.scratch,
+        let (word, _) = self.word(kind);
+        let other = match kind {
+            KeyKind::Committed => &self.words.scratch.0,
+            KeyKind::Scratch => &self.words.committed.0,
+        };
+        let (seen, newest) = (word.load(Ordering::Acquire), other.load(Ordering::Acquire));
+        if seen >> 32 < newest >> 32 {
+            return 0;
         }
+        u32::try_from(seen & RATE_COUNT).unwrap_or(u32::MAX)
+    }
+
+    /// A counter of `kind` already charged `count` times in the interval
+    /// of `now_ns` (tests).
+    #[cfg(test)]
+    pub(crate) fn preset(kind: KeyKind, now_ns: u64, count: u32) -> Self {
+        let rate = Self::default();
+        let (word, _) = rate.word(kind);
+        word.store(
+            (((now_ns / SECOND_NS) & RATE_COUNT) << 32) | u64::from(count),
+            Ordering::Release,
+        );
+        rate
     }
 }
 
 /// The per channel accounting of one receiving party: the rate counters
 /// and the rejection counters. Fixed size, allocation free.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct EncChannel {
     /// The open rate counters.
     pub rate: OpenRate,
@@ -662,6 +718,19 @@ impl ChannelKeys {
             .map(|file| file.epoch)
             .filter(|epoch| *epoch > key_epoch)
             .min()
+    }
+
+    /// Each held file epoch and its IKM, the inputs of a receive shard's
+    /// domain 5 scratch derivations (ADR-0127 decision 2, step 4): the
+    /// epochs a SETUP is accepted under, as in [`open_bootstrap`]. Each
+    /// copy is erased on drop.
+    pub(crate) fn shard_setup(&self) -> [Option<shards::SetupView>; CHANNEL_FILES] {
+        self.files.each_ref().map(|file| {
+            file.as_ref().map(|file| shards::SetupView {
+                epoch: file.epoch,
+                ikm: Zeroizing::new(*file.secret),
+            })
+        })
     }
 }
 
@@ -1626,6 +1695,20 @@ pub(crate) struct OpenerShare {
     leases: LeaseCount,
 }
 
+impl OpenerShare {
+    /// Marks it withdrawn: a verifier cancels every job leased under it
+    /// instead of opening it.
+    pub(crate) fn withdraw(&self) {
+        self.withdrawn.store(true, Ordering::Release);
+    }
+
+    /// The leases out (tests).
+    #[cfg(test)]
+    pub(crate) fn leases(&self) -> u32 {
+        self.leases.0.load(Ordering::Acquire)
+    }
+}
+
 /// The lease count of an [`OpenerShare`], away from its withdrawn mark.
 #[derive(Debug, Default)]
 #[repr(align(128))]
@@ -1638,19 +1721,32 @@ struct LeaseCount(AtomicU32);
 /// the last one of a dropped key returns, the key is erased on drop.
 pub(crate) struct Lease {
     share: Arc<OpenerShare>,
-    key: Arc<KeyCell>,
+    /// The committed key it holds; `None` for a receive shard's scratch
+    /// derivation, whose key lives in its lane slot and is erased there
+    /// after the open (ADR-0127 decision 2, step 4).
+    key: Option<Arc<KeyCell>>,
 }
 
 impl Lease {
+    /// A lease on `share` holding `key`, counted now: taken before its
+    /// job is queued.
+    pub(crate) fn take(share: &Arc<OpenerShare>, key: Option<Arc<KeyCell>>) -> Self {
+        share.leases.0.fetch_add(1, Ordering::AcqRel);
+        Self {
+            share: Arc::clone(share),
+            key,
+        }
+    }
+
     /// Whether its opener instance was withdrawn: a verifier that reads it
     /// before an open cancels instead.
     pub(crate) fn is_withdrawn(&self) -> bool {
         self.share.withdrawn.load(Ordering::Acquire)
     }
 
-    /// The key it holds.
-    pub(crate) fn key(&self) -> &AesGcmSiv {
-        &self.key
+    /// The committed key it holds, if any.
+    pub(crate) fn key(&self) -> Option<&AesGcmSiv> {
+        self.key.as_deref().map(|cell| &**cell)
     }
 }
 
@@ -1664,7 +1760,7 @@ impl Drop for Lease {
 impl core::fmt::Debug for Lease {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Lease")
-            .field("context", self.key.context())
+            .field("context", &self.key.as_ref().map(|key| *key.context()))
             .finish_non_exhaustive()
     }
 }
@@ -1774,6 +1870,11 @@ pub struct EncOpener {
     generation: u64,
     /// This opener's instance, named by each [`Pending`] it verifies.
     instance: u64,
+    /// Whether the receive shards' snapshot holds a reference to its
+    /// previous key (ADR-0127): one more holder than its leases, which
+    /// [`Self::can_promote`] allows for. Its role takes the snapshot back
+    /// before anything changes a key in place.
+    published_previous: bool,
 }
 
 impl Drop for EncOpener {
@@ -1839,7 +1940,79 @@ impl EncOpener {
             withdrawn: false,
             generation: vm_generation::generation(),
             instance: OPENERS.fetch_add(1, Ordering::Relaxed),
+            published_previous: false,
         })
+    }
+
+    /// What a receive shard reads of this opener at `now_ns` (ADR-0127
+    /// decision 2): its instance, VM generation and withdrawal share, and
+    /// its committed keys with their epoch pairs and original age
+    /// deadlines (decision 4: from the commit, never restarted by a
+    /// republication), the previous one only inside its overlap. `None`
+    /// once withdrawn or of an earlier VM generation. Built on the control
+    /// path; the snapshot then holds a reference to each key, which its
+    /// role takes back before any key changes in place.
+    pub(crate) fn shard_view(&mut self, now_ns: u64) -> Option<shards::OpenerView> {
+        if self.withdrawn || self.generation != vm_generation::generation() {
+            self.published_previous = false;
+            return None;
+        }
+        let view = |slot: &Slot| shards::KeyView {
+            epochs: (slot.key.context().key_epoch, slot.key.context().party_epoch),
+            key: Arc::clone(&slot.key),
+            deadline: slot.committed_ns.saturating_add(KEY_AGE_NS),
+            until: u64::MAX,
+        };
+        let previous = self
+            .previous
+            .as_ref()
+            .filter(|(_, until)| now_ns < *until)
+            .map(|(slot, until)| shards::KeyView {
+                until: *until,
+                ..view(slot)
+            });
+        self.published_previous = previous.is_some();
+        // The next epochs [`Self::is_next`] accepts, each with the inputs
+        // of its scratch derivation (decision 2, step 4): the current
+        // context at that pair, and its file epoch's IKM.
+        let base = *self.current.key.context();
+        let (key_epoch, party_epoch) = self.epochs();
+        let next = [
+            party_epoch.checked_add(1).map(|party| (key_epoch, party)),
+            self.keys.next_epoch(key_epoch).map(|epoch| (epoch, 0)),
+        ]
+        .map(|pair| {
+            let (key_epoch, party_epoch) = pair?;
+            let ikm = self.keys.ikm(key_epoch)?;
+            Some(shards::ScratchView {
+                context: KeyContext {
+                    key_epoch,
+                    party_epoch,
+                    ..base
+                },
+                ikm: Zeroizing::new(*ikm),
+            })
+        });
+        Some(shards::OpenerView {
+            instance: self.instance,
+            generation: self.generation,
+            share: Arc::clone(&self.share),
+            current: view(&self.current),
+            previous,
+            next,
+        })
+    }
+
+    /// The receive shards' snapshot no longer holds its keys (ADR-0127).
+    pub(crate) fn shard_unpublished(&mut self) {
+        self.published_previous = false;
+    }
+
+    /// Whether committing `pending` promotes its epoch: the role takes its
+    /// shards' snapshot back first, so the promotion changes keys no
+    /// snapshot holds (ADR-0127 decision 7).
+    pub(crate) fn commit_promotes(&self, pending: &Pending) -> bool {
+        pending.opener == self.instance && self.committed_slot(pending.epochs, pending.at).is_none()
     }
 
     /// Withdraws it (H8 finding 4): its key files, previous and spare keys
@@ -2075,11 +2248,7 @@ impl EncOpener {
         let seq = key.check_before_open(datagram)?;
         let mut head = [0_u8; HEADER_LEN];
         head.copy_from_slice(datagram.get(..HEADER_LEN).ok_or(EncRejection::Short)?);
-        self.share.leases.0.fetch_add(1, Ordering::AcqRel);
-        let lease = Lease {
-            share: Arc::clone(&self.share),
-            key: Arc::clone(key),
-        };
+        let lease = Lease::take(&self.share, Some(Arc::clone(key)));
         Ok(Prepared::Dispatch(
             Ticket {
                 opener: self.instance,
@@ -2129,10 +2298,36 @@ impl EncOpener {
         if *header != ticket.header || len != ticket.len || opened.seq != ticket.seq {
             return Err(EncRejection::Binding);
         }
-        let slot = self
-            .committed_entry(ticket.epochs, now_ns)
-            .filter(|slot| Arc::ptr_eq(&slot.key, &lease.key))
-            .ok_or(EncRejection::Epoch)?;
+        let committed = self.committed_entry(ticket.epochs, now_ns);
+        let slot = match lease.key.as_ref() {
+            Some(key) => committed
+                .filter(|slot| Arc::ptr_eq(&slot.key, key))
+                .ok_or(EncRejection::Epoch)?,
+            // ADR-0127 decision 2, step 4: a receive shard's scratch
+            // derivation of the next epoch, from the inputs this opener
+            // derives that pair from. Once another datagram promoted the
+            // pair, its committed slot decides; until then the pair must
+            // still be the next one and promotable, within its
+            // predecessor's age (decision 4). The open rate was charged on
+            // the shard, never here; the commit derives and promotes.
+            None => match committed {
+                Some(slot) => slot,
+                None if self.is_next(ticket.epochs.0, ticket.epochs.1) && self.can_promote() => {
+                    if now_ns.saturating_sub(self.current.committed_ns) > KEY_AGE_NS {
+                        return Err(EncRejection::KeyAge);
+                    }
+                    return Ok(Pending {
+                        frames: opened.frames,
+                        epochs: ticket.epochs,
+                        seq: ticket.seq,
+                        opener: self.instance,
+                        at: now_ns,
+                        generation: self.generation,
+                    });
+                }
+                None => return Err(EncRejection::Epoch),
+            },
+        };
         if now_ns.saturating_sub(slot.committed_ns) > KEY_AGE_NS {
             return Err(EncRejection::KeyAge);
         }
@@ -2432,7 +2627,9 @@ impl EncOpener {
     /// after [`Self::can_promote`] held, since only the role thread takes
     /// leases and a lease only ever returns.
     fn promote(&mut self, now_ns: u64) -> bool {
-        if !self.can_promote() {
+        // A previous key the shards' snapshot still holds is never
+        // recycled: its role takes the snapshot back first (ADR-0127).
+        if !self.can_promote() || (self.published_previous && self.previous.is_some()) {
             return false;
         }
         let recycled = match self.previous.take() {
@@ -2463,7 +2660,10 @@ impl EncOpener {
     /// datagram that could not promote is refused without effects.
     fn can_promote(&self) -> bool {
         match &self.previous {
-            Some((slot, _)) => Arc::strong_count(&slot.key) == 1,
+            Some((slot, _)) => {
+                Arc::strong_count(&slot.key)
+                    == 1_usize.saturating_add(usize::from(self.published_previous))
+            }
             None => self.spare.is_some(),
         }
     }
@@ -2641,6 +2841,99 @@ pub fn open_bootstrap_in(
         frames: opened.frames,
         current_epoch: keys.binds(header.key_epoch),
     })
+}
+
+/// ADR-0127 decision 2, on the role thread: a domain 5 SETUP whose scratch
+/// key a receive shard derived and a verifier opened into `frames`. The
+/// checks of [`open_bootstrap_in`] before the open are evaluated again
+/// against `keys`, changing nothing and charging nothing (the shard
+/// charged the scratch rate once, decision 3): the VM generation, the
+/// job's authenticated header, length and sequence, the domain, the epoch
+/// pair (a held file epoch, `party_epoch` 0), the sequence cap and the
+/// publication. Then the frame is checked as there, `inner` included.
+/// Allocates nothing.
+///
+/// # Errors
+///
+/// The first [`EncRejection`] that applies.
+pub(crate) fn bootstrap_complete(
+    keys: &ChannelKeys,
+    (ticket, head): (&Ticket, &Header),
+    opened: &karyos_protocol::protection::aes_gcm_siv::Opened,
+    (header, len): (&[u8; HEADER_LEN], usize),
+    frames: &[u8],
+    inner: impl FnOnce(&Header, &[u8]) -> Result<(), EncRejection>,
+) -> Result<Bootstrap, EncRejection> {
+    if quiesced() || ticket.generation != vm_generation::generation() {
+        return Err(EncRejection::VmGeneration);
+    }
+    if *header != ticket.header
+        || len != ticket.len
+        || opened.seq != ticket.seq
+        || head.seq != ticket.seq
+        || (head.key_epoch, head.party_epoch) != ticket.epochs
+    {
+        return Err(EncRejection::Binding);
+    }
+    if head.domain != Domain::Setup {
+        return Err(EncRejection::Domain);
+    }
+    if head.party_epoch != 0 || keys.ikm(head.key_epoch).is_none() {
+        return Err(EncRejection::Epoch);
+    }
+    if head.seq >= BOOTSTRAP_SEQ_CAP {
+        return Err(EncRejection::SequenceCap);
+    }
+    if head.publication.is_none() {
+        return Err(EncRejection::Party);
+    }
+    let frames = frames.get(..opened.frames).ok_or(EncRejection::Short)?;
+    check_matrix(head.domain, frames)?;
+    inner(head, frames)?;
+    Ok(Bootstrap {
+        header: *head,
+        frames: opened.frames,
+        current_epoch: keys.binds(head.key_epoch),
+    })
+}
+
+/// The context a receive shard's lane slot rests in between scratch
+/// derivations (ADR-0127): a valid bootstrap context under the all-zero
+/// key, which is what [`erase`] writes.
+fn scratch_rest() -> KeyContext {
+    KeyContext {
+        domain: Domain::Setup,
+        key_epoch: 1,
+        party_epoch: 0,
+        session_id: 0,
+        stream_id: 0,
+        publication: PublicationIdentity {
+            driver_id: [1; 16],
+            registration_id: 1,
+            incarnation: 1,
+        },
+        receiver: None,
+        salt: Salt::Empty,
+    }
+}
+
+/// A receive shard's lane slot for scratch derivations, made on the
+/// control path at rest (erased): every derivation re-keys it in place,
+/// so the data path constructs no key. `None` if it cannot be made.
+pub(crate) fn scratch_slot() -> Option<AesGcmSiv> {
+    AesGcmSiv::new(&[0; KEY_LEN], scratch_rest(), &[]).ok()
+}
+
+/// Erases a lane slot's scratch key in place after its use (H8-16, as the
+/// role's scratch slot): no derived key survives its job.
+pub(crate) fn erase_scratch(key: &mut AesGcmSiv) {
+    erase(key, scratch_rest());
+}
+
+/// Whether a lane slot's scratch key is at rest, erased (tests).
+#[cfg(test)]
+pub(crate) fn scratch_erased(key: &AesGcmSiv) -> bool {
+    *key.context() == scratch_rest()
 }
 
 /// The retired `receiver_boot_id` values of one publication incarnation
