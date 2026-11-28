@@ -189,3 +189,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: env ${{ matrix.env }} scripts/linux-test.sh -p karyos-io --features xdp --locked ${{ matrix.filter }}
+
+  runner-probe:
+    name: Runner probe (qs-shared)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, qs-shared]
+    steps:
+      - run: echo "qs-shared runner reachable on $(uname -a)"
