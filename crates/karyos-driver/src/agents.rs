@@ -2246,6 +2246,10 @@ impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
         let served = core.serve_commands(&mut |command| role.command(command))?;
         let served = served.checked_add(chains).ok_or(overflow.clone())?;
         if core.stopped {
+            // ADR-0127 decision 7: the receive shards are withdrawn,
+            // cancelled, drained and joined before the agent reports
+            // stopped, so the agent handed back runs nothing.
+            role.enc_shutdown(sessions, now);
             return Ok(served);
         }
         let work = role.duty(&mut core.halves, sessions, now)?;

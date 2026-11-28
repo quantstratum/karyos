@@ -1780,6 +1780,13 @@ pub(crate) struct Ticket {
     header: [u8; HEADER_LEN],
 }
 
+impl Ticket {
+    /// The epoch pair of the key slot its job selected.
+    pub(crate) fn epochs(&self) -> (u32, u16) {
+        self.epochs
+    }
+}
+
 /// What [`EncOpener::prepare`] decided for a datagram.
 #[derive(Debug)]
 pub(crate) enum Prepared {
@@ -2013,6 +2020,13 @@ impl EncOpener {
     /// snapshot holds (ADR-0127 decision 7).
     pub(crate) fn commit_promotes(&self, pending: &Pending) -> bool {
         pending.opener == self.instance && self.committed_slot(pending.epochs, pending.at).is_none()
+    }
+
+    /// Whether a datagram under `epochs` would promote them at `now_ns`:
+    /// no committed key holds that pair (ADR-0127: the role takes its
+    /// shards' snapshot back before such a datagram's last check).
+    pub(crate) fn promotes(&self, epochs: (u32, u16), now_ns: u64) -> bool {
+        self.committed_slot(epochs, now_ns).is_none()
     }
 
     /// Withdraws it (H8 finding 4): its key files, previous and spare keys

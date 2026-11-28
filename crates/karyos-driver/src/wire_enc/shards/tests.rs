@@ -116,8 +116,13 @@ fn alias() -> Alias {
 }
 
 /// A set of `lanes` lanes of `slots` with no thread: the test thread is
-/// the shard, the verifier and the role.
+/// the shard, the verifier and the role. Its clock is the role's readings.
 fn detached(lanes: usize, slots: u16, ring: u16) -> ShardSet<u32> {
+    with_clock(lanes, slots, ring, SetClock::new(published_only, clock()))
+}
+
+/// [`detached`] on `clock`.
+fn with_clock(lanes: usize, slots: u16, ring: u16, clock: SetClock) -> ShardSet<u32> {
     ShardSet {
         shared: Arc::new(
             SetShared::new(
@@ -126,6 +131,7 @@ fn detached(lanes: usize, slots: u16, ring: u16) -> ShardSet<u32> {
                 usize::from(karyos_io::sockets::endpoint::MAX_DATAGRAM),
                 1,
                 (4, 4, 4),
+                clock,
             )
             .unwrap(),
         ),
@@ -178,7 +184,7 @@ fn shard_take(set: &ShardSet<u32>, lane: usize, bytes: &[u8]) -> Step {
 /// Runs the shard path on `bytes` from `from` in lane `lane`.
 fn shard_take_from(set: &ShardSet<u32>, lane: usize, bytes: &[u8], from: SocketAddr) -> Step {
     let snapshot = set.shared.snapshot.read().unwrap();
-    let now = set.shared.clock.0.load(Ordering::Acquire);
+    let now = set.shared.clock.0.now();
     set.shared.take(lane, &snapshot, bytes, from, now)
 }
 
@@ -280,7 +286,7 @@ fn each_datagram_is_received_exactly_once_across_shards() {
         },
         handles,
         1408,
-        (4, 4, 4),
+        ((4, 4, 4), SetClock::new(published_only, clock())),
     )
     .unwrap();
     assert_eq!(set.shards(), 4);
@@ -418,12 +424,13 @@ fn key_age_crossing_while_work_is_queued_is_refused_without_an_open() {
     assert_eq!(opener.leases(), 0, "every lease back once");
 }
 
-/// Decision 5 and ADR-0126 decisions 4 and 5 across shards: a delayed job
-/// holds back only its own lane's later results; another lane's are
-/// consumed; cancellation ends the queued ones in every lane, and every
-/// lease returns exactly once.
+/// Decision 5 and ADR-0126 decisions 4 and 5 across shards: results are
+/// consumed in dispatch order across the lanes, so a delayed job holds
+/// back every later one, of its own lane and of the others; cancellation
+/// ends the queued ones in every lane, and every lease returns exactly
+/// once.
 #[test]
-fn delayed_completion_and_cancellation_hold_per_lane_across_shards() {
+fn delayed_completion_and_cancellation_hold_in_dispatch_order_across_shards() {
     let set = detached(2, 8, 4);
     let mut opener = opener();
     let rate = OpenRate::default();
@@ -443,55 +450,223 @@ fn delayed_completion_and_cancellation_hold_per_lane_across_shards() {
     assert!(run(set.shared.lanes[1].cell(0).unwrap(), clock_word));
     let mut plain = [0_u8; MAX_PLAINTEXT];
     assert!(set.take(0, &mut plain).is_none(), "held back by its first");
-    let other = set.take(1, &mut plain).unwrap();
-    assert!(matches!(other.outcome, Outcome::Verified(_)));
-    assert_eq!(other.context.ticket.seq, 3, "lane 1 in its own order");
-    drop(other);
+    assert!(
+        set.take(1, &mut plain).is_none(),
+        "held back by lane 0's earlier dispatch"
+    );
+    assert!(set.take_next(&mut plain).is_none());
     // Cancellation: lane 0's first and third, lane 1's second.
     assert_eq!(set.cancel_all(), 3);
-    let outcomes: Vec<_> = core::iter::from_fn(|| set.take(0, &mut plain))
+    let outcomes: Vec<_> = core::iter::from_fn(|| set.take_next(&mut plain))
         .map(|done| (done.context.ticket.seq, done.outcome))
         .collect();
-    assert_eq!(outcomes.len(), 3);
+    assert_eq!(outcomes.len(), 5);
     assert_eq!(outcomes[0], (0, Outcome::Cancelled));
     assert!(matches!(outcomes[1], (1, Outcome::Verified(_))));
     assert_eq!(outcomes[2], (2, Outcome::Cancelled));
-    assert_eq!(
-        set.take(1, &mut plain).map(|done| done.outcome),
-        Some(Outcome::Cancelled)
-    );
+    assert!(matches!(outcomes[3], (3, Outcome::Verified(_))));
+    assert_eq!(outcomes[4], (4, Outcome::Cancelled));
     assert_eq!(opener.leases(), 0, "each lease returned exactly once");
     assert_eq!(set.in_flight(), 0);
 }
 
-/// Decision 5: at most the replay window of jobs is in flight across the
-/// lanes, so an older datagram in flight is never displaced from the
-/// window by newer ones committed meanwhile; the next is dropped before
-/// its open and counted.
+/// The role's decision of one verified job, as `enc_decide` and
+/// `enc_commit` make it: the re-check against the real replay window
+/// ([`EncOpener::complete`]), then the commit, which marks it. Its
+/// sequence.
+fn decide(opener: &mut EncOpener, done: Done<ShardJob<u32>>) -> Result<u64, EncRejection> {
+    let Outcome::Verified(opened) = done.outcome else {
+        return Err(EncRejection::Withdrawn);
+    };
+    let seq = done.context.ticket.seq;
+    let pending = opener.complete(
+        &done.context.ticket,
+        done.lease.as_ref().ok_or(EncRejection::Withdrawn)?,
+        &opened,
+        (&done.header, done.len),
+        clock(),
+    )?;
+    drop(done);
+    opener.commit(pending)?;
+    Ok(seq)
+}
+
+/// Decision 5, rolling: one lane holds sequence 0 unverified while another
+/// lane's jobs, 1 onwards, are verified and replenished over and over,
+/// well past twice the window. None is committed before sequence 0; the
+/// in-flight cap then drops the rest before their open, counted. Once
+/// sequence 0 completes, it and every later one pass the real replay
+/// check and commit: the older datagram in flight was never pushed out of
+/// the window by newer ones another lane completed.
 #[test]
-fn the_slot_cap_keeps_in_flight_work_within_the_replay_window() {
+fn an_older_job_in_flight_is_never_pushed_out_of_the_replay_window() {
     let set = detached(2, 1_024, 4);
     let mut opener = opener();
     let rate = OpenRate::default();
     let counts = bind(&set, &mut opener, &rate);
-    let genuine = sealed(0x11, 1_025);
-    for (at, bytes) in genuine[..1_024].iter().enumerate() {
-        assert!(matches!(shard_take(&set, at % 2, bytes), Step::Dispatched));
-    }
-    assert_eq!(set.in_flight(), ENC_SHARD_IN_FLIGHT as usize);
-    assert!(matches!(
-        shard_take(&set, 0, &genuine[1_024]),
-        Step::Refused
-    ));
-    assert_eq!(counted(&counts, EncRejection::VerifyBusy), 1);
-    // The oldest in flight is at most the window behind the newest.
-    let (oldest, newest) = (0_u64, 1_023_u64);
-    assert!(newest.saturating_sub(oldest) < karyos_protocol::protection::replay::WINDOW);
+    let window = usize::try_from(karyos_protocol::protection::replay::WINDOW).unwrap();
+    let total = 2 * window + 100;
+    let genuine = sealed(0x11, total);
+    assert!(matches!(shard_take(&set, 0, &genuine[0]), Step::Dispatched));
     let mut plain = [0_u8; MAX_PLAINTEXT];
-    assert_eq!(set.cancel_all(), 1_024);
-    for lane in 0..2 {
-        while set.take(lane, &mut plain).is_some() {}
+    let mut committed = Vec::new();
+    for bytes in &genuine[1..] {
+        let _ = shard_take(&set, 1, bytes);
+        while set.shared.lanes[1].run_one(&set.shared.clock.0) {}
+        while let Some(done) = set.take_next(&mut plain) {
+            committed.push(decide(&mut opener, done));
+        }
     }
+    assert!(
+        committed.is_empty(),
+        "decided past sequence 0 in flight: {} of them",
+        committed.len()
+    );
+    assert_eq!(set.in_flight(), ENC_SHARD_IN_FLIGHT as usize);
+    assert_eq!(
+        counted(&counts, EncRejection::VerifyBusy),
+        u64::try_from(total - ENC_SHARD_IN_FLIGHT as usize).unwrap()
+    );
+    // Sequence 0 completes last, still inside the window.
+    assert!(set.shared.lanes[0].run_one(&set.shared.clock.0));
+    let first = set.take_next(&mut plain).unwrap();
+    assert_eq!(decide(&mut opener, first), Ok(0));
+    while let Some(done) = set.take_next(&mut plain) {
+        committed.push(decide(&mut opener, done));
+    }
+    assert_eq!(
+        committed,
+        (1..u64::from(ENC_SHARD_IN_FLIGHT))
+            .map(Ok)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(set.in_flight(), 0);
+    assert_eq!(opener.leases(), 0);
+}
+
+/// A live clock for [`a_deadline_crossed_while_the_role_publishes_nothing_is_refused_before_the_open`].
+static LIVE: AtomicU64 = AtomicU64::new(0);
+
+fn live() -> u64 {
+    LIVE.load(Ordering::SeqCst)
+}
+
+/// Decision 4 on a live clock: a set reads its clock source at every
+/// check, from a valid reading at creation (never 0). A deadline crossed
+/// while the role publishes nothing is refused by the verifier without an
+/// open, and by the shard before dispatch.
+#[test]
+fn a_deadline_crossed_while_the_role_publishes_nothing_is_refused_before_the_open() {
+    LIVE.store(clock(), Ordering::SeqCst);
+    let set = with_clock(1, 8, 4, SetClock::new(live, clock()));
+    assert_eq!(set.shared.clock.0.now(), clock(), "valid from the start");
+    assert_eq!(
+        with_clock(1, 1, 1, SetClock::new(published_only, clock()))
+            .shared
+            .clock
+            .0
+            .now(),
+        clock(),
+        "a set on the role's readings alone starts at its reading, not 0"
+    );
+    let mut opener = opener();
+    let rate = OpenRate::default();
+    let counts = bind(&set, &mut opener, &rate);
+    let genuine = sealed(0x11, 2);
+    assert!(matches!(shard_take(&set, 0, &genuine[0]), Step::Dispatched));
+    // The deadline passes; the role publishes nothing.
+    LIVE.store(clock() + KEY_AGE_NS + 1, Ordering::SeqCst);
+    assert!(set.shared.lanes[0].run_one(&set.shared.clock.0));
+    let mut plain = [0xAA_u8; MAX_PLAINTEXT];
+    let done = set.take(0, &mut plain).unwrap();
+    assert_eq!(done.outcome, Outcome::Failed(EncRejection::KeyAge));
+    assert!(plain.iter().all(|byte| *byte == 0xAA), "nothing opened");
+    drop(done);
+    assert!(matches!(shard_take(&set, 0, &genuine[1]), Step::Refused));
+    assert_eq!(counted(&counts, EncRejection::KeyAge), 1);
+    assert_eq!(opener.leases(), 0);
+}
+
+/// A verifier's cursor moves past each lane it ran a job of: with fewer
+/// verifiers than shards and one lane replenished before every step, the
+/// other lane's job is still verified within one round of the lanes.
+#[test]
+fn a_replenished_lane_never_starves_another_of_its_verifier() {
+    let set = detached(2, 64, 4);
+    let mut opener = opener();
+    let rate = OpenRate::default();
+    let _counts = bind(&set, &mut opener, &rate);
+    let genuine = sealed(0x11, 40);
+    assert!(matches!(shard_take(&set, 1, &genuine[0]), Step::Dispatched));
+    let waiting = set.shared.lanes[1].cell(0).unwrap();
+    let mut cursor = 0;
+    let mut verified_at = None;
+    for (step, bytes) in genuine[1..].iter().enumerate() {
+        assert!(matches!(shard_take(&set, 0, bytes), Step::Dispatched));
+        assert!(set.shared.verify_step(&mut cursor));
+        if waiting.state.load(Ordering::SeqCst) == DONE {
+            verified_at = Some(step);
+            break;
+        }
+    }
+    assert!(
+        verified_at.is_some_and(|step| step < 2),
+        "lane 1 verified at step {verified_at:?}"
+    );
+    let _ = set.cancel_all();
+    let mut plain = [0_u8; MAX_PLAINTEXT];
+    while set.take_next(&mut plain).is_some() {}
+    assert_eq!(opener.leases(), 0);
+}
+
+/// The wake handshake under stress: a verifier thread spinning, setting
+/// its sleeping mark or parked while one job at a time is dispatched and
+/// woken for, at varying delays; every job is verified (none is left
+/// queued behind a parked verifier, which only a wake would end).
+#[test]
+fn a_dispatch_racing_a_verifier_going_to_park_is_never_missed() {
+    let mut set = detached(1, 8, 4);
+    let mut opener = opener();
+    let rate = OpenRate::default();
+    let _counts = bind(&set, &mut opener, &rate);
+    let genuine = sealed(0x11, 8);
+    let held = Arc::clone(&set.shared);
+    let handle = std::thread::Builder::new()
+        .name("karyos-enc-shard-verify-test".into())
+        .spawn(move || verifier(&held, 0))
+        .unwrap();
+    let _ = set
+        .shared
+        .verifier_threads
+        .set(vec![Some(handle.thread().clone())].into_boxed_slice());
+    set.verifiers.push(handle);
+    let mut plain = [0_u8; MAX_PLAINTEXT];
+    let mut seed = 0x9E37_79B9_u32;
+    for round in 0..20_000_usize {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        for _ in 0..seed % 6_000 {
+            core::hint::spin_loop();
+        }
+        assert!(matches!(
+            shard_take(&set, 0, &genuine[round % genuine.len()]),
+            Step::Dispatched
+        ));
+        set.shared.wake();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if set.take_next(&mut plain).is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: a dispatch missed by a parked verifier"
+            );
+            std::thread::yield_now();
+        }
+    }
+    drop(set);
     assert_eq!(opener.leases(), 0);
 }
 
@@ -649,7 +824,7 @@ fn shard_shutdown_joins_the_shards_before_their_descriptors_close() {
         },
         handles,
         1408,
-        (4, 4, 4),
+        ((4, 4, 4), SetClock::new(published_only, clock())),
     )
     .unwrap();
     assert_eq!((set.shards(), set.verifiers()), (3, 2));

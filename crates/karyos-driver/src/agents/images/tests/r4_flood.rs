@@ -44,10 +44,16 @@ use crate::wire_enc::{
     ChannelKeys, DEFAULT_ENC_VERIFY_SLOTS, EncSealer, EncVerifyConfig, MAX_SEALED,
 };
 
-/// Verifier threads of the receiver's pool (ADR-0126) by default;
-/// `KARYOS_R4_VERIFIERS` overrides it, 0 running every open on the
-/// receiver's own thread.
-const VERIFIERS: u16 = 3;
+/// Verifier threads by default, of the receiver's pool (ADR-0126) and of
+/// its receive shards (ADR-0127); `KARYOS_R4_VERIFIERS` overrides it, 0
+/// running every pool open on the receiver's own thread (the shards then
+/// run one verifier).
+const VERIFIERS: u16 = 4;
+
+/// Receive shards of the encrypted endpoint by default (ADR-0127);
+/// `KARYOS_R4_SHARDS` overrides it, 0 receiving on the receiver's own
+/// thread.
+const SHARDS: u16 = 2;
 
 /// The receiver's verifier pool of a run: [`VERIFIERS`] threads and
 /// [`DEFAULT_ENC_VERIFY_SLOTS`] slots, or `KARYOS_R4_VERIFIERS` and
@@ -66,15 +72,15 @@ fn r4_pool() -> EncVerifyConfig {
 }
 
 /// The receiver's receive shards per encrypted endpoint (ADR-0127):
-/// `KARYOS_R4_SHARDS`, 0 (the default) receiving on the receiver's own
-/// thread; with shards, their verifiers are the pool's count, each lane
-/// of `KARYOS_R4_SLOTS` slots.
+/// `KARYOS_R4_SHARDS`, or [`SHARDS`], 0 receiving on the receiver's own
+/// thread; with shards, their verifiers are the pool's count (at least
+/// one), each lane of `KARYOS_R4_SLOTS` slots.
 fn r4_shards() -> crate::wire_enc::EncShardConfig {
     crate::wire_enc::EncShardConfig {
         shards: std::env::var("KARYOS_R4_SHARDS")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(0),
+            .unwrap_or(SHARDS),
         ..crate::wire_enc::EncShardConfig::default()
     }
 }
@@ -500,6 +506,20 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
         "forger threads: {forgers} (KARYOS_R4_FORGERS at most {max_forgers}, \
          {PER_FORGER}/s each at most)"
     );
+    let shard_stats = rig.agents.receiver.role.enc_shard_stats(b);
+    let _ = writeln!(
+        report,
+        "effective configuration: shards={} (KARYOS_R4_SHARDS, running {}) verifiers={} \
+         (KARYOS_R4_VERIFIERS; pool {:?}, shard verifiers running {}) slots={} \
+         (KARYOS_R4_SLOTS) ring={} forgers={forgers}",
+        shards.shards,
+        shard_stats.map_or(0, |stats| stats.shards),
+        verify.verifiers,
+        rig.agents.receiver.role.enc_verifiers(),
+        shard_stats.map_or(0, |stats| stats.verifiers),
+        verify.slots,
+        shards.ring,
+    );
     #[allow(clippy::cast_precision_loss, reason = "a reported rate")]
     let achieved = (
         appended as f64 / elapsed_s,
@@ -612,6 +632,14 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     }
     assert_eq!(receiver_allocs, 0, "{report}");
     assert_eq!(sender_allocs, 0, "{report}");
+    // With shards configured, the receiver used them: they ran and
+    // received the endpoint's traffic, dispatching the bound datagrams.
+    if shards.shards > 0 {
+        let stats = shard_stats.expect("the receiver runs receive shards");
+        assert_eq!(stats.shards, usize::from(shards.shards), "{report}");
+        assert!(stats.verifiers >= 1, "{report}");
+        assert!(stats.received > stats.forwarded, "{report}");
+    }
     // Every forged datagram read is refused for its tag, or dropped before
     // its open when no verification slot was free (ADR-0126 decision 4,
     // which drops valid datagrams too: those are repaired).

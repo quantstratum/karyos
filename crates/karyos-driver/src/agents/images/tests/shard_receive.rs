@@ -265,3 +265,112 @@ with_shards! {
     shards_replayed_data => replayed_encrypted_data_and_heartbeats_do_not_keep_the_image_alive;
     shards_retirement => an_ordinary_retirement_erases_a_queued_domain_4_sealer;
 }
+
+/// Decision 7 for a promotion: a datagram the role re-checked as
+/// promotable always commits. Two sender controls promote the next party
+/// epochs in turn; before the second, a shard snapshot holds the previous
+/// key. A shard racing the second commit, leasing that previous key
+/// between the role's last check and the commit, finds the snapshot
+/// already taken back: it takes nothing, and the promotion commits.
+#[test]
+fn a_promotion_rechecked_by_the_role_always_commits() {
+    use karyos_protocol::network::{Control, PathHeartbeat};
+    use karyos_protocol::protection::aes_gcm_siv::Domain;
+
+    let (mut rig, b) = with_enc_shards(SHARDS, VERIFY, encrypted_rig);
+    crate::wire_enc::record_seals();
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let first: Vec<Vec<u8>> = (0..3u8).map(|i| vec![i; 100]).collect();
+    assert_eq!(enc_deliver(&mut rig, &mut subscriber, &first), first);
+    rig.sender_stopped = true;
+    let data = crate::wire_enc::take_seals()
+        .iter()
+        .rfind(|record| record.context.domain == Domain::Sender)
+        .unwrap()
+        .clone();
+    let heartbeat = Control::PathHeartbeat(PathHeartbeat {
+        alias: alias(),
+        identity: identity(),
+    });
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let mut context = data.context;
+    for promotion in 0..2 {
+        context.party_epoch += 1;
+        let mut record = data.clone();
+        let mut frames = vec![0_u8; 512];
+        let length = heartbeat.encode(&mut frames).unwrap();
+        frames.truncate(length);
+        record.context = context;
+        record.seq = 0;
+        record.frames = frames;
+        if promotion == 1 {
+            assert!(
+                rig.agents.receiver.role.enc_shards_hold_previous(),
+                "a shard snapshot holds the previous key"
+            );
+            rig.agents.receiver.role.enc_race_promotions(true);
+        }
+        let receiver = &mut rig.agents.receiver;
+        receiver
+            .role
+            .inject_datagram(&receiver.sessions, b, source, &replayed(&record), rig.now);
+        assert_eq!(
+            rig.agents.receiver.role.enc_epochs(slot),
+            Some((context.key_epoch, context.party_epoch)),
+            "promotion {promotion} committed"
+        );
+    }
+    assert_eq!(
+        rig.agents.receiver.role.enc_raced(),
+        (1, 0),
+        "the commit was raced once and no lease was taken"
+    );
+    assert_eq!(rig.agents.receiver.role.enc_leases(slot).unwrap().0, 0);
+}
+
+/// Decision 7 at the agent: stopping the receiver through its runner
+/// withdraws, cancels, drains and joins its shards before it reports
+/// stopped. The agent handed back, still held, has no shard set (its
+/// shards and verifiers joined), nothing in flight and no lease out.
+#[test]
+fn stopping_the_receiver_joins_its_shards_before_it_is_handed_back() {
+    use crate::agents::{AgentRunner, ThreadingMode, YieldThenSleep};
+
+    let InFlight {
+        rig,
+        b,
+        slot,
+        _conductor: _keep_conductor,
+        _subscriber: _keep_subscriber,
+        ..
+    } = in_flight();
+    assert!(rig.agents.receiver.role.enc_shard_stats(b).is_some());
+    let Rig {
+        agents,
+        links: _links,
+        endpoints: _endpoints,
+        ..
+    } = rig;
+    let runner = AgentRunner::start(
+        ThreadingMode::Dedicated,
+        agents,
+        AgentConfig::default(),
+        YieldThenSleep::default,
+    )
+    .unwrap();
+    let stopped = runner.stop();
+    assert!(stopped.failures.is_empty() && stopped.late.is_empty());
+    let receiver = stopped.receiver.expect("the receiver is handed back");
+    assert!(
+        receiver.role.enc_shard_stats(b).is_none(),
+        "its shards were joined before it reported stopped"
+    );
+    assert_eq!(receiver.role.enc_in_flight(), 0);
+    assert_eq!(
+        receiver.role.enc_leases(slot).unwrap().0,
+        0,
+        "every lease back"
+    );
+    drop(receiver);
+}

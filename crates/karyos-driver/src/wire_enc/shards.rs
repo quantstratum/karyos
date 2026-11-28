@@ -25,9 +25,13 @@
 //!   stays the role's commit.
 //! - **One lane per shard** (decision 5): a ring of job slots the shard
 //!   fills in its receive order, verifiers run (the key age checked again
-//!   just before the open), and the role consumes in that order. At most
-//!   [`ENC_SHARD_IN_FLIGHT`] jobs, the replay window, are in flight across
-//!   the lanes of a set.
+//!   just before the open, against a live clock), and the role consumes.
+//!   Every job carries its dispatch number across the set's lanes, and the
+//!   role consumes, and so commits, strictly in that order: no job is
+//!   decided while an earlier dispatched one is still in flight, so an
+//!   older datagram is never pushed out of the replay window by later ones
+//!   another lane completed. At most [`ENC_SHARD_IN_FLIGHT`] jobs, the
+//!   replay window, are in flight across the lanes of a set.
 //! - **One ring per shard for everything else** (decision 6): datagrams
 //!   that are not encrypted for this endpoint's subscriptions (control,
 //!   other classes, a local publication's envelopes), and those only the
@@ -45,7 +49,7 @@
 //!
 //! Nothing a shard, a verifier or the role does per datagram allocates.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::thread::{JoinHandle, Thread};
@@ -70,9 +74,12 @@ use crate::wire_keys::KEY_LEN;
 /// Receive shards an encrypted endpoint may run at most.
 pub const MAX_ENC_SHARDS: u16 = 8;
 /// Jobs in flight across the lanes of one endpoint's shards at most: the
-/// replay window, so that an older datagram still in flight is never more
-/// than the window behind the newest committed sequence of its context
-/// (decision 5).
+/// replay window (decision 5). With the role consuming in dispatch order
+/// across the lanes, nothing dispatched after a job still in flight is
+/// committed before it, so an older datagram still in flight is never more
+/// than the window behind the newest committed sequence of its context:
+/// whatever is committed meanwhile was received before it, exactly as on
+/// one receive thread.
 pub const ENC_SHARD_IN_FLIGHT: u32 = 1_024;
 const _: () = assert!(ENC_SHARD_IN_FLIGHT as u64 == karyos_protocol::protection::replay::WINDOW);
 /// Datagrams each shard's ring for the role holds by default.
@@ -294,6 +301,43 @@ const DONE: u8 = 3;
 #[repr(align(128))]
 struct Padded<T>(T);
 
+/// The clock the shards and the verifiers check rate intervals, overlaps
+/// and key ages against (decision 4): a live monotonic `source` in the
+/// time domain of the role's clock and of the key deadlines, read at each
+/// check, never behind the last reading the role published. A set is made
+/// with a valid reading, never 0.
+pub(crate) struct SetClock {
+    source: fn() -> u64,
+    floor: AtomicU64,
+}
+
+impl SetClock {
+    /// A clock reading `source`, at least `now` from the start.
+    pub(crate) fn new(source: fn() -> u64, now: u64) -> Self {
+        Self {
+            source,
+            floor: AtomicU64::new(now),
+        }
+    }
+
+    /// The reading now.
+    fn now(&self) -> u64 {
+        (self.source)().max(self.floor.load(Ordering::Acquire))
+    }
+
+    /// The role's reading, the least `now` gives from now on.
+    fn publish(&self, now: u64) {
+        self.floor.store(now, Ordering::Release);
+    }
+}
+
+/// A clock source for a role whose clock is not the host's (tests: a
+/// virtual clock): the role's published reading alone.
+#[cfg(test)]
+pub(crate) fn published_only() -> u64 {
+    0
+}
+
 /// The contents of one lane slot.
 struct LaneJob<B> {
     bytes: [u8; MAX_DATAGRAM],
@@ -327,6 +371,9 @@ impl<B> LaneJob<B> {
 #[repr(align(128))]
 struct LaneCell<B> {
     state: AtomicU8,
+    /// The job's dispatch number across the set's lanes (decision 5),
+    /// written before the job is published.
+    number: AtomicU64,
     job: Mutex<LaneJob<B>>,
 }
 
@@ -355,6 +402,7 @@ impl<B> Lane<B> {
             .map(|_| {
                 Some(LaneCell {
                     state: AtomicU8::new(FREE),
+                    number: AtomicU64::new(u64::MAX),
                     job: Mutex::new(LaneJob {
                         bytes: [0; MAX_DATAGRAM],
                         len: 0,
@@ -387,7 +435,7 @@ impl<B> Lane<B> {
     }
 
     /// Takes the next claim and runs its job; whether it ran one.
-    fn run_one(&self, clock: &AtomicU64) -> bool {
+    fn run_one(&self, clock: &SetClock) -> bool {
         loop {
             let claimed = self.claimed.0.load(Ordering::Acquire);
             if claimed >= self.produced.0.load(Ordering::Acquire) {
@@ -414,9 +462,10 @@ impl<B> Lane<B> {
 }
 
 /// Runs the job in `cell` if it is queued: the withdrawn mark, then the
-/// key age against the clock, then the open, under the slot's scratch key
-/// for a scratch derivation, which is erased then. Whether it ran it.
-fn run<B>(cell: &LaneCell<B>, clock: &AtomicU64) -> bool {
+/// key age against the live clock, read just before the open, then the
+/// open, under the slot's scratch key for a scratch derivation, which is
+/// erased then. Whether it ran it.
+fn run<B>(cell: &LaneCell<B>, clock: &SetClock) -> bool {
     if cell
         .state
         .compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire)
@@ -438,7 +487,7 @@ fn run<B>(cell: &LaneCell<B>, clock: &AtomicU64) -> bool {
     } = &mut *guard;
     *outcome = match lease.as_ref() {
         Some(lease) if !lease.is_withdrawn() => {
-            if clock.load(Ordering::Acquire) > *deadline {
+            if clock.now() > *deadline {
                 // Decision 4: queued work that crossed the key's age is
                 // refused without an open.
                 Outcome::Failed(EncRejection::KeyAge)
@@ -581,9 +630,14 @@ struct SetShared<B> {
     /// Jobs in flight across the lanes, at most `cap`.
     in_flight: Padded<AtomicU32>,
     cap: u32,
-    /// The role's clock, published every duty: what the shards and the
-    /// verifiers check the rate intervals, overlaps and key ages against.
-    clock: Padded<AtomicU64>,
+    /// Dispatch numbers given out: the next job's (decision 5).
+    issued: Padded<AtomicU64>,
+    /// The dispatch number the role consumes next: jobs are consumed, and
+    /// committed, in dispatch order across the lanes.
+    next: Padded<AtomicU64>,
+    /// What the shards and the verifiers check the rate intervals,
+    /// overlaps and key ages against.
+    clock: Padded<SetClock>,
     /// `max_datagram + 1`, a receive slot.
     stride: usize,
     max_datagram: usize,
@@ -650,14 +704,15 @@ fn envelope_alias(bytes: &[u8]) -> Option<Alias> {
 impl<B> SetShared<B> {
     /// The tables of `count` shards: lanes of `slots` and rings of `ring`
     /// datagrams of up to `max_datagram` bytes, `verifiers` sleeping
-    /// marks, and an empty snapshot with room for `streams` and
-    /// `bindings`.
+    /// marks, an empty snapshot with room for `streams` and `bindings`,
+    /// and `clock`.
     fn new(
         count: usize,
         (slots, ring): (u16, u16),
         max_datagram: usize,
         verifiers: usize,
         (streams, bindings, parties): (usize, usize, usize),
+        clock: SetClock,
     ) -> Option<Self> {
         let slots = usize::from(slots).clamp(1, ENC_SHARD_IN_FLIGHT as usize);
         let stride = max_datagram.saturating_add(1);
@@ -682,7 +737,9 @@ impl<B> SetShared<B> {
             counts: (0..count).map(|_| ShardCounts::default()).collect(),
             in_flight: Padded(AtomicU32::new(0)),
             cap: ENC_SHARD_IN_FLIGHT,
-            clock: Padded(AtomicU64::new(0)),
+            issued: Padded::default(),
+            next: Padded::default(),
+            clock: Padded(clock),
             stride,
             max_datagram,
             shards_stop: AtomicBool::new(false),
@@ -1056,6 +1113,9 @@ impl<B: Copy> SetShared<B> {
             held.deadline = deadline;
             held.context = Some(job);
         }
+        // Nothing fails from here on: every number given out is published.
+        let number = self.issued.0.fetch_add(1, Ordering::AcqRel);
+        cell.number.store(number, Ordering::Relaxed);
         cell.state.store(QUEUED, Ordering::Release);
         lane.produced
             .0
@@ -1070,7 +1130,7 @@ impl<B: Copy> SetShared<B> {
             return 0;
         };
         let snapshot = self.snapshot.read().unwrap_or_else(PoisonError::into_inner);
-        let now = self.clock.0.load(Ordering::Acquire);
+        let now = self.clock.0.now();
         let (mut datagrams, mut dispatched) = (0_usize, false);
         for (at, result) in results.iter().enumerate() {
             let (len, truncated, source) = match *result {
@@ -1127,14 +1187,24 @@ impl<B: Copy> SetShared<B> {
         datagrams
     }
 
-    /// Wakes one parked verifier, if any.
+    /// Wakes one parked verifier, if any, after a dispatch.
+    ///
+    /// A store-buffering handshake (Dekker): the shard publishes (each
+    /// lane's `produced`), then a sequentially consistent fence, then reads
+    /// the sleeping marks; a verifier sets its mark, then the same fence,
+    /// then reads every lane again before it parks ([`verifier`]). Of two
+    /// such sequences one always sees the other's write: either the
+    /// verifier finds the job and does not park, or this sees its mark and
+    /// unparks it (a token that outlives an unpark before the park). No
+    /// publication is missed.
     fn wake(&self) {
+        fence(Ordering::SeqCst);
         let Some(threads) = self.verifier_threads.get() else {
             return;
         };
         for (sleeping, thread) in self.sleeping.iter().zip(threads.iter()) {
             if let Some(thread) = thread
-                && sleeping.load(Ordering::Acquire)
+                && sleeping.load(Ordering::SeqCst)
                 && sleeping.swap(false, Ordering::SeqCst)
             {
                 thread.unpark();
@@ -1150,13 +1220,40 @@ impl<B: Copy> SetShared<B> {
         })
     }
 
-    /// Runs one queued job of any lane, from lane `from` on.
-    fn run_any(&self, from: usize) -> bool {
+    /// Runs one queued job of any lane, from lane `from` on: the lane it
+    /// ran one of.
+    fn run_any(&self, from: usize) -> Option<usize> {
         let lanes = self.lanes.len().max(1);
-        (0..lanes).any(|offset| {
-            self.lanes
-                .get((from.saturating_add(offset)) % lanes)
-                .is_some_and(|lane| lane.run_one(&self.clock.0))
+        (0..lanes)
+            .map(|offset| from.wrapping_add(offset) % lanes)
+            .find(|at| {
+                self.lanes
+                    .get(*at)
+                    .is_some_and(|lane| lane.run_one(&self.clock.0))
+            })
+    }
+
+    /// One verifier step: runs one queued job, from lane `cursor` on, and
+    /// moves `cursor` past the lane it ran one of, so that a lane kept full
+    /// never starves the others. Whether it ran one.
+    fn verify_step(&self, cursor: &mut usize) -> bool {
+        let Some(lane) = self.run_any(*cursor) else {
+            return false;
+        };
+        *cursor = lane.wrapping_add(1) % self.lanes.len().max(1);
+        true
+    }
+
+    /// The lane whose oldest job is the next in dispatch order (decision
+    /// 5), once its shard has published it.
+    fn next_lane(&self) -> Option<usize> {
+        let next = self.next.0.load(Ordering::Relaxed);
+        self.lanes.iter().position(|lane| {
+            let consumed = lane.consumed.0.load(Ordering::Relaxed);
+            consumed < lane.produced.0.load(Ordering::Acquire)
+                && lane
+                    .cell(consumed)
+                    .is_some_and(|cell| cell.number.load(Ordering::Relaxed) == next)
         })
     }
 }
@@ -1193,8 +1290,9 @@ fn shard<B: Copy>(shared: &SetShared<B>, me: usize, socket: &mut dyn SharedRecv,
 /// then parks until a shard dispatches or the set stops.
 fn verifier<B: Copy>(shared: &SetShared<B>, me: usize) {
     let mut idle = 0_u32;
+    let mut cursor = me;
     while !shared.verifiers_stop.load(Ordering::Acquire) {
-        if shared.run_any(me) {
+        if shared.verify_step(&mut cursor) {
             idle = 0;
             continue;
         }
@@ -1208,7 +1306,10 @@ fn verifier<B: Copy>(shared: &SetShared<B>, me: usize) {
             std::thread::yield_now();
             continue;
         };
+        // The handshake of [`SetShared::wake`]: the mark, the fence, then
+        // every lane read again.
         sleeping.store(true, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         if shared.waiting() || shared.verifiers_stop.load(Ordering::SeqCst) {
             sleeping.store(false, Ordering::SeqCst);
             continue;
@@ -1264,8 +1365,8 @@ impl<B: Copy + Send + Sync + 'static> ShardSet<B> {
     /// `verify.verifiers` verifiers (at least one). Its snapshot is empty,
     /// with room for `tables`: streams and aliases, bound images, and
     /// verified targets and retired identities each: every datagram goes
-    /// to the role until the role publishes.
-    /// Control path: allocates the tables and starts the threads.
+    /// to the role until the role publishes. Its shards and verifiers read
+    /// `clock`. Control path: allocates the tables and starts the threads.
     ///
     /// `None` when no shard could start: the role keeps receiving itself.
     pub(crate) fn new(
@@ -1273,7 +1374,7 @@ impl<B: Copy + Send + Sync + 'static> ShardSet<B> {
         verify: EncVerifyConfig,
         receivers: Vec<Box<dyn SharedRecv>>,
         max_datagram: usize,
-        tables: (usize, usize, usize),
+        (tables, clock): ((usize, usize, usize), SetClock),
     ) -> Option<Self> {
         let count = receivers.len();
         let verifiers = usize::from(verify.verifiers.clamp(1, MAX_ENC_VERIFIERS));
@@ -1285,6 +1386,7 @@ impl<B: Copy + Send + Sync + 'static> ShardSet<B> {
                 max_datagram,
                 verifiers,
                 tables,
+                clock,
             )?),
             shards: Vec::with_capacity(count),
             verifiers: Vec::with_capacity(verifiers),
@@ -1327,9 +1429,10 @@ impl<B: Copy + Send + Sync + 'static> ShardSet<B> {
         fill(&mut snapshot);
     }
 
-    /// Publishes the role's clock for the shards and verifiers.
+    /// Publishes the role's clock reading: the shards and verifiers read
+    /// their live clock, never behind it.
     pub(crate) fn set_clock(&self, now: u64) {
-        self.shared.clock.0.store(now, Ordering::Release);
+        self.shared.clock.0.publish(now);
     }
 
     /// Shards running (tests).
@@ -1355,19 +1458,18 @@ impl<B: Copy + Send + Sync + 'static> ShardSet<B> {
         usize::try_from(self.shared.in_flight.0.load(Ordering::Acquire)).unwrap_or(usize::MAX)
     }
 
-    /// Jobs lane `lane` has dispatched so far: the bound a settle waits up
-    /// to.
-    pub(crate) fn produced(&self, lane: usize) -> u64 {
-        self.shared
-            .lanes
-            .get(lane)
-            .map_or(0, |lane| lane.produced.0.load(Ordering::Acquire))
+    /// Jobs the shards have dispatched so far, across the lanes: the
+    /// dispatch number a settle waits up to.
+    pub(crate) fn issued(&self) -> u64 {
+        self.shared.issued.0.load(Ordering::Acquire)
     }
 
-    /// The oldest job of lane `lane`, if it is done: consumed and its slot
+    /// The oldest job of lane `lane`, if it is the next in dispatch order
+    /// across the lanes (decision 5) and done: consumed and its slot
     /// freed, its plaintext copied to `plain` when it verified. `None`
-    /// while it is not done (it holds back the lane's later ones) or the
-    /// lane is empty. Allocates nothing.
+    /// while it is not done (it holds back every later one, of any lane),
+    /// while an earlier dispatched job of another lane is still to be
+    /// consumed, or when the lane is empty. Allocates nothing.
     pub(crate) fn take(
         &self,
         lane: usize,
@@ -1379,6 +1481,10 @@ impl<B: Copy + Send + Sync + 'static> ShardSet<B> {
             return None;
         }
         let cell = held.cell(consumed)?;
+        let next = self.shared.next.0.load(Ordering::Relaxed);
+        if cell.number.load(Ordering::Relaxed) != next {
+            return None;
+        }
         if cell.state.load(Ordering::Acquire) != DONE {
             return None;
         }
@@ -1409,30 +1515,48 @@ impl<B: Copy + Send + Sync + 'static> ShardSet<B> {
         held.consumed
             .0
             .store(consumed.wrapping_add(1), Ordering::Release);
+        self.shared
+            .next
+            .0
+            .store(next.wrapping_add(1), Ordering::Release);
         self.shared.in_flight.0.fetch_sub(1, Ordering::AcqRel);
         done
     }
 
-    /// [`Self::take`], waiting for lane `lane`'s oldest job while the lane
-    /// has consumed fewer than `limit` jobs; while it waits the role runs
-    /// queued jobs itself, so it never waits on a verifier that is not
-    /// running. `None` once `limit` jobs are consumed.
+    /// The next job in dispatch order across the lanes, if it is done
+    /// ([`Self::take`]). Allocates nothing.
+    pub(crate) fn take_next(&self, plain: &mut [u8; MAX_PLAINTEXT]) -> Option<Done<ShardJob<B>>> {
+        let lane = self.shared.next_lane()?;
+        self.take(lane, plain)
+    }
+
+    /// [`Self::take_next`], waiting for the next job while fewer than
+    /// `limit` jobs are consumed; while it waits the role runs that job
+    /// itself if no verifier has claimed it, so it never waits on a
+    /// verifier that is not running. `None` once `limit` jobs are
+    /// consumed.
     pub(crate) fn take_waiting(
         &self,
-        lane: usize,
         limit: u64,
         plain: &mut [u8; MAX_PLAINTEXT],
     ) -> Option<Done<ShardJob<B>>> {
-        let held = self.shared.lanes.get(lane)?;
         loop {
-            let consumed = held.consumed.0.load(Ordering::Acquire);
-            if consumed >= limit || consumed >= held.produced.0.load(Ordering::Acquire) {
+            if self.shared.next.0.load(Ordering::Acquire) >= limit {
                 return None;
             }
+            // A number given out is published by its shard straight after.
+            let Some(lane) = self.shared.next_lane() else {
+                core::hint::spin_loop();
+                continue;
+            };
             if let Some(done) = self.take(lane, plain) {
                 return Some(done);
             }
-            if !held.run_one(&self.shared.clock.0) {
+            let ran = self.shared.lanes.get(lane).is_some_and(|held| {
+                held.cell(held.consumed.0.load(Ordering::Acquire))
+                    .is_some_and(|cell| run(cell, &self.shared.clock.0))
+            });
+            if !ran {
                 core::hint::spin_loop();
             }
         }
@@ -1562,7 +1686,25 @@ impl<B: Copy + Send + Sync + 'static> ShardSet<B> {
     /// would (tests).
     #[cfg(test)]
     pub(crate) fn verify_one(&self) -> bool {
-        self.shared.run_any(0)
+        self.shared.run_any(0).is_some()
+    }
+
+    #[cfg(test)]
+    /// Takes a lease on the previous key of the first bound image the
+    /// snapshot holds one for, as a shard dispatching under it would
+    /// (tests: a shard racing a promotion).
+    pub(crate) fn lease_previous(&self) -> Option<Lease> {
+        let snapshot = self
+            .shared
+            .snapshot
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        snapshot.bindings.iter().find_map(|binding| {
+            let view = &binding.opener;
+            view.previous
+                .as_ref()
+                .map(|previous| Lease::take(&view.share, Some(Arc::clone(&previous.key))))
+        })
     }
 
     /// Counts the shard-handled datagrams of `length` from now on (tests).
