@@ -437,6 +437,48 @@ fn recv_batch_some(
     }
 }
 
+/// Receives exactly `want` datagrams into consecutive slots from slot
+/// `filled` on, across as many batches as loopback delivery needs: a batch
+/// that ends in `EAGAIN` before every datagram has arrived is retried,
+/// within `PATIENCE`, and the `EAGAIN` is not counted. Any other error
+/// fails the test.
+fn recv_datagrams(
+    socket: &mut PortableSocket,
+    slab: &mut [u8],
+    stride: usize,
+    results: &mut [RecvResult],
+    want: usize,
+) {
+    let start = Instant::now();
+    let mut filled = 0;
+    while filled < want {
+        let got = socket.recv_batch(
+            &mut slab[filled * stride..],
+            stride,
+            &mut results[filled..want],
+        );
+        let datagrams = results[filled..filled + got]
+            .iter()
+            .take_while(|result| matches!(result, RecvResult::Datagram { .. }))
+            .count();
+        if let Some(stop) = results[filled + datagrams..filled + got].first() {
+            assert_eq!(
+                *stop,
+                RecvResult::Error(Errno::AGAIN),
+                "after {filled} datagrams"
+            );
+        }
+        filled += datagrams;
+        assert!(
+            start.elapsed() < PATIENCE,
+            "only {filled} of {want} datagrams arrived"
+        );
+        if filled < want {
+            std::thread::yield_now();
+        }
+    }
+}
+
 /// Section 4.4 batched on macOS: the default batch of single receives
 /// returns several datagrams in order, each with its own source and
 /// length exactly as `recv` reports them (a long datagram fills its slot
@@ -475,10 +517,7 @@ fn a_batched_receive_returns_each_datagram_with_its_source() {
     let mut slab = vec![0_u8; stride * 8];
     let mut results = [RecvResult::Error(Errno::INVAL); 8];
     // A partial batch: two slots of the five queued.
-    let mut filled = 0;
-    while filled < 2 {
-        filled += recv_batch_some(&mut receiver, &mut slab, stride, &mut results[filled..2]);
-    }
+    recv_datagrams(&mut receiver, &mut slab, stride, &mut results, 2);
     assert_eq!(
         results[..2],
         [
@@ -498,10 +537,11 @@ fn a_batched_receive_returns_each_datagram_with_its_source() {
         (&slab[..3], &slab[stride..stride + 3]),
         (&b"one"[..], &b"two"[..])
     );
-    // The rest, then the EAGAIN that ends the batch.
+    // The rest, then the EAGAIN that ends a batch on an empty queue.
+    recv_datagrams(&mut receiver, &mut slab, stride, &mut results, 3);
     assert_eq!(
-        recv_batch_some(&mut receiver, &mut slab, stride, &mut results),
-        4
+        receiver.recv_batch(&mut slab[3 * stride..], stride, &mut results[3..4]),
+        1
     );
     assert_eq!(
         results[..4],
