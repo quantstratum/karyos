@@ -104,16 +104,19 @@ const SEND_BATCH: usize = 32;
 /// alone tops out near 450 000 datagrams/s on xaskar.
 const FORGERS: u64 = 4;
 
-/// Threads sending the flood at most: `KARYOS_R4_FORGERS`, at least 1, or
+/// Threads sending the flood: `KARYOS_R4_FORGERS` exactly when set (at
+/// least 1); otherwise one per [`PER_FORGER`] of the forged rate, at most
 /// [`FORGERS`].
-fn r4_forgers() -> u64 {
+fn r4_forgers(forged_rate: u64) -> u64 {
     std::env::var("KARYOS_R4_FORGERS")
         .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(FORGERS)
-        .max(1)
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or_else(
+            || forged_rate.div_ceil(PER_FORGER).clamp(1, FORGERS),
+            |forgers| forgers.max(1),
+        )
 }
-/// Forged datagrams per second one sending thread is given at most.
+/// Forged datagrams per second one sending thread is given by default.
 const PER_FORGER: u64 = 300_000;
 /// The share of the forged datagrams sent that UDP may lose before the
 /// receiver reads them, or the run is refused as underloaded.
@@ -320,8 +323,7 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     let go = Arc::new(AtomicBool::new(false));
     // The flood, on its own thread, on its own schedule from the start
     // both loads share: forged sent, send calls refused, largest lag.
-    let max_forgers = r4_forgers();
-    let forgers = forged_rate.div_ceil(PER_FORGER).clamp(1, max_forgers);
+    let forgers = r4_forgers(forged_rate);
     let floods: Vec<_> = (0..forgers)
         .map(|share| {
             let go = Arc::clone(&go);
@@ -505,8 +507,8 @@ fn r4(rate: u64, invalid_percent: u64) -> String {
     );
     let _ = writeln!(
         report,
-        "forger threads: {forgers} (KARYOS_R4_FORGERS at most {max_forgers}, \
-         {PER_FORGER}/s each at most)"
+        "forger threads: {forgers} (KARYOS_R4_FORGERS when set, otherwise one per \
+         {PER_FORGER}/s up to {FORGERS})"
     );
     let shard_stats = rig.agents.receiver.role.enc_shard_stats(b);
     let _ = writeln!(
