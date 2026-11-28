@@ -37,7 +37,7 @@ use karyos_raft_eval::openraft_core::OpenRaftBatch16;
 use karyos_raft_eval::process::{NodeConfig, ProcessError, Served, Wire, cases, run_server};
 use karyos_raft_eval::raft_rs::RaftRsBatch16;
 use karyos_raft_eval::record;
-use karyos_sim::harness::custom::Custom;
+use karyos_sim::harness::custom::{Custom, PoolStats, pool_stats};
 use karyos_sim::harness::probe::{Measured, Probed, Stage, WARMUP, measure_with};
 use karyos_sys::alloc_count::CountingAllocator;
 
@@ -93,9 +93,16 @@ fn measured<C: Wire>(config: &NodeConfig) -> Result<(Served, Measured), Failed> 
     Ok((run.map_err(Failed::Run)?, measured))
 }
 
-/// The report on stdout: every stamped observation, the state line and
-/// the probe line.
-fn report(id: u32, served: &Served, measured: &Measured) -> std::io::Result<()> {
+/// The report on stdout: every stamped observation, the state line, the
+/// probe line and, for the custom core, its pool line: the thread pool's
+/// [`PoolStats`], so a failed allocation bound names whether the pool ran
+/// out (entries created past the prefill, vector or payload misses).
+fn report(
+    id: u32,
+    served: &Served,
+    measured: &Measured,
+    pool: Option<PoolStats>,
+) -> std::io::Result<()> {
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     for (stamp, item) in &served.items {
@@ -130,6 +137,9 @@ fn report(id: u32, served: &Served, measured: &Measured) -> std::io::Result<()> 
         measured.counts.frees,
         stages.join(","),
     )?;
+    if let Some(pool) = pool {
+        writeln!(out, "pool {id} {pool:?}")?;
+    }
     out.flush()
 }
 
@@ -167,7 +177,12 @@ fn main() -> ExitCode {
         }
     };
     match run {
-        Ok((served, measured)) => match report(config.id, &served, &measured) {
+        Ok((served, measured)) => match report(
+            config.id,
+            &served,
+            &measured,
+            (core == "custom").then(pool_stats),
+        ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 let _ = writeln!(std::io::stderr(), "raft-eval-node {}: {error}", config.id);
